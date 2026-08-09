@@ -33,8 +33,9 @@ void calcBodyCov(Eigen::Vector3d &pb, const float range_inc, const float degree_
   cov = direction * range_var * direction.transpose() + A * direction_var * A.transpose();
 }
 
-void loadVoxelConfig(ros::NodeHandle &nh, VoxelMapConfig &voxel_config)
+void loadVoxelConfig(const rclcpp::Node::SharedPtr &node, VoxelMapConfig &voxel_config)
 {
+  Ros2ParameterReader nh(node);
   nh.param<bool>("publish/pub_plane_en", voxel_config.is_pub_plane_map_, false);
   
   nh.param<int>("lio/max_layer", voxel_config.max_layer_, 1);
@@ -43,7 +44,7 @@ void loadVoxelConfig(ros::NodeHandle &nh, VoxelMapConfig &voxel_config)
   nh.param<double>("lio/sigma_num", voxel_config.sigma_num_, 3);
   nh.param<double>("lio/beam_err", voxel_config.beam_err_, 0.02);
   nh.param<double>("lio/dept_err", voxel_config.dept_err_, 0.05);
-  nh.param<vector<int>>("lio/layer_init_num", voxel_config.layer_init_num_, vector<int>{5,5,5,5,5});
+  nh.param("lio/layer_init_num", voxel_config.layer_init_num_, vector<int>{5,5,5,5,5});
   nh.param<int>("lio/max_points_num", voxel_config.max_points_num_, 50);
   nh.param<int>("lio/max_iterations", voxel_config.max_iterations_, 5);
 
@@ -490,7 +491,7 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
           (I_STATE.block<DIM_STATE, DIM_STATE>(0, 0) - G.block<DIM_STATE, DIM_STATE>(0, 0)) * state_.cov.block<DIM_STATE, DIM_STATE>(0, 0);
       // total_distance += (_state.pos_end - position_last).norm();
       position_last_ = state_.pos_end;
-      geoQuat_ = tf::createQuaternionMsgFromRollPitchYaw(euler_cur(0), euler_cur(1), euler_cur(2));
+      geoQuat_ = quaternionFromRpy(euler_cur(0), euler_cur(1), euler_cur(2));
 
       // VD(DIM_STATE) K_sum  = K.rowwise().sum();
       // VD(DIM_STATE) P_diag = _state.cov.diagonal();
@@ -789,7 +790,7 @@ void VoxelMapManager::pubVoxelMap()
 {
   double max_trace = 0.25;
   double pow_num = 0.2;
-  ros::Rate loop(500);
+  rclcpp::Rate loop(500.0);
   float use_alpha = 0.8;
   visualization_msgs::MarkerArray voxel_plane;
   voxel_plane.markers.reserve(1000000);
@@ -813,7 +814,7 @@ void VoxelMapManager::pubVoxelMap()
     else { alpha = 0; }
     pubSinglePlane(voxel_plane, "plane", pub_plane_list[i], alpha, plane_rgb);
   }
-  voxel_map_pub_.publish(voxel_plane);
+  voxel_map_pub_->publish(voxel_plane);
   loop.sleep();
 }
 
@@ -838,8 +839,8 @@ void VoxelMapManager::pubSinglePlane(visualization_msgs::MarkerArray &plane_pub,
                                      const float alpha, const Eigen::Vector3d rgb)
 {
   visualization_msgs::Marker plane;
-  plane.header.frame_id = "camera_init";
-  plane.header.stamp = ros::Time();
+  plane.header.frame_id = "mine";
+  plane.header.stamp = builtin_interfaces::msg::Time();
   plane.ns = plane_ns;
   plane.id = single_plane.id_;
   plane.type = visualization_msgs::Marker::CYLINDER;
@@ -857,7 +858,7 @@ void VoxelMapManager::pubSinglePlane(visualization_msgs::MarkerArray &plane_pub,
   plane.color.r = rgb(0);
   plane.color.g = rgb(1);
   plane.color.b = rgb(2);
-  plane.lifetime = ros::Duration();
+  plane.lifetime = builtin_interfaces::msg::Duration();
   plane_pub.markers.push_back(plane);
 }
 

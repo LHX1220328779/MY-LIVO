@@ -1,2 +1,14 @@
 Log/*
 build/*
+
+# ROS/colcon generated output
+install/
+log/
+symlink_install_manifest.txt
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Accidental command output
+/0

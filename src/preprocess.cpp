@@ -57,7 +57,7 @@ void Preprocess::process(const livox_ros_driver::CustomMsg::ConstPtr &msg, Point
   *pcl_out = pl_surf;
 }
 
-void Preprocess::process(const sensor_msgs::PointCloud2::ConstPtr &msg, PointCloudXYZI::Ptr &pcl_out)
+void Preprocess::process(const sensor_msgs::PointCloud2::ConstSharedPtr &msg, PointCloudXYZI::Ptr &pcl_out)
 {
   switch (lidar_type)
   {
@@ -83,6 +83,10 @@ void Preprocess::process(const sensor_msgs::PointCloud2::ConstPtr &msg, PointClo
 
   case ROBOSENSE:
     robosense_handler(msg);
+    break;
+
+  case MINE_FRONT_LIDAR:
+    mine_front_lidar_handler(msg);
     break;
 
   default:
@@ -200,7 +204,7 @@ void Preprocess::avia_handler(const livox_ros_driver::CustomMsg::ConstPtr &msg)
   printf("[ Preprocess ] Output point number: %zu \n", pl_surf.points.size());
 }
 
-void Preprocess::l515_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
+void Preprocess::l515_handler(const sensor_msgs::PointCloud2::ConstSharedPtr &msg)
 {
   pl_surf.clear();
   pl_corn.clear();
@@ -211,7 +215,7 @@ void Preprocess::l515_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
   pl_corn.reserve(plsize);
   pl_surf.reserve(plsize);
 
-  double time_stamp = msg->header.stamp.toSec();
+  double time_stamp = stampToSec(msg->header.stamp);
   // cout << "===================================" << endl;
   // printf("Pt size = %d, N_SCANS = %d\r\n", plsize, N_SCANS);
   for (int i = 0; i < pl_orig.points.size(); i++)
@@ -240,7 +244,7 @@ void Preprocess::l515_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
   // pub_func(pl_surf, pub_corn, msg->header.stamp);
 }
 
-void Preprocess::oust64_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
+void Preprocess::oust64_handler(const sensor_msgs::PointCloud2::ConstSharedPtr &msg)
 {
   pl_surf.clear();
   pl_corn.clear();
@@ -302,7 +306,7 @@ void Preprocess::oust64_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
   }
   else
   {
-    double time_stamp = msg->header.stamp.toSec();
+    double time_stamp = stampToSec(msg->header.stamp);
     // cout << "===================================" << endl;
     // printf("Pt size = %d, N_SCANS = %d\r\n", plsize, N_SCANS);
     for (int i = 0; i < pl_orig.points.size(); i++)
@@ -343,7 +347,7 @@ void Preprocess::oust64_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
 
 #define MAX_LINE_NUM 64
 
-void Preprocess::velodyne_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
+void Preprocess::velodyne_handler(const sensor_msgs::PointCloud2::ConstSharedPtr &msg)
 {
   pl_surf.clear();
   pl_corn.clear();
@@ -511,7 +515,7 @@ void Preprocess::velodyne_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
   // pub_func(pl_surf, pub_corn, msg->header.stamp);
 }
 
-void Preprocess::Pandar128_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
+void Preprocess::Pandar128_handler(const sensor_msgs::PointCloud2::ConstSharedPtr &msg)
 {
   pl_surf.clear();
 
@@ -563,7 +567,7 @@ void Preprocess::Pandar128_handler(const sensor_msgs::PointCloud2::ConstPtr &msg
   // cout << GREEN << "pl_surf.points[31000].timestamp: " << pl_surf.points[31000].curvature << RESET << endl;
 }
 
-void Preprocess::xt32_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
+void Preprocess::xt32_handler(const sensor_msgs::PointCloud2::ConstSharedPtr &msg)
 {
   pl_surf.clear();
   pl_corn.clear();
@@ -707,7 +711,61 @@ void Preprocess::xt32_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
   // pub_func(pl_surf, pub_corn, msg->header.stamp);
 }
 
-void Preprocess::robosense_handler(const sensor_msgs::PointCloud2::ConstPtr &msg)
+void Preprocess::mine_front_lidar_handler(const sensor_msgs::PointCloud2::ConstSharedPtr &msg)
+{
+  pl_surf.clear();
+  pl_corn.clear();
+  pl_full.clear();
+
+  pcl::PointCloud<mine_lidar_ros::Point> source;
+  pcl::fromROSMsg(*msg, source);
+  pl_surf.reserve(source.size() / std::max(1, point_filter_num) + 1);
+
+  // The converter stores absolute Unix seconds in float32, whose resolution
+  // at this epoch is 128 s, so its point timestamp field cannot be used. This
+  // front lidar is a limited-FOV solid-state scanner (about 124 degrees), not
+  // a 360-degree spinner. Its serialized points are column-major and strictly
+  // follow acquisition order, therefore map that order over the configured
+  // 10 Hz frame period. Using 360-degree azimuth timing would compress a
+  // 100 ms scan to about 34 ms and corrupt IMU deskewing.
+  constexpr std::size_t ring_count = 128;
+  const double index_to_milliseconds =
+      source.size() > 1 ? scan_period_ms / static_cast<double>(source.size() - 1) : 0.0;
+
+  for (std::size_t index = 0; index < source.size(); ++index)
+  {
+    const auto &input = source[index];
+    if (input.ring >= ring_count || !std::isfinite(input.x) ||
+        !std::isfinite(input.y) || !std::isfinite(input.z))
+    {
+      continue;
+    }
+
+    const double offset_ms = static_cast<double>(index) * index_to_milliseconds;
+
+    if (index % static_cast<std::size_t>(std::max(1, point_filter_num)) != 0) continue;
+    const double range_squared = input.x * input.x + input.y * input.y + input.z * input.z;
+    if (range_squared <= blind_sqr) continue;
+
+    PointType output;
+    output.x = input.x;
+    output.y = input.y;
+    output.z = input.z;
+    output.intensity = input.intensity;
+    output.normal_x = 0.0F;
+    output.normal_y = 0.0F;
+    output.normal_z = 0.0F;
+    output.curvature = static_cast<float>(offset_ms);
+    pl_surf.push_back(output);
+  }
+
+  std::sort(pl_surf.begin(), pl_surf.end(),
+            [](const PointType &left, const PointType &right) {
+              return left.curvature < right.curvature;
+            });
+}
+
+void Preprocess::robosense_handler(const sensor_msgs::PointCloud2::ConstSharedPtr &msg)
 {
   pl_surf.clear();
 
@@ -977,16 +1035,6 @@ void Preprocess::give_feature(pcl::PointCloud<PointType> &pl, vector<orgtype> &t
       last_surface = -1;
     }
   }
-}
-
-void Preprocess::pub_func(PointCloudXYZI &pl, const ros::Time &ct)
-{
-  pl.height = 1;
-  pl.width = pl.size();
-  sensor_msgs::PointCloud2 output;
-  pcl::toROSMsg(pl, output);
-  output.header.frame_id = "livox";
-  output.header.stamp = ct;
 }
 
 int Preprocess::plane_judge(const PointCloudXYZI &pl, vector<orgtype> &types, uint i_cur, uint &i_nex, Eigen::Vector3d &curr_direct)

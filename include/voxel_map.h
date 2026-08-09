@@ -20,12 +20,10 @@ which is included as part of this source code package.
 #include <mutex>
 #include <omp.h>
 #include <pcl/common/io.h>
-#include <ros/ros.h>
+#include "ros2_compat.h"
 #include <thread>
 #include <unistd.h>
 #include <unordered_map>
-#include <visualization_msgs/Marker.h>
-#include <visualization_msgs/MarkerArray.h>
 
 #define VOXELMAP_HASH_P 116101
 #define VOXELMAP_MAX_N 10000000000
@@ -182,7 +180,7 @@ public:
   VoxelOctoTree *Insert(const pointWithVar &pv);
 };
 
-void loadVoxelConfig(ros::NodeHandle &nh, VoxelMapConfig &voxel_config);
+void loadVoxelConfig(const rclcpp::Node::SharedPtr &node, VoxelMapConfig &voxel_config);
 
 class VoxelMapManager
 {
@@ -190,7 +188,7 @@ public:
   VoxelMapManager() = default;
   VoxelMapConfig config_setting_;
   int current_frame_id_ = 0;
-  ros::Publisher voxel_map_pub_;
+  rclcpp::Publisher<visualization_msgs::MarkerArray>::SharedPtr voxel_map_pub_;
   std::unordered_map<VOXEL_LOCATION, VoxelOctoTree *> voxel_map_;
 
   PointCloudXYZI::Ptr feats_undistort_;

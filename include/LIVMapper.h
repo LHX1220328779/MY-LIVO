@@ -18,15 +18,15 @@ which is included as part of this source code package.
 #include "preprocess.h"
 #include <cv_bridge/cv_bridge.h>
 #include <image_transport/image_transport.h>
-#include <nav_msgs/Path.h>
-#include <vikit/camera_loader.h>
+#include <tf2_ros/transform_broadcaster.h>
+#include <filesystem>
 
 class LIVMapper
 {
 public:
-  LIVMapper(ros::NodeHandle &nh);
+  explicit LIVMapper(const rclcpp::Node::SharedPtr &node);
   ~LIVMapper();
-  void initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_transport::ImageTransport &it);
+  void initializeSubscribersAndPublishers();
   void initializeComponents();
   void initializeFiles();
   void run();
@@ -40,27 +40,36 @@ public:
   
   bool sync_packages(LidarMeasureGroup &meas);
   void prop_imu_once(StatesGroup &imu_prop_state, const double dt, V3D acc_avr, V3D angvel_avr);
-  void imu_prop_callback(const ros::TimerEvent &e);
+  void imu_prop_callback();
   void transformLidar(const Eigen::Matrix3d rot, const Eigen::Vector3d t, const PointCloudXYZI::Ptr &input_cloud, PointCloudXYZI::Ptr &trans_cloud);
   void pointBodyToWorld(const PointType &pi, PointType &po);
   void RGBpointBodyLidarToIMU(PointType const *const pi, PointType *const po);
   void RGBpointBodyToWorld(PointType const *const pi, PointType *const po);
-  void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg);
+  void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstSharedPtr &msg);
   void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg_in);
-  void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in);
+  void imu_cbk(const sensor_msgs::Imu::ConstSharedPtr &msg_in);
   void img_cbk(const sensor_msgs::ImageConstPtr &msg_in);
   void publish_img_rgb(const image_transport::Publisher &pubImage, VIOManagerPtr vio_manager);
-  void publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, VIOManagerPtr vio_manager);
-  void publish_visual_sub_map(const ros::Publisher &pubSubVisualMap);
-  void publish_effect_world(const ros::Publisher &pubLaserCloudEffect, const std::vector<PointToPlane> &ptpl_list);
-  void publish_odometry(const ros::Publisher &pubOdomAftMapped);
-  void publish_mavros(const ros::Publisher &mavros_pose_publisher);
-  void publish_path(const ros::Publisher pubPath);
-  void readParameters(ros::NodeHandle &nh);
+  void publish_frame_world(const rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr &publisher, VIOManagerPtr vio_manager);
+  void publish_visual_sub_map(const rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr &publisher);
+  void publish_effect_world(const rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr &publisher, const std::vector<PointToPlane> &ptpl_list);
+  void publish_odometry(const rclcpp::Publisher<nav_msgs::Odometry>::SharedPtr &publisher);
+  void publish_mavros(const rclcpp::Publisher<geometry_msgs::PoseStamped>::SharedPtr &publisher);
+  void publish_path(const rclcpp::Publisher<nav_msgs::Path>::SharedPtr &publisher);
+  void readParameters();
+  void initializeMineFrame(double initialization_time);
+  void publishReferenceTrajectory(double current_time);
   template <typename T> void set_posestamp(T &out);
   template <typename T> void pointBodyToWorld(const Eigen::Matrix<T, 3, 1> &pi, Eigen::Matrix<T, 3, 1> &po);
   template <typename T> Eigen::Matrix<T, 3, 1> pointBodyToWorld(const Eigen::Matrix<T, 3, 1> &pi);
   cv::Mat getImageFromMsg(const sensor_msgs::ImageConstPtr &img_msg);
+
+  struct MinePose
+  {
+    double stamp = 0.0;
+    V3D position = V3D::Zero();
+    Eigen::Quaterniond orientation = Eigen::Quaterniond::Identity();
+  };
 
   std::mutex mtx_buffer, mtx_buffer_imu_prop;
   std::condition_variable sig_buffer;
@@ -95,7 +104,6 @@ public:
   sensor_msgs::Imu newest_imu;
   double latest_ekf_time;
   nav_msgs::Odometry imu_prop_odom;
-  ros::Publisher pubImuPropOdom;
   double imu_time_offset = 0.0;
   double lidar_time_offset = 0.0;
 
@@ -105,13 +113,14 @@ public:
 
   bool lidar_pushed = false, imu_en, gravity_est_en, flg_reset = false, ba_bg_est_en = true;
   bool dense_map_en = false;
-  int img_en = 1, imu_int_frame = 3;
+  bool img_en = true;
+  int imu_int_frame = 3;
   bool normal_en = true;
   bool exposure_estimate_en = false;
   double exposure_time_init = 0.0;
   bool inverse_composition_en = false;
   bool raycast_en = false;
-  int lidar_en = 1;
+  bool lidar_en = true;
   bool is_first_frame = false;
   int grid_size, patch_size, grid_n_width, grid_n_height, patch_pyrimid_level;
   double outlier_threshold;
@@ -120,7 +129,7 @@ public:
   double img_time_offset = 0.0;
   deque<PointCloudXYZI::Ptr> lid_raw_data_buffer;
   deque<double> lid_header_time_buffer;
-  deque<sensor_msgs::Imu::ConstPtr> imu_buffer;
+  deque<sensor_msgs::Imu::ConstSharedPtr> imu_buffer;
   deque<cv::Mat> img_buffer;
   deque<double> img_time_buffer;
   vector<pointWithVar> _pv_list;
@@ -128,7 +137,22 @@ public:
   vector<double> extrinR;
   vector<double> cameraextrinT;
   vector<double> cameraextrinR;
+  vector<double> camera_intrinsics;
+  vector<double> camera_distortion;
+  int camera_width = 1920;
+  int camera_height = 1080;
   double IMG_POINT_COV;
+
+  bool mine_frame_initialized = false;
+  bool imu_gyro_in_degrees = true;
+  bool imu_acceleration_gravity_compensated = true;
+  double imu_acceleration_scale = 1.0;
+  M3D imu_acceleration_transform = M3D::Identity();
+  double mine_initialization_time = 0.0;
+  std::vector<MinePose> mine_pose_samples;
+  std::size_t mine_pose_publish_index = 0;
+  nav_msgs::Path imu_reference_path;
+  nav_msgs::Odometry imu_reference_odom;
 
   PointCloudXYZI::Ptr visual_sub_map;
   PointCloudXYZI::Ptr feats_undistort;
@@ -158,25 +182,32 @@ public:
   ImuProcessPtr p_imu;
   VoxelMapManagerPtr voxelmap_manager;
   VIOManagerPtr vio_manager;
+  std::unique_ptr<vk::PinholeCamera> camera_model;
 
-  ros::Publisher plane_pub;
-  ros::Publisher voxel_pub;
-  ros::Subscriber sub_pcl;
-  ros::Subscriber sub_imu;
-  ros::Subscriber sub_img;
-  ros::Publisher pubLaserCloudFullRes;
-  ros::Publisher pubNormal;
-  ros::Publisher pubSubVisualMap;
-  ros::Publisher pubLaserCloudEffect;
-  ros::Publisher pubLaserCloudMap;
-  ros::Publisher pubOdomAftMapped;
-  ros::Publisher pubPath;
-  ros::Publisher pubLaserCloudDyn;
-  ros::Publisher pubLaserCloudDynRmed;
-  ros::Publisher pubLaserCloudDynDbg;
+  rclcpp::Node::SharedPtr node_;
+  std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+
+  rclcpp::Publisher<visualization_msgs::Marker>::SharedPtr plane_pub;
+  rclcpp::Publisher<visualization_msgs::MarkerArray>::SharedPtr voxel_pub;
+  rclcpp::Subscription<sensor_msgs::PointCloud2>::SharedPtr sub_pcl;
+  rclcpp::Subscription<sensor_msgs::Imu>::SharedPtr sub_imu;
+  rclcpp::Subscription<sensor_msgs::Image>::SharedPtr sub_img;
+  rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr pubLaserCloudFullRes;
+  rclcpp::Publisher<visualization_msgs::MarkerArray>::SharedPtr pubNormal;
+  rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr pubSubVisualMap;
+  rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr pubLaserCloudEffect;
+  rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr pubLaserCloudMap;
+  rclcpp::Publisher<nav_msgs::Odometry>::SharedPtr pubOdomAftMapped;
+  rclcpp::Publisher<nav_msgs::Path>::SharedPtr pubPath;
+  rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr pubLaserCloudDyn;
+  rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr pubLaserCloudDynRmed;
+  rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr pubLaserCloudDynDbg;
   image_transport::Publisher pubImage;
-  ros::Publisher mavros_pose_publisher;
-  ros::Timer imu_prop_timer;
+  rclcpp::Publisher<geometry_msgs::PoseStamped>::SharedPtr mavros_pose_publisher;
+  rclcpp::Publisher<nav_msgs::Odometry>::SharedPtr pubImuPropOdom;
+  rclcpp::Publisher<nav_msgs::Path>::SharedPtr pubImuReferencePath;
+  rclcpp::Publisher<nav_msgs::Odometry>::SharedPtr pubImuReferenceOdom;
+  rclcpp::TimerBase::SharedPtr imu_prop_timer;
 
   int frame_num = 0;
   double aver_time_consu = 0;

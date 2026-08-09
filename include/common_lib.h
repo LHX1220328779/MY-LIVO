@@ -17,9 +17,8 @@ which is included as part of this source code package.
 #include <utils/types.h>
 #include <utils/color.h>
 #include <opencv2/opencv.hpp>
-#include <sensor_msgs/Imu.h>
+#include "ros2_compat.h"
 #include <sophus/se3.h>
-#include <tf/transform_broadcaster.h>
 
 using namespace std;
 using namespace Eigen;
@@ -43,7 +42,8 @@ enum LID_TYPE
   L515 = 4,
   XT32 = 5,
   PANDAR128 = 6,
-  ROBOSENSE = 7
+  ROBOSENSE = 7,
+  MINE_FRONT_LIDAR = 8
 };
 enum SLAM_MODE
 {
@@ -63,7 +63,7 @@ struct MeasureGroup
 {
   double vio_time;
   double lio_time;
-  deque<sensor_msgs::Imu::ConstPtr> imu;
+  deque<sensor_msgs::Imu::ConstSharedPtr> imu;
   cv::Mat img;
   MeasureGroup()
   {
