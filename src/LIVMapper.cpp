@@ -55,6 +55,7 @@ void LIVMapper::readParameters()
   Ros2ParameterReader nh(node_);
   nh.param<string>("common/lid_topic", lid_topic, "/livox/lidar");
   nh.param<string>("common/imu_topic", imu_topic, "/livox/imu");
+  nh.param<string>("common/ins_odom_topic", ins_odom_topic, "/imu_data/odometry");
   nh.param<bool>("common/ros_driver_bug_fix", ros_driver_fix_en, false);
   nh.param<bool>("common/img_en", img_en, true);
   nh.param<bool>("common/lidar_en", lidar_en, true);
@@ -94,10 +95,8 @@ void LIVMapper::readParameters()
   nh.param<bool>("preprocess/hilti_en", hilti_en, false);
   nh.param<int>("preprocess/lidar_type", p_pre->lidar_type, AVIA);
   nh.param<int>("preprocess/scan_line", p_pre->N_SCANS, 6);
-  double lidar_scan_rate = 10.0;
-  nh.param<double>("preprocess/scan_rate", lidar_scan_rate, 10.0);
-  if (lidar_scan_rate <= 0.0) throw std::runtime_error("preprocess.scan_rate must be positive.");
-  p_pre->scan_period_ms = 1000.0 / lidar_scan_rate;
+  if (p_pre->N_SCANS <= 0 || p_pre->N_SCANS > 128)
+    throw std::runtime_error("preprocess.scan_line must be in [1, 128].");
   nh.param<int>("preprocess/point_filter_num", p_pre->point_filter_num, 3);
   nh.param<bool>("preprocess/feature_extract_enabled", p_pre->feature_enabled, false);
 
@@ -111,6 +110,22 @@ void LIVMapper::readParameters()
   nh.param<double>("pcd_save/filter_size_pcd", filter_size_pcd, 0.5);
   nh.param<vector<double>>("extrin_calib/extrinsic_T", extrinT, vector<double>());
   nh.param<vector<double>>("extrin_calib/extrinsic_R", extrinR, vector<double>());
+  vector<double> rear_axle_lidar_t;
+  vector<double> rear_axle_lidar_r;
+  nh.param<vector<double>>(
+      "extrin_calib/front_lidar_to_rear_axle_T",
+      rear_axle_lidar_t, vector<double>());
+  nh.param<vector<double>>(
+      "extrin_calib/front_lidar_to_rear_axle_R",
+      rear_axle_lidar_r, vector<double>());
+  if (!rear_axle_lidar_t.empty() || !rear_axle_lidar_r.empty())
+  {
+    if (rear_axle_lidar_t.size() != 3 || rear_axle_lidar_r.size() != 9)
+      throw std::runtime_error(
+          "front_lidar_to_rear_axle_T/R must contain 3 and 9 values.");
+    extrinT = rear_axle_lidar_t;
+    extrinR = rear_axle_lidar_r;
+  }
   nh.param<vector<double>>("extrin_calib/Pcl", cameraextrinT, vector<double>());
   nh.param<vector<double>>("extrin_calib/Rcl", cameraextrinR, vector<double>());
   nh.param<vector<double>>("camera/intrinsics", camera_intrinsics,
@@ -120,9 +135,35 @@ void LIVMapper::readParameters()
                           vector<double>{0.0, 0.0, 0.0, 0.0, 0.0});
   nh.param<int>("camera/width", camera_width, 1920);
   nh.param<int>("camera/height", camera_height, 1080);
+  string imu_message_format;
+  nh.param<string>("mine/imu_message_format", imu_message_format, "packed_mine_pose");
+  if (imu_message_format == "standard_rfu")
+  {
+    imu_standard_rfu = true;
+  }
+  else if (imu_message_format != "packed_mine_pose")
+  {
+    throw std::runtime_error(
+        "mine.imu_message_format must be standard_rfu or packed_mine_pose.");
+  }
   nh.param<bool>("mine/imu_gyro_in_degrees", imu_gyro_in_degrees, true);
   nh.param<bool>("mine/imu_acceleration_gravity_compensated", imu_acceleration_gravity_compensated, true);
   nh.param<double>("mine/imu_acceleration_scale", imu_acceleration_scale, 1.0);
+  nh.param<bool>("reference_frame_conversion/enabled", rear_axle_to_imu_enabled, false);
+  vector<double> antenna_to_rear_axle_values;
+  vector<double> imu_to_antenna_values;
+  nh.param<vector<double>>(
+      "reference_frame_conversion/antenna_to_rear_axle_m",
+      antenna_to_rear_axle_values, vector<double>{0.0, 0.0, 0.0});
+  nh.param<vector<double>>(
+      "reference_frame_conversion/imu_to_antenna_m",
+      imu_to_antenna_values, vector<double>{0.0, 0.0, 0.0});
+  if (antenna_to_rear_axle_values.size() != 3 || imu_to_antenna_values.size() != 3)
+    throw std::runtime_error("reference-frame lever arms must each contain 3 values.");
+  imu_to_rear_axle <<
+      imu_to_antenna_values[0] + antenna_to_rear_axle_values[0],
+      imu_to_antenna_values[1] + antenna_to_rear_axle_values[1],
+      imu_to_antenna_values[2] + antenna_to_rear_axle_values[2];
   vector<double> imu_acceleration_transform_values;
   nh.param<vector<double>>(
       "mine/imu_acceleration_transform", imu_acceleration_transform_values,
@@ -147,11 +188,35 @@ void LIVMapper::readParameters()
 void LIVMapper::initializeComponents() 
 {
   downSizeFilterSurf.setLeafSize(filter_size_surf_min, filter_size_surf_min, filter_size_surf_min);
+  if (extrinT.size() != 3 || extrinR.size() != 9)
+    throw std::runtime_error("LiDAR body extrinsic T/R must contain 3 and 9 values.");
   extT << VEC_FROM_ARRAY(extrinT);
   extR << MAT_FROM_ARRAY(extrinR);
 
-  voxelmap_manager->extT_ << VEC_FROM_ARRAY(extrinT);
-  voxelmap_manager->extR_ << MAT_FROM_ARRAY(extrinR);
+  // The truck calibration is T_rear_axle_lidar. When enabled, relocate the
+  // estimator body to the physical IMU centre without changing the LIO/IEKF.
+  // All involved vehicle frames use the same RFU axes, so only translation
+  // changes: T_imu_lidar = T_imu_rear_axle * T_rear_axle_lidar.
+  if (rear_axle_to_imu_enabled)
+  {
+    extT += imu_to_rear_axle;
+  }
+
+  voxelmap_manager->extT_ = extT;
+  voxelmap_manager->extR_ = extR;
+
+  RCLCPP_INFO(
+      node_->get_logger(),
+      "Wuhu LiDAR time contract: header=scan-start, point timestamp=relative-seconds; "
+      "rear_axle_to_imu=%s; active lidar->body T=[%.3f, %.3f, %.3f] m; "
+      "IMU format=%s, gyro=%s, acceleration=%s",
+      rear_axle_to_imu_enabled ? "true" : "false",
+      extT.x(), extT.y(), extT.z(),
+      imu_standard_rfu ? "standard_rfu" : "packed_mine_pose",
+      imu_gyro_in_degrees ? "deg/s->rad/s" : "rad/s",
+      imu_acceleration_gravity_compensated
+          ? "gravity-free; restoring gravity"
+          : "specific force with gravity");
 
   if (camera_intrinsics.size() != 4 || camera_distortion.size() != 5)
     throw std::runtime_error("Camera intrinsics must be [fx, fy, cx, cy] and distortion must contain five values.");
@@ -254,6 +319,12 @@ void LIVMapper::initializeSubscribersAndPublishers()
       lid_topic, lidar_qos, std::bind(&LIVMapper::standard_pcl_cbk, this, std::placeholders::_1));
   sub_imu = node_->create_subscription<sensor_msgs::Imu>(
       imu_topic, imu_qos, std::bind(&LIVMapper::imu_cbk, this, std::placeholders::_1));
+  if (imu_standard_rfu)
+  {
+    sub_ins_odom = node_->create_subscription<nav_msgs::Odometry>(
+        ins_odom_topic, imu_qos,
+        std::bind(&LIVMapper::ins_odom_cbk, this, std::placeholders::_1));
+  }
   sub_img = node_->create_subscription<sensor_msgs::Image>(
       img_topic, image_qos, std::bind(&LIVMapper::img_cbk, this, std::placeholders::_1));
 
@@ -354,7 +425,8 @@ void LIVMapper::initializeMineFrame(double initialization_time)
 
   if (sample_count == 0)
   {
-    throw std::runtime_error("No packed INS pose was available at IMU initialization time.");
+    throw std::runtime_error(
+        "No INS odometry pose was available at IMU initialization time.");
   }
 
   mean_position /= static_cast<double>(sample_count);
@@ -394,9 +466,10 @@ void LIVMapper::initializeMineFrame(double initialization_time)
   imu_reference_path.poses.clear();
   imu_reference_path.poses.push_back(initial_pose);
 
-  RCLCPP_INFO(node_->get_logger(),
-              "Mine frame initialized from %zu stationary INS samples at [%.3f, %.3f, %.3f]",
-              sample_count, mean_position.x(), mean_position.y(), mean_position.z());
+  RCLCPP_INFO(
+      node_->get_logger(),
+      "Mine frame initialized from %zu stationary INS samples at [%.3f, %.3f, %.3f]",
+      sample_count, mean_position.x(), mean_position.y(), mean_position.z());
 }
 
 void LIVMapper::publishReferenceTrajectory(double current_time)
@@ -876,16 +949,24 @@ void LIVMapper::standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstSharedPtr 
   if (!lidar_en) return;
   mtx_buffer.lock();
 
-  double cur_head_time = stampToSec(msg->header.stamp) + lidar_time_offset;
-  // cout<<"got feature"<<endl;
-  if (cur_head_time < last_timestamp_lidar)
-  {
-    ROS_ERROR("lidar loop back, clear buffer");
-    lid_raw_data_buffer.clear();
-  }
-  // ROS_INFO("get point cloud at time: %.6f", msg->header.stamp.toSec());
   PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
   p_pre->process(msg, ptr);
+  // GroundExtractor normalizes header.stamp to the first-point/scan-start
+  // time. Never subtract a scan period here.
+  const double cur_head_time =
+      stampToSec(msg->header.stamp) + lidar_time_offset;
+  if (cur_head_time < last_timestamp_lidar)
+  {
+    RCLCPP_FATAL(node_->get_logger(),
+                 "LiDAR timestamp moved backwards; stop this run and restart the node");
+    lid_raw_data_buffer.clear();
+    lid_header_time_buffer.clear();
+    lidar_pushed = false;
+    mtx_buffer.unlock();
+    sig_buffer.notify_all();
+    rclcpp::shutdown();
+    return;
+  }
   lid_raw_data_buffer.push_back(ptr);
   lid_header_time_buffer.push_back(cur_head_time);
   last_timestamp_lidar = cur_head_time;
@@ -916,8 +997,15 @@ void LIVMapper::livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg_i
   ROS_INFO("Get LiDAR, its header time: %.6f", cur_head_time);
   if (cur_head_time < last_timestamp_lidar)
   {
-    ROS_ERROR("lidar loop back, clear buffer");
+    RCLCPP_FATAL(node_->get_logger(),
+                 "LiDAR timestamp moved backwards; stop this run and restart the node");
     lid_raw_data_buffer.clear();
+    lid_header_time_buffer.clear();
+    lidar_pushed = false;
+    mtx_buffer.unlock();
+    sig_buffer.notify_all();
+    rclcpp::shutdown();
+    return;
   }
   // ROS_INFO("get point cloud at time: %.6f", msg->header.stamp.toSec());
   PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
@@ -937,6 +1025,77 @@ void LIVMapper::livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg_i
   sig_buffer.notify_all();
 }
 
+void LIVMapper::ins_odom_cbk(const nav_msgs::Odometry::ConstSharedPtr &msg_in)
+{
+  if (!imu_en || !imu_standard_rfu) return;
+
+  const bool legacy_mislabeled_rear_axle =
+      msg_in->child_frame_id == "imu_link_rfu";
+  if (msg_in->header.frame_id != "ins_local_enu" ||
+      (msg_in->child_frame_id != "vehicle_rear_axle_rfu" &&
+       !legacy_mislabeled_rear_axle))
+  {
+    RCLCPP_WARN_THROTTLE(
+        node_->get_logger(), *node_->get_clock(), 5000,
+        "Ignoring INS odometry with unexpected frames %s -> %s",
+        msg_in->header.frame_id.c_str(), msg_in->child_frame_id.c_str());
+    return;
+  }
+  if (legacy_mislabeled_rear_axle)
+  {
+    RCLCPP_WARN_ONCE(
+        node_->get_logger(),
+        "Legacy INS Odometry child_frame_id=imu_link_rfu is mislabeled; "
+        "treating its translation as rear axle and applying the lever arm.");
+  }
+
+  MinePose mine_pose;
+  mine_pose.stamp = stampToSec(msg_in->header.stamp) - imu_time_offset;
+  mine_pose.position << msg_in->pose.pose.position.x,
+                        msg_in->pose.pose.position.y,
+                        msg_in->pose.pose.position.z;
+  mine_pose.orientation = Eigen::Quaterniond(
+      msg_in->pose.pose.orientation.w,
+      msg_in->pose.pose.orientation.x,
+      msg_in->pose.pose.orientation.y,
+      msg_in->pose.pose.orientation.z);
+
+  const bool pose_is_finite = std::isfinite(mine_pose.stamp)
+      && mine_pose.position.allFinite()
+      && mine_pose.orientation.coeffs().allFinite();
+  if (!pose_is_finite || mine_pose.orientation.norm() < 1.0e-6)
+  {
+    RCLCPP_WARN_THROTTLE(
+        node_->get_logger(), *node_->get_clock(), 5000,
+        "Ignoring invalid INS odometry pose on %s", ins_odom_topic.c_str());
+    return;
+  }
+  mine_pose.orientation.normalize();
+
+  if (rear_axle_to_imu_enabled)
+  {
+    // The new Odometry preserves the same st_point_3d/f_pos_alt translation
+    // carried by the legacy packed INS pose. When the estimator body is moved
+    // from the rear axle to the physical IMU, move this reference pose by the
+    // same lever arm so LIO and RTK/INS remain at the same physical point.
+    mine_pose.position -=
+        mine_pose.orientation.toRotationMatrix() * imu_to_rear_axle;
+  }
+
+  if (!mine_pose_samples.empty() &&
+      mine_pose.stamp < mine_pose_samples.back().stamp)
+  {
+    RCLCPP_WARN_THROTTLE(
+        node_->get_logger(), *node_->get_clock(), 5000,
+        "Ignoring out-of-order INS odometry sample");
+    return;
+  }
+  // This separate odometry is used only for the one-time mine-frame anchor
+  // and the RViz reference path. It is never inserted into LIO propagation or
+  // measurement updates.
+  mine_pose_samples.push_back(mine_pose);
+}
+
 void LIVMapper::imu_cbk(const sensor_msgs::Imu::ConstSharedPtr &msg_in)
 {
   if (!imu_en) return;
@@ -944,24 +1103,42 @@ void LIVMapper::imu_cbk(const sensor_msgs::Imu::ConstSharedPtr &msg_in)
   auto msg = std::make_shared<sensor_msgs::Imu>(*msg_in);
   double timestamp = stampToSec(msg->header.stamp) - imu_time_offset;
 
-  // clip_converter.cpp contract:
-  // pitch=cov[0], roll=cov[1], local x/y=cov[3:4], altitude=orientation.z,
-  // heading=orientation.w. Reproduce Rz(-heading)*Ry(roll)*Rx(pitch).
   constexpr double degrees_to_radians = M_PI / 180.0;
-  const double pitch = msg_in->orientation_covariance[0] * degrees_to_radians;
-  const double roll = msg_in->orientation_covariance[1] * degrees_to_radians;
-  const double heading = msg_in->orientation.w * degrees_to_radians;
-  const M3D mine_from_imu =
-      Eigen::AngleAxisd(-heading, V3D::UnitZ()).toRotationMatrix() *
-      Eigen::AngleAxisd(roll, V3D::UnitY()).toRotationMatrix() *
-      Eigen::AngleAxisd(pitch, V3D::UnitX()).toRotationMatrix();
+  M3D mine_from_body = M3D::Identity();
+  if (imu_standard_rfu)
+  {
+    Eigen::Quaterniond orientation(
+        msg_in->orientation.w, msg_in->orientation.x,
+        msg_in->orientation.y, msg_in->orientation.z);
+    if (orientation.coeffs().allFinite() && orientation.norm() >= 1.0e-6)
+      mine_from_body = orientation.normalized().toRotationMatrix();
+  }
+  else
+  {
+    // Legacy clip_converter contract:
+    // pitch=cov[0], roll=cov[1], local x/y=cov[3:4], altitude=orientation.z,
+    // heading=orientation.w. Reproduce Rz(-heading)*Ry(roll)*Rx(pitch).
+    const double pitch = msg_in->orientation_covariance[0] * degrees_to_radians;
+    const double roll = msg_in->orientation_covariance[1] * degrees_to_radians;
+    const double heading = msg_in->orientation.w * degrees_to_radians;
+    mine_from_body =
+        Eigen::AngleAxisd(-heading, V3D::UnitZ()).toRotationMatrix() *
+        Eigen::AngleAxisd(roll, V3D::UnitY()).toRotationMatrix() *
+        Eigen::AngleAxisd(pitch, V3D::UnitX()).toRotationMatrix();
 
-  MinePose mine_pose;
-  mine_pose.stamp = timestamp;
-  mine_pose.position << msg_in->orientation_covariance[3],
-                        msg_in->orientation_covariance[4], msg_in->orientation.z;
-  mine_pose.orientation = Eigen::Quaterniond(mine_from_imu).normalized();
-  mine_pose_samples.push_back(mine_pose);
+    MinePose mine_pose;
+    mine_pose.stamp = timestamp;
+    mine_pose.position << msg_in->orientation_covariance[3],
+                          msg_in->orientation_covariance[4], msg_in->orientation.z;
+    if (rear_axle_to_imu_enabled)
+    {
+      // Legacy packed position is at the rear axle; relocate it to the
+      // physical IMU only for that legacy input format.
+      mine_pose.position -= mine_from_body * imu_to_rear_axle;
+    }
+    mine_pose.orientation = Eigen::Quaterniond(mine_from_body).normalized();
+    mine_pose_samples.push_back(mine_pose);
+  }
 
   const double gyro_scale = imu_gyro_in_degrees ? degrees_to_radians : 1.0;
   msg->angular_velocity.x = msg_in->angular_velocity.x * gyro_scale;
@@ -973,7 +1150,7 @@ void LIVMapper::imu_cbk(const sensor_msgs::Imu::ConstSharedPtr &msg_in)
   acceleration = imu_acceleration_transform * acceleration * imu_acceleration_scale;
   if (imu_acceleration_gravity_compensated)
   {
-    acceleration += mine_from_imu.transpose() * V3D(0.0, 0.0, G_m_s2);
+    acceleration += mine_from_body.transpose() * V3D(0.0, 0.0, G_m_s2);
   }
   msg->linear_acceleration.x = acceleration.x();
   msg->linear_acceleration.y = acceleration.y();
@@ -988,7 +1165,7 @@ void LIVMapper::imu_cbk(const sensor_msgs::Imu::ConstSharedPtr &msg_in)
   msg->header.stamp = stampFromSec(timestamp);
 
   // Preserve the original estimator behavior: inertial samples begin once a
-  // lidar time base exists. INS poses above are retained for the init mean.
+  // lidar time base exists. INS odometry is buffered by its separate callback.
   if (last_timestamp_lidar < 0.0) return;
 
   if (fabs(last_timestamp_lidar - timestamp) > 0.5 && (!ros_driver_fix_en))
@@ -1006,7 +1183,10 @@ void LIVMapper::imu_cbk(const sensor_msgs::Imu::ConstSharedPtr &msg_in)
   {
     mtx_buffer.unlock();
     sig_buffer.notify_all();
-    ROS_ERROR("imu loop back, offset: %lf \n", last_timestamp_imu - timestamp);
+    RCLCPP_FATAL(node_->get_logger(),
+                 "IMU timestamp moved backwards by %.9f s; stop this run and restart the node",
+                 last_timestamp_imu - timestamp);
+    rclcpp::shutdown();
     return;
   }
 
@@ -1067,7 +1247,9 @@ void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg_in)
 
   if (msg_header_time < last_timestamp_img)
   {
-    ROS_ERROR("image loop back. \n");
+    RCLCPP_FATAL(node_->get_logger(),
+                 "Image timestamp moved backwards; stop this run and restart the node");
+    rclcpp::shutdown();
     return;
   }
 
@@ -1132,10 +1314,19 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
 
     m.imu.clear();
     m.lio_time = meas.lidar_frame_end_time;
+    m.point_time_reference = meas.lidar_frame_beg_time;
     mtx_buffer.lock();
     while (!imu_buffer.empty())
     {
-      if (stampToSec(imu_buffer.front()->header.stamp) > meas.lidar_frame_end_time) break;
+      if (stampToSec(imu_buffer.front()->header.stamp) >
+          meas.lidar_frame_end_time)
+      {
+        // Once initialization is complete, retain this future sample in the
+        // shared buffer but also give the current measurement a reference to it
+        // so IMU values can be interpolated exactly at the LiDAR frame end.
+        if (!p_imu->imu_need_init) m.imu.push_back(imu_buffer.front());
+        break;
+      }
       m.imu.push_back(imu_buffer.front());
       imu_buffer.pop_front();
     }
@@ -1200,10 +1391,18 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
       // printf("[ Data Cut ] img_capture_time: %lf \n", img_capture_time);
       m.imu.clear();
       m.lio_time = img_capture_time;
+      // pcl_proc_cur is assembled below with curvature rebased to the previous
+      // estimator update, unlike a complete ONLY_LIO scan whose origin is its
+      // own header timestamp.
+      m.point_time_reference = meas.last_lio_update_time;
       mtx_buffer.lock();
       while (!imu_buffer.empty())
       {
-        if (stampToSec(imu_buffer.front()->header.stamp) > m.lio_time) break;
+        if (stampToSec(imu_buffer.front()->header.stamp) > m.lio_time)
+        {
+          if (!p_imu->imu_need_init) m.imu.push_back(imu_buffer.front());
+          break;
+        }
 
         if (stampToSec(imu_buffer.front()->header.stamp) > meas.last_lio_update_time) m.imu.push_back(imu_buffer.front());
 
@@ -1269,6 +1468,7 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
       struct MeasureGroup m;
       m.vio_time = img_capture_time;
       m.lio_time = meas.last_lio_update_time;
+      m.point_time_reference = meas.last_lio_update_time;
       m.img = img_buffer.front();
       mtx_buffer.lock();
       // while ((!imu_buffer.empty() && (imu_time < img_capture_time)))
@@ -1313,6 +1513,7 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
     }
     struct MeasureGroup m; // standard method to keep imu message.
     m.lio_time = meas.lidar_frame_end_time;
+    m.point_time_reference = meas.lidar_frame_beg_time;
     mtx_buffer.lock();
     lid_raw_data_buffer.pop_front();
     lid_header_time_buffer.pop_front();

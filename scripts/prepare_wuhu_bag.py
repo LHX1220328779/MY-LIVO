@@ -30,6 +30,7 @@ import rosbag2_py
 DEFAULT_TOPICS = {
     "front_lidar",
     "imu_data",
+    "imu_data/odometry",
     "midrange_camera/ffmpeg",
 }
 

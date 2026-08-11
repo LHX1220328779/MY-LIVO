@@ -48,6 +48,7 @@ public:
   void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstSharedPtr &msg);
   void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg_in);
   void imu_cbk(const sensor_msgs::Imu::ConstSharedPtr &msg_in);
+  void ins_odom_cbk(const nav_msgs::Odometry::ConstSharedPtr &msg_in);
   void img_cbk(const sensor_msgs::ImageConstPtr &msg_in);
   void publish_img_rgb(const image_transport::Publisher &pubImage, VIOManagerPtr vio_manager);
   void publish_frame_world(const rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr &publisher, VIOManagerPtr vio_manager);
@@ -78,7 +79,7 @@ public:
   std::unordered_map<VOXEL_LOCATION, VoxelOctoTree *> voxel_map;
   
   string root_dir;
-  string lid_topic, imu_topic, seq_name, img_topic;
+  string lid_topic, imu_topic, ins_odom_topic, seq_name, img_topic;
   V3D extT;
   M3D extR;
 
@@ -144,10 +145,13 @@ public:
   double IMG_POINT_COV;
 
   bool mine_frame_initialized = false;
+  bool imu_standard_rfu = false;
   bool imu_gyro_in_degrees = true;
   bool imu_acceleration_gravity_compensated = true;
   double imu_acceleration_scale = 1.0;
   M3D imu_acceleration_transform = M3D::Identity();
+  bool rear_axle_to_imu_enabled = false;
+  V3D imu_to_rear_axle = V3D::Zero();
   double mine_initialization_time = 0.0;
   std::vector<MinePose> mine_pose_samples;
   std::size_t mine_pose_publish_index = 0;
@@ -191,6 +195,7 @@ public:
   rclcpp::Publisher<visualization_msgs::MarkerArray>::SharedPtr voxel_pub;
   rclcpp::Subscription<sensor_msgs::PointCloud2>::SharedPtr sub_pcl;
   rclcpp::Subscription<sensor_msgs::Imu>::SharedPtr sub_imu;
+  rclcpp::Subscription<nav_msgs::Odometry>::SharedPtr sub_ins_odom;
   rclcpp::Subscription<sensor_msgs::Image>::SharedPtr sub_img;
   rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr pubLaserCloudFullRes;
   rclcpp::Publisher<visualization_msgs::MarkerArray>::SharedPtr pubNormal;

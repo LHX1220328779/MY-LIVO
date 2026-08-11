@@ -11,10 +11,16 @@ import os
 
 def generate_launch_description():
     share = get_package_share_directory("fast_livo")
-    config = os.path.join(share, "config", "wuhu_truck29.yaml")
+    installed_config = os.path.join(share, "config", "wuhu_truck29.yaml")
+    source_config = "/home/project/MY-LIVO1.0/config/wuhu_truck29.yaml"
+    default_config = (
+        source_config if os.path.isfile(source_config) else installed_config
+    )
     rviz_config = os.path.join(share, "rviz_cfg", "wuhu_truck29.rviz")
+    config_file = LaunchConfiguration("config_file")
     use_camera = LaunchConfiguration("use_camera")
     use_rviz = LaunchConfiguration("use_rviz")
+    rear_axle_to_imu = LaunchConfiguration("rear_axle_to_imu")
 
     decoder = Node(
         package="image_transport",
@@ -41,8 +47,13 @@ def generate_launch_description():
         name="laser_mapping",
         output="screen",
         parameters=[
-            config,
-            {"common.img_en": ParameterValue(use_camera, value_type=bool)},
+            config_file,
+            {
+                "common.img_en": ParameterValue(use_camera, value_type=bool),
+                "reference_frame_conversion.enabled": ParameterValue(
+                    rear_axle_to_imu, value_type=bool
+                ),
+            },
         ],
     )
 
@@ -58,6 +69,8 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument("use_camera", default_value="true"),
         DeclareLaunchArgument("use_rviz", default_value="true"),
+        DeclareLaunchArgument("config_file", default_value=default_config),
+        DeclareLaunchArgument("rear_axle_to_imu", default_value="true"),
         decoder,
         mapping,
         rviz,

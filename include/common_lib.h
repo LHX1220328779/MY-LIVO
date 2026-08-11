@@ -63,12 +63,18 @@ struct MeasureGroup
 {
   double vio_time;
   double lio_time;
+  // Absolute timestamp represented by point.curvature == 0. Point curvature is
+  // expressed in milliseconds, but a complete LIO scan and a camera-split LIVO
+  // cloud use different origins. Carry that origin with the measurement so IMU
+  // deskew always compares times on one explicit axis.
+  double point_time_reference;
   deque<sensor_msgs::Imu::ConstSharedPtr> imu;
   cv::Mat img;
   MeasureGroup()
   {
     vio_time = 0.0;
     lio_time = 0.0;
+    point_time_reference = 0.0;
   };
 };
 

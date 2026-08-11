@@ -721,27 +721,20 @@ void Preprocess::mine_front_lidar_handler(const sensor_msgs::PointCloud2::ConstS
   pcl::fromROSMsg(*msg, source);
   pl_surf.reserve(source.size() / std::max(1, point_filter_num) + 1);
 
-  // The converter stores absolute Unix seconds in float32, whose resolution
-  // at this epoch is 128 s, so its point timestamp field cannot be used. This
-  // front lidar is a limited-FOV solid-state scanner (about 124 degrees), not
-  // a 360-degree spinner. Its serialized points are column-major and strictly
-  // follow acquisition order, therefore map that order over the configured
-  // 10 Hz frame period. Using 360-degree azimuth timing would compress a
-  // 100 ms scan to about 34 ms and corrupt IMU deskewing.
-  constexpr std::size_t ring_count = 128;
-  const double index_to_milliseconds =
-      source.size() > 1 ? scan_period_ms / static_cast<double>(source.size() - 1) : 0.0;
-
+  // GroundExtractor's normalized contract is fixed: the cloud header is the
+  // scan start and every float32 timestamp is relative seconds from it.
   for (std::size_t index = 0; index < source.size(); ++index)
   {
     const auto &input = source[index];
-    if (input.ring >= ring_count || !std::isfinite(input.x) ||
+    const double relative_seconds = static_cast<double>(input.timestamp);
+    if (input.ring >= static_cast<std::uint32_t>(N_SCANS) ||
+        !std::isfinite(input.x) ||
         !std::isfinite(input.y) || !std::isfinite(input.z))
     {
       continue;
     }
 
-    const double offset_ms = static_cast<double>(index) * index_to_milliseconds;
+    const double offset_ms = relative_seconds * 1000.0;
 
     if (index % static_cast<std::size_t>(std::max(1, point_filter_num)) != 0) continue;
     const double range_squared = input.x * input.x + input.y * input.y + input.z * input.z;

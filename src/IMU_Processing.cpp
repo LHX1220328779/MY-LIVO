@@ -44,6 +44,7 @@ void ImuProcess::Reset()
   IMUpose.clear();
   last_imu.reset(new sensor_msgs::Imu());
   cur_pcl_un_.reset(new PointCloudXYZI());
+  last_prop_end_time = -1.0;
 }
 
 void ImuProcess::disable_imu()
@@ -251,6 +252,12 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
   // printf("[ IMU ] lidar_scan_index_now: %d \n", lidar_meas.lidar_scan_index_now);
 
   const double prop_end_time = lidar_meas.lio_vio_flg == LIO ? meas.lio_time : meas.vio_time;
+  if (!std::isfinite(prop_beg_time) || !std::isfinite(prop_end_time) ||
+      !std::isfinite(meas.point_time_reference) || prop_beg_time < 0.0 ||
+      prop_end_time < prop_beg_time)
+  {
+    throw std::runtime_error("Invalid IMU propagation or point-time reference");
+  }
 
   /*** cut lidar point based on the propagation-start time and required
    * propagation-end time ***/
@@ -328,17 +335,47 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
     {
       auto head = v_imu[i];
       auto tail = v_imu[i + 1];
+      const double head_time = stampToSec(head->header.stamp);
+      const double tail_time = stampToSec(tail->header.stamp);
+      if (tail_time <= prop_beg_time) continue;
+      if (head_time >= prop_end_time) break;
+      if (tail_time <= head_time) continue;
 
-      if (stampToSec(tail->header.stamp) < prop_beg_time) continue;
+      // Clip this IMU interval to the exact propagation window. The
+      // synchronizer supplies the first sample after prop_end_time, allowing
+      // measurements at both clipped endpoints to be interpolated instead of
+      // extrapolating the final in-scan sample.
+      const double interval_begin = std::max(head_time, prop_beg_time);
+      const double interval_end = std::min(tail_time, prop_end_time);
+      if (interval_end <= interval_begin) continue;
+      const double pair_duration = tail_time - head_time;
+      const double begin_ratio = (interval_begin - head_time) / pair_duration;
+      const double end_ratio = (interval_end - head_time) / pair_duration;
 
-      angvel_avr << 0.5 * (head->angular_velocity.x + tail->angular_velocity.x), 0.5 * (head->angular_velocity.y + tail->angular_velocity.y),
-          0.5 * (head->angular_velocity.z + tail->angular_velocity.z);
-
-      // angvel_avr<<tail->angular_velocity.x, tail->angular_velocity.y,
-      // tail->angular_velocity.z;
-
-      acc_avr << 0.5 * (head->linear_acceleration.x + tail->linear_acceleration.x), 0.5 * (head->linear_acceleration.y + tail->linear_acceleration.y),
-          0.5 * (head->linear_acceleration.z + tail->linear_acceleration.z);
+      const V3D angular_head(head->angular_velocity.x,
+                             head->angular_velocity.y,
+                             head->angular_velocity.z);
+      const V3D angular_tail(tail->angular_velocity.x,
+                             tail->angular_velocity.y,
+                             tail->angular_velocity.z);
+      const V3D acceleration_head(head->linear_acceleration.x,
+                                  head->linear_acceleration.y,
+                                  head->linear_acceleration.z);
+      const V3D acceleration_tail(tail->linear_acceleration.x,
+                                  tail->linear_acceleration.y,
+                                  tail->linear_acceleration.z);
+      const V3D angular_begin =
+          angular_head + (angular_tail - angular_head) * begin_ratio;
+      const V3D angular_end =
+          angular_head + (angular_tail - angular_head) * end_ratio;
+      const V3D acceleration_begin =
+          acceleration_head +
+          (acceleration_tail - acceleration_head) * begin_ratio;
+      const V3D acceleration_end =
+          acceleration_head +
+          (acceleration_tail - acceleration_head) * end_ratio;
+      angvel_avr = 0.5 * (angular_begin + angular_end);
+      acc_avr = 0.5 * (acceleration_begin + acceleration_end);
 
       // cout<<"angvel_avr: "<<angvel_avr.transpose()<<endl;
       // cout<<"acc_avr: "<<acc_avr.transpose()<<endl;
@@ -352,24 +389,8 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
       angvel_avr -= state_inout.bias_g;
       acc_avr = acc_avr * G_m_s2 / mean_acc.norm() - state_inout.bias_a;
 
-      if (stampToSec(head->header.stamp) < prop_beg_time)
-      {
-        // printf("00 \n");
-        dt = stampToSec(tail->header.stamp) - last_prop_end_time;
-        offs_t = stampToSec(tail->header.stamp) - prop_beg_time;
-      }
-      else if (i != v_imu.size() - 2)
-      {
-        // printf("11 \n");
-        dt = stampToSec(tail->header.stamp) - stampToSec(head->header.stamp);
-        offs_t = stampToSec(tail->header.stamp) - prop_beg_time;
-      }
-      else
-      {
-        // printf("22 \n");
-        dt = prop_end_time - stampToSec(head->header.stamp);
-        offs_t = prop_end_time - prop_beg_time;
-      }
+      dt = interval_end - interval_begin;
+      offs_t = interval_end - prop_beg_time;
 
       dt_all += dt;
       // printf("[ LIO Propagation ] dt: %lf \n", dt);
@@ -428,6 +449,7 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
       // "<<tail->header.stamp.toSec()<<endl; printf("[ LIO Propagation ]
       // offs_t: %lf \n", offs_t);
       IMUpose.push_back(set_pose6d(offs_t, acc_imu, angvel_avr, vel_imu, pos_imu, R_imu));
+      if (interval_end >= prop_end_time) break;
     }
 
     // unbiased_gyr = V3D(IMUpose.back().gyr[0], IMUpose.back().gyr[1], IMUpose.back().gyr[2]);
@@ -466,7 +488,23 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
   // cout<<"[ Propagation ] output state: "<<state_inout.vel_end.transpose() <<
   // state_inout.pos_end.transpose()<<endl;
 
-  last_imu = v_imu.back();
+  // Keep the last sample at or before the propagated state time. The sample
+  // after prop_end_time remains in LIVMapper's buffer and is intentionally
+  // reused as the left endpoint of the next interval.
+  bool found_last_in_window = false;
+  for (auto it = v_imu.rbegin(); it != v_imu.rend(); ++it)
+  {
+    if (stampToSec((*it)->header.stamp) <= prop_end_time)
+    {
+      last_imu = *it;
+      found_last_in_window = true;
+      break;
+    }
+  }
+  if (!found_last_in_window)
+  {
+    throw std::runtime_error("No IMU sample at or before propagation end");
+  }
   last_prop_end_time = prop_end_time;
 
   double t1 = omp_get_wtime();
@@ -493,10 +531,19 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
    * update ***/
   if (lidar_meas.lio_vio_flg == LIO)
   {
+    if (IMUpose.size() < 2)
+    {
+      throw std::runtime_error("IMU propagation did not cover the LiDAR update");
+    }
     auto it_pcl = pcl_wait_proc.points.end() - 1;
     M3D extR_Ri(Lid_rot_to_IMU.transpose() * state_inout.rot_end.transpose());
     V3D exrR_extT(Lid_rot_to_IMU.transpose() * Lid_offset_to_IMU);
-    for (auto it_kp = IMUpose.end() - 1; it_kp != IMUpose.begin(); it_kp--)
+    const double point_time_shift =
+        meas.point_time_reference - prop_beg_time;
+    const double propagation_duration = prop_end_time - prop_beg_time;
+    bool all_points_processed = false;
+    for (auto it_kp = IMUpose.end() - 1;
+         it_kp != IMUpose.begin() && !all_points_processed; it_kp--)
     {
       auto head = it_kp - 1;
       auto tail = it_kp;
@@ -511,9 +558,22 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
       // printf("it_pcl->curvature: %lf pt dt: %lf \n", it_pcl->curvature,
       // it_pcl->curvature / double(1000) - head->offset_time);
 
-      for (; it_pcl->curvature / double(1000) > head->offset_time; it_pcl--)
+      while (true)
       {
-        dt = it_pcl->curvature / double(1000) - head->offset_time;
+        const double raw_point_offset =
+            point_time_shift + it_pcl->curvature / double(1000);
+        constexpr double kPointTimeToleranceSeconds = 1.0e-6;
+        if (raw_point_offset < -kPointTimeToleranceSeconds ||
+            raw_point_offset >
+                propagation_duration + kPointTimeToleranceSeconds)
+        {
+          throw std::runtime_error(
+              "LiDAR point time lies outside the IMU propagation window");
+        }
+        const double point_offset = std::max(
+            0.0, std::min(raw_point_offset, propagation_duration));
+        if (point_offset + 1.0e-9 < head->offset_time) break;
+        dt = point_offset - head->offset_time;
 
         /* Transform to the 'end' frame */
         M3D R_i(R_imu * Exp(angvel_avr, dt));
@@ -530,8 +590,18 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
         it_pcl->y = P_compensate(1);
         it_pcl->z = P_compensate(2);
 
-        if (it_pcl == pcl_wait_proc.points.begin()) break;
+        if (it_pcl == pcl_wait_proc.points.begin())
+        {
+          all_points_processed = true;
+          break;
+        }
+        --it_pcl;
       }
+    }
+    if (!all_points_processed)
+    {
+      throw std::runtime_error(
+          "LiDAR points were not fully covered by propagated IMU poses");
     }
     pcl_out = pcl_wait_proc;
     pcl_wait_proc.clear();
@@ -570,6 +640,11 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, Poin
     {
       // cov_acc *= pow(G_m_s2 / mean_acc.norm(), 2);
       imu_need_init = false;
+      // The initialized state represents the end of this measurement group.
+      // Seed both propagation clocks explicitly; otherwise the first deskewed
+      // scan reads an indeterminate last_prop_end_time and mixes time origins.
+      last_prop_end_time = pcl_end_time;
+      lidar_meas.last_lio_update_time = pcl_end_time;
       ROS_INFO("IMU Initials: Gravity: %.4f %.4f %.4f %.4f; acc covarience: "
                "%.8f %.8f %.8f; gry covarience: %.8f %.8f %.8f \n",
                stat.gravity[0], stat.gravity[1], stat.gravity[2], mean_acc.norm(), cov_acc[0], cov_acc[1], cov_acc[2], cov_gyr[0], cov_gyr[1],

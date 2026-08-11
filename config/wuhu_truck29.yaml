@@ -3,17 +3,19 @@ laser_mapping:
     common:
       lid_topic: "/front_lidar"
       imu_topic: "/imu_data"
+      ins_odom_topic: "/imu_data/odometry"
       img_topic: "/midrange_camera/image_raw"
       img_en: true
       lidar_en: true
       ros_driver_bug_fix: false
 
     extrin_calib:
-      # target_from_source: IMU <- front lidar
-      extrinsic_T: [-0.033, 7.793, 0.051]
-      extrinsic_R: [-0.0027913370671459603, -0.9997368648819889, 0.022768606310221123,
-                    0.9995713588659305, -0.0034529758783883313, -0.029071902113564328,
-                    0.029142871723544572, 0.0226776972710091, 0.9993179749580158]
+      # Raw truck calibration: target_from_source = rear axle <- front lidar.
+      # It is used unchanged unless reference_frame_conversion.enabled is true.
+      front_lidar_to_rear_axle_T: [-0.033, 7.793, 0.051]
+      front_lidar_to_rear_axle_R: [-0.0027913370671459603, -0.9997368648819889, 0.022768606310221123,
+                                   0.9995713588659305, -0.0034529758783883313, -0.029071902113564328,
+                                   0.029142871723544572, 0.0226776972710091, 0.9993179749580158]
       # target_from_source: midrange camera <- front lidar
       Pcl: [-0.0631409, 1.69232, 0.191722]
       Rcl: [0.00795227, -0.999963, -0.00342797,
@@ -31,15 +33,19 @@ laser_mapping:
       # rosbag2 publishes this prepared MCAP with RELIABLE QoS. Matching it
       # prevents large PointCloud2 samples from being lost by best-effort DDS.
       reliable_input_qos: true
-      imu_gyro_in_degrees: true
-      imu_acceleration_gravity_compensated: true
+      # Current MCAP contract: standard ROS Imu in physical-IMU RFU axes.
+      # RTK/INS local pose is carried separately by common.ins_odom_topic.
+      imu_message_format: "standard_rfu"
+      imu_gyro_in_degrees: false
+      # Raw specific force already contains the full attitude-projected gravity
+      # response (static norm about 9.91 m/s^2); never add gravity again here.
+      imu_acceleration_gravity_compensated: false
       imu_acceleration_scale: 1.0
-      # Motion-consistency analysis on this bag shows f_accel X/Y/Z follows
-      # forward/lateral/down, while the calibrated IMU is Y/X/up. Gyro already
-      # matches the IMU axes and is intentionally not changed.
-      imu_acceleration_transform: [0.0, 1.0, 0.0,
-                                   1.0, 0.0, 0.0,
-                                   0.0, 0.0, -1.0]
+      # The converter has already restored x-right/y-forward/z-up for both
+      # accelerometer and gyroscope, so the adapter must remain identity.
+      imu_acceleration_transform: [1.0, 0.0, 0.0,
+                                   0.0, 1.0, 0.0,
+                                   0.0, 0.0, 1.0]
 
     time_offset:
       imu_time_offset: 0.0
@@ -47,10 +53,21 @@ laser_mapping:
       img_time_offset: 0.0
       exposure_time_init: 0.0
 
+    reference_frame_conversion:
+      # The Odometry child frame is vehicle_rear_axle_rfu. When enabled,
+      # relocate both its pose and the LiDAR extrinsic to the physical IMU
+      # measurement centre.
+      enabled: true
+      # Supplier convention: A->B means p_B-p_A in vehicle RFU axes.
+      antenna_to_rear_axle_m: [0.325, -7.674, -2.705]
+      imu_to_antenna_m: [0.579, 2.995, 1.006]
+
     preprocess:
       lidar_type: 8
+      # The three MCAP segments contain 34 active ring IDs, but their original
+      # channel IDs are sparse and reach 126. This parameter is max ID + 1,
+      # not the count of active rings; 128 therefore preserves every point.
       scan_line: 128
-      scan_rate: 10.0
       point_filter_num: 3
       feature_extract_enabled: false
       blind: 2.0
@@ -62,7 +79,7 @@ laser_mapping:
       # About two seconds at 100 Hz; completes before the sampled motion begins.
       imu_int_frame: 200
       acc_cov: 0.1
-      gyr_cov: 0.0001
+      gyr_cov: 0.01
       gravity_est_en: true
       ba_bg_est_en: true
 
