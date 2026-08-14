@@ -68,7 +68,7 @@ laser_mapping:
       # channel IDs are sparse and reach 126. This parameter is max ID + 1,
       # not the count of active rings; 128 therefore preserves every point.
       scan_line: 128
-      point_filter_num: 3
+      point_filter_num: 2
       feature_extract_enabled: false
       blind: 2.0
       filter_size_surf: 0.30
@@ -80,17 +80,20 @@ laser_mapping:
       imu_int_frame: 200
       acc_cov: 0.1
       gyr_cov: 0.01
+      # 100 Hz source: allow one missing sample, but never interpolate across
+      # a long hole while deskewing a scan.
+      maximum_time_gap: 0.025
       gravity_est_en: true
       ba_bg_est_en: true
 
     vio:
       max_iterations: 5
-      outlier_threshold: 1000.0
+      outlier_threshold: 300.0
       img_point_cov: 100.0
       patch_size: 8
-      patch_pyrimid_level: 3
-      grid_size: 5
-      grid_n_height: 17
+      patch_pyrimid_level: 4
+      grid_size: 20
+      grid_n_height: 54
       normal_en: true
       raycast_en: false
       inverse_composition_en: false
@@ -99,10 +102,10 @@ laser_mapping:
 
     lio:
       max_iterations: 5
-      dept_err: 0.05
-      beam_err: 0.02
-      min_eigen_value: 0.005
-      voxel_size: 1.0
+      dept_err: 0.02
+      beam_err: 0.05
+      min_eigen_value: 0.0025
+      voxel_size: 0.5
       max_layer: 2
       max_points_num: 50
       layer_init_num: [5, 5, 5, 5, 5]
@@ -111,7 +114,7 @@ laser_mapping:
     local_map:
       map_sliding_en: true
       half_map_size: 300
-      sliding_thresh: 30.0
+      sliding_thresh: 8.0
 
     uav:
       imu_rate_odom: false
@@ -122,7 +125,7 @@ laser_mapping:
       pub_effect_point_en: false
       pub_plane_en: false
       pub_scan_num: 1
-      blind_rgb_points: 0.0
+      blind_rgb_points: 2.0
 
     evo:
       seq_name: "wuhu_truck29"
@@ -132,7 +135,7 @@ laser_mapping:
       pcd_save_en: false
       type: 0
       colmap_output_en: false
-      filter_size_pcd: 0.30
+      filter_size_pcd: 0.20
       interval: -1
 
     image_save:

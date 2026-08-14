@@ -85,10 +85,13 @@ void LIVMapper::readParameters()
   nh.param<bool>("evo/pose_output_en", pose_output_en, false);
   nh.param<double>("imu/gyr_cov", gyr_cov, 1.0);
   nh.param<double>("imu/acc_cov", acc_cov, 1.0);
+  nh.param<double>("imu/maximum_time_gap", imu_max_time_gap, 0.2);
   nh.param<int>("imu/imu_int_frame", imu_int_frame, 3);
   nh.param<bool>("imu/imu_en", imu_en, false);
   nh.param<bool>("imu/gravity_est_en", gravity_est_en, true);
   nh.param<bool>("imu/ba_bg_est_en", ba_bg_est_en, true);
+  if (!std::isfinite(imu_max_time_gap) || imu_max_time_gap <= 0.0)
+    throw std::runtime_error("imu.maximum_time_gap must be finite and positive.");
 
   nh.param<double>("preprocess/blind", p_pre->blind, 0.01);
   nh.param<double>("preprocess/filter_size_surf", filter_size_surf_min, 0.5);
@@ -430,9 +433,12 @@ void LIVMapper::initializeMineFrame(double initialization_time)
   }
 
   mean_position /= static_cast<double>(sample_count);
-  Eigen::Quaterniond mean_orientation;
-  mean_orientation.coeffs() = quaternion_sum.normalized();
-  const M3D mine_rotation = mean_orientation.normalized().toRotationMatrix();
+  quaternion_sum.normalize();
+  Eigen::Quaterniond mean_orientation(
+      quaternion_sum.w(), quaternion_sum.x(),
+      quaternion_sum.y(), quaternion_sum.z());
+  mean_orientation.normalize();
+  const M3D mine_rotation = mean_orientation.toRotationMatrix();
 
   // Change only the estimator's initial world frame. Subsequent RTK positions
   // never enter state propagation or measurement updates.
@@ -440,6 +446,17 @@ void LIVMapper::initializeMineFrame(double initialization_time)
   _state.rot_end = mine_rotation * _state.rot_end;
   _state.vel_end = mine_rotation * _state.vel_end;
   _state.gravity = mine_rotation * _state.gravity;
+
+  // Right-multiplicative attitude errors stay in the body tangent space under
+  // this left world-frame change. Position, velocity and gravity errors are
+  // world vectors, so rotate their complete covariance rows/columns as well.
+  MD(DIM_STATE, DIM_STATE) transform_jacobian =
+      MD(DIM_STATE, DIM_STATE)::Identity();
+  transform_jacobian.block<3, 3>(3, 3) = mine_rotation;
+  transform_jacobian.block<3, 3>(7, 7) = mine_rotation;
+  transform_jacobian.block<3, 3>(16, 16) = mine_rotation;
+  _state.cov =
+      transform_jacobian * _state.cov * transform_jacobian.transpose();
   state_propagat = _state;
   voxelmap_manager->state_ = _state;
 
@@ -955,6 +972,17 @@ void LIVMapper::standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstSharedPtr 
   // time. Never subtract a scan period here.
   const double cur_head_time =
       stampToSec(msg->header.stamp) + lidar_time_offset;
+  if (!std::isfinite(cur_head_time) || !ptr || ptr->size() <= 1)
+  {
+    RCLCPP_FATAL(
+        node_->get_logger(),
+        "Invalid LiDAR frame: timestamp must be finite and at least two "
+        "valid time-tagged points must remain");
+    mtx_buffer.unlock();
+    sig_buffer.notify_all();
+    rclcpp::shutdown();
+    return;
+  }
   if (cur_head_time < last_timestamp_lidar)
   {
     RCLCPP_FATAL(node_->get_logger(),
@@ -1070,6 +1098,9 @@ void LIVMapper::ins_odom_cbk(const nav_msgs::Odometry::ConstSharedPtr &msg_in)
         "Ignoring invalid INS odometry pose on %s", ins_odom_topic.c_str());
     return;
   }
+  const M3D mine_from_rear_axle =
+      mine_pose.orientation.normalized().toRotationMatrix();
+  mine_pose.orientation = Eigen::Quaterniond(mine_from_rear_axle);
   mine_pose.orientation.normalize();
 
   if (rear_axle_to_imu_enabled)
@@ -1078,8 +1109,7 @@ void LIVMapper::ins_odom_cbk(const nav_msgs::Odometry::ConstSharedPtr &msg_in)
     // carried by the legacy packed INS pose. When the estimator body is moved
     // from the rear axle to the physical IMU, move this reference pose by the
     // same lever arm so LIO and RTK/INS remain at the same physical point.
-    mine_pose.position -=
-        mine_pose.orientation.toRotationMatrix() * imu_to_rear_axle;
+    mine_pose.position += mine_from_rear_axle * (-imu_to_rear_axle);
   }
 
   if (!mine_pose_samples.empty() &&
@@ -1164,11 +1194,12 @@ void LIVMapper::imu_cbk(const sensor_msgs::Imu::ConstSharedPtr &msg_in)
   msg->header.frame_id = "imu";
   msg->header.stamp = stampFromSec(timestamp);
 
-  // Preserve the original estimator behavior: inertial samples begin once a
-  // lidar time base exists. INS odometry is buffered by its separate callback.
-  if (last_timestamp_lidar < 0.0) return;
-
-  if (fabs(last_timestamp_lidar - timestamp) > 0.5 && (!ros_driver_fix_en))
+  // Retain the real pre-scan IMU samples. GroundExtractor deliberately keeps
+  // a left and right IMU envelope around every LiDAR scan; discarding the
+  // samples before the first LiDAR callback destroys that contract.
+  if (last_timestamp_lidar >= 0.0 &&
+      fabs(last_timestamp_lidar - timestamp) > 0.5 &&
+      (!ros_driver_fix_en))
   {
     RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
                          "IMU and LiDAR delta time is %.3f s", last_timestamp_lidar - timestamp);
@@ -1186,6 +1217,20 @@ void LIVMapper::imu_cbk(const sensor_msgs::Imu::ConstSharedPtr &msg_in)
     RCLCPP_FATAL(node_->get_logger(),
                  "IMU timestamp moved backwards by %.9f s; stop this run and restart the node",
                  last_timestamp_imu - timestamp);
+    rclcpp::shutdown();
+    return;
+  }
+
+  if (last_timestamp_imu > 0.0 &&
+      timestamp - last_timestamp_imu > imu_max_time_gap)
+  {
+    const double gap = timestamp - last_timestamp_imu;
+    mtx_buffer.unlock();
+    sig_buffer.notify_all();
+    RCLCPP_FATAL(node_->get_logger(),
+                 "IMU stream has a %.6f s gap (limit %.6f s); strict "
+                 "LiDAR deskew cannot continue",
+                 gap, imu_max_time_gap);
     rclcpp::shutdown();
     return;
   }

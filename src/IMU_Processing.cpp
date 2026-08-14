@@ -144,7 +144,10 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, StatesGroup &state_inout, in
   IMU_mean_acc_norm = mean_acc.norm();
   state_inout.gravity = -mean_acc / mean_acc.norm() * G_m_s2;
   state_inout.rot_end = Eye3d; // Exp(mean_acc.cross(V3D(0, 0, -1 / scale_gravity)));
-  state_inout.bias_g = Zero3d; // mean_gyr;
+  // A stationary gyroscope bias is directly observable during initialization.
+  // Ignoring the mean is especially harmful for the normalized raw CGI-610
+  // channel, where even a small constant rate integrates into attitude drift.
+  state_inout.bias_g = mean_gyr;
 
   last_imu = meas.imu.back();
 }
@@ -258,6 +261,9 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
   {
     throw std::runtime_error("Invalid IMU propagation or point-time reference");
   }
+  // A previous empty/aborted cloud must not leave poses that could be reused
+  // under a different propagation origin on the next scan.
+  IMUpose.clear();
 
   /*** cut lidar point based on the propagation-start time and required
    * propagation-end time ***/
@@ -454,6 +460,13 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
 
     // unbiased_gyr = V3D(IMUpose.back().gyr[0], IMUpose.back().gyr[1], IMUpose.back().gyr[2]);
     // cout<<"prop end - start: "<<prop_end_time - prop_beg_time<<" dt_all: "<<dt_all<<endl;
+    constexpr double kPropagationToleranceSeconds = 1.0e-6;
+    if (std::abs(dt_all - (prop_end_time - prop_beg_time)) >
+        kPropagationToleranceSeconds)
+    {
+      throw std::runtime_error(
+          "IMU samples do not fully cover the requested propagation interval");
+    }
     lidar_meas.last_lio_update_time = prop_end_time;
     // dt = prop_end_time - imu_end_time;
     // printf("[ LIO Propagation ] dt: %lf \n", dt);
@@ -548,11 +561,14 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
       auto head = it_kp - 1;
       auto tail = it_kp;
       R_imu << MAT_FROM_ARRAY(head->rot);
-      acc_imu << VEC_FROM_ARRAY(head->acc);
+      // The forward pass stores the input used over [head, tail] in the tail
+      // pose. The head pose still carries the preceding interval's input.
+      // Using head here shifts deskew dynamics by one IMU interval.
+      acc_imu << VEC_FROM_ARRAY(tail->acc);
       // cout<<"head imu acc: "<<acc_imu.transpose()<<endl;
       vel_imu << VEC_FROM_ARRAY(head->vel);
       pos_imu << VEC_FROM_ARRAY(head->pos);
-      angvel_avr << VEC_FROM_ARRAY(head->gyr);
+      angvel_avr << VEC_FROM_ARRAY(tail->gyr);
 
       // printf("head->offset_time: %lf \n", head->offset_time);
       // printf("it_pcl->curvature: %lf pt dt: %lf \n", it_pcl->curvature,

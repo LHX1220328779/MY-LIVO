@@ -3,7 +3,7 @@ set -euo pipefail
 
 BAG_ROOT="/home/project/data/haibo/wuhu_livo/ros2bag"
 START_OFFSET="0"
-PLAY_RATE="0.5"
+PLAY_RATE="1.0"
 PLAY_ALL_TOPICS=0
 LIO_ONLY=1
 DRY_RUN=0
@@ -58,6 +58,10 @@ fi
 set -u
 export ROS_LOG_DIR="${ROS_LOG_DIR:-/tmp/my_livo_ros_log}"
 mkdir -p "$ROS_LOG_DIR"
+
+# Offline playback is local to this host. Avoid Fast DDS shared-memory port
+# lock conflicts left by another ROS 2 process or an unclean previous exit.
+export FASTDDS_BUILTIN_TRANSPORTS="UDPv4"
 
 if [[ -z "$PREPARED_BAG" ]]; then PREPARED_BAG="${BAG_ROOT%/}_my_livo"; fi
 if [[ -f "$PREPARED_BAG/metadata.yaml" ]]; then

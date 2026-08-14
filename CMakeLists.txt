@@ -15,8 +15,12 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm|aarch64|ARM|AARCH64)")
                       $<$<CONFIG:Release>:-mtune=native> $<$<CONFIG:Release>:-ffast-math>)
   add_compile_definitions(ARM_ARCH)
 else()
-  add_compile_options($<$<CONFIG:Release>:-O3> $<$<CONFIG:Release>:-march=native>
-                      $<$<CONFIG:Release>:-mtune=native> $<$<CONFIG:Release>:-funroll-loops>)
+  # Keep Eigen's alignment ABI identical to the Ubuntu PCL binaries. Enabling
+  # a wider native SIMD ABI in this translation unit can make Eigen-aligned
+  # point containers incompatible with the prebuilt PCL libraries and has
+  # caused shutdown-time deallocation faults on this host.
+  add_compile_options($<$<CONFIG:Release>:-O3>
+                      $<$<CONFIG:Release>:-mtune=native>)
   add_compile_definitions(X86_ARCH)
 endif()
 

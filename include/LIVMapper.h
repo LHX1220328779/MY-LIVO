@@ -107,6 +107,7 @@ public:
   nav_msgs::Odometry imu_prop_odom;
   double imu_time_offset = 0.0;
   double lidar_time_offset = 0.0;
+  double imu_max_time_gap = 0.2;
 
   bool gravity_align_en = false, gravity_align_finished = false;
 

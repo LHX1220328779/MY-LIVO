@@ -53,6 +53,7 @@ def generate_launch_description():
                 "reference_frame_conversion.enabled": ParameterValue(
                     rear_axle_to_imu, value_type=bool
                 ),
+                "use_sim_time": True,
             },
         ],
     )
@@ -67,8 +68,8 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        DeclareLaunchArgument("use_camera", default_value="true"),
-        DeclareLaunchArgument("use_rviz", default_value="true"),
+        DeclareLaunchArgument("use_camera", default_value="false"),
+        DeclareLaunchArgument("use_rviz", default_value="false"),
         DeclareLaunchArgument("config_file", default_value=default_config),
         DeclareLaunchArgument("rear_axle_to_imu", default_value="true"),
         decoder,

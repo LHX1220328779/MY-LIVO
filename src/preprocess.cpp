@@ -714,48 +714,59 @@ void Preprocess::xt32_handler(const sensor_msgs::PointCloud2::ConstSharedPtr &ms
 void Preprocess::mine_front_lidar_handler(const sensor_msgs::PointCloud2::ConstSharedPtr &msg)
 {
   pl_surf.clear();
-  pl_corn.clear();
-  pl_full.clear();
+  const std::size_t point_count =
+      static_cast<std::size_t>(msg->width) *
+      static_cast<std::size_t>(msg->height);
+  if (point_count == 0) return;
 
-  pcl::PointCloud<mine_lidar_ros::Point> source;
-  pcl::fromROSMsg(*msg, source);
-  pl_surf.reserve(source.size() / std::max(1, point_filter_num) + 1);
-
-  // GroundExtractor's normalized contract is fixed: the cloud header is the
-  // scan start and every float32 timestamp is relative seconds from it.
-  for (std::size_t index = 0; index < source.size(); ++index)
+  try
   {
-    const auto &input = source[index];
-    const double relative_seconds = static_cast<double>(input.timestamp);
-    if (input.ring >= static_cast<std::uint32_t>(N_SCANS) ||
-        !std::isfinite(input.x) ||
-        !std::isfinite(input.y) || !std::isfinite(input.z))
+    sensor_msgs::PointCloud2ConstIterator<float> x(*msg, "x");
+    sensor_msgs::PointCloud2ConstIterator<float> y(*msg, "y");
+    sensor_msgs::PointCloud2ConstIterator<float> z(*msg, "z");
+    sensor_msgs::PointCloud2ConstIterator<float> intensity(*msg, "intensity");
+    sensor_msgs::PointCloud2ConstIterator<std::uint32_t> ring(*msg, "ring");
+    sensor_msgs::PointCloud2ConstIterator<float> timestamp(*msg, "timestamp");
+
+    pl_surf.reserve(
+        (point_count + point_filter_num - 1) / point_filter_num);
+    for (std::size_t index = 0; index < point_count;
+         ++index, ++x, ++y, ++z, ++intensity, ++ring, ++timestamp)
     {
-      continue;
+      const double relative_seconds = static_cast<double>(*timestamp);
+      if (index % static_cast<std::size_t>(point_filter_num) != 0) continue;
+      if (*ring >= static_cast<std::uint32_t>(N_SCANS)) continue;
+      if (!std::isfinite(*x) || !std::isfinite(*y) || !std::isfinite(*z))
+        continue;
+      if (!std::isfinite(relative_seconds) || relative_seconds < 0.0)
+        continue;
+
+      const double range_sqr = (*x) * (*x) + (*y) * (*y) + (*z) * (*z);
+      if (range_sqr < blind_sqr) continue;
+
+      PointType point;
+      point.x = *x;
+      point.y = *y;
+      point.z = *z;
+      point.intensity = *intensity;
+      point.normal_x = 0.0f;
+      point.normal_y = 0.0f;
+      point.normal_z = 0.0f;
+      point.curvature = relative_seconds * 1000.0;
+      pl_surf.push_back(point);
     }
-
-    const double offset_ms = relative_seconds * 1000.0;
-
-    if (index % static_cast<std::size_t>(std::max(1, point_filter_num)) != 0) continue;
-    const double range_squared = input.x * input.x + input.y * input.y + input.z * input.z;
-    if (range_squared <= blind_sqr) continue;
-
-    PointType output;
-    output.x = input.x;
-    output.y = input.y;
-    output.z = input.z;
-    output.intensity = input.intensity;
-    output.normal_x = 0.0F;
-    output.normal_y = 0.0F;
-    output.normal_z = 0.0F;
-    output.curvature = static_cast<float>(offset_ms);
-    pl_surf.push_back(output);
+    std::sort(
+        pl_surf.points.begin(), pl_surf.points.end(),
+        [](const PointType &left, const PointType &right) {
+          return left.curvature < right.curvature;
+        });
   }
-
-  std::sort(pl_surf.begin(), pl_surf.end(),
-            [](const PointType &left, const PointType &right) {
-              return left.curvature < right.curvature;
-            });
+  catch (const std::runtime_error &error)
+  {
+    std::cerr << "[Preprocess] Wuhu PointCloud2 layout mismatch: "
+              << error.what() << std::endl;
+    pl_surf.clear();
+  }
 }
 
 void Preprocess::robosense_handler(const sensor_msgs::PointCloud2::ConstSharedPtr &msg)
