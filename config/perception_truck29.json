@@ -1,12 +1,31 @@
 {
-  "calibration_type": "sensor_to_imu_manual",
-  "schema_version": 3,
+  "calibration_type": "sensor_to_vehicle_rear_axle_with_derived_physical_imu",
+  "schema_version": 4,
   "truck_num": 29,
   "correlated_lidar_matrix_tf": "transform_matrix_lidar_6",
+  "reference_frame_conversion": {
+    "vehicle_axes": "x_right_y_forward_z_up",
+    "lever_arm_semantics": "A_to_B_is_p_B_minus_p_A",
+    "antenna_to_rear_axle_m": [
+      0.325,
+      -7.674,
+      -2.705
+    ],
+    "imu_to_antenna_m": [
+      0.579,
+      2.995,
+      1.006
+    ],
+    "imu_to_rear_axle_m": [
+      0.9039999999999999,
+      -4.679,
+      -1.699
+    ]
+  },
   "transforms": {
-    "front_lidar_to_imu": {
+    "front_lidar_to_rear_axle": {
       "source_frame": "front_lidar",
-      "target_frame": "imu",
+      "target_frame": "vehicle_rear_axle",
       "transform_semantics": "target_from_source",
       "transform_matrix": [
         -0.0027913370671459603,
@@ -50,11 +69,11 @@
         1.0
       ]
     },
-    "midrange_camera_to_imu": {
+    "midrange_camera_to_rear_axle": {
       "source_frame": "midrange_camera",
-      "target_frame": "imu",
+      "target_frame": "vehicle_rear_axle",
       "transform_semantics": "target_from_source",
-      "derived_from": "front_lidar_to_imu * inverse(front_lidar_to_midrange_camera)",
+      "derived_from": "front_lidar_to_rear_axle * inverse(front_lidar_to_midrange_camera)",
       "transform_matrix": [
         0.9995996270525961,
         -0.02443309145139035,
@@ -68,6 +87,54 @@
         -0.9934956746553574,
         -0.11089533703940944,
         1.7519401742438354,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    },
+    "front_lidar_to_imu": {
+      "source_frame": "front_lidar",
+      "target_frame": "physical_imu",
+      "transform_semantics": "target_from_source",
+      "derived_from": "imu_from_rear_axle * front_lidar_to_rear_axle",
+      "transform_matrix": [
+        -0.0027913370671459603,
+        -0.9997368648819889,
+        0.022768606310221123,
+        0.8709999999999999,
+        0.9995713588659305,
+        -0.0034529758783883313,
+        -0.029071902113564328,
+        3.114,
+        0.029142871723544572,
+        0.0226776972710091,
+        0.9993179749580158,
+        -1.6480000000000001,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    },
+    "midrange_camera_to_imu": {
+      "source_frame": "midrange_camera",
+      "target_frame": "physical_imu",
+      "transform_semantics": "target_from_source",
+      "derived_from": "imu_from_rear_axle * midrange_camera_to_rear_axle",
+      "transform_matrix": [
+        0.9995996270525961,
+        -0.02443309145139035,
+        -0.014303899890627376,
+        0.9782066017116129,
+        0.01150136705653784,
+        -0.1112205576954382,
+        0.9937298350595682,
+        3.1124271094290332,
+        -0.025870738250305912,
+        -0.9934956746553574,
+        -0.11089533703940944,
+        0.05294017424383535,
         0.0,
         0.0,
         0.0,

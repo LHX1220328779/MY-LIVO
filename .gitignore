@@ -1,9 +1,15 @@
 Log/*
 build/*
+build.*/
+build_*/
 
 # ROS/colcon generated output
 install/
 log/
+install.*/
+log.*/
+install_*/
+log_*/
 symlink_install_manifest.txt
 
 # Python bytecode

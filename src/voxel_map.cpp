@@ -349,10 +349,15 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
 
   for (size_t i = 0; i < feats_down_body_->size(); i++)
   {
-    V3D point_this(feats_down_body_->points[i].x, feats_down_body_->points[i].y, feats_down_body_->points[i].z);
-    if (point_this[2] == 0) { point_this[2] = 0.001; }
+    const PointType &point = feats_down_body_->points[i];
+    V3D point_this(point.x, point.y, point.z);
+    V3D beam_origin(point.normal_x, point.normal_y, point.normal_z);
+    V3D measurement_ray = point_this - beam_origin;
+    if (measurement_ray.squaredNorm() < 1.0e-8)
+      measurement_ray = point_this;
     M3D var;
-    calcBodyCov(point_this, config_setting_.dept_err_, config_setting_.beam_err_, var);
+    calcBodyCov(measurement_ray, config_setting_.dept_err_,
+                config_setting_.beam_err_, var);
     body_cov_list_.push_back(var);
     point_this = extR_ * point_this + extT_;
     M3D point_crossmat;
@@ -544,9 +549,15 @@ void VoxelMapManager::BuildVoxelMap()
   {
     pointWithVar pv;
     pv.point_w << feats_down_world_->points[i].x, feats_down_world_->points[i].y, feats_down_world_->points[i].z;
-    V3D point_this(feats_down_body_->points[i].x, feats_down_body_->points[i].y, feats_down_body_->points[i].z);
+    const PointType &point = feats_down_body_->points[i];
+    V3D point_this(point.x, point.y, point.z);
+    V3D beam_origin(point.normal_x, point.normal_y, point.normal_z);
+    V3D measurement_ray = point_this - beam_origin;
+    if (measurement_ray.squaredNorm() < 1.0e-8)
+      measurement_ray = point_this;
     M3D var;
-    calcBodyCov(point_this, config_setting_.dept_err_, config_setting_.beam_err_, var);
+    calcBodyCov(measurement_ray, config_setting_.dept_err_,
+                config_setting_.beam_err_, var);
     M3D point_crossmat;
     point_crossmat << SKEW_SYM_MATRX(point_this);
     var = (state_.rot_end * extR_) * var * (state_.rot_end * extR_).transpose() +

@@ -1,15 +1,15 @@
 Panels:
   - Class: rviz_common/Displays
-    Help Height: 70
+    Help Height: 0
     Name: Displays
     Property Tree Widget:
       Expanded:
-        - /Mine Grid1
         - /Registered Cloud1
+        - /LIVO Pose1
         - /LIVO Trajectory1
         - /IMU RTK Reference1
       Splitter Ratio: 0.5
-    Tree Height: 205
+    Tree Height: 498
   - Class: rviz_common/Selection
     Name: Selection
   - Class: rviz_common/Views
@@ -69,11 +69,11 @@ Visualization Manager:
       Class: rviz_default_plugins/PointCloud2
       Color: 255; 255; 255
       Color Transformer: Intensity
-      Decay Time: 20
+      Decay Time: 180
       Enabled: true
       Invert Rainbow: false
       Max Color: 255; 255; 255
-      Max Intensity: 50
+      Max Intensity: 255
       Min Color: 0; 0; 0
       Min Intensity: 0
       Name: Registered Cloud
@@ -109,8 +109,8 @@ Visualization Manager:
           Scale: 1
           Value: true
         Value: true
-      Enabled: false
-      Keep: 50
+      Enabled: true
+      Keep: 1
       Name: LIVO Pose
       Position Tolerance: 0.10000000149011612
       Shape:
@@ -130,11 +130,11 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /aft_mapped_to_init
-      Value: false
+      Value: true
     - Alpha: 1
       Buffer Length: 1
       Class: rviz_default_plugins/Path
-      Color: 0; 220; 255
+      Color: 255; 0; 0
       Enabled: true
       Head Diameter: 0.30000001192092896
       Head Length: 0.20000000298023224
@@ -162,7 +162,7 @@ Visualization Manager:
     - Alpha: 1
       Buffer Length: 1
       Class: rviz_default_plugins/Path
-      Color: 255; 80; 210
+      Color: 0; 255; 0
       Enabled: true
       Head Diameter: 0.30000001192092896
       Head Length: 0.20000000298023224
@@ -252,6 +252,8 @@ Visualization Manager:
     - Class: rviz_default_plugins/MoveCamera
     - Class: rviz_default_plugins/Select
     - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+      Line color: 128; 128; 0
   Transformation:
     Current:
       Class: rviz_default_plugins/TF
@@ -268,25 +270,25 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Scale: 63.84881591796875
+      Scale: 15.104586601257324
       Target Frame: mine
       Value: TopDownOrtho (rviz_default_plugins)
-      X: 200.2945098876953
-      Y: -435.87255859375
+      X: -80.00741577148438
+      Y: 68.3323974609375
     Saved: ~
 Window Geometry:
   Displays:
     collapsed: false
-  Height: 1016
+  Height: 1043
   Hide Left Dock: false
   Hide Right Dock: false
   Midrange Camera:
     collapsed: false
-  QMainWindow State: 000000ff00000000fd00000001000000000000019b000003a2fc0200000004fb0000001e004d0069006400720061006e00670065002000430061006d006500720061010000003b000000c80000002800fffffffb000000100044006900730070006c00610079007301000001090000014e000000c700fffffffb0000001200530065006c0065006300740069006f006e010000025d000000a30000005c00fffffffb0000000a005600690065007700730100000306000000d7000000a000ffffff000005a5000003a200000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  QMainWindow State: 000000ff00000000fd00000001000000000000019b000003bdfc0200000004fb0000001e004d0069006400720061006e00670065002000430061006d006500720061010000003b000000e40000002800fffffffb000000100044006900730070006c00610079007301000001250000022d000000c700fffffffb0000001200530065006c0065006300740069006f006e000000026d000000a80000005c00fffffffb0000000a005600690065007700730100000358000000a0000000a000ffffff000005a5000003bd00000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
   Selection:
     collapsed: false
   Views:
     collapsed: false
   Width: 1862
   X: 3258
-  Y: 527
+  Y: 424

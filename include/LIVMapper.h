@@ -20,6 +20,7 @@ which is included as part of this source code package.
 #include <image_transport/image_transport.h>
 #include <tf2_ros/transform_broadcaster.h>
 #include <filesystem>
+#include <memory>
 
 class LIVMapper
 {
@@ -46,8 +47,14 @@ public:
   void RGBpointBodyLidarToIMU(PointType const *const pi, PointType *const po);
   void RGBpointBodyToWorld(PointType const *const pi, PointType *const po);
   void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstSharedPtr &msg);
+  void multi_lidar_pcl_cbk(
+      const sensor_msgs::PointCloud2::ConstSharedPtr &msg,
+      std::size_t source_index);
+  void synchronizeMultiLidarFrames();
+  void loadMultiLidarCalibration();
   void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg_in);
   void imu_cbk(const sensor_msgs::Imu::ConstSharedPtr &msg_in);
+  void ins_odom_cbk(const nav_msgs::Odometry::ConstSharedPtr &msg_in);
   void img_cbk(const sensor_msgs::ImageConstPtr &msg_in);
   void publish_img_rgb(const image_transport::Publisher &pubImage, VIOManagerPtr vio_manager);
   void publish_frame_world(const rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr &publisher, VIOManagerPtr vio_manager);
@@ -78,7 +85,7 @@ public:
   std::unordered_map<VOXEL_LOCATION, VoxelOctoTree *> voxel_map;
   
   string root_dir;
-  string lid_topic, imu_topic, seq_name, img_topic;
+  string lid_topic, imu_topic, ins_odom_topic, seq_name, img_topic;
   V3D extT;
   M3D extR;
 
@@ -106,6 +113,7 @@ public:
   nav_msgs::Odometry imu_prop_odom;
   double imu_time_offset = 0.0;
   double lidar_time_offset = 0.0;
+  double imu_max_time_gap = 0.2;
 
   bool gravity_align_en = false, gravity_align_finished = false;
 
@@ -129,6 +137,46 @@ public:
   double img_time_offset = 0.0;
   deque<PointCloudXYZI::Ptr> lid_raw_data_buffer;
   deque<double> lid_header_time_buffer;
+
+  struct PendingLidarFrame
+  {
+    double header_time = 0.0;
+    PointCloudXYZI::Ptr points;
+  };
+
+  struct LidarBodyExclusionRectangle
+  {
+    double min_x = 0.0;
+    double max_x = 0.0;
+    double min_y = 0.0;
+    double max_y = 0.0;
+  };
+
+  struct LidarSource
+  {
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    string topic;
+    string transform_key;
+    M3D rear_from_lidar_rotation = M3D::Identity();
+    V3D rear_from_lidar_translation = V3D::Zero();
+    vector<LidarBodyExclusionRectangle> body_exclusion_rectangles;
+    deque<PendingLidarFrame> pending_frames;
+    double last_header_time = -1.0;
+  };
+
+  bool multi_lidar_enabled = false;
+  string multi_lidar_calibration_file;
+  vector<string> multi_lidar_topics;
+  vector<string> multi_lidar_transform_keys;
+  vector<vector<LidarBodyExclusionRectangle>>
+      multi_lidar_body_exclusion_rectangles;
+  vector<std::unique_ptr<LidarSource>> lidar_sources;
+  double multi_lidar_sync_tolerance = 0.005;
+  double multi_lidar_body_exclusion_min_z = -3.0;
+  double lidar_max_point_offset = 0.2;
+  std::size_t multi_lidar_queue_size = 5;
+  std::size_t multi_lidar_frame_count = 0;
+
   deque<sensor_msgs::Imu::ConstSharedPtr> imu_buffer;
   deque<cv::Mat> img_buffer;
   deque<double> img_time_buffer;
@@ -144,10 +192,13 @@ public:
   double IMG_POINT_COV;
 
   bool mine_frame_initialized = false;
+  bool imu_standard_rfu = false;
   bool imu_gyro_in_degrees = true;
   bool imu_acceleration_gravity_compensated = true;
   double imu_acceleration_scale = 1.0;
   M3D imu_acceleration_transform = M3D::Identity();
+  bool rear_axle_to_imu_enabled = false;
+  V3D imu_to_rear_axle = V3D::Zero();
   double mine_initialization_time = 0.0;
   std::vector<MinePose> mine_pose_samples;
   std::size_t mine_pose_publish_index = 0;
@@ -190,7 +241,9 @@ public:
   rclcpp::Publisher<visualization_msgs::Marker>::SharedPtr plane_pub;
   rclcpp::Publisher<visualization_msgs::MarkerArray>::SharedPtr voxel_pub;
   rclcpp::Subscription<sensor_msgs::PointCloud2>::SharedPtr sub_pcl;
+  vector<rclcpp::Subscription<sensor_msgs::PointCloud2>::SharedPtr> sub_pcls;
   rclcpp::Subscription<sensor_msgs::Imu>::SharedPtr sub_imu;
+  rclcpp::Subscription<nav_msgs::Odometry>::SharedPtr sub_ins_odom;
   rclcpp::Subscription<sensor_msgs::Image>::SharedPtr sub_img;
   rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr pubLaserCloudFullRes;
   rclcpp::Publisher<visualization_msgs::MarkerArray>::SharedPtr pubNormal;

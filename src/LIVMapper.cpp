@@ -12,6 +12,46 @@ which is included as part of this source code package.
 
 #include "LIVMapper.h"
 
+#include <json/json.h>
+
+#include <fstream>
+#include <set>
+
+namespace
+{
+struct DownsampleVoxelKey
+{
+  std::int64_t x;
+  std::int64_t y;
+  std::int64_t z;
+
+  bool operator==(const DownsampleVoxelKey &other) const
+  {
+    return x == other.x && y == other.y && z == other.z;
+  }
+};
+
+struct DownsampleVoxelKeyHash
+{
+  std::size_t operator()(const DownsampleVoxelKey &key) const
+  {
+    std::size_t seed = std::hash<std::int64_t>{}(key.x);
+    seed ^= std::hash<std::int64_t>{}(key.y) +
+            0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+    seed ^= std::hash<std::int64_t>{}(key.z) +
+            0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+    return seed;
+  }
+};
+
+struct DownsampleMetadata
+{
+  V3D beam_origin_sum = V3D::Zero();
+  double intensity_sum = 0.0;
+  std::size_t count = 0;
+};
+}  // namespace
+
 LIVMapper::LIVMapper(const rclcpp::Node::SharedPtr &node)
     : extT(0, 0, 0),
       node_(node),
@@ -55,10 +95,111 @@ void LIVMapper::readParameters()
   Ros2ParameterReader nh(node_);
   nh.param<string>("common/lid_topic", lid_topic, "/livox/lidar");
   nh.param<string>("common/imu_topic", imu_topic, "/livox/imu");
+  nh.param<string>("common/ins_odom_topic", ins_odom_topic, "/imu_data/odometry");
   nh.param<bool>("common/ros_driver_bug_fix", ros_driver_fix_en, false);
   nh.param<bool>("common/img_en", img_en, true);
   nh.param<bool>("common/lidar_en", lidar_en, true);
   nh.param<string>("common/img_topic", img_topic, "/left_camera/image");
+
+  nh.param<bool>("multi_lidar/enabled", multi_lidar_enabled, false);
+  nh.param<string>("multi_lidar/calibration_file",
+                   multi_lidar_calibration_file, "");
+  nh.param<vector<string>>(
+      "multi_lidar/topics", multi_lidar_topics,
+      vector<string>{"/front_lidar"});
+  nh.param<vector<string>>(
+      "multi_lidar/transform_keys", multi_lidar_transform_keys,
+      vector<string>{"transform_matrix_lidar_6"});
+  nh.param<double>("multi_lidar/synchronization_tolerance_sec",
+                   multi_lidar_sync_tolerance, 0.005);
+  int multi_lidar_queue_size_parameter = 5;
+  nh.param<int>("multi_lidar/queue_size",
+                multi_lidar_queue_size_parameter, 5);
+  if (multi_lidar_enabled)
+  {
+    if (multi_lidar_topics.empty() ||
+        multi_lidar_topics.size() != multi_lidar_transform_keys.size())
+      throw std::runtime_error(
+          "multi_lidar.topics and transform_keys must be non-empty and "
+          "have the same length.");
+    if (multi_lidar_calibration_file.empty())
+      throw std::runtime_error(
+          "multi_lidar.calibration_file must not be empty.");
+    if (!std::isfinite(multi_lidar_sync_tolerance) ||
+        multi_lidar_sync_tolerance <= 0.0)
+      throw std::runtime_error(
+          "multi_lidar.synchronization_tolerance_sec must be positive.");
+    if (multi_lidar_queue_size_parameter <= 0)
+      throw std::runtime_error("multi_lidar.queue_size must be positive.");
+    multi_lidar_queue_size =
+        static_cast<std::size_t>(multi_lidar_queue_size_parameter);
+
+    const std::set<string> unique_topics(
+        multi_lidar_topics.begin(), multi_lidar_topics.end());
+    const std::set<string> unique_keys(
+        multi_lidar_transform_keys.begin(),
+        multi_lidar_transform_keys.end());
+    if (unique_topics.size() != multi_lidar_topics.size())
+      throw std::runtime_error("multi_lidar.topics contains duplicates.");
+    if (unique_keys.size() != multi_lidar_transform_keys.size())
+      throw std::runtime_error(
+          "multi_lidar.transform_keys contains duplicates.");
+
+    nh.param<double>("multi_lidar/body_filter/minimum_z",
+                     multi_lidar_body_exclusion_min_z, -3.0);
+    if (!std::isfinite(multi_lidar_body_exclusion_min_z))
+      throw std::runtime_error(
+          "multi_lidar.body_filter.minimum_z must be finite.");
+
+    multi_lidar_body_exclusion_rectangles.clear();
+    multi_lidar_body_exclusion_rectangles.resize(
+        multi_lidar_topics.size());
+    std::set<string> body_filter_parameter_names;
+    for (std::size_t source_index = 0;
+         source_index < multi_lidar_topics.size(); ++source_index)
+    {
+      string topic_parameter_name = multi_lidar_topics[source_index];
+      while (!topic_parameter_name.empty() &&
+             topic_parameter_name.front() == '/')
+        topic_parameter_name.erase(topic_parameter_name.begin());
+      std::replace(topic_parameter_name.begin(), topic_parameter_name.end(),
+                   '/', '_');
+      if (topic_parameter_name.empty() ||
+          !body_filter_parameter_names.insert(topic_parameter_name).second)
+        throw std::runtime_error(
+            "Multi-LiDAR topics do not produce unique body-filter parameter "
+            "names.");
+
+      vector<double> rectangle_coordinates;
+      nh.param<vector<double>>(
+          "multi_lidar/body_filter/" + topic_parameter_name,
+          rectangle_coordinates, vector<double>{});
+      if (rectangle_coordinates.size() % 4 != 0)
+        throw std::runtime_error(
+            "multi_lidar.body_filter." + topic_parameter_name +
+            " must contain x1,y1,x2,y2 for each rectangle.");
+
+      auto &rectangles =
+          multi_lidar_body_exclusion_rectangles[source_index];
+      rectangles.reserve(rectangle_coordinates.size() / 4);
+      for (std::size_t coordinate_index = 0;
+           coordinate_index < rectangle_coordinates.size();
+           coordinate_index += 4)
+      {
+        const double x1 = rectangle_coordinates[coordinate_index];
+        const double y1 = rectangle_coordinates[coordinate_index + 1];
+        const double x2 = rectangle_coordinates[coordinate_index + 2];
+        const double y2 = rectangle_coordinates[coordinate_index + 3];
+        if (!std::isfinite(x1) || !std::isfinite(y1) ||
+            !std::isfinite(x2) || !std::isfinite(y2))
+          throw std::runtime_error(
+              "multi_lidar.body_filter." + topic_parameter_name +
+              " contains a non-finite coordinate.");
+        rectangles.push_back({std::min(x1, x2), std::max(x1, x2),
+                              std::min(y1, y2), std::max(y1, y2)});
+      }
+    }
+  }
 
   nh.param<bool>("vio/normal_en", normal_en, true);
   nh.param<bool>("vio/inverse_composition_en", inverse_composition_en, false);
@@ -84,22 +225,33 @@ void LIVMapper::readParameters()
   nh.param<bool>("evo/pose_output_en", pose_output_en, false);
   nh.param<double>("imu/gyr_cov", gyr_cov, 1.0);
   nh.param<double>("imu/acc_cov", acc_cov, 1.0);
+  nh.param<double>("imu/maximum_time_gap", imu_max_time_gap, 0.2);
   nh.param<int>("imu/imu_int_frame", imu_int_frame, 3);
   nh.param<bool>("imu/imu_en", imu_en, false);
   nh.param<bool>("imu/gravity_est_en", gravity_est_en, true);
   nh.param<bool>("imu/ba_bg_est_en", ba_bg_est_en, true);
+  if (!std::isfinite(imu_max_time_gap) || imu_max_time_gap <= 0.0)
+    throw std::runtime_error("imu.maximum_time_gap must be finite and positive.");
 
   nh.param<double>("preprocess/blind", p_pre->blind, 0.01);
   nh.param<double>("preprocess/filter_size_surf", filter_size_surf_min, 0.5);
+  if (!std::isfinite(filter_size_surf_min) || filter_size_surf_min <= 0.0)
+    throw std::runtime_error(
+        "preprocess.filter_size_surf must be finite and positive.");
   nh.param<bool>("preprocess/hilti_en", hilti_en, false);
   nh.param<int>("preprocess/lidar_type", p_pre->lidar_type, AVIA);
   nh.param<int>("preprocess/scan_line", p_pre->N_SCANS, 6);
-  double lidar_scan_rate = 10.0;
-  nh.param<double>("preprocess/scan_rate", lidar_scan_rate, 10.0);
-  if (lidar_scan_rate <= 0.0) throw std::runtime_error("preprocess.scan_rate must be positive.");
-  p_pre->scan_period_ms = 1000.0 / lidar_scan_rate;
+  if (p_pre->N_SCANS <= 0 || p_pre->N_SCANS > 128)
+    throw std::runtime_error("preprocess.scan_line must be in [1, 128].");
   nh.param<int>("preprocess/point_filter_num", p_pre->point_filter_num, 3);
   nh.param<bool>("preprocess/feature_extract_enabled", p_pre->feature_enabled, false);
+  nh.param<double>("preprocess/maximum_point_offset_sec",
+                   lidar_max_point_offset, 0.2);
+  if (!std::isfinite(lidar_max_point_offset) ||
+      lidar_max_point_offset <= 0.0)
+    throw std::runtime_error(
+        "preprocess.maximum_point_offset_sec must be positive.");
+  p_pre->maximum_point_offset_sec = lidar_max_point_offset;
 
   nh.param<int>("pcd_save/interval", pcd_save_interval, -1);
   nh.param<bool>("pcd_save/pcd_save_en", pcd_save_en, false);
@@ -111,6 +263,22 @@ void LIVMapper::readParameters()
   nh.param<double>("pcd_save/filter_size_pcd", filter_size_pcd, 0.5);
   nh.param<vector<double>>("extrin_calib/extrinsic_T", extrinT, vector<double>());
   nh.param<vector<double>>("extrin_calib/extrinsic_R", extrinR, vector<double>());
+  vector<double> rear_axle_lidar_t;
+  vector<double> rear_axle_lidar_r;
+  nh.param<vector<double>>(
+      "extrin_calib/front_lidar_to_rear_axle_T",
+      rear_axle_lidar_t, vector<double>());
+  nh.param<vector<double>>(
+      "extrin_calib/front_lidar_to_rear_axle_R",
+      rear_axle_lidar_r, vector<double>());
+  if (!rear_axle_lidar_t.empty() || !rear_axle_lidar_r.empty())
+  {
+    if (rear_axle_lidar_t.size() != 3 || rear_axle_lidar_r.size() != 9)
+      throw std::runtime_error(
+          "front_lidar_to_rear_axle_T/R must contain 3 and 9 values.");
+    extrinT = rear_axle_lidar_t;
+    extrinR = rear_axle_lidar_r;
+  }
   nh.param<vector<double>>("extrin_calib/Pcl", cameraextrinT, vector<double>());
   nh.param<vector<double>>("extrin_calib/Rcl", cameraextrinR, vector<double>());
   nh.param<vector<double>>("camera/intrinsics", camera_intrinsics,
@@ -120,9 +288,36 @@ void LIVMapper::readParameters()
                           vector<double>{0.0, 0.0, 0.0, 0.0, 0.0});
   nh.param<int>("camera/width", camera_width, 1920);
   nh.param<int>("camera/height", camera_height, 1080);
+  if (multi_lidar_enabled) loadMultiLidarCalibration();
+  string imu_message_format;
+  nh.param<string>("mine/imu_message_format", imu_message_format, "packed_mine_pose");
+  if (imu_message_format == "standard_rfu")
+  {
+    imu_standard_rfu = true;
+  }
+  else if (imu_message_format != "packed_mine_pose")
+  {
+    throw std::runtime_error(
+        "mine.imu_message_format must be standard_rfu or packed_mine_pose.");
+  }
   nh.param<bool>("mine/imu_gyro_in_degrees", imu_gyro_in_degrees, true);
   nh.param<bool>("mine/imu_acceleration_gravity_compensated", imu_acceleration_gravity_compensated, true);
   nh.param<double>("mine/imu_acceleration_scale", imu_acceleration_scale, 1.0);
+  nh.param<bool>("reference_frame_conversion/enabled", rear_axle_to_imu_enabled, false);
+  vector<double> antenna_to_rear_axle_values;
+  vector<double> imu_to_antenna_values;
+  nh.param<vector<double>>(
+      "reference_frame_conversion/antenna_to_rear_axle_m",
+      antenna_to_rear_axle_values, vector<double>{0.0, 0.0, 0.0});
+  nh.param<vector<double>>(
+      "reference_frame_conversion/imu_to_antenna_m",
+      imu_to_antenna_values, vector<double>{0.0, 0.0, 0.0});
+  if (antenna_to_rear_axle_values.size() != 3 || imu_to_antenna_values.size() != 3)
+    throw std::runtime_error("reference-frame lever arms must each contain 3 values.");
+  imu_to_rear_axle <<
+      imu_to_antenna_values[0] + antenna_to_rear_axle_values[0],
+      imu_to_antenna_values[1] + antenna_to_rear_axle_values[1],
+      imu_to_antenna_values[2] + antenna_to_rear_axle_values[2];
   vector<double> imu_acceleration_transform_values;
   nh.param<vector<double>>(
       "mine/imu_acceleration_transform", imu_acceleration_transform_values,
@@ -144,14 +339,179 @@ void LIVMapper::readParameters()
   p_pre->blind_sqr = p_pre->blind * p_pre->blind;
 }
 
+void LIVMapper::loadMultiLidarCalibration()
+{
+  const std::filesystem::path requested_path(multi_lidar_calibration_file);
+  if (!std::filesystem::exists(requested_path))
+    throw std::runtime_error(
+        "Multi-LiDAR calibration file does not exist: " +
+        requested_path.string());
+  const std::filesystem::path calibration_path =
+      std::filesystem::canonical(requested_path);
+  multi_lidar_calibration_file = calibration_path.string();
+
+  std::ifstream stream(calibration_path);
+  if (!stream.is_open())
+    throw std::runtime_error(
+        "Cannot open Multi-LiDAR calibration: " +
+        calibration_path.string());
+  Json::CharReaderBuilder builder;
+  Json::Value calibration;
+  string parse_errors;
+  if (!Json::parseFromStream(
+          builder, stream, &calibration, &parse_errors))
+    throw std::runtime_error(
+        "Cannot parse Multi-LiDAR calibration " +
+        calibration_path.string() + ": " + parse_errors);
+  if (calibration["lidar_transform_semantics"].asString() !=
+      "lidar_to_body_rear_axle")
+    throw std::runtime_error(
+        "Calibration lidar_transform_semantics must be "
+        "lidar_to_body_rear_axle.");
+
+  const auto parse_rigid_transform = [](
+      const Json::Value &values, const string &name) {
+    if (!values.isArray() || values.size() != 16)
+      throw std::runtime_error(
+          name + " must contain 16 row-major numeric values.");
+    Eigen::Matrix4d transform;
+    for (Json::ArrayIndex index = 0; index < 16; ++index)
+    {
+      if (!values[index].isNumeric())
+        throw std::runtime_error(name + " contains a non-numeric value.");
+      const double value = values[index].asDouble();
+      if (!std::isfinite(value))
+        throw std::runtime_error(name + " contains a non-finite value.");
+      transform(static_cast<int>(index / 4),
+                static_cast<int>(index % 4)) = value;
+    }
+    const Eigen::Vector4d expected_last_row(0.0, 0.0, 0.0, 1.0);
+    if (!transform.row(3).transpose().isApprox(expected_last_row, 1.0e-12))
+      throw std::runtime_error(name + " is not a homogeneous transform.");
+    const M3D rotation = transform.block<3, 3>(0, 0);
+    if (!(rotation.transpose() * rotation).isApprox(M3D::Identity(), 2.0e-3) ||
+        std::abs(rotation.determinant() - 1.0) > 2.0e-3)
+      throw std::runtime_error(name + " rotation is not a proper rotation.");
+    return transform;
+  };
+
+  const Json::Value &lidar_entries = calibration["lidar"];
+  if (!lidar_entries.isArray() || lidar_entries.empty())
+    throw std::runtime_error(
+        "Calibration must contain a non-empty lidar array.");
+
+  lidar_sources.clear();
+  lidar_sources.reserve(multi_lidar_topics.size());
+  for (std::size_t source_index = 0;
+       source_index < multi_lidar_topics.size(); ++source_index)
+  {
+    const string &transform_key =
+        multi_lidar_transform_keys[source_index];
+    const Json::Value *matrix_values = nullptr;
+    for (const auto &entry : lidar_entries)
+    {
+      if (entry.isObject() && entry.isMember(transform_key))
+      {
+        matrix_values = &entry[transform_key];
+        break;
+      }
+    }
+    if (matrix_values == nullptr)
+      throw std::runtime_error(
+          "Calibration is missing " + transform_key + ".");
+
+    const Eigen::Matrix4d rear_from_lidar =
+        parse_rigid_transform(*matrix_values, transform_key);
+    auto source = std::make_unique<LidarSource>();
+    source->topic = multi_lidar_topics[source_index];
+    source->transform_key = transform_key;
+    source->rear_from_lidar_rotation =
+        rear_from_lidar.block<3, 3>(0, 0);
+    source->rear_from_lidar_translation =
+        rear_from_lidar.block<3, 1>(0, 3);
+    source->body_exclusion_rectangles =
+        multi_lidar_body_exclusion_rectangles[source_index];
+    lidar_sources.push_back(std::move(source));
+  }
+
+  // The synchronized cloud is represented in the rear-axle frame.  It is a
+  // virtual LiDAR input whose LiDAR->rear transform is therefore identity.
+  // initializeComponents() optionally composes rear->IMU afterwards.
+  extrinT = {0.0, 0.0, 0.0};
+  extrinR = {1.0, 0.0, 0.0,
+             0.0, 1.0, 0.0,
+             0.0, 0.0, 1.0};
+
+  // VIO consumes virtual-lidar(rear axle)->camera.  The same external file
+  // stores camera->rear axle, so invert that rigid transform here.
+  const Json::Value &rear_from_camera_values =
+      calibration["transforms"]["midrange_camera_to_rear_axle"]
+                 ["transform_matrix"];
+  const Eigen::Matrix4d rear_from_camera = parse_rigid_transform(
+      rear_from_camera_values, "midrange_camera_to_rear_axle");
+  const M3D camera_from_rear_rotation =
+      rear_from_camera.block<3, 3>(0, 0).transpose();
+  const V3D camera_from_rear_translation =
+      -camera_from_rear_rotation * rear_from_camera.block<3, 1>(0, 3);
+  // Eigen stores matrices column-major; the downstream MAT_FROM_ARRAY macro
+  // expects row-major parameter order.
+  cameraextrinR = {
+      camera_from_rear_rotation(0, 0), camera_from_rear_rotation(0, 1),
+      camera_from_rear_rotation(0, 2), camera_from_rear_rotation(1, 0),
+      camera_from_rear_rotation(1, 1), camera_from_rear_rotation(1, 2),
+      camera_from_rear_rotation(2, 0), camera_from_rear_rotation(2, 1),
+      camera_from_rear_rotation(2, 2)};
+  cameraextrinT = {
+      camera_from_rear_translation.x(),
+      camera_from_rear_translation.y(),
+      camera_from_rear_translation.z()};
+
+  string source_description;
+  for (std::size_t index = 0; index < lidar_sources.size(); ++index)
+  {
+    if (index != 0) source_description += ", ";
+    source_description += lidar_sources[index]->topic + "->" +
+                          lidar_sources[index]->transform_key;
+  }
+  RCLCPP_INFO(
+      node_->get_logger(),
+      "Loaded %zu LiDAR source(s) from %s: %s",
+      lidar_sources.size(), multi_lidar_calibration_file.c_str(),
+      source_description.c_str());
+}
+
 void LIVMapper::initializeComponents() 
 {
   downSizeFilterSurf.setLeafSize(filter_size_surf_min, filter_size_surf_min, filter_size_surf_min);
+  if (extrinT.size() != 3 || extrinR.size() != 9)
+    throw std::runtime_error("LiDAR body extrinsic T/R must contain 3 and 9 values.");
   extT << VEC_FROM_ARRAY(extrinT);
   extR << MAT_FROM_ARRAY(extrinR);
 
-  voxelmap_manager->extT_ << VEC_FROM_ARRAY(extrinT);
-  voxelmap_manager->extR_ << MAT_FROM_ARRAY(extrinR);
+  // The truck calibration is T_rear_axle_lidar. When enabled, relocate the
+  // estimator body to the physical IMU centre without changing the LIO/IEKF.
+  // All involved vehicle frames use the same RFU axes, so only translation
+  // changes: T_imu_lidar = T_imu_rear_axle * T_rear_axle_lidar.
+  if (rear_axle_to_imu_enabled)
+  {
+    extT += imu_to_rear_axle;
+  }
+
+  voxelmap_manager->extT_ = extT;
+  voxelmap_manager->extR_ = extR;
+
+  RCLCPP_INFO(
+      node_->get_logger(),
+      "Wuhu LiDAR time contract: header=scan-start, point timestamp=relative-seconds; "
+      "rear_axle_to_imu=%s; active lidar->body T=[%.3f, %.3f, %.3f] m; "
+      "IMU format=%s, gyro=%s, acceleration=%s",
+      rear_axle_to_imu_enabled ? "true" : "false",
+      extT.x(), extT.y(), extT.z(),
+      imu_standard_rfu ? "standard_rfu" : "packed_mine_pose",
+      imu_gyro_in_degrees ? "deg/s->rad/s" : "rad/s",
+      imu_acceleration_gravity_compensated
+          ? "gravity-free; restoring gravity"
+          : "specific force with gravity");
 
   if (camera_intrinsics.size() != 4 || camera_distortion.size() != 5)
     throw std::runtime_error("Camera intrinsics must be [fx, fy, cx, cy] and distortion must contain five values.");
@@ -250,10 +610,36 @@ void LIVMapper::initializeSubscribersAndPublishers()
     imu_qos.best_effort();
     image_qos.best_effort();
   }
-  sub_pcl = node_->create_subscription<sensor_msgs::PointCloud2>(
-      lid_topic, lidar_qos, std::bind(&LIVMapper::standard_pcl_cbk, this, std::placeholders::_1));
+  if (multi_lidar_enabled)
+  {
+    sub_pcls.reserve(lidar_sources.size());
+    for (std::size_t source_index = 0;
+         source_index < lidar_sources.size(); ++source_index)
+    {
+      sub_pcls.push_back(
+          node_->create_subscription<sensor_msgs::PointCloud2>(
+              lidar_sources[source_index]->topic, lidar_qos,
+              [this, source_index](
+                  const sensor_msgs::PointCloud2::ConstSharedPtr msg) {
+                multi_lidar_pcl_cbk(msg, source_index);
+              }));
+    }
+  }
+  else
+  {
+    sub_pcl = node_->create_subscription<sensor_msgs::PointCloud2>(
+        lid_topic, lidar_qos,
+        std::bind(&LIVMapper::standard_pcl_cbk, this,
+                  std::placeholders::_1));
+  }
   sub_imu = node_->create_subscription<sensor_msgs::Imu>(
       imu_topic, imu_qos, std::bind(&LIVMapper::imu_cbk, this, std::placeholders::_1));
+  if (imu_standard_rfu)
+  {
+    sub_ins_odom = node_->create_subscription<nav_msgs::Odometry>(
+        ins_odom_topic, imu_qos,
+        std::bind(&LIVMapper::ins_odom_cbk, this, std::placeholders::_1));
+  }
   sub_img = node_->create_subscription<sensor_msgs::Image>(
       img_topic, image_qos, std::bind(&LIVMapper::img_cbk, this, std::placeholders::_1));
 
@@ -317,10 +703,17 @@ void LIVMapper::processImu()
   if (gravity_align_en) gravityAlignment();
   if (was_initializing && !p_imu->imu_need_init && !mine_frame_initialized)
   {
-    // During upstream IMU initialization last_lio_update_time intentionally
-    // remains at the first scan. Use the scan that actually completed
-    // initialization so the stationary INS mean includes the whole interval.
-    initializeMineFrame(LidarMeasures.lidar_frame_end_time);
+    // Use the exact measurement-group endpoint that Process2 used to finish
+    // IMU initialization. lidar_frame_end_time is populated for complete
+    // ONLY_LIO scans, but remains zero in LIVO where LiDAR data is cut at
+    // image timestamps; using it there rejects every valid INS sample.
+    const MeasureGroup &initialization_measure =
+        LidarMeasures.measures.back();
+    const double initialization_time =
+        LidarMeasures.lio_vio_flg == LIO
+            ? initialization_measure.lio_time
+            : initialization_measure.vio_time;
+    initializeMineFrame(initialization_time);
   }
 
   state_propagat = _state;
@@ -354,13 +747,17 @@ void LIVMapper::initializeMineFrame(double initialization_time)
 
   if (sample_count == 0)
   {
-    throw std::runtime_error("No packed INS pose was available at IMU initialization time.");
+    throw std::runtime_error(
+        "No INS odometry pose was available at IMU initialization time.");
   }
 
   mean_position /= static_cast<double>(sample_count);
-  Eigen::Quaterniond mean_orientation;
-  mean_orientation.coeffs() = quaternion_sum.normalized();
-  const M3D mine_rotation = mean_orientation.normalized().toRotationMatrix();
+  quaternion_sum.normalize();
+  Eigen::Quaterniond mean_orientation(
+      quaternion_sum.w(), quaternion_sum.x(),
+      quaternion_sum.y(), quaternion_sum.z());
+  mean_orientation.normalize();
+  const M3D mine_rotation = mean_orientation.toRotationMatrix();
 
   // Change only the estimator's initial world frame. Subsequent RTK positions
   // never enter state propagation or measurement updates.
@@ -368,6 +765,17 @@ void LIVMapper::initializeMineFrame(double initialization_time)
   _state.rot_end = mine_rotation * _state.rot_end;
   _state.vel_end = mine_rotation * _state.vel_end;
   _state.gravity = mine_rotation * _state.gravity;
+
+  // Right-multiplicative attitude errors stay in the body tangent space under
+  // this left world-frame change. Position, velocity and gravity errors are
+  // world vectors, so rotate their complete covariance rows/columns as well.
+  MD(DIM_STATE, DIM_STATE) transform_jacobian =
+      MD(DIM_STATE, DIM_STATE)::Identity();
+  transform_jacobian.block<3, 3>(3, 3) = mine_rotation;
+  transform_jacobian.block<3, 3>(7, 7) = mine_rotation;
+  transform_jacobian.block<3, 3>(16, 16) = mine_rotation;
+  _state.cov =
+      transform_jacobian * _state.cov * transform_jacobian.transpose();
   state_propagat = _state;
   voxelmap_manager->state_ = _state;
 
@@ -394,9 +802,10 @@ void LIVMapper::initializeMineFrame(double initialization_time)
   imu_reference_path.poses.clear();
   imu_reference_path.poses.push_back(initial_pose);
 
-  RCLCPP_INFO(node_->get_logger(),
-              "Mine frame initialized from %zu stationary INS samples at [%.3f, %.3f, %.3f]",
-              sample_count, mean_position.x(), mean_position.y(), mean_position.z());
+  RCLCPP_INFO(
+      node_->get_logger(),
+      "Mine frame initialized from %zu stationary INS samples at [%.3f, %.3f, %.3f]",
+      sample_count, mean_position.x(), mean_position.y(), mean_position.z());
 }
 
 void LIVMapper::publishReferenceTrajectory(double current_time)
@@ -518,8 +927,67 @@ void LIVMapper::handleLIO()
 
   double t0 = omp_get_wtime();
 
+  std::unordered_map<DownsampleVoxelKey, DownsampleMetadata,
+                     DownsampleVoxelKeyHash> downsample_metadata;
+  if (multi_lidar_enabled)
+  {
+    downsample_metadata.reserve(feats_undistort->size());
+    const double inverse_leaf_size = 1.0 / filter_size_surf_min;
+    for (const PointType &point : feats_undistort->points)
+    {
+      const DownsampleVoxelKey key{
+          static_cast<std::int64_t>(
+              std::floor(point.x * inverse_leaf_size)),
+          static_cast<std::int64_t>(
+              std::floor(point.y * inverse_leaf_size)),
+          static_cast<std::int64_t>(
+              std::floor(point.z * inverse_leaf_size))};
+      DownsampleMetadata &metadata = downsample_metadata[key];
+      metadata.beam_origin_sum +=
+          V3D(point.normal_x, point.normal_y, point.normal_z);
+      metadata.intensity_sum += point.intensity;
+      ++metadata.count;
+    }
+    // PCL treats normal_* as a unit surface normal and normalizes it.  The
+    // Multi-LiDAR input uses these fields for the physical beam origin, so
+    // downsample XYZ only and restore averaged metadata explicitly below.
+    downSizeFilterSurf.setDownsampleAllData(false);
+  }
+  else
+  {
+    downSizeFilterSurf.setDownsampleAllData(true);
+  }
   downSizeFilterSurf.setInputCloud(feats_undistort);
   downSizeFilterSurf.filter(*feats_down_body);
+
+  if (multi_lidar_enabled)
+  {
+    const double inverse_leaf_size = 1.0 / filter_size_surf_min;
+    for (PointType &point : feats_down_body->points)
+    {
+      const DownsampleVoxelKey key{
+          static_cast<std::int64_t>(
+              std::floor(point.x * inverse_leaf_size)),
+          static_cast<std::int64_t>(
+              std::floor(point.y * inverse_leaf_size)),
+          static_cast<std::int64_t>(
+              std::floor(point.z * inverse_leaf_size))};
+      const auto metadata = downsample_metadata.find(key);
+      if (metadata == downsample_metadata.end() ||
+          metadata->second.count == 0)
+        throw std::runtime_error(
+            "Cannot recover Multi-LiDAR metadata after voxel filtering.");
+      const double inverse_count =
+          1.0 / static_cast<double>(metadata->second.count);
+      const V3D beam_origin =
+          metadata->second.beam_origin_sum * inverse_count;
+      point.normal_x = static_cast<float>(beam_origin.x());
+      point.normal_y = static_cast<float>(beam_origin.y());
+      point.normal_z = static_cast<float>(beam_origin.z());
+      point.intensity = static_cast<float>(
+          metadata->second.intensity_sum * inverse_count);
+    }
+  }
   
   double t_down = omp_get_wtime();
 
@@ -871,21 +1339,242 @@ void LIVMapper::RGBpointBodyLidarToIMU(PointType const *const pi, PointType *con
   po->intensity = pi->intensity;
 }
 
+void LIVMapper::multi_lidar_pcl_cbk(
+    const sensor_msgs::PointCloud2::ConstSharedPtr &msg,
+    std::size_t source_index)
+{
+  if (!lidar_en) return;
+  std::unique_lock<std::mutex> lock(mtx_buffer);
+  try
+  {
+    if (source_index >= lidar_sources.size())
+      throw std::runtime_error("Invalid Multi-LiDAR source index.");
+    LidarSource &source = *lidar_sources[source_index];
+    const double header_time = stampToSec(msg->header.stamp);
+    if (!std::isfinite(header_time))
+      throw std::runtime_error(
+          source.topic + " has a non-finite header timestamp.");
+    if (header_time <= source.last_header_time)
+      throw std::runtime_error(
+          source.topic + " timestamp is not strictly increasing.");
+    source.last_header_time = header_time;
+
+    PointCloudXYZI::Ptr points(new PointCloudXYZI());
+    // Preprocessing, including ring validation, decimation, point-time
+    // validation and the blind-zone filter, occurs in the physical sensor
+    // frame before applying the sensor extrinsic.
+    p_pre->process(msg, points);
+    if (!points || points->size() <= 1)
+      throw std::runtime_error(
+          source.topic + " has fewer than two valid time-tagged points.");
+
+    // These bounds are expressed in the physical source-LiDAR frame. Apply
+    // them before the source cloud is transformed into the common rear-axle
+    // frame, otherwise the configured rectangles would have the wrong axes.
+    if (!source.body_exclusion_rectangles.empty())
+    {
+      const auto first_retained = std::remove_if(
+          points->points.begin(), points->points.end(),
+          [&source, this](const PointType &point) {
+            if (point.z <= multi_lidar_body_exclusion_min_z) return false;
+            for (const auto &rectangle :
+                 source.body_exclusion_rectangles)
+            {
+              if (point.x >= rectangle.min_x &&
+                  point.x <= rectangle.max_x &&
+                  point.y >= rectangle.min_y &&
+                  point.y <= rectangle.max_y)
+                return true;
+            }
+            return false;
+          });
+      points->points.erase(first_retained, points->points.end());
+      points->width = static_cast<std::uint32_t>(points->points.size());
+      points->height = 1;
+      if (points->size() <= 1)
+        throw std::runtime_error(
+            source.topic +
+            " has fewer than two points after vehicle-body filtering.");
+    }
+
+    for (PointType &point : points->points)
+    {
+      const V3D lidar_point(point.x, point.y, point.z);
+      const V3D rear_point =
+          source.rear_from_lidar_rotation * lidar_point +
+          source.rear_from_lidar_translation;
+      point.x = static_cast<float>(rear_point.x());
+      point.y = static_cast<float>(rear_point.y());
+      point.z = static_cast<float>(rear_point.z());
+
+      // Preserve the physical beam origin in the otherwise unused normal
+      // fields.  Deskew transforms it together with the return point, and the
+      // measurement covariance is then computed from the true beam vector
+      // instead of incorrectly treating the rear axle as every LiDAR origin.
+      point.normal_x =
+          static_cast<float>(source.rear_from_lidar_translation.x());
+      point.normal_y =
+          static_cast<float>(source.rear_from_lidar_translation.y());
+      point.normal_z =
+          static_cast<float>(source.rear_from_lidar_translation.z());
+    }
+
+    source.pending_frames.push_back({header_time, points});
+    if (source.pending_frames.size() > multi_lidar_queue_size)
+    {
+      const double dropped_time = source.pending_frames.front().header_time;
+      source.pending_frames.pop_front();
+      RCLCPP_WARN(
+          node_->get_logger(),
+          "Dropping queued %s frame %.9f because the other configured "
+          "LiDAR sources did not arrive in time.",
+          source.topic.c_str(), dropped_time);
+    }
+    synchronizeMultiLidarFrames();
+  }
+  catch (const std::exception &error)
+  {
+    RCLCPP_FATAL(node_->get_logger(),
+                 "Multi-LiDAR input failed: %s", error.what());
+    lock.unlock();
+    sig_buffer.notify_all();
+    rclcpp::shutdown();
+    return;
+  }
+  lock.unlock();
+  sig_buffer.notify_all();
+}
+
+void LIVMapper::synchronizeMultiLidarFrames()
+{
+  while (!lidar_sources.empty())
+  {
+    bool every_source_ready = true;
+    for (const auto &source : lidar_sources)
+      every_source_ready &= !source->pending_frames.empty();
+    if (!every_source_ready) return;
+
+    std::size_t earliest_source = 0;
+    double earliest_time =
+        lidar_sources.front()->pending_frames.front().header_time;
+    double latest_time = earliest_time;
+    for (std::size_t index = 1; index < lidar_sources.size(); ++index)
+    {
+      const double time =
+          lidar_sources[index]->pending_frames.front().header_time;
+      if (time < earliest_time)
+      {
+        earliest_time = time;
+        earliest_source = index;
+      }
+      latest_time = std::max(latest_time, time);
+    }
+
+    const double start_span = latest_time - earliest_time;
+    if (start_span > multi_lidar_sync_tolerance)
+    {
+      LidarSource &source = *lidar_sources[earliest_source];
+      source.pending_frames.pop_front();
+      RCLCPP_WARN(
+          node_->get_logger(),
+          "Dropping unmatched %s frame: configured LiDAR scan-start span "
+          "%.3f ms exceeds %.3f ms.",
+          source.topic.c_str(), start_span * 1000.0,
+          multi_lidar_sync_tolerance * 1000.0);
+      continue;
+    }
+
+    PointCloudXYZI::Ptr merged(new PointCloudXYZI());
+    std::size_t total_points = 0;
+    for (const auto &source : lidar_sources)
+      total_points += source->pending_frames.front().points->size();
+    merged->reserve(total_points);
+
+    for (auto &source : lidar_sources)
+    {
+      PendingLidarFrame frame = std::move(source->pending_frames.front());
+      source->pending_frames.pop_front();
+      const float header_delta_ms = static_cast<float>(
+          (frame.header_time - earliest_time) * 1000.0);
+      for (PointType point : frame.points->points)
+      {
+        point.curvature += header_delta_ms;
+        merged->push_back(point);
+      }
+    }
+    if (merged->size() <= 1)
+      throw std::runtime_error(
+          "Merged Multi-LiDAR frame has fewer than two points.");
+    std::stable_sort(
+        merged->points.begin(), merged->points.end(),
+        [](const PointType &left, const PointType &right) {
+          return left.curvature < right.curvature;
+        });
+
+    const double merged_header_time = earliest_time + lidar_time_offset;
+    if (merged_header_time <= last_timestamp_lidar)
+      throw std::runtime_error(
+          "Merged Multi-LiDAR timestamp is not strictly increasing.");
+    const double point_span_seconds =
+        merged->points.back().curvature / 1000.0;
+    if (!std::isfinite(point_span_seconds) ||
+        point_span_seconds < 0.0 ||
+        point_span_seconds >
+            lidar_max_point_offset + multi_lidar_sync_tolerance + 1.0e-6)
+      throw std::runtime_error(
+          "Merged Multi-LiDAR point times exceed the configured envelope.");
+
+    lid_raw_data_buffer.push_back(merged);
+    lid_header_time_buffer.push_back(merged_header_time);
+    last_timestamp_lidar = merged_header_time;
+    ++multi_lidar_frame_count;
+    if (multi_lidar_frame_count == 1 ||
+        multi_lidar_frame_count % 100 == 0)
+    {
+      RCLCPP_INFO(
+          node_->get_logger(),
+          "Merged Multi-LiDAR frame %zu: sources=%zu, points=%zu, "
+          "scan-start span=%.3f ms, point span=%.3f ms.",
+          multi_lidar_frame_count, lidar_sources.size(), merged->size(),
+          start_span * 1000.0, point_span_seconds * 1000.0);
+    }
+  }
+}
+
 void LIVMapper::standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstSharedPtr &msg)
 {
   if (!lidar_en) return;
   mtx_buffer.lock();
 
-  double cur_head_time = stampToSec(msg->header.stamp) + lidar_time_offset;
-  // cout<<"got feature"<<endl;
-  if (cur_head_time < last_timestamp_lidar)
-  {
-    ROS_ERROR("lidar loop back, clear buffer");
-    lid_raw_data_buffer.clear();
-  }
-  // ROS_INFO("get point cloud at time: %.6f", msg->header.stamp.toSec());
   PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
   p_pre->process(msg, ptr);
+  // GroundExtractor normalizes header.stamp to the first-point/scan-start
+  // time. Never subtract a scan period here.
+  const double cur_head_time =
+      stampToSec(msg->header.stamp) + lidar_time_offset;
+  if (!std::isfinite(cur_head_time) || !ptr || ptr->size() <= 1)
+  {
+    RCLCPP_FATAL(
+        node_->get_logger(),
+        "Invalid LiDAR frame: timestamp must be finite and at least two "
+        "valid time-tagged points must remain");
+    mtx_buffer.unlock();
+    sig_buffer.notify_all();
+    rclcpp::shutdown();
+    return;
+  }
+  if (cur_head_time < last_timestamp_lidar)
+  {
+    RCLCPP_FATAL(node_->get_logger(),
+                 "LiDAR timestamp moved backwards; stop this run and restart the node");
+    lid_raw_data_buffer.clear();
+    lid_header_time_buffer.clear();
+    lidar_pushed = false;
+    mtx_buffer.unlock();
+    sig_buffer.notify_all();
+    rclcpp::shutdown();
+    return;
+  }
   lid_raw_data_buffer.push_back(ptr);
   lid_header_time_buffer.push_back(cur_head_time);
   last_timestamp_lidar = cur_head_time;
@@ -916,8 +1605,15 @@ void LIVMapper::livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg_i
   ROS_INFO("Get LiDAR, its header time: %.6f", cur_head_time);
   if (cur_head_time < last_timestamp_lidar)
   {
-    ROS_ERROR("lidar loop back, clear buffer");
+    RCLCPP_FATAL(node_->get_logger(),
+                 "LiDAR timestamp moved backwards; stop this run and restart the node");
     lid_raw_data_buffer.clear();
+    lid_header_time_buffer.clear();
+    lidar_pushed = false;
+    mtx_buffer.unlock();
+    sig_buffer.notify_all();
+    rclcpp::shutdown();
+    return;
   }
   // ROS_INFO("get point cloud at time: %.6f", msg->header.stamp.toSec());
   PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
@@ -937,6 +1633,79 @@ void LIVMapper::livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg_i
   sig_buffer.notify_all();
 }
 
+void LIVMapper::ins_odom_cbk(const nav_msgs::Odometry::ConstSharedPtr &msg_in)
+{
+  if (!imu_en || !imu_standard_rfu) return;
+
+  const bool legacy_mislabeled_rear_axle =
+      msg_in->child_frame_id == "imu_link_rfu";
+  if (msg_in->header.frame_id != "ins_local_enu" ||
+      (msg_in->child_frame_id != "vehicle_rear_axle_rfu" &&
+       !legacy_mislabeled_rear_axle))
+  {
+    RCLCPP_WARN_THROTTLE(
+        node_->get_logger(), *node_->get_clock(), 5000,
+        "Ignoring INS odometry with unexpected frames %s -> %s",
+        msg_in->header.frame_id.c_str(), msg_in->child_frame_id.c_str());
+    return;
+  }
+  if (legacy_mislabeled_rear_axle)
+  {
+    RCLCPP_WARN_ONCE(
+        node_->get_logger(),
+        "Legacy INS Odometry child_frame_id=imu_link_rfu is mislabeled; "
+        "treating its translation as rear axle and applying the lever arm.");
+  }
+
+  MinePose mine_pose;
+  mine_pose.stamp = stampToSec(msg_in->header.stamp) - imu_time_offset;
+  mine_pose.position << msg_in->pose.pose.position.x,
+                        msg_in->pose.pose.position.y,
+                        msg_in->pose.pose.position.z;
+  mine_pose.orientation = Eigen::Quaterniond(
+      msg_in->pose.pose.orientation.w,
+      msg_in->pose.pose.orientation.x,
+      msg_in->pose.pose.orientation.y,
+      msg_in->pose.pose.orientation.z);
+
+  const bool pose_is_finite = std::isfinite(mine_pose.stamp)
+      && mine_pose.position.allFinite()
+      && mine_pose.orientation.coeffs().allFinite();
+  if (!pose_is_finite || mine_pose.orientation.norm() < 1.0e-6)
+  {
+    RCLCPP_WARN_THROTTLE(
+        node_->get_logger(), *node_->get_clock(), 5000,
+        "Ignoring invalid INS odometry pose on %s", ins_odom_topic.c_str());
+    return;
+  }
+  const M3D mine_from_rear_axle =
+      mine_pose.orientation.normalized().toRotationMatrix();
+  mine_pose.orientation = Eigen::Quaterniond(mine_from_rear_axle);
+  mine_pose.orientation.normalize();
+
+  if (rear_axle_to_imu_enabled)
+  {
+    // The new Odometry preserves the same st_point_3d/f_pos_alt translation
+    // carried by the legacy packed INS pose. When the estimator body is moved
+    // from the rear axle to the physical IMU, move this reference pose by the
+    // same lever arm so LIO and RTK/INS remain at the same physical point.
+    mine_pose.position += mine_from_rear_axle * (-imu_to_rear_axle);
+  }
+
+  if (!mine_pose_samples.empty() &&
+      mine_pose.stamp < mine_pose_samples.back().stamp)
+  {
+    RCLCPP_WARN_THROTTLE(
+        node_->get_logger(), *node_->get_clock(), 5000,
+        "Ignoring out-of-order INS odometry sample");
+    return;
+  }
+  // This separate odometry is used only for the one-time mine-frame anchor
+  // and the RViz reference path. It is never inserted into LIO propagation or
+  // measurement updates.
+  mine_pose_samples.push_back(mine_pose);
+}
+
 void LIVMapper::imu_cbk(const sensor_msgs::Imu::ConstSharedPtr &msg_in)
 {
   if (!imu_en) return;
@@ -944,24 +1713,42 @@ void LIVMapper::imu_cbk(const sensor_msgs::Imu::ConstSharedPtr &msg_in)
   auto msg = std::make_shared<sensor_msgs::Imu>(*msg_in);
   double timestamp = stampToSec(msg->header.stamp) - imu_time_offset;
 
-  // clip_converter.cpp contract:
-  // pitch=cov[0], roll=cov[1], local x/y=cov[3:4], altitude=orientation.z,
-  // heading=orientation.w. Reproduce Rz(-heading)*Ry(roll)*Rx(pitch).
   constexpr double degrees_to_radians = M_PI / 180.0;
-  const double pitch = msg_in->orientation_covariance[0] * degrees_to_radians;
-  const double roll = msg_in->orientation_covariance[1] * degrees_to_radians;
-  const double heading = msg_in->orientation.w * degrees_to_radians;
-  const M3D mine_from_imu =
-      Eigen::AngleAxisd(-heading, V3D::UnitZ()).toRotationMatrix() *
-      Eigen::AngleAxisd(roll, V3D::UnitY()).toRotationMatrix() *
-      Eigen::AngleAxisd(pitch, V3D::UnitX()).toRotationMatrix();
+  M3D mine_from_body = M3D::Identity();
+  if (imu_standard_rfu)
+  {
+    Eigen::Quaterniond orientation(
+        msg_in->orientation.w, msg_in->orientation.x,
+        msg_in->orientation.y, msg_in->orientation.z);
+    if (orientation.coeffs().allFinite() && orientation.norm() >= 1.0e-6)
+      mine_from_body = orientation.normalized().toRotationMatrix();
+  }
+  else
+  {
+    // Legacy clip_converter contract:
+    // pitch=cov[0], roll=cov[1], local x/y=cov[3:4], altitude=orientation.z,
+    // heading=orientation.w. Reproduce Rz(-heading)*Ry(roll)*Rx(pitch).
+    const double pitch = msg_in->orientation_covariance[0] * degrees_to_radians;
+    const double roll = msg_in->orientation_covariance[1] * degrees_to_radians;
+    const double heading = msg_in->orientation.w * degrees_to_radians;
+    mine_from_body =
+        Eigen::AngleAxisd(-heading, V3D::UnitZ()).toRotationMatrix() *
+        Eigen::AngleAxisd(roll, V3D::UnitY()).toRotationMatrix() *
+        Eigen::AngleAxisd(pitch, V3D::UnitX()).toRotationMatrix();
 
-  MinePose mine_pose;
-  mine_pose.stamp = timestamp;
-  mine_pose.position << msg_in->orientation_covariance[3],
-                        msg_in->orientation_covariance[4], msg_in->orientation.z;
-  mine_pose.orientation = Eigen::Quaterniond(mine_from_imu).normalized();
-  mine_pose_samples.push_back(mine_pose);
+    MinePose mine_pose;
+    mine_pose.stamp = timestamp;
+    mine_pose.position << msg_in->orientation_covariance[3],
+                          msg_in->orientation_covariance[4], msg_in->orientation.z;
+    if (rear_axle_to_imu_enabled)
+    {
+      // Legacy packed position is at the rear axle; relocate it to the
+      // physical IMU only for that legacy input format.
+      mine_pose.position -= mine_from_body * imu_to_rear_axle;
+    }
+    mine_pose.orientation = Eigen::Quaterniond(mine_from_body).normalized();
+    mine_pose_samples.push_back(mine_pose);
+  }
 
   const double gyro_scale = imu_gyro_in_degrees ? degrees_to_radians : 1.0;
   msg->angular_velocity.x = msg_in->angular_velocity.x * gyro_scale;
@@ -973,7 +1760,7 @@ void LIVMapper::imu_cbk(const sensor_msgs::Imu::ConstSharedPtr &msg_in)
   acceleration = imu_acceleration_transform * acceleration * imu_acceleration_scale;
   if (imu_acceleration_gravity_compensated)
   {
-    acceleration += mine_from_imu.transpose() * V3D(0.0, 0.0, G_m_s2);
+    acceleration += mine_from_body.transpose() * V3D(0.0, 0.0, G_m_s2);
   }
   msg->linear_acceleration.x = acceleration.x();
   msg->linear_acceleration.y = acceleration.y();
@@ -987,11 +1774,12 @@ void LIVMapper::imu_cbk(const sensor_msgs::Imu::ConstSharedPtr &msg_in)
   msg->header.frame_id = "imu";
   msg->header.stamp = stampFromSec(timestamp);
 
-  // Preserve the original estimator behavior: inertial samples begin once a
-  // lidar time base exists. INS poses above are retained for the init mean.
-  if (last_timestamp_lidar < 0.0) return;
-
-  if (fabs(last_timestamp_lidar - timestamp) > 0.5 && (!ros_driver_fix_en))
+  // Retain the real pre-scan IMU samples. GroundExtractor deliberately keeps
+  // a left and right IMU envelope around every LiDAR scan; discarding the
+  // samples before the first LiDAR callback destroys that contract.
+  if (last_timestamp_lidar >= 0.0 &&
+      fabs(last_timestamp_lidar - timestamp) > 0.5 &&
+      (!ros_driver_fix_en))
   {
     RCLCPP_WARN_THROTTLE(node_->get_logger(), *node_->get_clock(), 5000,
                          "IMU and LiDAR delta time is %.3f s", last_timestamp_lidar - timestamp);
@@ -1004,10 +1792,57 @@ void LIVMapper::imu_cbk(const sensor_msgs::Imu::ConstSharedPtr &msg_in)
 
   if (last_timestamp_imu > 0.0 && timestamp < last_timestamp_imu)
   {
+    if (p_imu->imu_need_init)
+    {
+      RCLCPP_WARN(
+          node_->get_logger(),
+          "Dropping an out-of-order startup IMU sample %.9f s older than "
+          "the latest sample; no LiDAR deskew has started yet",
+          last_timestamp_imu - timestamp);
+      mtx_buffer.unlock();
+      sig_buffer.notify_all();
+      return;
+    }
     mtx_buffer.unlock();
     sig_buffer.notify_all();
-    ROS_ERROR("imu loop back, offset: %lf \n", last_timestamp_imu - timestamp);
+    RCLCPP_FATAL(node_->get_logger(),
+                 "IMU timestamp moved backwards by %.9f s; stop this run and restart the node",
+                 last_timestamp_imu - timestamp);
+    rclcpp::shutdown();
     return;
+  }
+
+  if (last_timestamp_imu > 0.0 &&
+      timestamp - last_timestamp_imu > imu_max_time_gap)
+  {
+    const double gap = timestamp - last_timestamp_imu;
+    if (p_imu->imu_need_init)
+    {
+      // No cloud is deskewed or inserted into the map during IMU
+      // initialization. A startup delivery discontinuity can therefore be
+      // handled without interpolation: discard the uncommitted prefix and
+      // restart the stationary initializer at the first sample after the
+      // gap. Once initialization finishes, the same condition remains fatal.
+      RCLCPP_WARN(
+          node_->get_logger(),
+          "Startup IMU delivery has a %.6f s gap (limit %.6f s) between "
+          "%.9f and %.9f; restarting IMU initialization from the newer "
+          "sample",
+          gap, imu_max_time_gap, last_timestamp_imu, timestamp);
+      imu_buffer.clear();
+      p_imu->Reset();
+    }
+    else
+    {
+      mtx_buffer.unlock();
+      sig_buffer.notify_all();
+      RCLCPP_FATAL(node_->get_logger(),
+                   "IMU stream has a %.6f s gap (limit %.6f s); strict "
+                   "LiDAR deskew cannot continue",
+                   gap, imu_max_time_gap);
+      rclcpp::shutdown();
+      return;
+    }
   }
 
   // if (last_timestamp_imu > 0.0 && timestamp > last_timestamp_imu + 0.2)
@@ -1067,7 +1902,9 @@ void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg_in)
 
   if (msg_header_time < last_timestamp_img)
   {
-    ROS_ERROR("image loop back. \n");
+    RCLCPP_FATAL(node_->get_logger(),
+                 "Image timestamp moved backwards; stop this run and restart the node");
+    rclcpp::shutdown();
     return;
   }
 
@@ -1132,10 +1969,19 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
 
     m.imu.clear();
     m.lio_time = meas.lidar_frame_end_time;
+    m.point_time_reference = meas.lidar_frame_beg_time;
     mtx_buffer.lock();
     while (!imu_buffer.empty())
     {
-      if (stampToSec(imu_buffer.front()->header.stamp) > meas.lidar_frame_end_time) break;
+      if (stampToSec(imu_buffer.front()->header.stamp) >
+          meas.lidar_frame_end_time)
+      {
+        // Once initialization is complete, retain this future sample in the
+        // shared buffer but also give the current measurement a reference to it
+        // so IMU values can be interpolated exactly at the LiDAR frame end.
+        if (!p_imu->imu_need_init) m.imu.push_back(imu_buffer.front());
+        break;
+      }
       m.imu.push_back(imu_buffer.front());
       imu_buffer.pop_front();
     }
@@ -1200,10 +2046,18 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
       // printf("[ Data Cut ] img_capture_time: %lf \n", img_capture_time);
       m.imu.clear();
       m.lio_time = img_capture_time;
+      // pcl_proc_cur is assembled below with curvature rebased to the previous
+      // estimator update, unlike a complete ONLY_LIO scan whose origin is its
+      // own header timestamp.
+      m.point_time_reference = meas.last_lio_update_time;
       mtx_buffer.lock();
       while (!imu_buffer.empty())
       {
-        if (stampToSec(imu_buffer.front()->header.stamp) > m.lio_time) break;
+        if (stampToSec(imu_buffer.front()->header.stamp) > m.lio_time)
+        {
+          if (!p_imu->imu_need_init) m.imu.push_back(imu_buffer.front());
+          break;
+        }
 
         if (stampToSec(imu_buffer.front()->header.stamp) > meas.last_lio_update_time) m.imu.push_back(imu_buffer.front());
 
@@ -1214,39 +2068,73 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
       mtx_buffer.unlock();
       sig_buffer.notify_all();
 
-      *(meas.pcl_proc_cur) = *(meas.pcl_proc_next);
-      PointCloudXYZI().swap(*meas.pcl_proc_next);
+      PointCloudXYZI carried_scan_tail;
+      carried_scan_tail.swap(*meas.pcl_proc_next);
+      const double carried_tail_time_reference =
+          meas.pcl_proc_next_time_reference;
+      meas.pcl_proc_cur->clear();
 
-      int lid_frame_num = lid_raw_data_buffer.size();
-      int max_size = meas.pcl_proc_cur->size() + 24000 * lid_frame_num;
-      meas.pcl_proc_cur->reserve(max_size);
-      meas.pcl_proc_next->reserve(max_size);
-      // deque<PointCloudXYZI::Ptr> lidar_buffer_tmp;
+      std::size_t maximum_point_count = carried_scan_tail.size();
+      for (const auto &buffered_cloud : lid_raw_data_buffer)
+        maximum_point_count += buffered_cloud->size();
+      meas.pcl_proc_cur->reserve(maximum_point_count);
+      meas.pcl_proc_next->reserve(maximum_point_count);
+
+      const auto distribute_points_at_image_boundary =
+          [&](const PointCloudXYZI &points,
+              double point_time_reference) {
+            if (points.empty()) return;
+            if (!std::isfinite(point_time_reference) ||
+                point_time_reference > m.lio_time + 1.0e-6)
+              throw std::runtime_error(
+                  "Invalid buffered LiDAR point-time reference in LIVO");
+
+            const double current_cutoff_ms =
+                (m.lio_time - point_time_reference) * 1000.0;
+            const double current_rebase_ms =
+                (point_time_reference - meas.last_lio_update_time) * 1000.0;
+            const double next_rebase_ms =
+                (point_time_reference - m.lio_time) * 1000.0;
+            for (PointType point : points.points)
+            {
+              if (point.curvature < current_cutoff_ms)
+              {
+                point.curvature += current_rebase_ms;
+                meas.pcl_proc_cur->push_back(point);
+              }
+              else
+              {
+                point.curvature += next_rebase_ms;
+                meas.pcl_proc_next->push_back(point);
+              }
+            }
+          };
+
+      // A 100 ms LiDAR scan spans about three 30 Hz image updates. Re-split
+      // the retained tail at every image boundary instead of consuming the
+      // whole tail one update too early.
+      distribute_points_at_image_boundary(
+          carried_scan_tail, carried_tail_time_reference);
 
       while (!lid_raw_data_buffer.empty())
       {
         if (lid_header_time_buffer.front() > img_capture_time) break;
-        auto pcl(lid_raw_data_buffer.front()->points);
-        double frame_header_time(lid_header_time_buffer.front());
-        float max_offs_time_ms = (m.lio_time - frame_header_time) * 1000.0f;
-
-        for (int i = 0; i < pcl.size(); i++)
-        {
-          auto pt = pcl[i];
-          if (pcl[i].curvature < max_offs_time_ms)
-          {
-            pt.curvature += (frame_header_time - meas.last_lio_update_time) * 1000.0f;
-            meas.pcl_proc_cur->points.push_back(pt);
-          }
-          else
-          {
-            pt.curvature += (frame_header_time - m.lio_time) * 1000.0f;
-            meas.pcl_proc_next->points.push_back(pt);
-          }
-        }
+        distribute_points_at_image_boundary(
+            *lid_raw_data_buffer.front(),
+            lid_header_time_buffer.front());
         lid_raw_data_buffer.pop_front();
         lid_header_time_buffer.pop_front();
       }
+      meas.pcl_proc_next_time_reference = m.lio_time;
+
+      const auto point_time_less =
+          [](const PointType &left, const PointType &right) {
+            return left.curvature < right.curvature;
+          };
+      std::stable_sort(meas.pcl_proc_cur->points.begin(),
+                       meas.pcl_proc_cur->points.end(), point_time_less);
+      std::stable_sort(meas.pcl_proc_next->points.begin(),
+                       meas.pcl_proc_next->points.end(), point_time_less);
 
       meas.measures.push_back(m);
       meas.lio_vio_flg = LIO;
@@ -1269,6 +2157,7 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
       struct MeasureGroup m;
       m.vio_time = img_capture_time;
       m.lio_time = meas.last_lio_update_time;
+      m.point_time_reference = meas.last_lio_update_time;
       m.img = img_buffer.front();
       mtx_buffer.lock();
       // while ((!imu_buffer.empty() && (imu_time < img_capture_time)))
@@ -1313,6 +2202,7 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
     }
     struct MeasureGroup m; // standard method to keep imu message.
     m.lio_time = meas.lidar_frame_end_time;
+    m.point_time_reference = meas.lidar_frame_beg_time;
     mtx_buffer.lock();
     lid_raw_data_buffer.pop_front();
     lid_header_time_buffer.pop_front();

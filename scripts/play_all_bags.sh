@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BAG_ROOT="/home/project/data/haibo/wuhu_livo/ros2bag"
-START_OFFSET="0"
-PLAY_RATE="0.3"
+BAG_ROOT="/home/project/data/haibo/huaining/03/ros2bag"
+START_OFFSET="10"
+PLAY_RATE="1.0"
 PLAY_ALL_TOPICS=0
-LIO_ONLY=0
+LIO_ONLY=1
 DRY_RUN=0
 PREPARED_BAG=""
 
 usage() {
-  echo "Usage: $0 [--bag-root DIR] [--prepared-bag DIR] [--start-offset SEC] [--rate RATE] [--lio-only | --all-topics] [--dry-run]"
+  echo "Usage: $0 [--bag-root DIR] [--prepared-bag DIR] [--start-offset SEC] [--rate RATE] [--lio-only | --with-camera | --all-topics] [--dry-run]"
 }
 
 while (($#)); do
@@ -20,6 +20,7 @@ while (($#)); do
     --start-offset) START_OFFSET="$2"; shift 2 ;;
     --rate) PLAY_RATE="$2"; shift 2 ;;
     --lio-only) LIO_ONLY=1; shift ;;
+    --with-camera) LIO_ONLY=0; shift ;;
     --all-topics) PLAY_ALL_TOPICS=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -58,12 +59,16 @@ set -u
 export ROS_LOG_DIR="${ROS_LOG_DIR:-/tmp/my_livo_ros_log}"
 mkdir -p "$ROS_LOG_DIR"
 
+# Offline playback is local to this host. Avoid Fast DDS shared-memory port
+# lock conflicts left by another ROS 2 process or an unclean previous exit.
+export FASTDDS_BUILTIN_TRANSPORTS="UDPv4"
+
 if [[ -z "$PREPARED_BAG" ]]; then PREPARED_BAG="${BAG_ROOT%/}_my_livo"; fi
 if [[ -f "$PREPARED_BAG/metadata.yaml" ]]; then
   if ((LIO_ONLY)); then
-    prepared_topic_args=(--topics front_lidar imu_data)
+    prepared_topic_args=(--topics front_left_lidar back_lidar front_right_lidar front_lidar imu_data imu_data/odometry)
   else
-    prepared_topic_args=(--topics front_lidar imu_data midrange_camera/ffmpeg)
+    prepared_topic_args=(--topics front_left_lidar back_lidar front_right_lidar front_lidar imu_data imu_data/odometry midrange_camera/ffmpeg)
   fi
   if ((PLAY_ALL_TOPICS)); then prepared_topic_args=(); fi
   echo "playing indexed runtime bag: $PREPARED_BAG start_offset=${START_OFFSET}s rate=${PLAY_RATE}"
@@ -116,7 +121,7 @@ run_stream() {
   elif [[ "$stream" == "camera" ]]; then
     topic_args=(--topics midrange_camera/ffmpeg)
   else
-    topic_args=(--topics front_lidar imu_data)
+    topic_args=(--topics front_left_lidar back_lidar front_right_lidar front_lidar imu_data imu_data/odometry)
   fi
 
   trap 'if [[ -n "${child_pid:-}" ]]; then kill -TERM "$child_pid" 2>/dev/null || true; fi; exit 0' INT TERM

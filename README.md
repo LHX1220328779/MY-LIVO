@@ -6,9 +6,9 @@
 
 ### 数据接口与处理边界
 
-- 激光雷达：`/front_lidar`，`sensor_msgs/msg/PointCloud2`。数据字段为 `x/y/z/intensity/ring/timestamp`；包内 `timestamp` 是低精度整秒值。该雷达是约 124° 视场、10 Hz 的固态扫描器，输入适配层按消息中的采样顺序重建 0–100 ms 帧内相对时间，只用于原算法的去畸变。
-- IMU：`/imu_data`，`sensor_msgs/msg/Imu`。按照 `clip_converter.cpp` 的打包约定解析 pitch、roll、heading、局部平面坐标和高度。陀螺仪由 deg/s 转为 rad/s；对已去重力的融合加速度完成车辆系到标定 IMU 系的轴变换并恢复机体系重力后，仍由原 FAST-LIVO2 IMU 模型融合。
-- `/imu_data` 中的 RTK/INS 位置不进入后续状态传播或观测更新。它只用于：在原算法 IMU 初始化完成的准确时刻，对此前局部位姿求均值并设置一次 `mine` 初始世界位姿；以及发布同步参考轨迹供 RViz2 对照。
+- 激光雷达：`/front_lidar`，`sensor_msgs/msg/PointCloud2`。数据字段为 `x/y/z/intensity/ring/timestamp`；消息头是首点/扫描起始时刻，`timestamp` 是从首点起算的 `float32` 相对秒。输入适配层直接使用 RTF 中每点的 10 us 偏移做去畸变；只有读取旧包且字段不合法时才按点序退化估算。
+- IMU：`/imu_data`，`sensor_msgs/msg/Imu`，坐标系 `imu_link_rfu`（x 右、y 前、z 上）。当前转换器已输出 raw 角速度 `rad/s` 和包含完整姿态投影重力响应的 raw 比力 `m/s²`；输入适配层不再换轴、重复转换角速度或补重力。标准四元数只用于初始化矿山坐标朝向，不作为 LIO 观测融合。
+- 组合导航：`/imu_data/odometry`，`nav_msgs/msg/Odometry`，父系 `ins_local_enu`、子系 `vehicle_rear_axle_rfu`。其中 x/y 严格为 `st_point_3d.x/y`，z 严格为 `f_pos_alt`。默认启用 `rear_axle_to_imu`，输入层按标定杆臂将参考轨迹和 LiDAR 外参同步转换到物理 IMU 点。位置只用于初始化完成时的静止均值锚定和 RViz2 同步参考轨迹，不进入 IMU 传播或 IEKF 更新。
 - 相机压缩流：`/midrange_camera/ffmpeg`，HEVC；启动文件用 `image_transport` 解码为 `/midrange_camera/image_raw`（实测 `1920x1080 bgr8`）。
 
 主要输出为 `/cloud_registered`、`/aft_mapped_to_init`、`/path`、`/imu_reference_odom` 和 `/imu_reference_path`，坐标系均为 `mine`。RViz2 中 LIVO 与 IMU/RTK 参考轨迹按当前 LIVO 时间戳同步推进。
@@ -18,20 +18,25 @@
 不要进入 Conda 环境。依次执行：
 
 ```bash
-cd /home/project/MY-LIVO
+cd /home/project/MY-LIVO1.0
 unset CONDA_PREFIX CONDA_DEFAULT_ENV PYTHONHOME PYTHONPATH
 export PATH=/opt/ros/humble/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 source /opt/ros/humble/setup.bash
-colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
+bash scripts/build_ros2_humble.sh
 source install/setup.bash
 ```
 
+launch 默认直接读取源码目录中的
+`/home/project/MY-LIVO1.0/config/wuhu_truck29.yaml`。以后修改并保存该 YAML
+只需重启 launch，无需重新编译；也可用 `config_file:=/绝对路径/file.yaml`
+指定另一份配置。
+
 ### 建图与 RViz2
 
-原始 MCAP 没有消息索引，且每个感知包还包含多个本算法不用的大流量雷达话题。首次运行前先生成一个按时间严格归并、带索引且只保留所需话题的运行包（原始包不会被修改）：
+原始 MCAP 没有消息索引，且每个感知包还包含多个本算法不用的大流量雷达话题。首次运行前先生成一个按时间严格归并、带索引且只保留前雷达、IMU、组合导航 Odometry 和可选相机话题的运行包（原始包不会被修改）：
 
 ```bash
-cd /home/project/MY-LIVO
+cd /home/project/MY-LIVO1.0
 ./scripts/prepare_wuhu_bag.py
 ```
 
@@ -40,20 +45,25 @@ cd /home/project/MY-LIVO
 终端 1：
 
 ```bash
-cd /home/project/MY-LIVO
+cd /home/project/MY-LIVO1.0
 unset CONDA_PREFIX CONDA_DEFAULT_ENV PYTHONHOME PYTHONPATH
 source /opt/ros/humble/setup.bash
 source install/setup.bash
 ros2 launch fast_livo wuhu_truck29.launch.py use_camera:=false use_rviz:=true
 ```
 
-仅验证 LiDAR-IMU 时，可改为 `use_camera:=false`。RViz2 配置文件为 `rviz_cfg/wuhu_truck29.rviz`。
+以上命令是 LiDAR-IMU 模式。完整 LIVO 使用 `use_camera:=true`。RViz2 配置文件为 `rviz_cfg/wuhu_truck29.rviz`。
+
+程序已内置当前数据的 LiDAR 时间契约：消息头是扫描起始时刻、逐点
+`timestamp` 是相对秒，不再提供 `lidar_header_is_scan_end` 开关。组合导航位置
+属于后轴，因此 `rear_axle_to_imu:=true`。实测三个 MCAP 共使用 34 个稀疏
+`ring` ID、最大为 126，因此 `scan_line` 按 ID 上界配置为 128，而不是误填 34。
 
 终端 2 播放完整 LIVO 输入：
 
 ```bash
-cd /home/project/MY-LIVO
-./scripts/play_all_bags.sh --start-offset 0
+cd /home/project/MY-LIVO1.0
+./scripts/play_all_bags.sh --with-camera
 ```
 
 仅播放 LIO 输入：
@@ -76,14 +86,15 @@ cd /home/project/MY-LIVO
 
 统一标定文件为 `config/perception_truck29.json`，其中包含：
 
-- LiDAR→IMU、LiDAR→中距相机，以及自动计算的中距相机→IMU 齐次变换；
+- 原始前雷达→后轴、前雷达→中距相机，以及由杆臂自动计算的前雷达/中距相机→物理 IMU 齐次变换；
 - 用户提供的中距相机和鱼眼相机内参；
 - `equation_10m` 至 `equation_100m`、最大距离/间隔和焦距参数。
 
-相机→IMU 使用以下关系自动生成：
+物理 IMU 外参使用以下关系自动生成：
 
 ```text
-T_imu_camera = T_imu_lidar * inverse(T_camera_lidar)
+T_imu_lidar  = T_imu_rear_axle * T_rear_axle_lidar
+T_imu_camera = T_imu_rear_axle * T_rear_axle_lidar * inverse(T_camera_lidar)
 ```
 
 重新计算并写回时执行：
@@ -96,13 +107,16 @@ T_imu_camera = T_imu_lidar * inverse(T_camera_lidar)
 
 ### LIO 验证结果
 
-ROS 2 Release 构建已通过。索引运行包包含 900 帧前雷达和 8999 帧 IMU；1 倍速全程测试得到 876 个初始化后 LIO 位姿，无时间回退和零有效特征帧，首帧矿山位姿使用初始化结束前 234 帧静止 INS 均值。相对包内 RTK/INS 参考，矿山坐标系位置 RMSE 为 1.79 m、P95 为 3.91 m、末端误差为 5.23 m；姿态 RMSE 为 2.37°、末端误差为 5.34°。RTK 位置只参与首帧锚定和参考显示，没有进入滤波传播或更新。
+当前三段感知包分别包含 `2999/3000/3000` 帧 IMU 和同数量、同纳秒时间戳的组合导航 Odometry。旧数据格式下得到的精度数值不再适用于本次 raw RFU IMU，完成新格式全程运行后应重新生成指标；评估脚本现在直接读取 `/imu_data/odometry`，不再从 IMU covariance 中解析伪装的位姿字段。
 
 需要复核当前轨迹时执行：
 
 ```bash
-./scripts/evaluate_wuhu_lio.py
+./scripts/evaluate_wuhu_lio.py --rear-axle-to-imu
 ```
+
+评估参数必须与 launch 中的 `rear_axle_to_imu` 保持一致；关闭该 launch
+开关时，评估脚本也不要传入 `--rear-axle-to-imu`。
 
 ## FAST-LIVO2: Fast, Direct LiDAR-Inertial-Visual Odometry
 

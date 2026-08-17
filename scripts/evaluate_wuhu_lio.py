@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Report compact LIO-versus-packed-INS metrics and input timing statistics."""
+"""Report compact LIO-versus-standard-INS-odometry metrics and timing."""
 
 import os
 import sys
@@ -24,27 +24,11 @@ import numpy as np
 import rosbag2_py
 from rclpy.serialization import deserialize_message
 from sensor_msgs.msg import Imu, PointCloud2
+from nav_msgs.msg import Odometry
 
 
 def stamp_seconds(stamp):
     return float(stamp.sec) + float(stamp.nanosec) * 1.0e-9
-
-
-def packed_ins_quaternion(message):
-    """Quaternion of Rz(-heading) * Ry(roll) * Rx(pitch), xyzw order."""
-    pitch = np.deg2rad(message.orientation_covariance[0])
-    roll = np.deg2rad(message.orientation_covariance[1])
-    heading = np.deg2rad(message.orientation.w)
-    x_angle, y_angle, z_angle = pitch, roll, -heading
-    cx, sx = np.cos(x_angle / 2.0), np.sin(x_angle / 2.0)
-    cy, sy = np.cos(y_angle / 2.0), np.sin(y_angle / 2.0)
-    cz, sz = np.cos(z_angle / 2.0), np.sin(z_angle / 2.0)
-    return np.array([
-        sx * cy * cz - cx * sy * sz,
-        cx * sy * cz + sx * cy * sz,
-        cx * cy * sz - sx * sy * cz,
-        cx * cy * cz + sx * sy * sz,
-    ])
 
 
 def timing_summary(name, values):
@@ -71,7 +55,14 @@ def main():
         default=Path("/home/project/data/haibo/wuhu_livo/ros2bag_my_livo"))
     parser.add_argument(
         "--trajectory", type=Path,
-        default=Path("/home/project/MY-LIVO/Log/result/wuhu_truck29.txt"))
+        default=Path("/home/project/MY-LIVO1.0/Log/result/wuhu_truck29.txt"))
+    parser.add_argument(
+        "--rear-axle-to-imu", action="store_true",
+        help="compare against the physical-IMU reference used by the matching launch switch")
+    parser.add_argument(
+        "--imu-to-rear-axle", type=float, nargs=3,
+        default=(0.904, -4.679, -1.699), metavar=("X", "Y", "Z"),
+        help="IMU-origin to rear-axle lever arm in RFU metres")
     args = parser.parse_args()
 
     reader = rosbag2_py.SequentialReader()
@@ -79,7 +70,8 @@ def main():
         rosbag2_py.StorageOptions(uri=str(args.bag), storage_id="mcap"),
         rosbag2_py.ConverterOptions("", ""))
 
-    imu_header_times, imu_record_times, reference_positions = [], [], []
+    imu_header_times, imu_record_times = [], []
+    reference_times, reference_positions = [], []
     reference_quaternions = []
     lidar_header_times, lidar_record_times = [], []
     while reader.has_next():
@@ -88,12 +80,20 @@ def main():
             message = deserialize_message(data, Imu)
             imu_header_times.append(stamp_seconds(message.header.stamp))
             imu_record_times.append(record_time * 1.0e-9)
+        elif topic == "imu_data/odometry":
+            message = deserialize_message(data, Odometry)
+            reference_times.append(stamp_seconds(message.header.stamp))
             reference_positions.append([
-                message.orientation_covariance[3],
-                message.orientation_covariance[4],
-                message.orientation.z,
+                message.pose.pose.position.x,
+                message.pose.pose.position.y,
+                message.pose.pose.position.z,
             ])
-            reference_quaternions.append(packed_ins_quaternion(message))
+            reference_quaternions.append([
+                message.pose.pose.orientation.x,
+                message.pose.pose.orientation.y,
+                message.pose.pose.orientation.z,
+                message.pose.pose.orientation.w,
+            ])
         elif topic == "front_lidar":
             message = deserialize_message(data, PointCloud2)
             lidar_header_times.append(stamp_seconds(message.header.stamp))
@@ -103,9 +103,32 @@ def main():
     lio_times = trajectory[:, 0]
     lio_positions = trajectory[:, 1:4]
     lio_quaternions = trajectory[:, 4:8]
-    reference_times = np.asarray(imu_header_times)
+    if not reference_times:
+        raise SystemExit(
+            "imu_data/odometry is missing; the standard Imu topic does not "
+            "contain an RTK/INS reference position")
+    reference_times = np.asarray(reference_times)
     reference_positions = np.asarray(reference_positions)
     reference_quaternions = np.asarray(reference_quaternions)
+    if args.rear_axle_to_imu:
+        lever = np.asarray(args.imu_to_rear_axle)
+        corrected_positions = []
+        for position, quaternion in zip(
+                reference_positions, reference_quaternions):
+            x, y, z, w = quaternion / np.linalg.norm(quaternion)
+            rotation = np.array([
+                [1.0 - 2.0 * (y * y + z * z),
+                 2.0 * (x * y - z * w),
+                 2.0 * (x * z + y * w)],
+                [2.0 * (x * y + z * w),
+                 1.0 - 2.0 * (x * x + z * z),
+                 2.0 * (y * z - x * w)],
+                [2.0 * (x * z - y * w),
+                 2.0 * (y * z + x * w),
+                 1.0 - 2.0 * (x * x + y * y)],
+            ])
+            corrected_positions.append(position - rotation @ lever)
+        reference_positions = np.asarray(corrected_positions)
 
     valid = (lio_times >= reference_times[0]) & (lio_times <= reference_times[-1])
     lio_times = lio_times[valid]
@@ -143,6 +166,7 @@ def main():
 
     print(timing_summary("IMU header", imu_header_times))
     print(timing_summary("IMU record", imu_record_times))
+    print(timing_summary("INS odometry header", reference_times))
     print(timing_summary("LiDAR header", lidar_header_times))
     print(timing_summary("LiDAR record", lidar_record_times))
     print(f"LIO poses: count={len(lio_times)}, span={lio_times[-1] - lio_times[0]:.3f}s")

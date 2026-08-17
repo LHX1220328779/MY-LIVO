@@ -63,12 +63,18 @@ struct MeasureGroup
 {
   double vio_time;
   double lio_time;
+  // Absolute timestamp represented by point.curvature == 0. Point curvature is
+  // expressed in milliseconds, but a complete LIO scan and a camera-split LIVO
+  // cloud use different origins. Carry that origin with the measurement so IMU
+  // deskew always compares times on one explicit axis.
+  double point_time_reference;
   deque<sensor_msgs::Imu::ConstSharedPtr> imu;
   cv::Mat img;
   MeasureGroup()
   {
     vio_time = 0.0;
     lio_time = 0.0;
+    point_time_reference = 0.0;
   };
 };
 
@@ -80,6 +86,10 @@ struct LidarMeasureGroup
   PointCloudXYZI::Ptr lidar;
   PointCloudXYZI::Ptr pcl_proc_cur;
   PointCloudXYZI::Ptr pcl_proc_next;
+  // Absolute timestamp represented by curvature == 0 in pcl_proc_next.
+  // LIVO retains scan tails across several image-rate updates, so the tail
+  // needs its own explicit time origin before it can be split again.
+  double pcl_proc_next_time_reference;
   deque<struct MeasureGroup> measures;
   EKF_STATE lio_vio_flg;
   int lidar_scan_index_now;
@@ -93,6 +103,7 @@ struct LidarMeasureGroup
     this->lidar.reset(new PointCloudXYZI());
     this->pcl_proc_cur.reset(new PointCloudXYZI());
     this->pcl_proc_next.reset(new PointCloudXYZI());
+    pcl_proc_next_time_reference = 0.0;
     this->measures.clear();
     lidar_scan_index_now = 0;
     last_lio_update_time = -1.0;

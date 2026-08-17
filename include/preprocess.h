@@ -16,6 +16,7 @@ which is included as part of this source code package.
 #include "common_lib.h"
 #include <livox_ros_driver/CustomMsg_ros2.h>
 #include <pcl_conversions/pcl_conversions.h>
+#include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <array>
 
 using namespace std;
@@ -148,23 +149,6 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(robosense_ros::Point,
                                   (float, x, x)(float, y, y)(float, z, z)(float, intensity, intensity)(double, timestamp, timestamp)(std::uint16_t, ring, ring))
 /*****************/
 
-/*** Mine front lidar MCAP contract: ring is uint32 and timestamp is float32. ***/
-namespace mine_lidar_ros
-{
-struct EIGEN_ALIGN16 Point
-{
-  PCL_ADD_POINT4D;
-  float intensity;
-  std::uint32_t ring;
-  float timestamp;
-  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-};
-} // namespace mine_lidar_ros
-POINT_CLOUD_REGISTER_POINT_STRUCT(mine_lidar_ros::Point,
-                                  (float, x, x)(float, y, y)(float, z, z)(float, intensity, intensity)
-                                  (std::uint32_t, ring, ring)(float, timestamp, timestamp))
-/*****************/
-
 class Preprocess
 {
 public:
@@ -184,7 +168,7 @@ public:
   int lidar_type, point_filter_num, N_SCANS;
   
   double blind, blind_sqr;
-  double scan_period_ms = 100.0;
+  double maximum_point_offset_sec = 0.2;
   bool feature_enabled, given_offset_time;
 private:
   void avia_handler(const livox_ros_driver::CustomMsg::ConstPtr &msg);
