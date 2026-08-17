@@ -45,6 +45,7 @@ void ImuProcess::Reset()
   last_imu.reset(new sensor_msgs::Imu());
   cur_pcl_un_.reset(new PointCloudXYZI());
   last_prop_end_time = -1.0;
+  stale_lidar_overlap_reported = false;
 }
 
 void ImuProcess::disable_imu()
@@ -223,16 +224,22 @@ void ImuProcess::Forward_without_imu(LidarMeasureGroup &meas, StatesGroup &state
         dt_j= pcl_end_offset_time - it_pcl->curvature/double(1000);
         M3D R_jk(Exp(state_inout.bias_g, - dt_j));
         V3D P_j(it_pcl->x, it_pcl->y, it_pcl->z);
+        V3D O_j(it_pcl->normal_x, it_pcl->normal_y,
+                it_pcl->normal_z);
         // Using rotation and translation to un-distort points
         V3D p_jk;
         p_jk = - state_inout.rot_end.transpose() * state_inout.vel_end * dt_j;
   
         V3D P_compensate =  R_jk * P_j + p_jk;
+        V3D O_compensate =  R_jk * O_j + p_jk;
   
         /// save Undistorted points and their rotation
         it_pcl->x = P_compensate(0);
         it_pcl->y = P_compensate(1);
         it_pcl->z = P_compensate(2);
+        it_pcl->normal_x = O_compensate(0);
+        it_pcl->normal_y = O_compensate(1);
+        it_pcl->normal_z = O_compensate(2);
     }
   }
 }
@@ -261,6 +268,7 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
   {
     throw std::runtime_error("Invalid IMU propagation or point-time reference");
   }
+  constexpr double kPointTimeToleranceSeconds = 1.0e-6;
   // A previous empty/aborted cloud must not leave poses that could be reused
   // under a different propagation origin on the next scan.
   IMUpose.clear();
@@ -291,6 +299,48 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
     pcl_wait_proc.resize(lidar_meas.pcl_proc_cur->points.size());
     pcl_wait_proc = *(lidar_meas.pcl_proc_cur);
     lidar_meas.lidar_scan_index_now = 0;
+
+    // Independent LiDARs are not perfectly phase locked.  After their scans
+    // are merged, the tail of one logical frame can therefore be a fraction
+    // of a millisecond later than the start of the next logical frame.  The
+    // estimator state has already consumed everything before
+    // prop_beg_time, so those points cannot be propagated a second time or
+    // deskewed by running the state backwards.  Keep the source timestamps
+    // intact and discard only points that lie strictly in the already
+    // consumed interval.  Points within the numerical tolerance are retained
+    // and clamped to the propagation start below.
+    const double stale_point_cutoff_ms =
+        (prop_beg_time - meas.point_time_reference -
+         kPointTimeToleranceSeconds) * 1000.0;
+    if (stale_point_cutoff_ms > 0.0 && !pcl_wait_proc.points.empty())
+    {
+      const auto first_current_point = std::lower_bound(
+          pcl_wait_proc.points.begin(), pcl_wait_proc.points.end(),
+          stale_point_cutoff_ms,
+          [](const PointType &point, double cutoff_ms) {
+            return point.curvature < cutoff_ms;
+          });
+      const std::size_t stale_count = static_cast<std::size_t>(
+          std::distance(pcl_wait_proc.points.begin(), first_current_point));
+      if (stale_count > 0)
+      {
+        pcl_wait_proc.points.erase(pcl_wait_proc.points.begin(),
+                                   first_current_point);
+        pcl_wait_proc.width =
+            static_cast<std::uint32_t>(pcl_wait_proc.points.size());
+        pcl_wait_proc.height = 1;
+        if (!stale_lidar_overlap_reported)
+        {
+          ROS_WARN(
+              "Overlapping Multi-LiDAR scan envelopes detected: discarded "
+              "%zu points older than the current IMU state (overlap %.3f "
+              "ms). Source point timestamps were not modified.",
+              stale_count,
+              (prop_beg_time - meas.point_time_reference) * 1000.0);
+          stale_lidar_overlap_reported = true;
+        }
+      }
+    }
     IMUpose.push_back(set_pose6d(0.0, acc_s_last, angvel_last, state_inout.vel_end, state_inout.pos_end, state_inout.rot_end));
   }
 
@@ -578,7 +628,6 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
       {
         const double raw_point_offset =
             point_time_shift + it_pcl->curvature / double(1000);
-        constexpr double kPointTimeToleranceSeconds = 1.0e-6;
         if (raw_point_offset < -kPointTimeToleranceSeconds ||
             raw_point_offset >
                 propagation_duration + kPointTimeToleranceSeconds)
@@ -596,15 +645,21 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
         V3D T_ei(pos_imu + vel_imu * dt + 0.5 * acc_imu * dt * dt - state_inout.pos_end);
 
         V3D P_i(it_pcl->x, it_pcl->y, it_pcl->z);
+        V3D O_i(it_pcl->normal_x, it_pcl->normal_y,
+                it_pcl->normal_z);
         // V3D P_compensate = Lid_rot_to_IMU.transpose() *
         // (state_inout.rot_end.transpose() * (R_i * (Lid_rot_to_IMU * P_i +
         // Lid_offset_to_IMU) + T_ei) - Lid_offset_to_IMU);
         V3D P_compensate = (extR_Ri * (R_i * (Lid_rot_to_IMU * P_i + Lid_offset_to_IMU) + T_ei) - exrR_extT);
+        V3D O_compensate = (extR_Ri * (R_i * (Lid_rot_to_IMU * O_i + Lid_offset_to_IMU) + T_ei) - exrR_extT);
 
         /// save Undistorted points and their rotation
         it_pcl->x = P_compensate(0);
         it_pcl->y = P_compensate(1);
         it_pcl->z = P_compensate(2);
+        it_pcl->normal_x = O_compensate(0);
+        it_pcl->normal_y = O_compensate(1);
+        it_pcl->normal_z = O_compensate(2);
 
         if (it_pcl == pcl_wait_proc.points.begin())
         {

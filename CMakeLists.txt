@@ -52,6 +52,9 @@ find_package(OpenCV REQUIRED)
 find_package(Boost REQUIRED COMPONENTS thread)
 find_package(OpenMP QUIET)
 find_package(mimalloc QUIET)
+if(NOT TARGET JsonCpp::JsonCpp)
+  find_package(jsoncpp CONFIG REQUIRED)
+endif()
 
 set(ROS_DEPENDENCIES
   rclcpp sensor_msgs nav_msgs geometry_msgs visualization_msgs
@@ -76,7 +79,7 @@ target_link_libraries(lio ${PCL_LIBRARIES})
 target_link_libraries(pre ${PCL_LIBRARIES})
 target_link_libraries(imu_proc ${PCL_LIBRARIES})
 target_link_libraries(laser_mapping vio lio pre imu_proc ${PCL_LIBRARIES}
-                      ${OpenCV_LIBRARIES} Boost::thread)
+                      ${OpenCV_LIBRARIES} Boost::thread JsonCpp::JsonCpp)
 
 add_executable(fastlivo_mapping src/main.cpp)
 target_include_directories(fastlivo_mapping PRIVATE include ${EIGEN3_INCLUDE_DIRS}

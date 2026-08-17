@@ -738,7 +738,8 @@ void Preprocess::mine_front_lidar_handler(const sensor_msgs::PointCloud2::ConstS
       if (*ring >= static_cast<std::uint32_t>(N_SCANS)) continue;
       if (!std::isfinite(*x) || !std::isfinite(*y) || !std::isfinite(*z))
         continue;
-      if (!std::isfinite(relative_seconds) || relative_seconds < 0.0)
+      if (!std::isfinite(relative_seconds) || relative_seconds < 0.0 ||
+          relative_seconds > maximum_point_offset_sec)
         continue;
 
       const double range_sqr = (*x) * (*x) + (*y) * (*y) + (*z) * (*z);

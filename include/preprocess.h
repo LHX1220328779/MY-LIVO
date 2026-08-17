@@ -168,6 +168,7 @@ public:
   int lidar_type, point_filter_num, N_SCANS;
   
   double blind, blind_sqr;
+  double maximum_point_offset_sec = 0.2;
   bool feature_enabled, given_offset_time;
 private:
   void avia_handler(const livox_ros_driver::CustomMsg::ConstPtr &msg);

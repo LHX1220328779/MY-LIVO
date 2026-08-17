@@ -20,6 +20,7 @@ which is included as part of this source code package.
 #include <image_transport/image_transport.h>
 #include <tf2_ros/transform_broadcaster.h>
 #include <filesystem>
+#include <memory>
 
 class LIVMapper
 {
@@ -46,6 +47,11 @@ public:
   void RGBpointBodyLidarToIMU(PointType const *const pi, PointType *const po);
   void RGBpointBodyToWorld(PointType const *const pi, PointType *const po);
   void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstSharedPtr &msg);
+  void multi_lidar_pcl_cbk(
+      const sensor_msgs::PointCloud2::ConstSharedPtr &msg,
+      std::size_t source_index);
+  void synchronizeMultiLidarFrames();
+  void loadMultiLidarCalibration();
   void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg_in);
   void imu_cbk(const sensor_msgs::Imu::ConstSharedPtr &msg_in);
   void ins_odom_cbk(const nav_msgs::Odometry::ConstSharedPtr &msg_in);
@@ -131,6 +137,46 @@ public:
   double img_time_offset = 0.0;
   deque<PointCloudXYZI::Ptr> lid_raw_data_buffer;
   deque<double> lid_header_time_buffer;
+
+  struct PendingLidarFrame
+  {
+    double header_time = 0.0;
+    PointCloudXYZI::Ptr points;
+  };
+
+  struct LidarBodyExclusionRectangle
+  {
+    double min_x = 0.0;
+    double max_x = 0.0;
+    double min_y = 0.0;
+    double max_y = 0.0;
+  };
+
+  struct LidarSource
+  {
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+    string topic;
+    string transform_key;
+    M3D rear_from_lidar_rotation = M3D::Identity();
+    V3D rear_from_lidar_translation = V3D::Zero();
+    vector<LidarBodyExclusionRectangle> body_exclusion_rectangles;
+    deque<PendingLidarFrame> pending_frames;
+    double last_header_time = -1.0;
+  };
+
+  bool multi_lidar_enabled = false;
+  string multi_lidar_calibration_file;
+  vector<string> multi_lidar_topics;
+  vector<string> multi_lidar_transform_keys;
+  vector<vector<LidarBodyExclusionRectangle>>
+      multi_lidar_body_exclusion_rectangles;
+  vector<std::unique_ptr<LidarSource>> lidar_sources;
+  double multi_lidar_sync_tolerance = 0.005;
+  double multi_lidar_body_exclusion_min_z = -3.0;
+  double lidar_max_point_offset = 0.2;
+  std::size_t multi_lidar_queue_size = 5;
+  std::size_t multi_lidar_frame_count = 0;
+
   deque<sensor_msgs::Imu::ConstSharedPtr> imu_buffer;
   deque<cv::Mat> img_buffer;
   deque<double> img_time_buffer;
@@ -195,6 +241,7 @@ public:
   rclcpp::Publisher<visualization_msgs::Marker>::SharedPtr plane_pub;
   rclcpp::Publisher<visualization_msgs::MarkerArray>::SharedPtr voxel_pub;
   rclcpp::Subscription<sensor_msgs::PointCloud2>::SharedPtr sub_pcl;
+  vector<rclcpp::Subscription<sensor_msgs::PointCloud2>::SharedPtr> sub_pcls;
   rclcpp::Subscription<sensor_msgs::Imu>::SharedPtr sub_imu;
   rclcpp::Subscription<nav_msgs::Odometry>::SharedPtr sub_ins_odom;
   rclcpp::Subscription<sensor_msgs::Image>::SharedPtr sub_img;

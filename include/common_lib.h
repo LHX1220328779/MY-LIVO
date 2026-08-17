@@ -86,6 +86,10 @@ struct LidarMeasureGroup
   PointCloudXYZI::Ptr lidar;
   PointCloudXYZI::Ptr pcl_proc_cur;
   PointCloudXYZI::Ptr pcl_proc_next;
+  // Absolute timestamp represented by curvature == 0 in pcl_proc_next.
+  // LIVO retains scan tails across several image-rate updates, so the tail
+  // needs its own explicit time origin before it can be split again.
+  double pcl_proc_next_time_reference;
   deque<struct MeasureGroup> measures;
   EKF_STATE lio_vio_flg;
   int lidar_scan_index_now;
@@ -99,6 +103,7 @@ struct LidarMeasureGroup
     this->lidar.reset(new PointCloudXYZI());
     this->pcl_proc_cur.reset(new PointCloudXYZI());
     this->pcl_proc_next.reset(new PointCloudXYZI());
+    pcl_proc_next_time_reference = 0.0;
     this->measures.clear();
     lidar_scan_index_now = 0;
     last_lio_update_time = -1.0;

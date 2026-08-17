@@ -1,7 +1,6 @@
 laser_mapping:
   ros__parameters:
     common:
-      lid_topic: "/front_lidar"
       imu_topic: "/imu_data"
       ins_odom_topic: "/imu_data/odometry"
       img_topic: "/midrange_camera/image_raw"
@@ -9,18 +8,28 @@ laser_mapping:
       lidar_en: true
       ros_driver_bug_fix: false
 
-    extrin_calib:
-      # Raw truck calibration: target_from_source = rear axle <- front lidar.
-      # It is used unchanged unless reference_frame_conversion.enabled is true.
-      front_lidar_to_rear_axle_T: [-0.033, 7.793, 0.051]
-      front_lidar_to_rear_axle_R: [-0.0027913370671459603, -0.9997368648819889, 0.022768606310221123,
-                                   0.9995713588659305, -0.0034529758783883313, -0.029071902113564328,
-                                   0.029142871723544572, 0.0226776972710091, 0.9993179749580158]
-      # target_from_source: midrange camera <- front lidar
-      Pcl: [-0.0631409, 1.69232, 0.191722]
-      Rcl: [0.00795227, -0.999963, -0.00342797,
-            -0.140058, 0.00228051, -0.990141,
-            0.990112, 0.00835396, -0.140035]
+    multi_lidar:
+      enabled: true
+      calibration_file: "/home/project/data/haibo/huaining/03/sensor-imu_calibration/perception_truck03.json"
+      # topics and transform_keys are paired by index. Keep only the desired
+      # pairs to run with any subset of the available LiDAR sources.
+      topics: ["/front_right_lidar", "/back_lidar", "/front_left_lidar", "/front_lidar"]
+      transform_keys: ["transform_matrix_lidar_1", "transform_matrix_lidar_2",
+                       "transform_matrix_lidar_3", "transform_matrix_lidar_6"]
+      # topics: ["/front_lidar"]
+      # transform_keys: ["transform_matrix_lidar_6"]
+      synchronization_tolerance_sec: 0.005
+      queue_size: 5
+      body_filter:
+        # Each consecutive x1,y1,x2,y2 group defines one rectangle in that
+        # physical LiDAR coordinate frame; endpoint order is unrestricted.
+        # Remove a point only when it is inside a rectangle and z > minimum_z.
+        minimum_z: -3.0
+        front_right_lidar: [-3.0, 2.0, 0.5, -9.0,
+                            0.0, 1.0, 1.0, -1.0]
+        back_lidar: [-1.0, 2.0, 3.0, -2.0]
+        front_left_lidar: [-3.0, -3.0, 1.0, 1.0,
+                           -2.0, 9.0, 0.0, 1.0]
 
     camera:
       width: 1920
@@ -64,13 +73,14 @@ laser_mapping:
 
     preprocess:
       lidar_type: 8
-      # The three MCAP segments contain 34 active ring IDs, but their original
-      # channel IDs are sparse and reach 126. This parameter is max ID + 1,
-      # not the count of active rings; 128 therefore preserves every point.
+      # All four source lidars retain their native sparse ring IDs. Their
+      # maximum ID is 126, so this is max ID + 1 rather than active-line count.
       scan_line: 128
       point_filter_num: 2
       feature_extract_enabled: false
+      # Applied independently in each physical LiDAR frame before transformation.
       blind: 2.0
+      maximum_point_offset_sec: 0.2
       filter_size_surf: 0.30
       hilti_en: false
 

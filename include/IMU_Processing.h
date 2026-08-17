@@ -77,6 +77,7 @@ private:
   V3D angvel_last;
   V3D acc_s_last;
   double last_prop_end_time = -1.0;
+  bool stale_lidar_overlap_reported = false;
   double time_last_scan;
   int init_iter_num = 1, MAX_INI_COUNT = 20;
   bool b_first_frame = true;
