@@ -134,11 +134,15 @@ T_imu_camera = T_imu_rear_axle * T_rear_axle_lidar * inverse(T_camera_lidar)
   --trajectory Log/result/wuhu_truck29.txt
 ./scripts/validate_odometry_pose_graph.py
 ./scripts/validate_loop_candidates.py
+./scripts/validate_loop_registration.py
 ```
 
 反斜杠续行后必须立即跟下一行参数；不要把
 `Log/result/wuhu_truck29.txt` 拆成两个 shell 命令。回环候选阶段只输出候选和
 初始相对位姿，不执行点云配准，也不会向 GTSAM 图中添加回环因子。
+多分辨率 NDT 在独立后台线程运行；进程退出时会先排空队列再关闭日志，因此必须
+等待 launch 进程完全退出后再执行配准验证脚本。Task 06 的配准输出仍不会加入
+GTSAM。
 
 ## FAST-LIVO2: Fast, Direct LiDAR-Inertial-Visual Odometry
 

@@ -12,9 +12,10 @@
 Task 01 baseline compile                       已完成
 Task 02 Frame/Time/Cloud Convention Audit      已完成
 Task 03 KeyframeManager                        已完成（447 KF rosbag 验证通过）
-Task 04 Odometry-only Pose Graph               GTSAM iSAM2 数值链路实测通过；诊断修复待复跑
-Task 05 Loop Candidate Detector                已实现，等待 rosbag 验收
-Loop registration / RTK factor / Global Map    尚未开始
+Task 04 Odometry-only Pose Graph               已完成（GTSAM iSAM2 实测通过）
+Task 05 Loop Candidate Detector                已完成（30 candidates 实测通过）
+Task 06 Loop Registration                      已实现，等待 rosbag 验收
+Loop verification / RTK factor / Global Map    尚未开始
 ```
 
 已落地文件与接口：
@@ -37,16 +38,24 @@ src/backend/loop_candidate_detector.cpp
 tests/loop_candidate_detector_test.cpp
 scripts/validate_loop_candidates.py
 docs/loop_candidate_detection.md
+include/backend/loop_registration.h
+src/backend/loop_registration.cpp
+tests/loop_registration_test.cpp
+scripts/validate_loop_registration.py
+docs/loop_registration.md
 
 /backend/keyframe_path_raw
 /backend/keyframe_cloud_raw
 /backend/keyframe_path_optimized
 /backend/odometry_optimized
 /backend/loop_candidates
+/backend/loop_registrations
 Log/backend/keyframes.csv
 Log/backend/pose_graph.csv
 Log/backend/loop_detection.csv
 Log/backend/loop_candidates.csv
+Log/backend/loop_registrations.csv
+Log/backend/loop_registration_levels.csv
 ```
 
 实际项目校准：
@@ -92,6 +101,11 @@ Log/backend/loop_candidates.csv
     未初始化该标量；现已改用 detailed variable status 计数，并给验证脚本增加
     严格上界，需下一次运行确认新日志。Task 05 同轮接入候选检测，但仍不添加
     配准结果或回环因子。
+12. 2026-08-19 修复后的 Task 04/05 联合实测通过：425 节点、424 里程计边，
+    iSAM2 `reeliminated_total=1272`、单关键帧最多 3；19 次候选搜索从 881 个
+    空间近邻中经排序/NMS 选出 30 对候选，初值最大位置误差 `5.18e-14 m`。
+    Task 06 已接入后台单线程多分辨率 NDT，使用候选局部系历史子地图，输出逐级
+    convergence/probability/fitness/overlap，但不做接受判定，也不修改 GTSAM。
 
 ## 0. 总目标
 
@@ -1742,6 +1756,27 @@ overlap
 ```
 
 仍禁止修改 graph。
+
+当前实现校准（2026-08-19）：
+
+```text
+target frame: historical candidate body frame
+target submap: candidate +/- 40 keyframes, stride 4
+source: current keyframe body cloud
+initial: detector T_candidate_current_initial
+NDT levels: 10 m -> 5 m -> 2 m -> 1 m
+voxel leaf: max(0.5 m, resolution * 0.25)
+execution: bounded FIFO background worker; frontend never runs NDT
+metrics: convergence, iterations, probability, fitness, overlap, inlier RMSE
+debug: summary CSV + per-level CSV + RViz diagnostic markers
+graph mutation: none
+```
+
+验收脚本：
+
+```bash
+./scripts/validate_loop_registration.py
+```
 
 ---
 

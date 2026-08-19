@@ -225,6 +225,18 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /backend/loop_candidates
       Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Backend Loop NDT
+      Namespaces:
+        {}
+      Topic:
+        Depth: 1
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /backend/loop_registrations
+      Value: true
     - Alpha: 1
       Buffer Length: 1
       Class: rviz_default_plugins/Path

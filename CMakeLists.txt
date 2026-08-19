@@ -53,7 +53,7 @@ find_package(image_transport REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(Eigen3 REQUIRED)
-find_package(PCL REQUIRED COMPONENTS common filters io)
+find_package(PCL REQUIRED COMPONENTS common filters io registration kdtree)
 find_package(OpenCV REQUIRED)
 find_package(Boost REQUIRED COMPONENTS thread)
 set(MY_LIVO_GTSAM_PREFIX
@@ -79,6 +79,7 @@ add_library(imu_proc src/IMU_Processing.cpp)
 add_library(backend_core
   src/backend/keyframe_manager.cpp
   src/backend/loop_candidate_detector.cpp
+  src/backend/loop_registration.cpp
   src/backend/pose_graph_optimizer.cpp)
 add_library(laser_mapping src/LIVMapper.cpp)
 
@@ -134,6 +135,13 @@ if(BUILD_TESTING)
   target_link_libraries(loop_candidate_detector_test backend_core)
   add_test(NAME loop_candidate_detector_test
     COMMAND loop_candidate_detector_test)
+
+  add_executable(loop_registration_test
+    tests/loop_registration_test.cpp)
+  target_include_directories(loop_registration_test PRIVATE
+    include ${EIGEN3_INCLUDE_DIRS} ${PCL_INCLUDE_DIRS})
+  target_link_libraries(loop_registration_test backend_core)
+  add_test(NAME loop_registration_test COMMAND loop_registration_test)
 endif()
 
 install(TARGETS fastlivo_mapping DESTINATION lib/${PROJECT_NAME})
@@ -144,6 +152,7 @@ install(PROGRAMS scripts/play_all_bags.sh scripts/generate_mine_calibration.py
         scripts/validate_backend_keyframes.py
         scripts/validate_odometry_pose_graph.py
         scripts/validate_loop_candidates.py
+        scripts/validate_loop_registration.py
         DESTINATION lib/${PROJECT_NAME})
 
 ament_package()

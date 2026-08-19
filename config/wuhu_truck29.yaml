@@ -167,6 +167,24 @@ laser_mapping:
         maximum_candidates_per_keyframe: 3
         detection_csv_path: "/home/project/MY-LIVO2.0/Log/backend/loop_detection.csv"
         candidate_csv_path: "/home/project/MY-LIVO2.0/Log/backend/loop_candidates.csv"
+      # Runs on a background worker. Results remain diagnostic and are not
+      # inserted into GTSAM until the separate verification stage passes.
+      loop_registration:
+        enabled: true
+        target_submap_half_width_keyframes: 40
+        target_submap_stride_keyframes: 4
+        resolutions_m: [10.0, 5.0, 2.0, 1.0]
+        voxel_leaf_size_ratio: 0.25
+        minimum_voxel_leaf_size_m: 0.50
+        transformation_epsilon: 0.05
+        step_size: 0.70
+        maximum_iterations: 40
+        overlap_max_correspondence_distance_m: 1.0
+        minimum_source_points: 100
+        minimum_target_points: 300
+        maximum_queue_size: 64
+        registration_csv_path: "/home/project/MY-LIVO2.0/Log/backend/loop_registrations.csv"
+        level_csv_path: "/home/project/MY-LIVO2.0/Log/backend/loop_registration_levels.csv"
 
     uav:
       imu_rate_odom: false

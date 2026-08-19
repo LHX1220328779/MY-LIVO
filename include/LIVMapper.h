@@ -16,6 +16,7 @@ which is included as part of this source code package.
 #include "IMU_Processing.h"
 #include "backend/keyframe_manager.h"
 #include "backend/loop_candidate_detector.h"
+#include "backend/loop_registration.h"
 #include "backend/pose_graph_optimizer.h"
 #include "vio.h"
 #include "preprocess.h"
@@ -213,6 +214,7 @@ public:
   bool backend_publish_keyframe_cloud = true;
   bool backend_pose_graph_enabled = false;
   bool backend_loop_detection_enabled = false;
+  bool backend_loop_registration_enabled = false;
   string backend_frontend_frame_id = "mine";
   string backend_map_frame_id = "map";
   string backend_body_frame_id = "body";
@@ -220,11 +222,15 @@ public:
   my_livo::backend::PoseGraphOptimizer::Options backend_pose_graph_options;
   my_livo::backend::LoopCandidateDetector::Options
       backend_loop_detection_options;
+  my_livo::backend::LoopRegistration::Options
+      backend_loop_registration_options;
   std::unique_ptr<my_livo::backend::KeyframeManager> keyframe_manager;
   std::unique_ptr<my_livo::backend::PoseGraphOptimizer>
       pose_graph_optimizer;
   std::unique_ptr<my_livo::backend::LoopCandidateDetector>
       loop_candidate_detector;
+  std::unique_ptr<my_livo::backend::LoopRegistration>
+      loop_registration;
   nav_msgs::Path backend_keyframe_path;
   nav_msgs::Path backend_optimized_path;
 
@@ -291,7 +297,10 @@ public:
       pubBackendOptimizedOdometry;
   rclcpp::Publisher<visualization_msgs::MarkerArray>::SharedPtr
       pubBackendLoopCandidates;
+  rclcpp::Publisher<visualization_msgs::MarkerArray>::SharedPtr
+      pubBackendLoopRegistrations;
   std::uint64_t backend_loop_marker_id = 0;
+  std::uint64_t backend_loop_registration_marker_id = 0;
   rclcpp::TimerBase::SharedPtr imu_prop_timer;
 
   int frame_num = 0;

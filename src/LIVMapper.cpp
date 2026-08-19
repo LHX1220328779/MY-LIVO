@@ -88,7 +88,29 @@ LIVMapper::LIVMapper(const rclcpp::Node::SharedPtr &node)
   tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(node_);
 }
 
-LIVMapper::~LIVMapper() {}
+LIVMapper::~LIVMapper()
+{
+  // Drain queued NDT jobs while the node, logger and publishers captured by
+  // the result callback are still alive.
+  if (loop_registration)
+  {
+    loop_registration->WaitUntilIdle();
+    const auto statistics = loop_registration->statistics();
+    RCLCPP_INFO(
+        node_->get_logger(),
+        "Loop registration stopped: enqueued=%lu, completed=%lu, "
+        "converged=%lu, failed=%lu, queue_drops=%lu, max_queue=%zu, "
+        "total_time=%.1f ms",
+        static_cast<unsigned long>(statistics.enqueued),
+        static_cast<unsigned long>(statistics.completed),
+        static_cast<unsigned long>(statistics.converged),
+        static_cast<unsigned long>(statistics.failed),
+        static_cast<unsigned long>(statistics.queue_drops),
+        statistics.maximum_queue_depth,
+        statistics.total_registration_time_ms);
+    loop_registration.reset();
+  }
+}
 
 void LIVMapper::readParameters()
 {
@@ -435,6 +457,75 @@ void LIVMapper::readParameters()
     throw std::runtime_error(
         "backend.loop_detection requires backend.pose_graph.enabled=true.");
 
+  nh.param<bool>("backend/loop_registration/enabled",
+                 backend_loop_registration_enabled, false);
+  nh.param<int>(
+      "backend/loop_registration/target_submap_half_width_keyframes",
+      backend_loop_registration_options.target_submap_half_width_keyframes,
+      40);
+  nh.param<int>("backend/loop_registration/target_submap_stride_keyframes",
+                backend_loop_registration_options
+                    .target_submap_stride_keyframes,
+                4);
+  nh.param<vector<double>>(
+      "backend/loop_registration/resolutions_m",
+      backend_loop_registration_options.resolutions_m,
+      vector<double>{10.0, 5.0, 2.0, 1.0});
+  nh.param<double>("backend/loop_registration/voxel_leaf_size_ratio",
+                   backend_loop_registration_options.voxel_leaf_size_ratio,
+                   0.25);
+  nh.param<double>("backend/loop_registration/minimum_voxel_leaf_size_m",
+                   backend_loop_registration_options
+                       .minimum_voxel_leaf_size_m,
+                   0.50);
+  nh.param<double>("backend/loop_registration/transformation_epsilon",
+                   backend_loop_registration_options
+                       .transformation_epsilon,
+                   0.05);
+  nh.param<double>("backend/loop_registration/step_size",
+                   backend_loop_registration_options.step_size, 0.70);
+  nh.param<int>("backend/loop_registration/maximum_iterations",
+                backend_loop_registration_options.maximum_iterations, 40);
+  nh.param<double>(
+      "backend/loop_registration/overlap_max_correspondence_distance_m",
+      backend_loop_registration_options
+          .overlap_max_correspondence_distance_m,
+      1.0);
+  int loop_registration_minimum_source_points = 100;
+  int loop_registration_minimum_target_points = 300;
+  int loop_registration_maximum_queue_size = 64;
+  nh.param<int>("backend/loop_registration/minimum_source_points",
+                loop_registration_minimum_source_points, 100);
+  nh.param<int>("backend/loop_registration/minimum_target_points",
+                loop_registration_minimum_target_points, 300);
+  nh.param<int>("backend/loop_registration/maximum_queue_size",
+                loop_registration_maximum_queue_size, 64);
+  if (loop_registration_minimum_source_points <= 0 ||
+      loop_registration_minimum_target_points <= 0 ||
+      loop_registration_maximum_queue_size <= 0)
+    throw std::runtime_error(
+        "backend.loop_registration point and queue limits must be "
+        "positive.");
+  backend_loop_registration_options.minimum_source_points =
+      static_cast<std::size_t>(loop_registration_minimum_source_points);
+  backend_loop_registration_options.minimum_target_points =
+      static_cast<std::size_t>(loop_registration_minimum_target_points);
+  backend_loop_registration_options.maximum_queue_size =
+      static_cast<std::size_t>(loop_registration_maximum_queue_size);
+  nh.param<string>("backend/loop_registration/registration_csv_path",
+                   backend_loop_registration_options.registration_csv_path,
+                   std::string(ROOT_DIR) +
+                       "Log/backend/loop_registrations.csv");
+  nh.param<string>("backend/loop_registration/level_csv_path",
+                   backend_loop_registration_options.level_csv_path,
+                   std::string(ROOT_DIR) +
+                       "Log/backend/loop_registration_levels.csv");
+  if (backend_loop_registration_enabled &&
+      !backend_loop_detection_enabled)
+    throw std::runtime_error(
+        "backend.loop_registration requires "
+        "backend.loop_detection.enabled=true.");
+
   nh.param<double>("publish/blind_rgb_points", blind_rgb_points, 0.01);
   nh.param<int>("publish/pub_scan_num", pub_scan_num, 1);
   nh.param<bool>("publish/pub_effect_point_en", pub_effect_point_en, false);
@@ -710,6 +801,103 @@ void LIVMapper::initializeComponents()
             backend_loop_detection_options.maximum_planar_distance_m,
             backend_loop_detection_options.maximum_height_difference_m,
             backend_loop_detection_options.maximum_candidates_per_keyframe);
+
+        if (backend_loop_registration_enabled)
+        {
+          loop_registration = std::make_unique<
+              my_livo::backend::LoopRegistration>(
+                  backend_loop_registration_options);
+          loop_registration->SetResultCallback(
+              [this](const my_livo::backend::LoopRegistrationResult &result) {
+                const char *status =
+                    my_livo::backend::LoopRegistrationStatusToString(
+                        result.status);
+                RCLCPP_INFO(
+                    node_->get_logger(),
+                    "Loop NDT %lu<-%lu: status=%s, converged=%d (%zu/%zu "
+                    "levels), probability=%.4f, fitness=%.4f m^2, "
+                    "overlap=%.3f, correction=%.3f m/%.3f deg, time=%.1f "
+                    "ms (diagnostic only; no graph factor)",
+                    static_cast<unsigned long>(result.candidate.candidate_id),
+                    static_cast<unsigned long>(result.candidate.current_id),
+                    status, static_cast<int>(result.converged),
+                    result.converged_levels, result.levels.size(),
+                    result.transformation_probability,
+                    result.fitness_score_m2, result.overlap,
+                    result.correction_translation_m,
+                    result.correction_angle_deg,
+                    result.registration_time_ms);
+                if (result.status !=
+                    my_livo::backend::LoopRegistrationStatus::kCompleted)
+                {
+                  RCLCPP_WARN(
+                      node_->get_logger(),
+                      "Loop NDT %lu<-%lu diagnostic: %s",
+                      static_cast<unsigned long>(
+                          result.candidate.candidate_id),
+                      static_cast<unsigned long>(result.candidate.current_id),
+                      result.diagnostic.c_str());
+                  return;
+                }
+
+                visualization_msgs::MarkerArray markers;
+                const auto make_marker = [this, &result](
+                    const char *name, const Eigen::Vector3d &from,
+                    const Eigen::Vector3d &to, float red, float green,
+                    float blue) {
+                  visualization_msgs::Marker marker;
+                  marker.header.frame_id = backend_map_frame_id;
+                  marker.header.stamp =
+                      stampFromSec(result.candidate.current_timestamp);
+                  marker.ns = name;
+                  marker.id = static_cast<int>(
+                      backend_loop_registration_marker_id++);
+                  marker.type = visualization_msgs::Marker::LINE_LIST;
+                  marker.action = visualization_msgs::Marker::ADD;
+                  marker.pose.orientation.w = 1.0;
+                  marker.scale.x = 0.22;
+                  marker.color.r = red;
+                  marker.color.g = green;
+                  marker.color.b = blue;
+                  marker.color.a = 0.95F;
+                  geometry_msgs::msg::Point start;
+                  start.x = from.x();
+                  start.y = from.y();
+                  start.z = from.z();
+                  geometry_msgs::msg::Point finish;
+                  finish.x = to.x();
+                  finish.y = to.y();
+                  finish.z = to.z();
+                  marker.points.push_back(start);
+                  marker.points.push_back(finish);
+                  return marker;
+                };
+                const my_livo::backend::Pose3d registered_current =
+                    result.T_map_candidate_snapshot *
+                    result.T_candidate_current;
+                markers.markers.push_back(make_marker(
+                    "backend_loop_ndt_links",
+                    result.T_map_candidate_snapshot.translation,
+                    registered_current.translation,
+                    result.converged ? 0.10F : 0.65F,
+                    result.converged ? 0.85F : 0.65F, 1.0F));
+                markers.markers.push_back(make_marker(
+                    "backend_loop_ndt_corrections",
+                    result.T_map_current_snapshot.translation,
+                    registered_current.translation, 1.0F, 0.15F, 0.85F));
+                pubBackendLoopRegistrations->publish(markers);
+              });
+          RCLCPP_INFO(
+              node_->get_logger(),
+              "Asynchronous multi-resolution NDT enabled: levels=%zu, "
+              "target window=+/- %d KFs stride %d, max queue=%zu",
+              backend_loop_registration_options.resolutions_m.size(),
+              backend_loop_registration_options
+                  .target_submap_half_width_keyframes,
+              backend_loop_registration_options
+                  .target_submap_stride_keyframes,
+              backend_loop_registration_options.maximum_queue_size);
+        }
       }
     }
   }
@@ -836,9 +1024,15 @@ void LIVMapper::initializeSubscribersAndPublishers()
           node_->create_publisher<nav_msgs::Odometry>(
               "/backend/odometry_optimized", 10);
       if (backend_loop_detection_enabled)
+      {
         pubBackendLoopCandidates =
             node_->create_publisher<visualization_msgs::MarkerArray>(
                 "/backend/loop_candidates", 10);
+        if (backend_loop_registration_enabled)
+          pubBackendLoopRegistrations =
+              node_->create_publisher<visualization_msgs::MarkerArray>(
+                  "/backend/loop_registrations", 10);
+      }
     }
   }
   imu_prop_timer = node_->create_wall_timer(std::chrono::milliseconds(4), std::bind(&LIVMapper::imu_prop_callback, this));
@@ -1470,6 +1664,15 @@ void LIVMapper::handleBackendKeyframe()
         marker.points.push_back(historical_point);
         marker.points.push_back(current_point);
         marker_array.markers.push_back(marker);
+
+        if (loop_registration &&
+            !loop_registration->Enqueue(candidate, stored_keyframes))
+          RCLCPP_ERROR(
+              node_->get_logger(),
+              "Failed to enqueue loop NDT candidate %lu<-%lu; queue is "
+              "full or the snapshot is invalid.",
+              static_cast<unsigned long>(candidate.candidate_id),
+              static_cast<unsigned long>(candidate.current_id));
       }
       pubBackendLoopCandidates->publish(marker_array);
     }
