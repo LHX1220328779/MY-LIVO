@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BAG_ROOT="/home/project/data/haibo/huaining/03/ros2bag"
-START_OFFSET="10"
+# BAG_ROOT="/home/project/data/haibo/huaining/03/ros2bag"
+BAG_ROOT="/home/project/data/haibo/wuhu_livo/ros2bag"
+START_OFFSET="0.0"
 PLAY_RATE="1.0"
 PLAY_ALL_TOPICS=0
 LIO_ONLY=1
@@ -61,14 +62,14 @@ mkdir -p "$ROS_LOG_DIR"
 
 # Offline playback is local to this host. Avoid Fast DDS shared-memory port
 # lock conflicts left by another ROS 2 process or an unclean previous exit.
-export FASTDDS_BUILTIN_TRANSPORTS="UDPv4"
+export FASTDDS_BUILTIN_TRANSPORTS="${FASTDDS_BUILTIN_TRANSPORTS:-UDPv4}"
 
 if [[ -z "$PREPARED_BAG" ]]; then PREPARED_BAG="${BAG_ROOT%/}_my_livo"; fi
 if [[ -f "$PREPARED_BAG/metadata.yaml" ]]; then
   if ((LIO_ONLY)); then
-    prepared_topic_args=(--topics front_left_lidar back_lidar front_right_lidar front_lidar imu_data imu_data/odometry)
+    prepared_topic_args=(--topics front_left_lidar back_lidar front_right_lidar front_lidar imu_data imu_data/odometry imu_data/ins_status)
   else
-    prepared_topic_args=(--topics front_left_lidar back_lidar front_right_lidar front_lidar imu_data imu_data/odometry midrange_camera/ffmpeg)
+    prepared_topic_args=(--topics front_left_lidar back_lidar front_right_lidar front_lidar imu_data imu_data/odometry imu_data/ins_status midrange_camera/ffmpeg)
   fi
   if ((PLAY_ALL_TOPICS)); then prepared_topic_args=(); fi
   echo "playing indexed runtime bag: $PREPARED_BAG start_offset=${START_OFFSET}s rate=${PLAY_RATE}"
@@ -121,7 +122,7 @@ run_stream() {
   elif [[ "$stream" == "camera" ]]; then
     topic_args=(--topics midrange_camera/ffmpeg)
   else
-    topic_args=(--topics front_left_lidar back_lidar front_right_lidar front_lidar imu_data imu_data/odometry)
+    topic_args=(--topics front_left_lidar back_lidar front_right_lidar front_lidar imu_data imu_data/odometry imu_data/ins_status)
   fi
 
   trap 'if [[ -n "${child_pid:-}" ]]; then kill -TERM "$child_pid" 2>/dev/null || true; fi; exit 0' INT TERM

@@ -188,6 +188,18 @@ std::vector<Keyframe::Ptr> KeyframeManager::keyframes() const
   return keyframes_;
 }
 
+Keyframe::Ptr KeyframeManager::latest_keyframe() const
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  return keyframes_.empty() ? nullptr : keyframes_.back();
+}
+
+std::size_t KeyframeManager::size() const
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  return keyframes_.size();
+}
+
 KeyframeManager::Statistics KeyframeManager::statistics() const
 {
   std::lock_guard<std::mutex> lock(mutex_);

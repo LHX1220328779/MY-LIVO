@@ -11,10 +11,14 @@ which is included as part of this source code package.
 */
 
 #include "LIVMapper.h"
+#include "backend/frame_transform.h"
 
 #include <json/json.h>
 
+#include <Eigen/Cholesky>
+
 #include <fstream>
+#include <limits>
 #include <set>
 
 namespace
@@ -110,6 +114,474 @@ LIVMapper::~LIVMapper()
         statistics.total_registration_time_ms);
     loop_registration.reset();
   }
+  if (loop_verifier)
+  {
+    const auto flushed = loop_verifier->Flush();
+    handleLoopVerificationDecisions(flushed, false);
+    const auto statistics = loop_verifier->statistics();
+    RCLCPP_INFO(
+        node_->get_logger(),
+        "Loop verifier stopped: registrations=%lu, individually_valid=%lu, "
+        "accepted=%lu, rejected=%lu, flushed=%zu",
+        static_cast<unsigned long>(statistics.registrations),
+        static_cast<unsigned long>(statistics.individually_valid),
+        static_cast<unsigned long>(statistics.accepted),
+        static_cast<unsigned long>(statistics.rejected), flushed.size());
+  }
+  // Stop and join the online tile worker before the exact final rebuild. Any
+  // coalesced periodic request is superseded by the complete final snapshot.
+  stopBackendGlobalMapWorker();
+  if (optimized_global_map && keyframe_manager && pose_graph_optimizer)
+  {
+    const auto keyframes = keyframe_manager->keyframes();
+    const auto optimized_poses = pose_graph_optimizer->optimized_poses();
+    if (!keyframes.empty() && keyframes.size() == optimized_poses.size())
+    {
+      const auto result = optimized_global_map->Build(
+          keyframes, optimized_poses, "final");
+      const bool saved = optimized_global_map->SaveLatest();
+      RCLCPP_INFO(
+          node_->get_logger(),
+          "Final optimized global map: revision=%zu, keyframes=%zu, "
+          "points=%zu->%zu, time=%.1f ms, saved=%d",
+          result.revision, result.keyframes, result.input_points,
+          result.output_points, result.build_time_ms,
+          static_cast<int>(saved));
+    }
+  }
+  if (rtk_observation_buffer)
+  {
+    const auto statistics = rtk_observation_buffer->statistics();
+    RCLCPP_INFO(
+        node_->get_logger(),
+        "RTK stopped: status=%lu (parsed=%lu), solutions=%lu, queries=%lu, "
+        "observations=%lu, selected=%lu, rejected selection=%lu, "
+        "innovation=%lu, max buffers=%zu/%zu",
+        static_cast<unsigned long>(statistics.status_messages),
+        static_cast<unsigned long>(statistics.status_parsed),
+        static_cast<unsigned long>(statistics.solutions),
+        static_cast<unsigned long>(statistics.queries),
+        static_cast<unsigned long>(statistics.observations),
+        static_cast<unsigned long>(backend_rtk_selected),
+        static_cast<unsigned long>(backend_rtk_rejected_selection),
+        static_cast<unsigned long>(backend_rtk_rejected_innovation),
+        statistics.maximum_status_buffer_size,
+        statistics.maximum_solution_buffer_size);
+  }
+}
+
+void LIVMapper::publishBackendOptimizedProducts(
+    bool allow_map_build, const std::string &map_build_reason)
+{
+  if (!pose_graph_optimizer || !keyframe_manager) return;
+  const auto latest_keyframe = keyframe_manager->latest_keyframe();
+  const std::size_t keyframe_count = keyframe_manager->size();
+  if (!latest_keyframe || keyframe_count == 0) return;
+
+  // Decide whether an O(N) graph snapshot is actually needed. High-rate
+  // optimized odometry and map->odom use only the latest cached graph pose.
+  const bool publish_full_path =
+      keyframe_count == 1 || map_build_reason == "loop" ||
+      keyframe_count >= backend_last_optimized_path_count.load() +
+                            backend_path_publish_interval;
+  bool request_map = false;
+  std::string map_reason;
+  if (allow_map_build && optimized_global_map)
+  {
+    // exchange() avoids clearing a graph correction that arrives
+    // concurrently after this scheduling decision.
+    const bool dirty = backend_global_map_dirty.exchange(false);
+    const bool force = map_build_reason == "final" ||
+                       map_build_reason == "loop";
+    if (dirty && !force &&
+        !optimized_global_map->CanBuildGraphUpdate(keyframe_count))
+    {
+      backend_global_map_dirty.store(true);
+    }
+    else if (force || dirty ||
+             optimized_global_map->NeedsPeriodicBuild(keyframe_count))
+    {
+      request_map = true;
+      map_reason = dirty ? "graph_update" : map_build_reason;
+      if (map_reason.empty()) map_reason = "periodic";
+    }
+  }
+
+  std::vector<my_livo::backend::Keyframe::Ptr> keyframes;
+  std::vector<my_livo::backend::Pose3d> optimized_poses;
+  if (publish_full_path || request_map)
+  {
+    keyframes = keyframe_manager->keyframes();
+    optimized_poses = pose_graph_optimizer->optimized_poses();
+    if (keyframes.size() != keyframe_count ||
+        optimized_poses.size() != keyframe_count)
+      throw std::runtime_error(
+          "Backend keyframe and optimized-pose snapshots differ.");
+  }
+
+  const my_livo::backend::Pose3d latest_pose =
+      optimized_poses.empty() ? latest_keyframe->T_map_body()
+                              : optimized_poses.back();
+  std_msgs::msg::Header output_header;
+  output_header.frame_id = backend_map_frame_id;
+  output_header.stamp = stampFromSec(latest_keyframe->timestamp());
+
+  if (publish_full_path)
+  {
+    nav_msgs::Path optimized_path;
+    optimized_path.header = output_header;
+    optimized_path.poses.reserve(keyframes.size());
+    for (std::size_t index = 0; index < keyframes.size(); ++index)
+    {
+      const auto &T_map_body = optimized_poses[index];
+      geometry_msgs::PoseStamped pose;
+      pose.header.frame_id = backend_map_frame_id;
+      pose.header.stamp = stampFromSec(keyframes[index]->timestamp());
+      pose.pose.position.x = T_map_body.translation.x();
+      pose.pose.position.y = T_map_body.translation.y();
+      pose.pose.position.z = T_map_body.translation.z();
+      pose.pose.orientation.x = T_map_body.rotation.x();
+      pose.pose.orientation.y = T_map_body.rotation.y();
+      pose.pose.orientation.z = T_map_body.rotation.z();
+      pose.pose.orientation.w = T_map_body.rotation.w();
+      optimized_path.poses.push_back(pose);
+    }
+    pubBackendOptimizedPath->publish(optimized_path);
+    backend_last_optimized_path_count.store(keyframe_count);
+  }
+
+  nav_msgs::Odometry optimized_odometry;
+  optimized_odometry.header = output_header;
+  optimized_odometry.child_frame_id = backend_body_frame_id;
+  optimized_odometry.pose.pose.position.x = latest_pose.translation.x();
+  optimized_odometry.pose.pose.position.y = latest_pose.translation.y();
+  optimized_odometry.pose.pose.position.z = latest_pose.translation.z();
+  optimized_odometry.pose.pose.orientation.x = latest_pose.rotation.x();
+  optimized_odometry.pose.pose.orientation.y = latest_pose.rotation.y();
+  optimized_odometry.pose.pose.orientation.z = latest_pose.rotation.z();
+  optimized_odometry.pose.pose.orientation.w = latest_pose.rotation.w();
+  for (int row = 0; row < 6; ++row)
+    for (int column = 0; column < 6; ++column)
+      optimized_odometry.pose.covariance[row * 6 + column] =
+          latest_keyframe->odom_covariance()(row, column);
+  pubBackendOptimizedOdometry->publish(optimized_odometry);
+
+  if (backend_map_frame_id != backend_frontend_frame_id)
+  {
+    const auto T_map_odom = my_livo::backend::ComputeMapToOdom(
+        latest_pose, latest_keyframe->T_odom_body());
+    geometry_msgs::msg::TransformStamped transform;
+    transform.header = output_header;
+    transform.child_frame_id = backend_frontend_frame_id;
+    transform.transform.translation.x = T_map_odom.translation.x();
+    transform.transform.translation.y = T_map_odom.translation.y();
+    transform.transform.translation.z = T_map_odom.translation.z();
+    transform.transform.rotation.x = T_map_odom.rotation.x();
+    transform.transform.rotation.y = T_map_odom.rotation.y();
+    transform.transform.rotation.z = T_map_odom.rotation.z();
+    transform.transform.rotation.w = T_map_odom.rotation.w();
+    tf_broadcaster_->sendTransform(transform);
+  }
+
+  if (request_map)
+    requestBackendGlobalMapBuild(
+        keyframes, optimized_poses, map_reason,
+        latest_keyframe->timestamp());
+}
+
+void LIVMapper::requestBackendGlobalMapBuild(
+    const std::vector<my_livo::backend::Keyframe::Ptr> &keyframes,
+    const std::vector<my_livo::backend::Pose3d> &optimized_poses,
+    const std::string &reason, double timestamp)
+{
+  if (!optimized_global_map || keyframes.empty() ||
+      keyframes.size() != optimized_poses.size())
+    return;
+  std::lock_guard<std::mutex> lock(backend_global_map_worker_mutex);
+  if (backend_global_map_worker_stop) return;
+  if (!backend_global_map_worker_started)
+  {
+    backend_global_map_worker_started = true;
+    backend_global_map_worker_thread =
+        std::thread(&LIVMapper::backendGlobalMapWorkerLoop, this);
+  }
+  BackendGlobalMapRequest request;
+  request.keyframes = keyframes;
+  request.optimized_poses = optimized_poses;
+  request.reason = reason;
+  request.timestamp = timestamp;
+  // Only the newest snapshot is useful. Preserve full-rebuild priority if a
+  // graph update is coalesced with newer periodic append requests.
+  if (backend_global_map_pending &&
+      backend_global_map_pending->reason == "graph_update")
+    request.reason = "graph_update";
+  backend_global_map_pending = std::move(request);
+  backend_global_map_worker_cv.notify_one();
+}
+
+void LIVMapper::backendGlobalMapWorkerLoop()
+{
+  while (true)
+  {
+    BackendGlobalMapRequest request;
+    {
+      std::unique_lock<std::mutex> lock(backend_global_map_worker_mutex);
+      backend_global_map_worker_cv.wait(lock, [this]() {
+        return backend_global_map_worker_stop ||
+               backend_global_map_pending.has_value();
+      });
+      if (backend_global_map_worker_stop) return;
+      // Give factors belonging to one keyframe/check a short window to merge
+      // into a single newest-pose snapshot. The wait releases the mutex, so
+      // producers remain non-blocking.
+      backend_global_map_worker_cv.wait_for(
+          lock,
+          std::chrono::milliseconds(
+              backend_global_map_request_coalesce_ms),
+          [this]() { return backend_global_map_worker_stop; });
+      if (backend_global_map_worker_stop) return;
+      request = std::move(*backend_global_map_pending);
+      backend_global_map_pending.reset();
+    }
+    try
+    {
+      const auto result = optimized_global_map->Build(
+          request.keyframes, request.optimized_poses, request.reason);
+      sensor_msgs::PointCloud2 message;
+      pcl::toROSMsg(*result.cloud, message);
+      message.header.frame_id = backend_map_frame_id;
+      message.header.stamp = stampFromSec(request.timestamp);
+      pubBackendOptimizedGlobalMap->publish(message);
+      RCLCPP_INFO(
+          node_->get_logger(),
+          "Optimized global map revision %zu: reason=%s, mode=%s, "
+          "keyframes=%zu, processed=%zu, tiles=%zu/%zu, points=%zu->%zu, "
+          "time=%.1f ms",
+          result.revision, request.reason.c_str(), result.build_mode.c_str(),
+          result.keyframes, result.processed_keyframes,
+          result.updated_tiles, result.total_tiles,
+          result.input_points, result.output_points, result.build_time_ms);
+    }
+    catch (const std::exception &error)
+    {
+      RCLCPP_ERROR(
+          node_->get_logger(), "Optimized global-map worker failed: %s",
+          error.what());
+    }
+  }
+}
+
+void LIVMapper::stopBackendGlobalMapWorker()
+{
+  {
+    std::lock_guard<std::mutex> lock(backend_global_map_worker_mutex);
+    if (!backend_global_map_worker_started) return;
+    backend_global_map_worker_stop = true;
+    backend_global_map_pending.reset();
+  }
+  backend_global_map_worker_cv.notify_all();
+  if (backend_global_map_worker_thread.joinable())
+    backend_global_map_worker_thread.join();
+  backend_global_map_worker_started = false;
+}
+
+void LIVMapper::handleRtkForKeyframe(
+    const my_livo::backend::Keyframe::Ptr &keyframe)
+{
+  if (!keyframe || !rtk_observation_buffer) return;
+  const auto query =
+      rtk_observation_buffer->GetObservationAt(keyframe->timestamp());
+  const auto write_decision = [this, &keyframe](
+      const char *decision,
+      const std::optional<my_livo::backend::RtkObservation> &observation,
+      const Eigen::Vector3d &innovation, double chi2, bool factor_added) {
+    if (!backend_rtk_decision_stream.is_open()) return;
+    backend_rtk_decision_stream << std::setprecision(17) << keyframe->id()
+        << ',' << keyframe->timestamp() << ',' << decision << ','
+        << static_cast<int>(factor_added);
+    if (observation)
+      backend_rtk_decision_stream << ',' << observation->position.x() << ','
+          << observation->position.y() << ',' << observation->position.z();
+    else
+      backend_rtk_decision_stream << ",,,";
+    backend_rtk_decision_stream << ',' << innovation.x() << ','
+        << innovation.y() << ',' << innovation.z() << ',' << chi2 << '\n';
+    backend_rtk_decision_stream.flush();
+  };
+  if (!query.observation)
+  {
+    write_decision(
+        my_livo::backend::RtkObservationRejectReasonToString(query.reason),
+        std::nullopt, Eigen::Vector3d::Zero(),
+        std::numeric_limits<double>::quiet_NaN(), false);
+    return;
+  }
+  ++backend_rtk_candidates;
+  if (!backend_rtk_factors_enabled)
+  {
+    write_decision("factor_disabled", query.observation,
+                   Eigen::Vector3d::Zero(), 0.0, false);
+    return;
+  }
+  if (!rtk_factor_selector->ShouldSelect(keyframe->id(), *query.observation))
+  {
+    ++backend_rtk_rejected_selection;
+    write_decision("selector_spacing", query.observation,
+                   Eigen::Vector3d::Zero(), 0.0, false);
+    return;
+  }
+
+  const Eigen::Vector3d innovation =
+      keyframe->T_map_body().translation - query.observation->position;
+  Eigen::Matrix3d innovation_covariance =
+      query.observation->position_covariance;
+  innovation_covariance.diagonal().array() +=
+      backend_rtk_innovation_prediction_sigma_m *
+      backend_rtk_innovation_prediction_sigma_m;
+  const Eigen::LDLT<Eigen::Matrix3d> decomposition(innovation_covariance);
+  if (decomposition.info() != Eigen::Success)
+    throw std::runtime_error("RTK innovation covariance is not invertible.");
+  const double chi2 = innovation.dot(decomposition.solve(innovation));
+  if (!std::isfinite(chi2) || chi2 > backend_rtk_innovation_gate_chi2)
+  {
+    ++backend_rtk_rejected_innovation;
+    write_decision("innovation_gate", query.observation, innovation, chi2,
+                   false);
+    RCLCPP_WARN(
+        node_->get_logger(),
+        "Rejecting RTK at KF %lu: innovation=%.3f m, chi2=%.3f > %.3f",
+        static_cast<unsigned long>(keyframe->id()), innovation.norm(), chi2,
+        backend_rtk_innovation_gate_chi2);
+    return;
+  }
+
+  const auto update = pose_graph_optimizer->AddRtkPositionFactor(
+      keyframe->id(), query.observation->position,
+      query.observation->position_covariance);
+  if (!update.added || !update.solution_usable)
+    throw std::runtime_error("GTSAM rejected an eligible RTK position factor.");
+  rtk_factor_selector->MarkSelected(keyframe->id(), *query.observation);
+  ++backend_rtk_selected;
+  if (optimized_global_map &&
+      optimized_global_map->CorrectionRequiresFullRebuild(
+          update.maximum_pose_correction_m,
+          update.maximum_pose_correction_deg))
+    backend_global_map_dirty.store(true);
+  write_decision("accepted", query.observation, innovation, chi2, true);
+  RCLCPP_INFO(
+      node_->get_logger(),
+      "GTSAM RTK KF %lu: innovation %.3f->%.3f m, chi2=%.3f, max pose "
+      "correction=%.3f m/%.3f deg, time=%.3f ms",
+      static_cast<unsigned long>(keyframe->id()),
+      update.innovation_before_m.norm(),
+      update.innovation_after_m.norm(), chi2,
+      update.maximum_pose_correction_m,
+      update.maximum_pose_correction_deg,
+      update.optimization_time_ms);
+}
+
+void LIVMapper::handleLoopVerificationDecisions(
+    const std::vector<my_livo::backend::LoopVerificationDecision> &decisions,
+    bool publish_outputs)
+{
+  if (decisions.empty()) return;
+  visualization_msgs::MarkerArray markers;
+  bool graph_changed = false;
+  for (const auto &decision : decisions)
+  {
+    const auto &registration = decision.registration;
+    RCLCPP_INFO(
+        node_->get_logger(),
+        "Loop verify %lu<-%lu: accepted=%d, reason=%s, neighbors=%zu, "
+        "best_consistency=%.3f m/%.3f deg, graph_factor=%d",
+        static_cast<unsigned long>(registration.candidate.candidate_id),
+        static_cast<unsigned long>(registration.candidate.current_id),
+        static_cast<int>(decision.accepted),
+        my_livo::backend::LoopRejectReasonToString(decision.reject_reason),
+        decision.consistent_neighbors,
+        decision.best_neighbor_translation_error_m,
+        decision.best_neighbor_rotation_error_deg,
+        static_cast<int>(decision.accepted &&
+                         backend_loop_factors_enabled));
+
+    if (decision.accepted && backend_loop_factors_enabled)
+    {
+      try
+      {
+        const auto update = pose_graph_optimizer->AddLoopFactor(
+            registration.candidate.candidate_id,
+            registration.candidate.current_id,
+            registration.T_candidate_current);
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "GTSAM loop %lu<-%lu: added=%d, residual %.4f m/%.4f deg -> "
+            "%.4f m/%.4f deg, max pose correction %.4f m/%.4f deg, "
+            "time=%.3f ms",
+            static_cast<unsigned long>(registration.candidate.candidate_id),
+            static_cast<unsigned long>(registration.candidate.current_id),
+            static_cast<int>(update.added),
+            update.residual_translation_before_m,
+            update.residual_rotation_before_deg,
+            update.residual_translation_after_m,
+            update.residual_rotation_after_deg,
+            update.maximum_pose_correction_m,
+            update.maximum_pose_correction_deg,
+            update.optimization_time_ms);
+        if (update.added)
+        {
+          graph_changed = true;
+          if (optimized_global_map &&
+              optimized_global_map->CorrectionRequiresFullRebuild(
+                  update.maximum_pose_correction_m,
+                  update.maximum_pose_correction_deg))
+            backend_global_map_dirty.store(true);
+        }
+      }
+      catch (const std::exception &error)
+      {
+        RCLCPP_ERROR(
+            node_->get_logger(),
+            "Failed to add verified loop %lu<-%lu: %s",
+            static_cast<unsigned long>(registration.candidate.candidate_id),
+            static_cast<unsigned long>(registration.candidate.current_id),
+            error.what());
+      }
+    }
+
+    const my_livo::backend::Pose3d registered_current =
+        registration.T_map_candidate_snapshot *
+        registration.T_candidate_current;
+    visualization_msgs::Marker marker;
+    marker.header.frame_id = backend_map_frame_id;
+    marker.header.stamp =
+        stampFromSec(registration.candidate.current_timestamp);
+    marker.ns = decision.accepted ? "backend_verified_loops_accepted"
+                                  : "backend_verified_loops_rejected";
+    marker.id = static_cast<int>(backend_loop_verification_marker_id++);
+    marker.type = visualization_msgs::Marker::LINE_LIST;
+    marker.action = visualization_msgs::Marker::ADD;
+    marker.pose.orientation.w = 1.0;
+    marker.scale.x = decision.accepted ? 0.32 : 0.16;
+    marker.color.r = decision.accepted ? 0.05F : 1.0F;
+    marker.color.g = decision.accepted ? 1.0F : 0.10F;
+    marker.color.b = decision.accepted ? 0.20F : 0.05F;
+    marker.color.a = decision.accepted ? 1.0F : 0.65F;
+    geometry_msgs::msg::Point historical;
+    historical.x = registration.T_map_candidate_snapshot.translation.x();
+    historical.y = registration.T_map_candidate_snapshot.translation.y();
+    historical.z = registration.T_map_candidate_snapshot.translation.z();
+    geometry_msgs::msg::Point current;
+    current.x = registered_current.translation.x();
+    current.y = registered_current.translation.y();
+    current.z = registered_current.translation.z();
+    marker.points.push_back(historical);
+    marker.points.push_back(current);
+    markers.markers.push_back(marker);
+  }
+  if (graph_changed && publish_outputs)
+    publishBackendOptimizedProducts(true, "loop");
+  if (publish_outputs && pubBackendVerifiedLoops)
+    pubBackendVerifiedLoops->publish(markers);
 }
 
 void LIVMapper::readParameters()
@@ -118,6 +590,8 @@ void LIVMapper::readParameters()
   nh.param<string>("common/lid_topic", lid_topic, "/livox/lidar");
   nh.param<string>("common/imu_topic", imu_topic, "/livox/imu");
   nh.param<string>("common/ins_odom_topic", ins_odom_topic, "/imu_data/odometry");
+  nh.param<string>("common/ins_status_topic", ins_status_topic,
+                   "/imu_data/ins_status");
   nh.param<bool>("common/ros_driver_bug_fix", ros_driver_fix_en, false);
   nh.param<bool>("common/img_en", img_en, true);
   nh.param<bool>("common/lidar_en", lidar_en, true);
@@ -374,6 +848,14 @@ void LIVMapper::readParameters()
                    backend_frontend_frame_id, "mine");
   nh.param<string>("backend/map_frame_id", backend_map_frame_id, "map");
   nh.param<string>("backend/body_frame_id", backend_body_frame_id, "body");
+  int backend_path_interval = 10;
+  nh.param<int>("backend/path_publish_keyframe_interval",
+                backend_path_interval, 10);
+  if (backend_path_interval <= 0)
+    throw std::runtime_error(
+        "backend.path_publish_keyframe_interval must be positive.");
+  backend_path_publish_interval =
+      static_cast<std::size_t>(backend_path_interval);
   if (backend_frontend_frame_id.empty())
     throw std::runtime_error("backend.frontend_frame_id must not be empty.");
   if (backend_map_frame_id.empty() || backend_body_frame_id.empty())
@@ -525,6 +1007,235 @@ void LIVMapper::readParameters()
     throw std::runtime_error(
         "backend.loop_registration requires "
         "backend.loop_detection.enabled=true.");
+
+  nh.param<bool>("backend/loop_verification/enabled",
+                 backend_loop_verification_enabled, false);
+  nh.param<bool>("backend/loop_verification/require_final_convergence",
+                 backend_loop_verification_options
+                     .require_final_convergence,
+                 true);
+  int loop_minimum_converged_levels = 4;
+  int loop_neighbor_current_window = 40;
+  int loop_neighbor_candidate_window = 40;
+  int loop_minimum_consistent_neighbors = 1;
+  nh.param<int>("backend/loop_verification/minimum_converged_levels",
+                loop_minimum_converged_levels, 4);
+  nh.param<double>(
+      "backend/loop_verification/minimum_transformation_probability",
+      backend_loop_verification_options
+          .minimum_transformation_probability,
+      0.35);
+  nh.param<double>("backend/loop_verification/maximum_fitness_score_m2",
+                   backend_loop_verification_options
+                       .maximum_fitness_score_m2,
+                   0.09);
+  nh.param<double>("backend/loop_verification/minimum_overlap",
+                   backend_loop_verification_options.minimum_overlap, 0.90);
+  nh.param<double>("backend/loop_verification/maximum_overlap_rmse_m",
+                   backend_loop_verification_options
+                       .maximum_overlap_rmse_m,
+                   0.32);
+  nh.param<double>(
+      "backend/loop_verification/maximum_translation_correction_m",
+      backend_loop_verification_options
+          .maximum_translation_correction_m,
+      5.0);
+  nh.param<double>(
+      "backend/loop_verification/maximum_rotation_correction_deg",
+      backend_loop_verification_options.maximum_rotation_correction_deg,
+      10.0);
+  nh.param<int>("backend/loop_verification/neighbor_current_id_window",
+                loop_neighbor_current_window, 40);
+  nh.param<int>("backend/loop_verification/neighbor_candidate_id_window",
+                loop_neighbor_candidate_window, 40);
+  nh.param<double>(
+      "backend/loop_verification/maximum_neighbor_translation_error_m",
+      backend_loop_verification_options
+          .maximum_neighbor_translation_error_m,
+      0.50);
+  nh.param<double>(
+      "backend/loop_verification/maximum_neighbor_rotation_error_deg",
+      backend_loop_verification_options
+          .maximum_neighbor_rotation_error_deg,
+      2.0);
+  nh.param<int>("backend/loop_verification/minimum_consistent_neighbors",
+                loop_minimum_consistent_neighbors, 1);
+  if (loop_minimum_converged_levels <= 0 ||
+      loop_neighbor_current_window <= 0 ||
+      loop_neighbor_candidate_window <= 0 ||
+      loop_minimum_consistent_neighbors <= 0)
+    throw std::runtime_error(
+        "backend.loop_verification integer parameters must be positive.");
+  backend_loop_verification_options.minimum_converged_levels =
+      static_cast<std::size_t>(loop_minimum_converged_levels);
+  backend_loop_verification_options.neighbor_current_id_window =
+      static_cast<std::uint64_t>(loop_neighbor_current_window);
+  backend_loop_verification_options.neighbor_candidate_id_window =
+      static_cast<std::uint64_t>(loop_neighbor_candidate_window);
+  backend_loop_verification_options.minimum_consistent_neighbors =
+      static_cast<std::size_t>(loop_minimum_consistent_neighbors);
+  nh.param<string>("backend/loop_verification/csv_path",
+                   backend_loop_verification_options.csv_path,
+                   std::string(ROOT_DIR) +
+                       "Log/backend/loop_verification.csv");
+  if (backend_loop_verification_enabled &&
+      !backend_loop_registration_enabled)
+    throw std::runtime_error(
+        "backend.loop_verification requires "
+        "backend.loop_registration.enabled=true.");
+
+  nh.param<bool>("backend/loop_pose_graph/enabled",
+                 backend_loop_factors_enabled, false);
+  nh.param<double>("backend/loop_pose_graph/translation_sigma_m",
+                   backend_pose_graph_options.loop_translation_sigma_m,
+                   0.20);
+  nh.param<double>("backend/loop_pose_graph/rotation_sigma_deg",
+                   backend_pose_graph_options.loop_rotation_sigma_deg,
+                   3.0);
+  nh.param<string>("backend/loop_pose_graph/robust_kernel",
+                   backend_pose_graph_options.loop_robust_kernel,
+                   "cauchy");
+  nh.param<double>("backend/loop_pose_graph/robust_delta",
+                   backend_pose_graph_options.loop_robust_delta, 2.0);
+  nh.param<int>("backend/loop_pose_graph/additional_update_steps",
+                backend_pose_graph_options.loop_additional_update_steps, 2);
+  nh.param<string>("backend/loop_pose_graph/csv_path",
+                   backend_pose_graph_options.loop_csv_path,
+                   std::string(ROOT_DIR) +
+                       "Log/backend/loop_factors.csv");
+  nh.param<string>("backend/optimized_trajectory_csv_path",
+                   backend_pose_graph_options.optimized_trajectory_csv_path,
+                   std::string(ROOT_DIR) +
+                       "Log/backend/optimized_trajectory.csv");
+  if (backend_loop_factors_enabled && !backend_loop_verification_enabled)
+    throw std::runtime_error(
+        "backend.loop_pose_graph requires "
+        "backend.loop_verification.enabled=true.");
+
+  nh.param<bool>("backend/global_map/enabled",
+                 backend_global_map_enabled, false);
+  nh.param<double>("backend/global_map/voxel_leaf_size_m",
+                   backend_global_map_options.voxel_leaf_size_m, 0.75);
+  nh.param<double>("backend/global_map/tile_size_m",
+                   backend_global_map_options.tile_size_m, 60.0);
+  int global_map_coalesce_ms = 50;
+  nh.param<int>("backend/global_map/request_coalesce_ms",
+                global_map_coalesce_ms, 50);
+  if (global_map_coalesce_ms < 0)
+    throw std::runtime_error(
+        "backend.global_map.request_coalesce_ms must be non-negative.");
+  backend_global_map_request_coalesce_ms =
+      static_cast<std::size_t>(global_map_coalesce_ms);
+  int global_map_interval = 20;
+  nh.param<int>("backend/global_map/periodic_keyframe_interval",
+                global_map_interval, 20);
+  if (global_map_interval <= 0)
+    throw std::runtime_error(
+        "backend.global_map.periodic_keyframe_interval must be positive.");
+  backend_global_map_options.periodic_keyframe_interval =
+      static_cast<std::size_t>(global_map_interval);
+  int minimum_graph_map_interval = 10;
+  nh.param<int>("backend/global_map/minimum_graph_rebuild_keyframe_interval",
+                minimum_graph_map_interval, 10);
+  if (minimum_graph_map_interval <= 0)
+    throw std::runtime_error(
+        "backend.global_map.minimum_graph_rebuild_keyframe_interval must "
+        "be positive.");
+  backend_global_map_options.minimum_graph_rebuild_keyframe_interval =
+      static_cast<std::size_t>(minimum_graph_map_interval);
+  nh.param<double>("backend/global_map/incremental_max_pose_change_m",
+                   backend_global_map_options.incremental_max_pose_change_m,
+                   0.10);
+  nh.param<double>("backend/global_map/incremental_max_pose_change_deg",
+                   backend_global_map_options.incremental_max_pose_change_deg,
+                   0.25);
+  nh.param<string>("backend/global_map/csv_path",
+                   backend_global_map_options.csv_path,
+                   std::string(ROOT_DIR) +
+                       "Log/backend/global_map_updates.csv");
+  nh.param<string>("backend/global_map/pcd_path",
+                   backend_global_map_options.pcd_path,
+                   std::string(ROOT_DIR) +
+                       "Log/backend/optimized_global_map.pcd");
+  if (backend_global_map_enabled && !backend_pose_graph_enabled)
+    throw std::runtime_error(
+        "backend.global_map requires backend.pose_graph.enabled=true.");
+
+  nh.param<bool>("backend/rtk/input_enabled",
+                 backend_rtk_input_enabled, false);
+  nh.param<bool>("backend/rtk/factor_enabled",
+                 backend_rtk_factors_enabled, false);
+  nh.param<int>("backend/rtk/required_ins_pos_mode",
+                backend_rtk_buffer_options.required_ins_pos_mode, 4);
+  nh.param<double>("backend/rtk/maximum_status_age_sec",
+                   backend_rtk_buffer_options.maximum_status_age_sec, 0.03);
+  nh.param<double>("backend/rtk/maximum_interpolation_gap_sec",
+                   backend_rtk_buffer_options.maximum_interpolation_gap_sec,
+                   0.05);
+  nh.param<double>("backend/rtk/maximum_endpoint_distance_sec",
+                   backend_rtk_buffer_options.maximum_endpoint_distance_sec,
+                   0.03);
+  nh.param<double>("backend/rtk/buffer_retention_sec",
+                   backend_rtk_buffer_options.retention_sec, 20.0);
+  nh.param<double>("backend/rtk/configured_sigma_xy_m",
+                   backend_rtk_buffer_options.configured_sigma_xy_m, 0.30);
+  nh.param<double>("backend/rtk/configured_sigma_z_m",
+                   backend_rtk_buffer_options.configured_sigma_z_m, 0.50);
+  nh.param<double>("backend/rtk/minimum_sigma_xy_m",
+                   backend_rtk_buffer_options.minimum_sigma_xy_m, 0.10);
+  nh.param<double>("backend/rtk/minimum_sigma_z_m",
+                   backend_rtk_buffer_options.minimum_sigma_z_m, 0.20);
+  nh.param<double>("backend/rtk/factor_minimum_time_interval_sec",
+                   backend_rtk_selector_options.minimum_time_interval_sec,
+                   2.0);
+  nh.param<double>("backend/rtk/factor_maximum_time_interval_sec",
+                   backend_rtk_selector_options.maximum_time_interval_sec,
+                   10.0);
+  nh.param<double>("backend/rtk/factor_minimum_translation_m",
+                   backend_rtk_selector_options.minimum_translation_m, 5.0);
+  nh.param<double>("backend/rtk/innovation_prediction_sigma_m",
+                   backend_rtk_innovation_prediction_sigma_m, 2.0);
+  nh.param<double>("backend/rtk/innovation_gate_chi2",
+                   backend_rtk_innovation_gate_chi2, 16.27);
+  nh.param<string>("backend/rtk/robust_kernel",
+                   backend_pose_graph_options.rtk_robust_kernel, "cauchy");
+  nh.param<double>("backend/rtk/robust_delta",
+                   backend_pose_graph_options.rtk_robust_delta, 2.0);
+  nh.param<int>("backend/rtk/additional_update_steps",
+                backend_pose_graph_options.rtk_additional_update_steps, 1);
+  nh.param<string>("backend/rtk/status_csv_path",
+                   backend_rtk_buffer_options.status_csv_path,
+                   std::string(ROOT_DIR) + "Log/backend/rtk_status.csv");
+  nh.param<string>("backend/rtk/solution_csv_path",
+                   backend_rtk_buffer_options.solution_csv_path,
+                   std::string(ROOT_DIR) + "Log/backend/rtk_solutions.csv");
+  nh.param<string>("backend/rtk/query_csv_path",
+                   backend_rtk_buffer_options.query_csv_path,
+                   std::string(ROOT_DIR) + "Log/backend/rtk_queries.csv");
+  nh.param<string>("backend/rtk/factor_csv_path",
+                   backend_pose_graph_options.rtk_csv_path,
+                   std::string(ROOT_DIR) + "Log/backend/rtk_factors.csv");
+  nh.param<string>("backend/rtk/decision_csv_path",
+                   backend_rtk_decision_csv_path,
+                   std::string(ROOT_DIR) + "Log/backend/rtk_decisions.csv");
+  if (backend_rtk_input_enabled && !imu_standard_rfu)
+    throw std::runtime_error(
+        "backend.rtk input requires the standard CGI-610 RFU data chain.");
+  if (backend_rtk_factors_enabled &&
+      (!backend_rtk_input_enabled || !backend_pose_graph_enabled))
+    throw std::runtime_error(
+        "backend.rtk factors require RTK input and the pose graph.");
+  if (!std::isfinite(backend_rtk_innovation_prediction_sigma_m) ||
+      backend_rtk_innovation_prediction_sigma_m <= 0.0 ||
+      !std::isfinite(backend_rtk_innovation_gate_chi2) ||
+      backend_rtk_innovation_gate_chi2 <= 0.0)
+    throw std::runtime_error("backend.rtk innovation gates must be positive.");
+  if ((backend_loop_factors_enabled || backend_global_map_enabled ||
+       backend_rtk_factors_enabled) &&
+      backend_map_frame_id == backend_frontend_frame_id)
+    throw std::runtime_error(
+        "Global backend products require distinct backend.map_frame_id and "
+        "backend.frontend_frame_id for map->odom.");
 
   nh.param<double>("publish/blind_rgb_points", blind_rgb_points, 0.01);
   nh.param<int>("publish/pub_scan_num", pub_scan_num, 1);
@@ -750,6 +1461,24 @@ void LIVMapper::initializeComponents()
 
   slam_mode_ = (img_en && lidar_en) ? LIVO : imu_en ? ONLY_LIO : ONLY_LO;
 
+  if (backend_rtk_input_enabled)
+  {
+    rtk_observation_buffer = std::make_unique<
+        my_livo::backend::RtkObservationBuffer>(
+            backend_rtk_buffer_options);
+    rtk_factor_selector = std::make_unique<
+        my_livo::backend::RtkFactorSelector>(
+            backend_rtk_selector_options);
+    RCLCPP_INFO(
+        node_->get_logger(),
+        "CGI-610 RTK buffer enabled: required mode=%d, status age<=%.3f "
+        "s, interpolation gap<=%.3f s, factors=%d",
+        backend_rtk_buffer_options.required_ins_pos_mode,
+        backend_rtk_buffer_options.maximum_status_age_sec,
+        backend_rtk_buffer_options.maximum_interpolation_gap_sec,
+        static_cast<int>(backend_rtk_factors_enabled));
+  }
+
   if (backend_keyframes_enabled)
   {
     keyframe_manager = std::make_unique<
@@ -771,6 +1500,26 @@ void LIVMapper::initializeComponents()
       pose_graph_optimizer = std::make_unique<
           my_livo::backend::PoseGraphOptimizer>(backend_pose_graph_options);
       backend_optimized_path.header.frame_id = backend_map_frame_id;
+      if (backend_global_map_enabled)
+      {
+        optimized_global_map = std::make_unique<
+            my_livo::backend::OptimizedGlobalMap>(
+                backend_global_map_options);
+        RCLCPP_INFO(
+            node_->get_logger(),
+            "Optimized tiled global map enabled: leaf=%.3f m, tile=%.1f m, "
+            "periodic/graph interval=%zu/%zu KFs, correction "
+            "threshold=%.2f m/%.2f deg, "
+            "output=%s",
+            backend_global_map_options.voxel_leaf_size_m,
+            backend_global_map_options.tile_size_m,
+            backend_global_map_options.periodic_keyframe_interval,
+            backend_global_map_options
+                .minimum_graph_rebuild_keyframe_interval,
+            backend_global_map_options.incremental_max_pose_change_m,
+            backend_global_map_options.incremental_max_pose_change_deg,
+            backend_global_map_options.pcd_path.c_str());
+      }
       RCLCPP_INFO(
           node_->get_logger(),
           "GTSAM iSAM2 odometry graph enabled: translation sigma=%.3f m, "
@@ -807,6 +1556,26 @@ void LIVMapper::initializeComponents()
           loop_registration = std::make_unique<
               my_livo::backend::LoopRegistration>(
                   backend_loop_registration_options);
+          if (backend_loop_verification_enabled)
+          {
+            loop_verifier = std::make_unique<
+                my_livo::backend::LoopVerifier>(
+                    backend_loop_verification_options);
+            RCLCPP_INFO(
+                node_->get_logger(),
+                "Loop verifier enabled: probability>=%.3f, fitness<=%.3f "
+                "m^2, overlap>=%.3f, RMSE<=%.3f m, neighbor error<=%.3f "
+                "m/%.3f deg",
+                backend_loop_verification_options
+                    .minimum_transformation_probability,
+                backend_loop_verification_options.maximum_fitness_score_m2,
+                backend_loop_verification_options.minimum_overlap,
+                backend_loop_verification_options.maximum_overlap_rmse_m,
+                backend_loop_verification_options
+                    .maximum_neighbor_translation_error_m,
+                backend_loop_verification_options
+                    .maximum_neighbor_rotation_error_deg);
+          }
           loop_registration->SetResultCallback(
               [this](const my_livo::backend::LoopRegistrationResult &result) {
                 const char *status =
@@ -827,6 +1596,9 @@ void LIVMapper::initializeComponents()
                     result.correction_translation_m,
                     result.correction_angle_deg,
                     result.registration_time_ms);
+                if (loop_verifier)
+                  handleLoopVerificationDecisions(
+                      loop_verifier->Add(result));
                 if (result.status !=
                     my_livo::backend::LoopRegistrationStatus::kCompleted)
                 {
@@ -855,7 +1627,7 @@ void LIVMapper::initializeComponents()
                   marker.type = visualization_msgs::Marker::LINE_LIST;
                   marker.action = visualization_msgs::Marker::ADD;
                   marker.pose.orientation.w = 1.0;
-                  marker.scale.x = 0.22;
+                  marker.scale.x = 0.05;
                   marker.color.r = red;
                   marker.color.g = green;
                   marker.color.b = blue;
@@ -908,6 +1680,7 @@ void LIVMapper::initializeFiles()
   std::filesystem::create_directories(std::string(ROOT_DIR) + "Log/result");
   std::filesystem::create_directories(std::string(ROOT_DIR) + "Log/pcd");
   std::filesystem::create_directories(std::string(ROOT_DIR) + "Log/image");
+  std::filesystem::create_directories(std::string(ROOT_DIR) + "Log/backend");
   std::filesystem::create_directories(std::string(ROOT_DIR) + "Log/Colmap/sparse/0");
   if (pcd_save_en && colmap_output_en)
   {
@@ -932,6 +1705,19 @@ void LIVMapper::initializeFiles()
   if(img_save_en) fout_visual_pos.open(std::string(ROOT_DIR) + "Log/image/image_poses.txt", std::ios::out);
   fout_pre.open(DEBUG_FILE_DIR("mat_pre.txt"), std::ios::out);
   fout_out.open(DEBUG_FILE_DIR("mat_out.txt"), std::ios::out);
+  if (backend_rtk_input_enabled && !backend_rtk_decision_csv_path.empty())
+  {
+    backend_rtk_decision_stream.open(
+        backend_rtk_decision_csv_path, std::ios::out | std::ios::trunc);
+    if (!backend_rtk_decision_stream.is_open())
+      throw std::runtime_error(
+          "Cannot open RTK decision CSV: " +
+          backend_rtk_decision_csv_path);
+    backend_rtk_decision_stream
+        << "keyframe_id,timestamp,decision,factor_added,measurement_x,"
+           "measurement_y,measurement_z,innovation_x,innovation_y,"
+           "innovation_z,innovation_chi2\n";
+  }
 }
 
 void LIVMapper::initializeSubscribersAndPublishers()
@@ -986,6 +1772,12 @@ void LIVMapper::initializeSubscribersAndPublishers()
     sub_ins_odom = node_->create_subscription<nav_msgs::Odometry>(
         ins_odom_topic, imu_qos,
         std::bind(&LIVMapper::ins_odom_cbk, this, std::placeholders::_1));
+    if (backend_rtk_input_enabled)
+      sub_ins_status = node_->create_subscription<
+          diagnostic_msgs::msg::DiagnosticArray>(
+              ins_status_topic, imu_qos,
+              std::bind(&LIVMapper::ins_status_cbk, this,
+                        std::placeholders::_1));
   }
   sub_img = node_->create_subscription<sensor_msgs::Image>(
       img_topic, image_qos, std::bind(&LIVMapper::img_cbk, this, std::placeholders::_1));
@@ -1023,15 +1815,25 @@ void LIVMapper::initializeSubscribersAndPublishers()
       pubBackendOptimizedOdometry =
           node_->create_publisher<nav_msgs::Odometry>(
               "/backend/odometry_optimized", 10);
+      if (backend_global_map_enabled)
+        pubBackendOptimizedGlobalMap =
+            node_->create_publisher<sensor_msgs::PointCloud2>(
+                "/backend/global_map_optimized", 1);
       if (backend_loop_detection_enabled)
       {
         pubBackendLoopCandidates =
             node_->create_publisher<visualization_msgs::MarkerArray>(
                 "/backend/loop_candidates", 10);
         if (backend_loop_registration_enabled)
+        {
           pubBackendLoopRegistrations =
               node_->create_publisher<visualization_msgs::MarkerArray>(
                   "/backend/loop_registrations", 10);
+          if (backend_loop_verification_enabled)
+            pubBackendVerifiedLoops =
+                node_->create_publisher<visualization_msgs::MarkerArray>(
+                    "/backend/verified_loops", 10);
+        }
       }
     }
   }
@@ -1550,7 +2352,9 @@ void LIVMapper::handleBackendKeyframe()
   pose.pose.orientation.w = keyframe->T_odom_body().rotation.w();
   backend_keyframe_path.header = pose.header;
   backend_keyframe_path.poses.push_back(pose);
-  pubBackendKeyframePath->publish(backend_keyframe_path);
+  if (keyframe->id() == 0 ||
+      (keyframe->id() + 1) % backend_path_publish_interval == 0)
+    pubBackendKeyframePath->publish(backend_keyframe_path);
 
   if (pose_graph_optimizer)
   {
@@ -1562,42 +2366,8 @@ void LIVMapper::handleBackendKeyframe()
           "estimates were restored.",
           static_cast<unsigned long>(keyframe->id()));
 
-    backend_optimized_path.poses.clear();
-    const auto backend_keyframes = keyframe_manager->keyframes();
-    backend_optimized_path.poses.reserve(backend_keyframes.size());
-    for (const auto &stored_keyframe : backend_keyframes)
-    {
-      const my_livo::backend::Pose3d T_map_body =
-          stored_keyframe->T_map_body();
-      geometry_msgs::PoseStamped optimized_pose;
-      optimized_pose.header.frame_id = backend_map_frame_id;
-      optimized_pose.header.stamp =
-          stampFromSec(stored_keyframe->timestamp());
-      optimized_pose.pose.position.x = T_map_body.translation.x();
-      optimized_pose.pose.position.y = T_map_body.translation.y();
-      optimized_pose.pose.position.z = T_map_body.translation.z();
-      optimized_pose.pose.orientation.x = T_map_body.rotation.x();
-      optimized_pose.pose.orientation.y = T_map_body.rotation.y();
-      optimized_pose.pose.orientation.z = T_map_body.rotation.z();
-      optimized_pose.pose.orientation.w = T_map_body.rotation.w();
-      backend_optimized_path.poses.push_back(optimized_pose);
-    }
-    backend_optimized_path.header.frame_id = backend_map_frame_id;
-    backend_optimized_path.header.stamp = pose.header.stamp;
-    pubBackendOptimizedPath->publish(backend_optimized_path);
-
-    nav_msgs::Odometry optimized_odometry;
-    optimized_odometry.header.frame_id = backend_map_frame_id;
-    optimized_odometry.header.stamp = pose.header.stamp;
-    optimized_odometry.child_frame_id = backend_body_frame_id;
-    const auto &latest_optimized_pose =
-        backend_optimized_path.poses.back().pose;
-    optimized_odometry.pose.pose = latest_optimized_pose;
-    for (int row = 0; row < 6; ++row)
-      for (int column = 0; column < 6; ++column)
-        optimized_odometry.pose.covariance[row * 6 + column] =
-            keyframe->odom_covariance()(row, column);
-    pubBackendOptimizedOdometry->publish(optimized_odometry);
+    handleRtkForKeyframe(keyframe);
+    publishBackendOptimizedProducts(true, "periodic");
 
     RCLCPP_INFO(
         node_->get_logger(),
@@ -1646,7 +2416,7 @@ void LIVMapper::handleBackendKeyframe()
         marker.type = visualization_msgs::Marker::LINE_LIST;
         marker.action = visualization_msgs::Marker::ADD;
         marker.pose.orientation.w = 1.0;
-        marker.scale.x = 0.35;
+        marker.scale.x = 0.1;
         marker.color.r = 1.0F;
         marker.color.g = 0.82F;
         marker.color.b = 0.05F;
@@ -2225,6 +2995,19 @@ void LIVMapper::livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg_i
   sig_buffer.notify_all();
 }
 
+void LIVMapper::ins_status_cbk(
+    const diagnostic_msgs::msg::DiagnosticArray::ConstSharedPtr &msg_in)
+{
+  if (!rtk_observation_buffer) return;
+  const double timestamp =
+      stampToSec(msg_in->header.stamp) - imu_time_offset;
+  const auto mode = my_livo::backend::ParseInsPosMode(*msg_in);
+  if (!rtk_observation_buffer->AddStatus(timestamp, mode))
+    RCLCPP_WARN_THROTTLE(
+        node_->get_logger(), *node_->get_clock(), 5000,
+        "Ignoring invalid or out-of-order CGI-610 INS status sample");
+}
+
 void LIVMapper::ins_odom_cbk(const nav_msgs::Odometry::ConstSharedPtr &msg_in)
 {
   if (!imu_en || !imu_standard_rfu) return;
@@ -2282,6 +3065,22 @@ void LIVMapper::ins_odom_cbk(const nav_msgs::Odometry::ConstSharedPtr &msg_in)
     // from the rear axle to the physical IMU, move this reference pose by the
     // same lever arm so LIO and RTK/INS remain at the same physical point.
     mine_pose.position += mine_from_rear_axle * (-imu_to_rear_axle);
+  }
+
+  if (rtk_observation_buffer)
+  {
+    my_livo::backend::RtkSolution solution;
+    solution.timestamp = mine_pose.stamp;
+    solution.position = mine_pose.position;
+    solution.orientation = mine_pose.orientation;
+    for (int row = 0; row < 3; ++row)
+      for (int column = 0; column < 3; ++column)
+        solution.position_covariance(row, column) =
+            msg_in->pose.covariance[row * 6 + column];
+    if (!rtk_observation_buffer->AddSolution(solution))
+      RCLCPP_WARN_THROTTLE(
+          node_->get_logger(), *node_->get_clock(), 5000,
+          "Ignoring invalid or out-of-order CGI-610 RTK solution");
   }
 
   if (!mine_pose_samples.empty() &&

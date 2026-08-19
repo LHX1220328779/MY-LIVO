@@ -17,14 +17,22 @@ which is included as part of this source code package.
 #include "backend/keyframe_manager.h"
 #include "backend/loop_candidate_detector.h"
 #include "backend/loop_registration.h"
+#include "backend/loop_verifier.h"
+#include "backend/optimized_global_map.h"
 #include "backend/pose_graph_optimizer.h"
+#include "backend/rtk_observation_buffer.h"
 #include "vio.h"
 #include "preprocess.h"
 #include <cv_bridge/cv_bridge.h>
 #include <image_transport/image_transport.h>
 #include <tf2_ros/transform_broadcaster.h>
+#include <atomic>
+#include <condition_variable>
 #include <filesystem>
 #include <memory>
+#include <mutex>
+#include <optional>
+#include <thread>
 
 class LIVMapper
 {
@@ -41,6 +49,20 @@ public:
   void handleVIO();
   void handleLIO();
   void handleBackendKeyframe();
+  void handleLoopVerificationDecisions(
+      const std::vector<my_livo::backend::LoopVerificationDecision>
+          &decisions,
+      bool publish_outputs = true);
+  void publishBackendOptimizedProducts(bool allow_map_build,
+                                       const std::string &map_build_reason);
+  void requestBackendGlobalMapBuild(
+      const std::vector<my_livo::backend::Keyframe::Ptr> &keyframes,
+      const std::vector<my_livo::backend::Pose3d> &optimized_poses,
+      const std::string &reason, double timestamp);
+  void backendGlobalMapWorkerLoop();
+  void stopBackendGlobalMapWorker();
+  void handleRtkForKeyframe(
+      const my_livo::backend::Keyframe::Ptr &keyframe);
   void savePCD();
   void processImu();
   
@@ -59,6 +81,8 @@ public:
   void loadMultiLidarCalibration();
   void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg_in);
   void imu_cbk(const sensor_msgs::Imu::ConstSharedPtr &msg_in);
+  void ins_status_cbk(
+      const diagnostic_msgs::msg::DiagnosticArray::ConstSharedPtr &msg_in);
   void ins_odom_cbk(const nav_msgs::Odometry::ConstSharedPtr &msg_in);
   void img_cbk(const sensor_msgs::ImageConstPtr &msg_in);
   void publish_img_rgb(const image_transport::Publisher &pubImage, VIOManagerPtr vio_manager);
@@ -90,7 +114,8 @@ public:
   std::unordered_map<VOXEL_LOCATION, VoxelOctoTree *> voxel_map;
   
   string root_dir;
-  string lid_topic, imu_topic, ins_odom_topic, seq_name, img_topic;
+  string lid_topic, imu_topic, ins_odom_topic, ins_status_topic, seq_name,
+      img_topic;
   V3D extT;
   M3D extR;
 
@@ -215,6 +240,21 @@ public:
   bool backend_pose_graph_enabled = false;
   bool backend_loop_detection_enabled = false;
   bool backend_loop_registration_enabled = false;
+  bool backend_loop_verification_enabled = false;
+  bool backend_loop_factors_enabled = false;
+  bool backend_global_map_enabled = false;
+  std::size_t backend_path_publish_interval = 10;
+  std::size_t backend_global_map_request_coalesce_ms = 50;
+  std::atomic<std::size_t> backend_last_optimized_path_count{0};
+  bool backend_rtk_input_enabled = false;
+  bool backend_rtk_factors_enabled = false;
+  double backend_rtk_innovation_prediction_sigma_m = 2.0;
+  double backend_rtk_innovation_gate_chi2 = 16.27;
+  string backend_rtk_decision_csv_path;
+  std::uint64_t backend_rtk_candidates = 0;
+  std::uint64_t backend_rtk_selected = 0;
+  std::uint64_t backend_rtk_rejected_selection = 0;
+  std::uint64_t backend_rtk_rejected_innovation = 0;
   string backend_frontend_frame_id = "mine";
   string backend_map_frame_id = "map";
   string backend_body_frame_id = "body";
@@ -224,6 +264,14 @@ public:
       backend_loop_detection_options;
   my_livo::backend::LoopRegistration::Options
       backend_loop_registration_options;
+  my_livo::backend::LoopVerifier::Options
+      backend_loop_verification_options;
+  my_livo::backend::OptimizedGlobalMap::Options
+      backend_global_map_options;
+  my_livo::backend::RtkObservationBuffer::Options
+      backend_rtk_buffer_options;
+  my_livo::backend::RtkFactorSelector::Options
+      backend_rtk_selector_options;
   std::unique_ptr<my_livo::backend::KeyframeManager> keyframe_manager;
   std::unique_ptr<my_livo::backend::PoseGraphOptimizer>
       pose_graph_optimizer;
@@ -231,6 +279,27 @@ public:
       loop_candidate_detector;
   std::unique_ptr<my_livo::backend::LoopRegistration>
       loop_registration;
+  std::unique_ptr<my_livo::backend::LoopVerifier> loop_verifier;
+  std::unique_ptr<my_livo::backend::OptimizedGlobalMap>
+      optimized_global_map;
+  std::unique_ptr<my_livo::backend::RtkObservationBuffer>
+      rtk_observation_buffer;
+  std::unique_ptr<my_livo::backend::RtkFactorSelector>
+      rtk_factor_selector;
+  struct BackendGlobalMapRequest
+  {
+    std::vector<my_livo::backend::Keyframe::Ptr> keyframes;
+    std::vector<my_livo::backend::Pose3d> optimized_poses;
+    std::string reason;
+    double timestamp = 0.0;
+  };
+  std::mutex backend_global_map_worker_mutex;
+  std::condition_variable backend_global_map_worker_cv;
+  std::optional<BackendGlobalMapRequest> backend_global_map_pending;
+  std::thread backend_global_map_worker_thread;
+  bool backend_global_map_worker_started = false;
+  bool backend_global_map_worker_stop = false;
+  std::atomic<bool> backend_global_map_dirty{false};
   nav_msgs::Path backend_keyframe_path;
   nav_msgs::Path backend_optimized_path;
 
@@ -244,6 +313,7 @@ public:
   PointCloudXYZI::Ptr pcl_wait_save_intensity;
 
   ofstream fout_pre, fout_out, fout_visual_pos, fout_lidar_pos, fout_points;
+  ofstream backend_rtk_decision_stream;
 
   pcl::VoxelGrid<PointType> downSizeFilterSurf;
 
@@ -272,6 +342,8 @@ public:
   rclcpp::Subscription<sensor_msgs::PointCloud2>::SharedPtr sub_pcl;
   vector<rclcpp::Subscription<sensor_msgs::PointCloud2>::SharedPtr> sub_pcls;
   rclcpp::Subscription<sensor_msgs::Imu>::SharedPtr sub_imu;
+  rclcpp::Subscription<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr
+      sub_ins_status;
   rclcpp::Subscription<nav_msgs::Odometry>::SharedPtr sub_ins_odom;
   rclcpp::Subscription<sensor_msgs::Image>::SharedPtr sub_img;
   rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr pubLaserCloudFullRes;
@@ -295,12 +367,17 @@ public:
   rclcpp::Publisher<nav_msgs::Path>::SharedPtr pubBackendOptimizedPath;
   rclcpp::Publisher<nav_msgs::Odometry>::SharedPtr
       pubBackendOptimizedOdometry;
+  rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr
+      pubBackendOptimizedGlobalMap;
   rclcpp::Publisher<visualization_msgs::MarkerArray>::SharedPtr
       pubBackendLoopCandidates;
   rclcpp::Publisher<visualization_msgs::MarkerArray>::SharedPtr
       pubBackendLoopRegistrations;
+  rclcpp::Publisher<visualization_msgs::MarkerArray>::SharedPtr
+      pubBackendVerifiedLoops;
   std::uint64_t backend_loop_marker_id = 0;
   std::uint64_t backend_loop_registration_marker_id = 0;
+  std::uint64_t backend_loop_verification_marker_id = 0;
   rclcpp::TimerBase::SharedPtr imu_prop_timer;
 
   int frame_num = 0;

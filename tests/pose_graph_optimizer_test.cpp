@@ -144,6 +144,153 @@ void TestIdInvariant()
   }
   Require(rejected, "non-contiguous pose-graph ID was not rejected");
 }
+
+void TestRobustLoopFactorUpdate()
+{
+  const auto temporary = std::filesystem::temp_directory_path();
+  const auto loop_path = temporary / "my_livo_loop_factor_test.csv";
+  const auto trajectory_path =
+      temporary / "my_livo_optimized_trajectory_test.csv";
+  {
+    PoseGraphOptimizer::Options options;
+    options.loop_translation_sigma_m = 0.05;
+    options.loop_rotation_sigma_deg = 1.0;
+    options.loop_robust_kernel = "cauchy";
+    options.loop_robust_delta = 10.0;
+    options.loop_additional_update_steps = 2;
+    options.loop_csv_path = loop_path.string();
+    options.optimized_trajectory_csv_path = trajectory_path.string();
+    PoseGraphOptimizer optimizer(options);
+    std::vector<Keyframe::Ptr> keyframes;
+    for (std::uint64_t id = 0; id < 4; ++id)
+    {
+      keyframes.push_back(MakeKeyframe(
+          id, static_cast<double>(id),
+          MakePose(1.1 * static_cast<double>(id), 0.0, 0.0, 0.0)));
+      (void)optimizer.AddKeyframe(keyframes.back());
+    }
+    const auto loop = optimizer.AddLoopFactor(
+        0, 3, MakePose(3.0, 0.0, 0.0, 0.0));
+    Require(loop.added && loop.solution_usable,
+            "valid robust loop factor was not added");
+    Require(loop.residual_translation_before_m > 0.29 &&
+                loop.residual_translation_after_m <
+                    loop.residual_translation_before_m,
+            "loop optimization did not reduce its translation residual");
+    Require(loop.maximum_pose_correction_m > 1.0e-3,
+            "loop factor did not change any optimized pose");
+    Require(std::abs(keyframes.back()->T_odom_body().translation.x() - 3.3) <
+                1.0e-12,
+            "loop optimization modified immutable raw odometry");
+    const auto statistics = optimizer.statistics();
+    Require(statistics.loop_factors == 1 &&
+                statistics.loop_optimization_runs == 1,
+            "loop-factor statistics are incorrect");
+
+    bool duplicate_rejected = false;
+    try
+    {
+      (void)optimizer.AddLoopFactor(
+          0, 3, MakePose(3.0, 0.0, 0.0, 0.0));
+    }
+    catch (const std::logic_error &)
+    {
+      duplicate_rejected = true;
+    }
+    Require(duplicate_rejected, "duplicate loop factor was not rejected");
+  }
+  std::ifstream loop_csv(loop_path);
+  std::ifstream trajectory_csv(trajectory_path);
+  Require(loop_csv.good() && trajectory_csv.good(),
+          "loop/final trajectory CSV was not created");
+  std::string line;
+  int loop_lines = 0;
+  while (std::getline(loop_csv, line)) ++loop_lines;
+  int trajectory_lines = 0;
+  while (std::getline(trajectory_csv, line)) ++trajectory_lines;
+  Require(loop_lines == 2, "loop-factor CSV row count is incorrect");
+  Require(trajectory_lines == 5,
+          "optimized-trajectory CSV row count is incorrect");
+  std::filesystem::remove(loop_path);
+  std::filesystem::remove(trajectory_path);
+}
+
+void TestRobustRtkPositionFactorUpdate()
+{
+  const auto path = std::filesystem::temp_directory_path() /
+                    "my_livo_rtk_factor_test.csv";
+  {
+    PoseGraphOptimizer::Options options;
+    options.rtk_robust_kernel = "huber";
+    options.rtk_robust_delta = 10.0;
+    options.rtk_additional_update_steps = 2;
+    options.rtk_csv_path = path.string();
+    PoseGraphOptimizer optimizer(options);
+    std::vector<Keyframe::Ptr> keyframes;
+    for (std::uint64_t id = 0; id < 4; ++id)
+    {
+      keyframes.push_back(MakeKeyframe(
+          id, static_cast<double>(id),
+          MakePose(1.1 * static_cast<double>(id), 0, 0, 0)));
+      (void)optimizer.AddKeyframe(keyframes.back());
+    }
+    const Eigen::Matrix3d covariance =
+        0.01 * Eigen::Matrix3d::Identity();
+    const auto update = optimizer.AddRtkPositionFactor(
+        3, Eigen::Vector3d(3.0, 0, 0), covariance);
+    Require(update.added && update.solution_usable,
+            "valid RTK position factor was not added");
+    Require(update.innovation_before_m.norm() > 0.29 &&
+                update.innovation_after_m.norm() <
+                    update.innovation_before_m.norm(),
+            "RTK position factor did not reduce its residual");
+    Require(std::abs(keyframes.back()->T_odom_body().translation.x() - 3.3) <
+                1.0e-12,
+            "RTK optimization modified immutable raw odometry");
+    Require(optimizer.statistics().rtk_factors == 1,
+            "RTK factor statistics are incorrect");
+    bool duplicate_rejected = false;
+    try
+    {
+      (void)optimizer.AddRtkPositionFactor(
+          3, Eigen::Vector3d(3.0, 0, 0), covariance);
+    }
+    catch (const std::logic_error &)
+    {
+      duplicate_rejected = true;
+    }
+    Require(duplicate_rejected, "duplicate RTK factor was not rejected");
+  }
+  std::ifstream csv(path);
+  std::string line;
+  int lines = 0;
+  while (std::getline(csv, line)) ++lines;
+  Require(lines == 2, "RTK factor CSV row count is incorrect");
+  std::filesystem::remove(path);
+}
+
+void TestRobustRtkOutlierDoesNotCollapseGraph()
+{
+  PoseGraphOptimizer::Options options;
+  options.rtk_robust_kernel = "cauchy";
+  options.rtk_robust_delta = 1.0;
+  options.rtk_additional_update_steps = 2;
+  PoseGraphOptimizer optimizer(options);
+  std::vector<Keyframe::Ptr> keyframes;
+  for (std::uint64_t id = 0; id < 10; ++id)
+  {
+    keyframes.push_back(MakeKeyframe(
+        id, static_cast<double>(id), MakePose(id, 0, 0, 0)));
+    (void)optimizer.AddKeyframe(keyframes.back());
+  }
+  const Eigen::Matrix3d covariance =
+      0.09 * Eigen::Matrix3d::Identity();
+  const auto update = optimizer.AddRtkPositionFactor(
+      9, Eigen::Vector3d(100, 100, 100), covariance);
+  Require(update.added, "robust RTK outlier factor was not processed");
+  Require(update.maximum_pose_correction_m < 0.1,
+          "Cauchy RTK outlier collapsed the odometry graph");
+}
 }  // namespace
 
 int main()
@@ -152,6 +299,9 @@ int main()
   {
     TestChainOptimizationAndStatistics();
     TestIdInvariant();
+    TestRobustLoopFactorUpdate();
+    TestRobustRtkPositionFactorUpdate();
+    TestRobustRtkOutlierDoesNotCollapseGraph();
   }
   catch (const std::exception &error)
   {

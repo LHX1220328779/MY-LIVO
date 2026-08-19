@@ -9,14 +9,19 @@
 - 激光雷达：`/front_lidar`，`sensor_msgs/msg/PointCloud2`。数据字段为 `x/y/z/intensity/ring/timestamp`；消息头是首点/扫描起始时刻，`timestamp` 是从首点起算的 `float32` 相对秒。输入适配层直接使用 RTF 中每点的 10 us 偏移做去畸变；只有读取旧包且字段不合法时才按点序退化估算。
 - IMU：`/imu_data`，`sensor_msgs/msg/Imu`，坐标系 `imu_link_rfu`（x 右、y 前、z 上）。当前转换器已输出 raw 角速度 `rad/s` 和包含完整姿态投影重力响应的 raw 比力 `m/s²`；输入适配层不再换轴、重复转换角速度或补重力。标准四元数只用于初始化矿山坐标朝向，不作为 LIO 观测融合。
 - 组合导航：`/imu_data/odometry`，`nav_msgs/msg/Odometry`，父系 `ins_local_enu`、子系 `vehicle_rear_axle_rfu`。其中 x/y 严格为 `st_point_3d.x/y`，z 严格为 `f_pos_alt`。默认启用 `rear_axle_to_imu`，输入层按标定杆臂将参考轨迹和 LiDAR 外参同步转换到物理 IMU 点。位置只用于初始化完成时的静止均值锚定和 RViz2 同步参考轨迹，不进入 IMU 传播或 IEKF 更新。
+- RTK 状态：`/imu_data/ins_status`，仅当 `ins_pos_mode` 精确为 `4` 时，后端才允许把同一时段的组合导航位置插值到关键帧时刻并生成稀疏位置因子。
 - 相机压缩流：`/midrange_camera/ffmpeg`，HEVC；启动文件用 `image_transport` 解码为 `/midrange_camera/image_raw`（实测 `1920x1080 bgr8`）。
 
 主要输出为 `/cloud_registered`、`/aft_mapped_to_init`、`/path`、`/imu_reference_odom` 和 `/imu_reference_path`，坐标系均为 `mine`。RViz2 中 LIVO 与 IMU/RTK 参考轨迹按当前 LIVO 时间戳同步推进。
 
-当前后端还会从完整 LIO 更新中选取关键帧并运行仅含相邻里程计边的 SE(3)
-Pose Graph，输出 `/backend/keyframe_path_raw`、
-`/backend/keyframe_path_optimized` 和 `/backend/odometry_optimized`。该阶段不含
-回环或 RTK factor，优化轨迹应与原始关键帧轨迹近似重合，且不会回写 IEKF。
+当前后端从完整 LIO 更新中选取关键帧，使用持久化 GTSAM iSAM2 联合相邻
+里程计边、经多分辨率 NDT 与一致性验证的鲁棒回环边，以及状态 4 的稀疏鲁棒
+CGI-610 位置因子。输出包括 `/backend/keyframe_path_raw`、
+`/backend/keyframe_path_optimized`、`/backend/odometry_optimized`、
+`/backend/verified_loops` 和 `/backend/global_map_optimized`。后端以 `odom` 表示
+连续前端轨迹、以 `mine` 表示全局轨迹，并发布 `mine -> odom`；任何修正都不会
+回写 IEKF。全局地图由独立线程按 60 m 瓦片增量维护，退出时保存精确重建的
+`Log/backend/optimized_global_map.pcd`。
 
 ### 编译
 
@@ -49,7 +54,9 @@ cd /home/project/MY-LIVO2.0
 ./scripts/prepare_wuhu_bag.py
 ```
 
-默认输出为 `/home/project/data/haibo/wuhu_livo/ros2bag_my_livo`，已存在时脚本会拒绝覆盖。只需要 LIO 数据的副本时可另行指定输出并加 `--lio-only`。
+默认输入为 `/home/project/data/haibo/huaining/03/ros2bag`，默认输出为相邻的
+`ros2bag_my_livo`。已存在时脚本会拒绝覆盖；只需要 LIO 数据的副本时可另行
+指定输出并加 `--lio-only`。
 
 终端 1：
 
@@ -127,22 +134,25 @@ T_imu_camera = T_imu_rear_axle * T_rear_axle_lidar * inverse(T_camera_lidar)
 评估参数必须与 launch 中的 `rear_axle_to_imu` 保持一致；关闭该 launch
 开关时，评估脚本也不要传入 `--rear-axle-to-imu`。
 
-关键帧、Odometry-only Pose Graph 与回环候选检测的分阶段验收命令为：
+完整 Loop + RTK + 全局地图验收命令为：
 
 ```bash
 ./scripts/validate_backend_keyframes.py \
   --trajectory Log/result/wuhu_truck29.txt
-./scripts/validate_odometry_pose_graph.py
 ./scripts/validate_loop_candidates.py
 ./scripts/validate_loop_registration.py
+./scripts/validate_loop_verification.py
+./scripts/validate_loop_pose_graph.py
+./scripts/validate_rtk_fusion.py
+./scripts/validate_optimized_global_map.py
 ```
 
 反斜杠续行后必须立即跟下一行参数；不要把
-`Log/result/wuhu_truck29.txt` 拆成两个 shell 命令。回环候选阶段只输出候选和
-初始相对位姿，不执行点云配准，也不会向 GTSAM 图中添加回环因子。
-多分辨率 NDT 在独立后台线程运行；进程退出时会先排空队列再关闭日志，因此必须
-等待 launch 进程完全退出后再执行配准验证脚本。Task 06 的配准输出仍不会加入
-GTSAM。
+`Log/result/wuhu_truck29.txt` 拆成两个 shell 命令。多分辨率 NDT 和瓦片地图均在
+独立后台线程运行；进程退出时会先排空回环队列，再完成最终全图重建和日志关闭，
+因此必须让 mapping 节点正常退出后再运行验证器。`validate_odometry_pose_graph.py`
+仅用于关闭 Loop/RTK 的消融模式；联合模式本来就应当改变 raw 轨迹，不能再用
+“optimized/raw 重合”作为通过条件。
 
 ## FAST-LIVO2: Fast, Direct LiDAR-Inertial-Visual Odometry
 

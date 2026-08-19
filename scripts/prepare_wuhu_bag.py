@@ -34,6 +34,7 @@ DEFAULT_TOPICS = {
     "front_lidar",
     "imu_data",
     "imu_data/odometry",
+    "imu_data/ins_status",
     "midrange_camera/ffmpeg",
 }
 

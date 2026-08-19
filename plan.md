@@ -1,21 +1,26 @@
 # FAST-LIVO2 + Loop Backend + CGI-610 RTK 高性能全局 SLAM 改造任务书
 
-## 实施状态与实际代码校准（2026-08-18）
+## 实施状态与实际代码校准（2026-08-19）
 
 本节是结合 `/home/project/MY-LIVO2.0` 当前源码形成的实施记录；当它与后文的
 初始任务拆分或进度要求冲突时，以本节和实际代码为准。仍坚持“一次完成一个可
 独立验收的大模块”，但允许把强相关的小 Task 合并，减少反复编译和接口返工。
 
-当前进度：
+当前进度（本节覆盖后文仍保留的初始阶段性措辞）：
 
 ```text
-Task 01 baseline compile                       已完成
-Task 02 Frame/Time/Cloud Convention Audit      已完成
-Task 03 KeyframeManager                        已完成（447 KF rosbag 验证通过）
-Task 04 Odometry-only Pose Graph               已完成（GTSAM iSAM2 实测通过）
-Task 05 Loop Candidate Detector                已完成（30 candidates 实测通过）
-Task 06 Loop Registration                      已实现，等待 rosbag 验收
-Loop verification / RTK factor / Global Map    尚未开始
+Task 01--05 baseline/frame/keyframe/odom/candidate       已完成
+Task 06--08 NDT registration/verification/robust Loop    已完成
+Task 09--10 optimized map + mine->odom                   已完成
+Task 11--18 CGI-610 status/solution/time/buffer/interp   已完成
+Task 19--25 selector/GPSFactor/covariance/gate/robust    已完成
+Task 26--28 LIO + Loop + RTK 联合 iSAM2                  已完成
+Task 31 RTK 丢失/恢复                                    已完成单元验收
+Task 32/40 后台 NDT、地图线程、增量 iSAM2                已完成
+Task 41 瓦片化增量在线地图 + 最终精确重建                已完成
+Task 42--48 日志/invariant/高频降采样/离群值测试          已完成
+Task 14 NavSatFix ENU 转换                               当前数据链无需启用
+Task 29/30/49 RTK yaw                                   按计划保留为可选二期
 ```
 
 已落地文件与接口：
@@ -43,6 +48,21 @@ src/backend/loop_registration.cpp
 tests/loop_registration_test.cpp
 scripts/validate_loop_registration.py
 docs/loop_registration.md
+include/backend/loop_verifier.h
+src/backend/loop_verifier.cpp
+tests/loop_verifier_test.cpp
+scripts/validate_loop_verification.py
+include/backend/pose_graph_optimizer.h
+src/backend/pose_graph_optimizer.cpp
+scripts/validate_loop_pose_graph.py
+include/backend/rtk_observation_buffer.h
+src/backend/rtk_observation_buffer.cpp
+tests/rtk_observation_buffer_test.cpp
+scripts/validate_rtk_fusion.py
+include/backend/optimized_global_map.h
+src/backend/optimized_global_map.cpp
+tests/optimized_global_map_test.cpp
+scripts/validate_optimized_global_map.py
 
 /backend/keyframe_path_raw
 /backend/keyframe_cloud_raw
@@ -50,28 +70,54 @@ docs/loop_registration.md
 /backend/odometry_optimized
 /backend/loop_candidates
 /backend/loop_registrations
+/backend/verified_loops
+/backend/global_map_optimized
 Log/backend/keyframes.csv
 Log/backend/pose_graph.csv
 Log/backend/loop_detection.csv
 Log/backend/loop_candidates.csv
 Log/backend/loop_registrations.csv
 Log/backend/loop_registration_levels.csv
+Log/backend/loop_verification.csv
+Log/backend/loop_factors.csv
+Log/backend/rtk_status.csv
+Log/backend/rtk_solutions.csv
+Log/backend/rtk_queries.csv
+Log/backend/rtk_decisions.csv
+Log/backend/rtk_factors.csv
+Log/backend/optimized_trajectory.csv
+Log/backend/global_map_updates.csv
+Log/backend/optimized_global_map.pcd
 ```
+
+最终联合实测（12 个连续 Perception MCAP，启动偏移 10 s）：447 个关键帧、31
+次 NDT 配准、27 个通过验证并加入图的鲁棒回环因子、83 个由 35,000 条 CGI-610
+solution 生成的稀疏 RTK 位置因子。RTK 残差中位数由 0.0536 m 降至 0.0242 m，
+优化轨迹相对 raw LIO 最大修正 3.4231 m/2.9166 deg，相邻里程计边最大变化仅
+0.0148 m/0.1073 deg。最终 3,616,075 个关键帧点经 0.75 m 体素生成 110,608
+点全局 PCD，`mine -> odom` 复合误差为 `1.28e-13 m`。所有离线验证器通过。
+
+长时性能补充实测：全局地图使用 60 m 瓦片并在独立线程构建；40 秒真实数据中
+8 个 RTK 因子经修正阈值和 10 KF 去抖后，在线地图只执行初始全建、一次增量瓦片
+更新和一次图修正全建，退出时再做最终精确全建。增量更新 20 个新关键帧/19 个
+瓦片耗时 12.9 ms。普通 odometry 节点只提取最新 GTSAM 位姿，完整 Path 每 10
+个关键帧发布，避免随任务时长形成 O(N^2) 的历史轨迹复制与网络发送。
 
 实际项目校准：
 
-1. 当前 `_state` 在初始化时已被 CGI-610 矿区位姿做一次世界系左变换，源码
-   frame id `mine` 目前同时承担“有 ENU 初值的前端局部世界”。第一阶段把
-   `_state` 视作 `T_odom_body` 的来源，但暂不改旧话题和 TF 的 frame id；
-   Pose Graph 稳定后再增加严格的 `map -> odom` 输出，禁止回写 IEKF。
+1. 当前 `_state` 在初始化时已被 CGI-610 矿区位姿做一次世界系左变换。为保持
+   原前端/相机接口不变，旧 `/path`、`/aft_mapped_to_init` 仍使用 `mine`；新后端
+   内部明确把该连续局部轨迹记为 `odom`，全局优化输出使用 `mine`，并发布严格的
+   `mine -> odom`。该变换和优化位姿从不回写 IEKF。
 2. Truck 29 多雷达模式的 `feats_down_body` 实际仍是合成虚拟雷达/后轴局部系。
    Keyframe 接入前显式执行 `p_body = extR * p + extT`，内部只保存物理 IMU
    body 点云。
 3. 当前 `/imu_data/odometry` 已给出 `ins_local_enu` 下的笛卡尔位置，所以当前
    数据链不需要重复执行 WGS84→ECEF→ENU。后文 Task 14 改为“仅在未来直接
    使用 `/imu_data/navsat_fix` 时启用的可选适配”。
-4. `ins_pos_mode` 位于 `/imu_data/ins_status`，当前运行包准备脚本尚未保留该
-   话题；进入 RTK 数据链模块时必须同时修改 `prepare_wuhu_bag.py`。
+4. `ins_pos_mode` 位于 `/imu_data/ins_status`；`prepare_wuhu_bag.py` 和
+   `play_all_bags.sh` 均已保留/播放该话题。只有精确解析为 4 且 keyframe 时刻
+   具有合法 status 与 solution bracket 时才生成 RTK observation。
 5. Lightning-LM 只借鉴/移植 Miao、NDT 回环流程和参数经验；不接入它的 LIO
    前端。其 RTK PGO 代码大部分仍是注释/TODO，不能作为现成 RTK 融合模块。
 6. 当前只在 `handleLIO()` 的完整 LIO 更新后产生关键帧，不修改相机、VIO、
@@ -83,11 +129,9 @@ Log/backend/loop_registration_levels.csv
    `build-system-eigen` / `install-system-eigen` 构建，且关闭会与当前 OpenCV
    `libtbb.so.2` 冲突的 GTSAM TBB。Task 04 数值后端已迁移为持久化 GTSAM
    iSAM2，每个关键帧只提交新节点与新边，不重建整图。
-9. Task 04 只添加相邻关键帧边，首节点用紧先验锚定；暂不添加 `k↔k+2`、Loop、RTK
-   或 `map->odom`。里程计阶段优化输出 frame id 暂用 `mine`，以便与原始路径
-   直接叠加验收；出现首个全局约束后再启用独立 `map` frame。添加 RTK 绝对边
-   前必须重新确定该先验的协方差或移除策略，避免锁死可由 RTK 修正的初始 ENU
-   小偏差。
+9. 最终图包含相邻里程计 `BetweenFactor<Pose3>`、经验证的鲁棒 Loop
+   `BetweenFactor<Pose3>` 和稀疏鲁棒 `GPSFactor`。首节点紧先验保留 CGI 初始化
+   给出的 ENU gauge；RTK 仅约束 position 且使用有限协方差，不融合 CGI 姿态。
 10. 2026-08-18 原 Ceres 版本完成 446 节点 / 445 里程计边 rosbag 验收，
     optimized/raw 最大位置差 `1.22e-12 m`、角度差 `1.71e-6 deg`，求解耗时
     median `1.887 ms`、max `4.457 ms`。两条轨迹重合是纯里程计图的理论正确
@@ -99,13 +143,13 @@ Log/backend/loop_registration_levels.csv
     max `1.737 ms`，图结构、输入和数值链路通过。日志中的超大
     `variablesReeliminated` 不是实际计算量，而是 GTSAM 4.2.2 空 `update()`
     未初始化该标量；现已改用 detailed variable status 计数，并给验证脚本增加
-    严格上界，需下一次运行确认新日志。Task 05 同轮接入候选检测，但仍不添加
-    配准结果或回环因子。
+    严格上界；后续联合实测已确认统计正常。该段仅作为迁移历史记录。
 12. 2026-08-19 修复后的 Task 04/05 联合实测通过：425 节点、424 里程计边，
     iSAM2 `reeliminated_total=1272`、单关键帧最多 3；19 次候选搜索从 881 个
     空间近邻中经排序/NMS 选出 30 对候选，初值最大位置误差 `5.18e-14 m`。
-    Task 06 已接入后台单线程多分辨率 NDT，使用候选局部系历史子地图，输出逐级
-    convergence/probability/fitness/overlap，但不做接受判定，也不修改 GTSAM。
+    Task 06 随后接入后台单线程多分辨率 NDT，使用候选局部系历史子地图，输出逐级
+    convergence/probability/fitness/overlap；当前版本已在其后增加 Task 07 验证，
+    只有通过质量与邻域一致性判定的结果才进入 GTSAM。
 
 ## 0. 总目标
 

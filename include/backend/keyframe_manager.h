@@ -47,6 +47,8 @@ public:
                           const Matrix6d &odom_covariance);
 
   std::vector<Keyframe::Ptr> keyframes() const;
+  Keyframe::Ptr latest_keyframe() const;
+  std::size_t size() const;
   Statistics statistics() const;
 
   static std::string TriggerMaskToString(std::uint8_t trigger_mask);

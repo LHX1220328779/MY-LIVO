@@ -3,6 +3,7 @@ laser_mapping:
     common:
       imu_topic: "/imu_data"
       ins_odom_topic: "/imu_data/odometry"
+      ins_status_topic: "/imu_data/ins_status"
       img_topic: "/midrange_camera/image_raw"
       img_en: true
       lidar_en: true
@@ -10,7 +11,8 @@ laser_mapping:
 
     multi_lidar:
       enabled: true
-      calibration_file: "/home/project/data/haibo/huaining/03/sensor-imu_calibration/perception_truck03.json"
+      # calibration_file: "/home/project/data/haibo/huaining/03/sensor-imu_calibration/perception_truck03.json"
+      calibration_file: "/home/project/data/haibo/wuhu_livo/sensor-imu_calibration/perception_truck29.json" # wuhu_29
       # topics and transform_keys are paired by index. Keep only the desired
       # pairs to run with any subset of the available LiDAR sources.
       topics: ["/front_right_lidar", "/back_lidar", "/front_left_lidar", "/front_lidar"]
@@ -128,12 +130,15 @@ laser_mapping:
 
     backend:
       # The backend never writes its estimate back to the FAST-LIVO2 IEKF.
-      # Loop and RTK factors remain disabled until their validation stages.
-      frontend_frame_id: "mine"
-      # Keep both paths in the same connected frame for the odometry-only
-      # acceptance test. A distinct map frame starts with global constraints.
+      # FAST-LIVO2 remains a continuous local odometry source. Global loop/RTK
+      # corrections are exposed only through mine->odom and are never fed back
+      # into its IEKF.
+      frontend_frame_id: "odom"
       map_frame_id: "mine"
       body_frame_id: "body"
+      # Full raw/optimized Path messages are diagnostic and grow with the
+      # mission; odometry and map->odom remain published at every keyframe.
+      path_publish_keyframe_interval: 10
       keyframes:
         enabled: true
         translation_threshold_m: 1.0
@@ -154,8 +159,8 @@ laser_mapping:
         wildfire_threshold: 0.001
         additional_update_steps: 1
         csv_path: "/home/project/MY-LIVO2.0/Log/backend/pose_graph.csv"
-      # Candidate generation only. No registration result or loop factor is
-      # accepted at this stage, so it cannot deform the optimized trajectory.
+      # Candidate generation is spatially gated and runs only at keyframe
+      # cadence; accepted candidates continue through registration/verification.
       loop_detection:
         enabled: true
         check_interval_keyframes: 20
@@ -167,8 +172,7 @@ laser_mapping:
         maximum_candidates_per_keyframe: 3
         detection_csv_path: "/home/project/MY-LIVO2.0/Log/backend/loop_detection.csv"
         candidate_csv_path: "/home/project/MY-LIVO2.0/Log/backend/loop_candidates.csv"
-      # Runs on a background worker. Results remain diagnostic and are not
-      # inserted into GTSAM until the separate verification stage passes.
+      # Multi-resolution NDT runs on a bounded background worker.
       loop_registration:
         enabled: true
         target_submap_half_width_keyframes: 40
@@ -185,6 +189,75 @@ laser_mapping:
         maximum_queue_size: 64
         registration_csv_path: "/home/project/MY-LIVO2.0/Log/backend/loop_registrations.csv"
         level_csv_path: "/home/project/MY-LIVO2.0/Log/backend/loop_registration_levels.csv"
+      # Only quality- and neighbor-consistent registrations enter GTSAM.
+      loop_verification:
+        enabled: true
+        require_final_convergence: true
+        minimum_converged_levels: 4
+        minimum_transformation_probability: 0.35
+        maximum_fitness_score_m2: 0.09
+        minimum_overlap: 0.90
+        maximum_overlap_rmse_m: 0.32
+        maximum_translation_correction_m: 5.0
+        maximum_rotation_correction_deg: 10.0
+        neighbor_current_id_window: 40
+        neighbor_candidate_id_window: 40
+        maximum_neighbor_translation_error_m: 0.50
+        maximum_neighbor_rotation_error_deg: 2.0
+        minimum_consistent_neighbors: 1
+        csv_path: "/home/project/MY-LIVO2.0/Log/backend/loop_verification.csv"
+      loop_pose_graph:
+        enabled: true
+        translation_sigma_m: 0.20
+        rotation_sigma_deg: 3.0
+        robust_kernel: "cauchy"
+        robust_delta: 2.0
+        additional_update_steps: 2
+        csv_path: "/home/project/MY-LIVO2.0/Log/backend/loop_factors.csv"
+      optimized_trajectory_csv_path: "/home/project/MY-LIVO2.0/Log/backend/optimized_trajectory.csv"
+      global_map:
+        enabled: true
+        voxel_leaf_size_m: 0.2
+        # 60 m equals 80 output voxels at the default leaf size, keeping tile
+        # boundaries aligned with the global voxel lattice.
+        tile_size_m: 30.0
+        request_coalesce_ms: 50
+        periodic_keyframe_interval: 20
+        minimum_graph_rebuild_keyframe_interval: 10
+        # Sub-threshold graph motion is accumulated and checked again at the
+        # next periodic snapshot instead of rebuilding after every RTK factor.
+        incremental_max_pose_change_m: 0.10
+        incremental_max_pose_change_deg: 0.25
+        csv_path: "/home/project/MY-LIVO2.0/Log/backend/global_map_updates.csv"
+        pcd_path: "/home/project/MY-LIVO2.0/Log/backend/optimized_global_map.pcd"
+      # Keyframe-driven CGI-610 fusion. The 100 Hz callbacks only populate a
+      # bounded buffer; factors are selected and inserted exclusively here at
+      # keyframe cadence, and only when ins_pos_mode is exactly 4.
+      rtk:
+        input_enabled: true
+        factor_enabled: true
+        required_ins_pos_mode: 4
+        maximum_status_age_sec: 0.03
+        maximum_interpolation_gap_sec: 0.05
+        maximum_endpoint_distance_sec: 0.03
+        buffer_retention_sec: 20.0
+        configured_sigma_xy_m: 0.30
+        configured_sigma_z_m: 0.50
+        minimum_sigma_xy_m: 0.10
+        minimum_sigma_z_m: 0.20
+        factor_minimum_time_interval_sec: 2.0
+        factor_maximum_time_interval_sec: 10.0
+        factor_minimum_translation_m: 5.0
+        innovation_prediction_sigma_m: 2.0
+        innovation_gate_chi2: 16.27
+        robust_kernel: "cauchy"
+        robust_delta: 2.0
+        additional_update_steps: 1
+        status_csv_path: "/home/project/MY-LIVO2.0/Log/backend/rtk_status.csv"
+        solution_csv_path: "/home/project/MY-LIVO2.0/Log/backend/rtk_solutions.csv"
+        query_csv_path: "/home/project/MY-LIVO2.0/Log/backend/rtk_queries.csv"
+        factor_csv_path: "/home/project/MY-LIVO2.0/Log/backend/rtk_factors.csv"
+        decision_csv_path: "/home/project/MY-LIVO2.0/Log/backend/rtk_decisions.csv"
 
     uav:
       imu_rate_odom: false

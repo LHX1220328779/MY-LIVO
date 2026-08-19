@@ -21,6 +21,7 @@ def generate_launch_description():
     use_camera = LaunchConfiguration("use_camera")
     use_rviz = LaunchConfiguration("use_rviz")
     rear_axle_to_imu = LaunchConfiguration("rear_axle_to_imu")
+    middleware_transport = LaunchConfiguration("middleware_transport")
 
     decoder = Node(
         package="image_transport",
@@ -68,8 +69,12 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        DeclareLaunchArgument(
+            "middleware_transport",
+            default_value=os.environ.get("FASTDDS_BUILTIN_TRANSPORTS", "UDPv4"),
+            description="Fast DDS builtin transport (UDPv4 or SHM)"),
         SetEnvironmentVariable(
-            name="FASTDDS_BUILTIN_TRANSPORTS", value="UDPv4"),
+            name="FASTDDS_BUILTIN_TRANSPORTS", value=middleware_transport),
         DeclareLaunchArgument("use_camera", default_value="false"),
         DeclareLaunchArgument("use_rviz", default_value="false"),
         DeclareLaunchArgument("config_file", default_value=default_config),

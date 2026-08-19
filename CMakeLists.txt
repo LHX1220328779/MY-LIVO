@@ -46,6 +46,7 @@ find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(cv_bridge REQUIRED)
@@ -69,7 +70,7 @@ if(NOT TARGET JsonCpp::JsonCpp)
 endif()
 
 set(ROS_DEPENDENCIES
-  rclcpp sensor_msgs nav_msgs geometry_msgs visualization_msgs
+  rclcpp sensor_msgs nav_msgs geometry_msgs diagnostic_msgs visualization_msgs
   pcl_conversions cv_bridge image_transport tf2 tf2_ros)
 
 add_library(vio src/vio.cpp src/frame.cpp src/visual_point.cpp)
@@ -80,7 +81,10 @@ add_library(backend_core
   src/backend/keyframe_manager.cpp
   src/backend/loop_candidate_detector.cpp
   src/backend/loop_registration.cpp
-  src/backend/pose_graph_optimizer.cpp)
+  src/backend/loop_verifier.cpp
+  src/backend/optimized_global_map.cpp
+  src/backend/pose_graph_optimizer.cpp
+  src/backend/rtk_observation_buffer.cpp)
 add_library(laser_mapping src/LIVMapper.cpp)
 
 foreach(target vio lio pre imu_proc backend_core laser_mapping)
@@ -142,6 +146,27 @@ if(BUILD_TESTING)
     include ${EIGEN3_INCLUDE_DIRS} ${PCL_INCLUDE_DIRS})
   target_link_libraries(loop_registration_test backend_core)
   add_test(NAME loop_registration_test COMMAND loop_registration_test)
+
+  add_executable(loop_verifier_test tests/loop_verifier_test.cpp)
+  target_include_directories(loop_verifier_test PRIVATE
+    include ${EIGEN3_INCLUDE_DIRS} ${PCL_INCLUDE_DIRS})
+  target_link_libraries(loop_verifier_test backend_core)
+  add_test(NAME loop_verifier_test COMMAND loop_verifier_test)
+
+  add_executable(optimized_global_map_test
+    tests/optimized_global_map_test.cpp)
+  target_include_directories(optimized_global_map_test PRIVATE
+    include ${EIGEN3_INCLUDE_DIRS} ${PCL_INCLUDE_DIRS})
+  target_link_libraries(optimized_global_map_test backend_core ${PCL_LIBRARIES})
+  add_test(NAME optimized_global_map_test COMMAND optimized_global_map_test)
+
+  add_executable(rtk_observation_buffer_test
+    tests/rtk_observation_buffer_test.cpp)
+  target_include_directories(rtk_observation_buffer_test PRIVATE
+    include ${EIGEN3_INCLUDE_DIRS})
+  ament_target_dependencies(rtk_observation_buffer_test diagnostic_msgs)
+  target_link_libraries(rtk_observation_buffer_test backend_core)
+  add_test(NAME rtk_observation_buffer_test COMMAND rtk_observation_buffer_test)
 endif()
 
 install(TARGETS fastlivo_mapping DESTINATION lib/${PROJECT_NAME})
@@ -153,6 +178,10 @@ install(PROGRAMS scripts/play_all_bags.sh scripts/generate_mine_calibration.py
         scripts/validate_odometry_pose_graph.py
         scripts/validate_loop_candidates.py
         scripts/validate_loop_registration.py
+        scripts/validate_loop_verification.py
+        scripts/validate_loop_pose_graph.py
+        scripts/validate_optimized_global_map.py
+        scripts/validate_rtk_fusion.py
         DESTINATION lib/${PROJECT_NAME})
 
 ament_package()

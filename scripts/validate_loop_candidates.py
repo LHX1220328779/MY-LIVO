@@ -124,6 +124,11 @@ def main() -> int:
     parser.add_argument(
         "--graph", type=Path, default=Path("Log/backend/pose_graph.csv")
     )
+    parser.add_argument(
+        "--loop-factors", type=Path, default=Path("Log/backend/loop_factors.csv"),
+        help="when non-empty, validate candidate-time pose snapshots rather than "
+             "incorrectly comparing them with the final optimized graph",
+    )
     parser.add_argument("--check-interval", type=int, default=20)
     parser.add_argument("--minimum-id-separation", type=int, default=50)
     parser.add_argument("--minimum-time-separation", type=float, default=30.0)
@@ -150,6 +155,10 @@ def main() -> int:
     require_columns(detection_fields, DETECTION_COLUMNS, "loop detection")
     require_columns(candidate_fields, CANDIDATE_COLUMNS, "loop candidate")
     require_columns(graph_fields, GRAPH_COLUMNS, "pose graph")
+    graph_is_dynamic = False
+    if args.loop_factors.is_file():
+        with args.loop_factors.open(newline="", encoding="utf-8") as stream:
+            graph_is_dynamic = any(True for _ in csv.DictReader(stream))
     if len(detection_rows) != len(graph_rows):
         raise RuntimeError(
             "loop-detection/pose-graph row count differs: "
@@ -243,6 +252,71 @@ def main() -> int:
 
         if int(summary["eligible_history"]) != len(eligible):
             raise RuntimeError(f"row {current_id} eligible-history count is inconsistent")
+        logged = candidates_by_current.get(current_id, [])
+        if int(summary["candidates"]) != len(logged):
+            raise RuntimeError(f"row {current_id} candidate count is inconsistent")
+
+        # Once the first loop factor is inserted, historical optimized poses
+        # continue to move.  pose_graph.csv stores the *final* estimates, while
+        # each candidate row intentionally stores the transform and distances
+        # at detection time.  Recomputing an old search against the final graph
+        # is therefore invalid.  In this mode validate every invariant that is
+        # independent of later graph updates and the candidate snapshot's own
+        # rigid-transform consistency.
+        if graph_is_dynamic:
+            reported_nearby = int(summary["nearby_history"])
+            if not 0 <= reported_nearby <= len(eligible):
+                raise RuntimeError(f"row {current_id} nearby-history count is impossible")
+            if len(logged) > min(args.maximum_candidates, reported_nearby):
+                raise RuntimeError(f"row {current_id} selected too many candidates")
+            eligible_total += len(eligible)
+            nearby_total += reported_nearby
+            previous_planar = -math.inf
+            selected_ids = []
+            for row in logged:
+                candidate_id = int(row["candidate_id"])
+                candidate_time = poses[candidate_id][0]
+                close(float(row["current_timestamp"]), timestamp, 1.0e-9,
+                      f"candidate {candidate_id}->{current_id} current time")
+                close(float(row["candidate_timestamp"]), candidate_time, 1.0e-9,
+                      f"candidate {candidate_id}->{current_id} historical time")
+                if int(row["id_separation"]) != current_id - candidate_id:
+                    raise RuntimeError(f"candidate {candidate_id}->{current_id} ID gap is wrong")
+                close(float(row["time_separation_sec"]), timestamp - candidate_time,
+                      1.0e-9, f"candidate {candidate_id}->{current_id} time gap")
+                planar = float(row["planar_distance_m"])
+                height = float(row["height_difference_m"])
+                distance = float(row["translation_distance_m"])
+                logged_initial_t = tuple(
+                    float(row[name]) for name in ("initial_tx", "initial_ty", "initial_tz")
+                )
+                logged_initial_q = tuple(
+                    float(row[name])
+                    for name in ("initial_qx", "initial_qy", "initial_qz", "initial_qw")
+                )
+                if not all(math.isfinite(value) for value in (
+                    planar, height, distance, *logged_initial_t, *logged_initial_q
+                )):
+                    raise RuntimeError(f"candidate {candidate_id}->{current_id} is non-finite")
+                if planar < 0 or planar > args.maximum_planar_distance + 1.0e-9:
+                    raise RuntimeError(f"candidate {candidate_id}->{current_id} violates planar gate")
+                if height < 0 or height > args.maximum_height_difference + 1.0e-9:
+                    raise RuntimeError(f"candidate {candidate_id}->{current_id} violates height gate")
+                close(math.hypot(planar, height), distance, 1.0e-8,
+                      f"candidate {candidate_id}->{current_id} distance components")
+                close(norm(logged_initial_t), distance, 1.0e-8,
+                      f"candidate {candidate_id}->{current_id} transform distance")
+                close(norm(logged_initial_q), 1.0, 1.0e-5,
+                      f"candidate {candidate_id}->{current_id} quaternion norm")
+                if planar + 1.0e-12 < previous_planar:
+                    raise RuntimeError(f"row {current_id} candidates are not distance-ranked")
+                if any(abs(candidate_id - other) < args.candidate_id_separation
+                       for other in selected_ids):
+                    raise RuntimeError(f"row {current_id} candidates violate ID diversity")
+                previous_planar = planar
+                selected_ids.append(candidate_id)
+            continue
+
         if int(summary["nearby_history"]) != len(nearby):
             raise RuntimeError(f"row {current_id} nearby-history count is inconsistent")
         eligible_total += len(eligible)
@@ -260,9 +334,6 @@ def main() -> int:
             if len(selected) >= args.maximum_candidates:
                 break
 
-        logged = candidates_by_current.get(current_id, [])
-        if int(summary["candidates"]) != len(logged):
-            raise RuntimeError(f"row {current_id} candidate count is inconsistent")
         expected_ids = [item[1] for item in selected]
         logged_ids = [int(row["candidate_id"]) for row in logged]
         if logged_ids != expected_ids:
@@ -335,9 +406,11 @@ def main() -> int:
         f"max={max(distances):.3f}m"
     )
     print(
-        "initial transform equality: "
-        f"max_position={maximum_initial_position_error:.9g}m, "
-        f"max_angle={maximum_initial_angle_error:.9g}deg"
+        ("candidate snapshot self-consistency: dynamic_graph=1"
+         if graph_is_dynamic else
+         "initial transform equality: "
+         f"max_position={maximum_initial_position_error:.9g}m, "
+         f"max_angle={maximum_initial_angle_error:.9g}deg")
     )
     print("loop-candidate validation passed")
     return 0
