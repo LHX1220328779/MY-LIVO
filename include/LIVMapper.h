@@ -14,6 +14,9 @@ which is included as part of this source code package.
 #define LIV_MAPPER_H
 
 #include "IMU_Processing.h"
+#include "backend/keyframe_manager.h"
+#include "backend/loop_candidate_detector.h"
+#include "backend/pose_graph_optimizer.h"
 #include "vio.h"
 #include "preprocess.h"
 #include <cv_bridge/cv_bridge.h>
@@ -36,6 +39,7 @@ public:
   void stateEstimationAndMapping();
   void handleVIO();
   void handleLIO();
+  void handleBackendKeyframe();
   void savePCD();
   void processImu();
   
@@ -205,6 +209,25 @@ public:
   nav_msgs::Path imu_reference_path;
   nav_msgs::Odometry imu_reference_odom;
 
+  bool backend_keyframes_enabled = false;
+  bool backend_publish_keyframe_cloud = true;
+  bool backend_pose_graph_enabled = false;
+  bool backend_loop_detection_enabled = false;
+  string backend_frontend_frame_id = "mine";
+  string backend_map_frame_id = "map";
+  string backend_body_frame_id = "body";
+  my_livo::backend::KeyframeManager::Options backend_keyframe_options;
+  my_livo::backend::PoseGraphOptimizer::Options backend_pose_graph_options;
+  my_livo::backend::LoopCandidateDetector::Options
+      backend_loop_detection_options;
+  std::unique_ptr<my_livo::backend::KeyframeManager> keyframe_manager;
+  std::unique_ptr<my_livo::backend::PoseGraphOptimizer>
+      pose_graph_optimizer;
+  std::unique_ptr<my_livo::backend::LoopCandidateDetector>
+      loop_candidate_detector;
+  nav_msgs::Path backend_keyframe_path;
+  nav_msgs::Path backend_optimized_path;
+
   PointCloudXYZI::Ptr visual_sub_map;
   PointCloudXYZI::Ptr feats_undistort;
   PointCloudXYZI::Ptr feats_down_body;
@@ -260,6 +283,15 @@ public:
   rclcpp::Publisher<nav_msgs::Odometry>::SharedPtr pubImuPropOdom;
   rclcpp::Publisher<nav_msgs::Path>::SharedPtr pubImuReferencePath;
   rclcpp::Publisher<nav_msgs::Odometry>::SharedPtr pubImuReferenceOdom;
+  rclcpp::Publisher<nav_msgs::Path>::SharedPtr pubBackendKeyframePath;
+  rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr
+      pubBackendKeyframeCloud;
+  rclcpp::Publisher<nav_msgs::Path>::SharedPtr pubBackendOptimizedPath;
+  rclcpp::Publisher<nav_msgs::Odometry>::SharedPtr
+      pubBackendOptimizedOdometry;
+  rclcpp::Publisher<visualization_msgs::MarkerArray>::SharedPtr
+      pubBackendLoopCandidates;
+  std::uint64_t backend_loop_marker_id = 0;
   rclcpp::TimerBase::SharedPtr imu_prop_timer;
 
   int frame_num = 0;

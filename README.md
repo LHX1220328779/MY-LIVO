@@ -13,12 +13,21 @@
 
 主要输出为 `/cloud_registered`、`/aft_mapped_to_init`、`/path`、`/imu_reference_odom` 和 `/imu_reference_path`，坐标系均为 `mine`。RViz2 中 LIVO 与 IMU/RTK 参考轨迹按当前 LIVO 时间戳同步推进。
 
+当前后端还会从完整 LIO 更新中选取关键帧并运行仅含相邻里程计边的 SE(3)
+Pose Graph，输出 `/backend/keyframe_path_raw`、
+`/backend/keyframe_path_optimized` 和 `/backend/odometry_optimized`。该阶段不含
+回环或 RTK factor，优化轨迹应与原始关键帧轨迹近似重合，且不会回写 IEKF。
+
 ### 编译
 
 不要进入 Conda 环境。依次执行：
 
+后端 Pose Graph 使用项目内 `3rdparty/gtsam` 的 GTSAM 4.2.2 iSAM2。构建脚本
+会在首次编译时自动生成与 ROS/PCL 相同的 system-Eigen 版本，输出到
+`3rdparty/gtsam/install-system-eigen`，不会覆盖已有 GTSAM build/install。
+
 ```bash
-cd /home/project/MY-LIVO1.0
+cd /home/project/MY-LIVO2.0
 unset CONDA_PREFIX CONDA_DEFAULT_ENV PYTHONHOME PYTHONPATH
 export PATH=/opt/ros/humble/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 source /opt/ros/humble/setup.bash
@@ -27,7 +36,7 @@ source install/setup.bash
 ```
 
 launch 默认直接读取源码目录中的
-`/home/project/MY-LIVO1.0/config/wuhu_truck29.yaml`。以后修改并保存该 YAML
+`/home/project/MY-LIVO2.0/config/wuhu_truck29.yaml`。以后修改并保存该 YAML
 只需重启 launch，无需重新编译；也可用 `config_file:=/绝对路径/file.yaml`
 指定另一份配置。
 
@@ -36,7 +45,7 @@ launch 默认直接读取源码目录中的
 原始 MCAP 没有消息索引，且每个感知包还包含多个本算法不用的大流量雷达话题。首次运行前先生成一个按时间严格归并、带索引且只保留前雷达、IMU、组合导航 Odometry 和可选相机话题的运行包（原始包不会被修改）：
 
 ```bash
-cd /home/project/MY-LIVO1.0
+cd /home/project/MY-LIVO2.0
 ./scripts/prepare_wuhu_bag.py
 ```
 
@@ -45,7 +54,7 @@ cd /home/project/MY-LIVO1.0
 终端 1：
 
 ```bash
-cd /home/project/MY-LIVO1.0
+cd /home/project/MY-LIVO2.0
 unset CONDA_PREFIX CONDA_DEFAULT_ENV PYTHONHOME PYTHONPATH
 source /opt/ros/humble/setup.bash
 source install/setup.bash
@@ -62,7 +71,7 @@ ros2 launch fast_livo wuhu_truck29.launch.py use_camera:=false use_rviz:=true
 终端 2 播放完整 LIVO 输入：
 
 ```bash
-cd /home/project/MY-LIVO1.0
+cd /home/project/MY-LIVO2.0
 ./scripts/play_all_bags.sh --with-camera
 ```
 
@@ -117,6 +126,19 @@ T_imu_camera = T_imu_rear_axle * T_rear_axle_lidar * inverse(T_camera_lidar)
 
 评估参数必须与 launch 中的 `rear_axle_to_imu` 保持一致；关闭该 launch
 开关时，评估脚本也不要传入 `--rear-axle-to-imu`。
+
+关键帧、Odometry-only Pose Graph 与回环候选检测的分阶段验收命令为：
+
+```bash
+./scripts/validate_backend_keyframes.py \
+  --trajectory Log/result/wuhu_truck29.txt
+./scripts/validate_odometry_pose_graph.py
+./scripts/validate_loop_candidates.py
+```
+
+反斜杠续行后必须立即跟下一行参数；不要把
+`Log/result/wuhu_truck29.txt` 拆成两个 shell 命令。回环候选阶段只输出候选和
+初始相对位姿，不执行点云配准，也不会向 GTSAM 图中添加回环因子。
 
 ## FAST-LIVO2: Fast, Direct LiDAR-Inertial-Visual Odometry
 

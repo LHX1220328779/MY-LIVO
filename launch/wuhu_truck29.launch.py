@@ -12,7 +12,7 @@ import os
 def generate_launch_description():
     share = get_package_share_directory("fast_livo")
     installed_config = os.path.join(share, "config", "wuhu_truck29.yaml")
-    source_config = "/home/project/MY-LIVO1.0/config/wuhu_truck29.yaml"
+    source_config = "/home/project/MY-LIVO2.0/config/wuhu_truck29.yaml"
     default_config = (
         source_config if os.path.isfile(source_config) else installed_config
     )

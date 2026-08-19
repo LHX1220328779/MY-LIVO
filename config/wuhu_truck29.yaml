@@ -126,6 +126,48 @@ laser_mapping:
       half_map_size: 300
       sliding_thresh: 8.0
 
+    backend:
+      # The backend never writes its estimate back to the FAST-LIVO2 IEKF.
+      # Loop and RTK factors remain disabled until their validation stages.
+      frontend_frame_id: "mine"
+      # Keep both paths in the same connected frame for the odometry-only
+      # acceptance test. A distinct map frame starts with global constraints.
+      map_frame_id: "mine"
+      body_frame_id: "body"
+      keyframes:
+        enabled: true
+        translation_threshold_m: 1.0
+        rotation_threshold_deg: 10.0
+        minimum_interval_sec: 0.20
+        maximum_interval_sec: 2.0
+        cloud_leaf_size_m: 0.50
+        csv_path: "/home/project/MY-LIVO2.0/Log/backend/keyframes.csv"
+        publish_latest_cloud: true
+      pose_graph:
+        enabled: true
+        odometry_translation_sigma_m: 0.10
+        odometry_rotation_sigma_deg: 0.50
+        prior_translation_sigma_m: 0.000001
+        prior_rotation_sigma_deg: 0.0001
+        relinearize_threshold: 0.01
+        relinearize_skip: 1
+        wildfire_threshold: 0.001
+        additional_update_steps: 1
+        csv_path: "/home/project/MY-LIVO2.0/Log/backend/pose_graph.csv"
+      # Candidate generation only. No registration result or loop factor is
+      # accepted at this stage, so it cannot deform the optimized trajectory.
+      loop_detection:
+        enabled: true
+        check_interval_keyframes: 20
+        minimum_id_separation_keyframes: 50
+        minimum_time_separation_sec: 30.0
+        maximum_planar_distance_m: 20.0
+        maximum_height_difference_m: 5.0
+        minimum_candidate_id_separation_keyframes: 20
+        maximum_candidates_per_keyframe: 3
+        detection_csv_path: "/home/project/MY-LIVO2.0/Log/backend/loop_detection.csv"
+        candidate_csv_path: "/home/project/MY-LIVO2.0/Log/backend/loop_candidates.csv"
+
     uav:
       imu_rate_odom: false
       gravity_align_en: false

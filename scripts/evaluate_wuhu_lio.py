@@ -55,7 +55,7 @@ def main():
         default=Path("/home/project/data/haibo/wuhu_livo/ros2bag_my_livo"))
     parser.add_argument(
         "--trajectory", type=Path,
-        default=Path("/home/project/MY-LIVO1.0/Log/result/wuhu_truck29.txt"))
+        default=Path("/home/project/MY-LIVO2.0/Log/result/wuhu_truck29.txt"))
     parser.add_argument(
         "--rear-axle-to-imu", action="store_true",
         help="compare against the physical-IMU reference used by the matching launch switch")

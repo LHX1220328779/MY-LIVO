@@ -21,6 +21,12 @@ set +u
 source /opt/ros/humble/setup.bash
 set -u
 
+gtsam_config="$repo_dir/3rdparty/gtsam/install-system-eigen/lib/cmake/GTSAM/GTSAMConfig.cmake"
+if [[ ! -f "$gtsam_config" ]]; then
+  echo "System-Eigen GTSAM was not found; building it once..."
+  BUILD_JOBS="$build_jobs" "$repo_dir/scripts/build_gtsam_system_eigen.sh"
+fi
+
 echo "Repository:    $repo_dir"
 echo "System Python: $(command -v python3)"
 echo "System CMake:  $(command -v cmake)"
