@@ -19,6 +19,10 @@ def norm(values):
     return math.sqrt(sum(value * value for value in values))
 
 
+def distance(a, b):
+    return norm(tuple(x-y for x, y in zip(a, b)))
+
+
 def qn(q):
     length = norm(q)
     if abs(length - 1.0) > 1.0e-5:
@@ -102,23 +106,41 @@ def main():
                         default=Path("Log/backend/optimized_global_map.pcd"))
     parser.add_argument("--trajectory", type=Path,
                         default=Path("Log/backend/optimized_trajectory.csv"))
+    parser.add_argument("--global-trajectory", type=Path,
+                        default=Path("Log/backend/global_trajectory.csv"))
     parser.add_argument("--keyframes", type=Path,
                         default=Path("Log/backend/keyframes.csv"))
     parser.add_argument("--maximum-build-time-ms", type=float, default=3000.0)
+    parser.add_argument("--rigid-submap-boundary-position", type=float,
+                        default=0.50)
+    parser.add_argument("--rigid-submap-boundary-angle-deg", type=float,
+                        default=0.50)
+    parser.add_argument("--rigid-submap-length", type=float, default=10.0)
+    parser.add_argument("--rigid-submap-output", type=Path,
+                        default=Path(
+                            "Log/backend/rigid_submap_fidelity.csv"))
     args = parser.parse_args()
 
     fields, updates = rows(args.updates)
     trajectory_fields, trajectory = rows(args.trajectory)
+    global_fields, global_trajectory = rows(args.global_trajectory)
     _, keyframes = rows(args.keyframes)
-    required = {"revision", "reason", "keyframes", "input_points",
+    required = {"revision", "reason", "keyframes", "included_keyframes",
+                "quarantined_keyframes", "input_points",
                 "output_points", "build_time_ms", "min_x", "min_y", "min_z",
-                "max_x", "max_y", "max_z"}
+                "max_x", "max_y", "max_z", "rigid_submaps",
+                "local_voxel_points", "spatial_deformation_nodes",
+                "maximum_suppressed_position_warp_m",
+                "maximum_suppressed_angle_warp_deg"}
     if not required.issubset(fields):
         raise RuntimeError(f"map update CSV is missing {sorted(required-set(fields))}")
-    if not updates or not trajectory or len(trajectory) != len(keyframes):
+    if not updates or not trajectory or len(trajectory) != len(keyframes) or \
+            len(global_trajectory) != len(keyframes):
         raise RuntimeError("map/trajectory/keyframe logs are incomplete")
     if not {"raw_tx", "raw_qw", "opt_tx", "opt_qw"}.issubset(trajectory_fields):
         raise RuntimeError("optimized trajectory columns are incomplete")
+    if not {"global_tx", "global_qw", "map_eligible"}.issubset(global_fields):
+        raise RuntimeError("global trajectory columns are incomplete")
 
     tiled_fields = {"build_mode", "processed_keyframes", "updated_tiles",
                     "total_tiles"}
@@ -130,21 +152,42 @@ def main():
         if int(row["revision"]) != index:
             raise RuntimeError("map revisions are not contiguous")
         keyframe_count = int(row["keyframes"])
+        included = int(row["included_keyframes"])
+        quarantined = int(row["quarantined_keyframes"])
         input_points = int(row["input_points"])
         output_points = int(row["output_points"])
         elapsed = float(row["build_time_ms"])
+        rigid_submaps = int(row["rigid_submaps"])
+        local_voxel_points = int(row["local_voxel_points"])
+        deformation_nodes = int(row["spatial_deformation_nodes"])
+        suppressed_position = float(
+            row["maximum_suppressed_position_warp_m"])
+        suppressed_angle = float(row["maximum_suppressed_angle_warp_deg"])
         bounds = [float(row[name]) for name in
                   ("min_x", "min_y", "min_z", "max_x", "max_y", "max_z")]
         if not 0 < keyframe_count <= len(keyframes):
             raise RuntimeError(f"map revision {index} has an invalid keyframe count")
+        if included <= 0 or included+quarantined != keyframe_count:
+            raise RuntimeError(f"map revision {index} has invalid quarantine accounting")
         if not 0 < output_points <= input_points:
             raise RuntimeError(f"map revision {index} has invalid point accounting")
+        if not 0 < output_points <= local_voxel_points <= input_points or \
+                deformation_nodes != included:
+            raise RuntimeError(
+                f"map revision {index} did not use local-first spatial deformation")
         if not math.isfinite(elapsed) or not 0 <= elapsed <= args.maximum_build_time_ms:
             raise RuntimeError(f"map revision {index} exceeded the build-time gate")
         if not all(math.isfinite(value) for value in bounds):
             raise RuntimeError(f"map revision {index} has invalid bounds")
         if any(bounds[axis] > bounds[axis+3] for axis in range(3)):
             raise RuntimeError(f"map revision {index} has reversed bounds")
+        if rigid_submaps <= 0 or not (
+                0 <= suppressed_position <=
+                args.rigid_submap_boundary_position+1e-8) or not (
+                0 <= suppressed_angle <=
+                args.rigid_submap_boundary_angle_deg+1e-8):
+            raise RuntimeError(
+                f"map revision {index} violated rigid-submap bounds")
         if tiled:
             mode = row["build_mode"]
             processed = int(row["processed_keyframes"])
@@ -160,7 +203,7 @@ def main():
                 if processed != keyframe_count - previous_keyframes or processed <= 0:
                     raise RuntimeError(
                         f"incremental map revision {index} processed the wrong keyframes")
-            if not 0 < updated_tiles <= total_tiles:
+            if not 0 <= updated_tiles <= total_tiles or total_tiles <= 0:
                 raise RuntimeError(f"map revision {index} has invalid tile accounting")
             build_modes[mode] = build_modes.get(mode, 0) + 1
         times.append(elapsed)
@@ -168,13 +211,72 @@ def main():
     final = updates[-1]
     if final["reason"] != "final" or int(final["keyframes"]) != len(keyframes):
         raise RuntimeError("the last map rebuild is not the complete final graph")
+    trusted = sum(int(row["map_eligible"]) for row in global_trajectory)
+    if trusted != int(final["included_keyframes"]) or \
+            len(keyframes)-trusted != int(final["quarantined_keyframes"]):
+        raise RuntimeError("final map differs from global quarantine mask")
     pcd_points = pcd_point_count(args.pcd)
     if pcd_points != int(final["output_points"]):
         raise RuntimeError("PCD point count differs from final map diagnostics")
 
+    local_poses = [pose(row, "opt") for row in trajectory]
+    global_poses = [pose(row, "global") for row in global_trajectory]
+    eligible = [int(row["map_eligible"]) for row in global_trajectory]
+    assignment_rows = []
+    submap_count = 0
+    maximum_suppressed_position = 0.0
+    maximum_suppressed_angle = 0.0
+    begin = 0
+    while begin < len(keyframes):
+        if eligible[begin] == 0:
+            begin += 1
+            continue
+        submap_count += 1
+        anchor_transform = compose(global_poses[begin], inverse(local_poses[begin]))
+        path_length = 0.0
+        end = begin
+        while end < len(keyframes) and eligible[end] != 0:
+            if end > begin:
+                step = distance(local_poses[end-1][0], local_poses[end][0])
+                candidate = compose(anchor_transform, local_poses[end])
+                position_warp, angle_warp = error(candidate, global_poses[end])
+                if path_length+step > args.rigid_submap_length or \
+                        position_warp > args.rigid_submap_boundary_position or \
+                        angle_warp > args.rigid_submap_boundary_angle_deg:
+                    break
+                path_length += step
+            map_pose = compose(anchor_transform, local_poses[end])
+            position_warp, angle_warp = error(map_pose, global_poses[end])
+            maximum_suppressed_position = max(
+                maximum_suppressed_position, position_warp)
+            maximum_suppressed_angle = max(
+                maximum_suppressed_angle, angle_warp)
+            assignment_rows.append((
+                end, submap_count, begin, path_length,
+                *local_poses[end][0], *global_poses[end][0], *map_pose[0],
+                position_warp, angle_warp))
+            end += 1
+        begin = end
+    if submap_count != int(final["rigid_submaps"]) or abs(
+            maximum_suppressed_position-float(
+                final["maximum_suppressed_position_warp_m"])) > 1e-8 or abs(
+            maximum_suppressed_angle-float(
+                final["maximum_suppressed_angle_warp_deg"])) > 1e-8:
+        raise RuntimeError(
+            "final rigid-submap diagnostics do not replay from logged poses")
+    args.rigid_submap_output.parent.mkdir(parents=True, exist_ok=True)
+    with args.rigid_submap_output.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream)
+        writer.writerow((
+            "keyframe_id", "submap_id", "anchor_keyframe_id", "path_m",
+            "local_x", "local_y", "local_z", "global_x", "global_y",
+            "global_z", "map_x", "map_y", "map_z",
+            "suppressed_position_warp_m", "suppressed_angle_warp_deg"))
+        writer.writerows(assignment_rows)
+
     latest = trajectory[-1]
     raw = pose(latest, "raw")
-    optimized = pose(latest, "opt")
+    optimized = pose(global_trajectory[-1], "global")
     map_to_odom = compose(optimized, inverse(raw))
     recomposed = compose(map_to_odom, raw)
     composition_error = error(optimized, recomposed)
@@ -184,8 +286,15 @@ def main():
 
     ordered = sorted(times)
     median = ordered[len(ordered)//2]
-    print(f"optimized global map: revisions={len(updates)}, keyframes={len(keyframes)}, "
-          f"points={int(final['input_points'])}->{pcd_points}")
+    print(f"optimized global map: revisions={len(updates)}, "
+          f"keyframes={trusted}/{len(keyframes)}, "
+          f"points={int(final['input_points'])}->{pcd_points}, "
+          f"local_voxels={final['local_voxel_points']}, "
+          f"deformation_nodes={final['spatial_deformation_nodes']}, "
+          f"rigid_submaps={final['rigid_submaps']}, "
+          f"suppressed_warp="
+          f"{float(final['maximum_suppressed_position_warp_m']):.3f}m/"
+          f"{float(final['maximum_suppressed_angle_warp_deg']):.3f}deg")
     if tiled:
         print(f"tiled map builds: {build_modes}, final_tiles={final['total_tiles']}")
     print(f"map build time: median={median:.1f}ms, max={max(times):.1f}ms; "

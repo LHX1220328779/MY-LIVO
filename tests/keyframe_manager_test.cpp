@@ -136,8 +136,8 @@ void TestTimestampInvariantAndOptimizedPose()
           "non-increasing timestamp did not raise a logic error");
 
   const Pose3d optimized = MakePose(5.0, 15.0);
-  keyframe->set_T_map_body(optimized);
-  Require((keyframe->T_map_body().translation -
+  keyframe->set_T_slam_body(optimized);
+  Require((keyframe->T_slam_body().translation -
            optimized.translation).norm() < 1.0e-12,
           "optimized keyframe pose was not stored");
   Require((keyframe->T_odom_body().translation -

@@ -78,13 +78,21 @@ add_library(lio src/voxel_map.cpp)
 add_library(pre src/preprocess.cpp)
 add_library(imu_proc src/IMU_Processing.cpp)
 add_library(backend_core
+  src/backend/correction_feasibility_monitor.cpp
+  src/backend/elastic_segment_acceptance_monitor.cpp
+  src/backend/global_pose_layer.cpp
   src/backend/keyframe_manager.cpp
+  src/backend/low_frequency_correction_field.cpp
   src/backend/loop_candidate_detector.cpp
   src/backend/loop_registration.cpp
   src/backend/loop_verifier.cpp
   src/backend/optimized_global_map.cpp
   src/backend/pose_graph_optimizer.cpp
-  src/backend/rtk_observation_buffer.cpp)
+  src/backend/regularized_correction_field_4d.cpp
+  src/backend/rigid_relocalization_monitor.cpp
+  src/backend/rtk_fusion_diagnostics.cpp
+  src/backend/rtk_observation_buffer.cpp
+  src/backend/rtk_velocity_guard.cpp)
 add_library(laser_mapping src/LIVMapper.cpp)
 
 foreach(target vio lio pre imu_proc backend_core laser_mapping)
@@ -119,11 +127,55 @@ if(mimalloc_FOUND)
 endif()
 
 if(BUILD_TESTING)
+  add_executable(voxel_map_reset_test tests/voxel_map_reset_test.cpp)
+  target_include_directories(voxel_map_reset_test PRIVATE
+    include ${EIGEN3_INCLUDE_DIRS} ${PCL_INCLUDE_DIRS})
+  target_link_libraries(voxel_map_reset_test lio ${PCL_LIBRARIES})
+  add_test(NAME voxel_map_reset_test COMMAND voxel_map_reset_test)
+
   add_executable(keyframe_manager_test tests/keyframe_manager_test.cpp)
   target_include_directories(keyframe_manager_test PRIVATE
     include ${EIGEN3_INCLUDE_DIRS} ${PCL_INCLUDE_DIRS})
   target_link_libraries(keyframe_manager_test backend_core ${PCL_LIBRARIES})
   add_test(NAME keyframe_manager_test COMMAND keyframe_manager_test)
+
+  add_executable(global_pose_layer_test tests/global_pose_layer_test.cpp)
+  target_include_directories(global_pose_layer_test PRIVATE
+    include ${EIGEN3_INCLUDE_DIRS} ${PCL_INCLUDE_DIRS})
+  target_link_libraries(global_pose_layer_test backend_core ${PCL_LIBRARIES})
+  add_test(NAME global_pose_layer_test COMMAND global_pose_layer_test)
+
+  add_executable(elastic_segment_acceptance_monitor_test
+    tests/elastic_segment_acceptance_monitor_test.cpp)
+  target_include_directories(elastic_segment_acceptance_monitor_test PRIVATE
+    include ${EIGEN3_INCLUDE_DIRS})
+  target_link_libraries(elastic_segment_acceptance_monitor_test backend_core)
+  add_test(NAME elastic_segment_acceptance_monitor_test
+    COMMAND elastic_segment_acceptance_monitor_test)
+
+  add_executable(correction_feasibility_monitor_test
+    tests/correction_feasibility_monitor_test.cpp)
+  target_include_directories(correction_feasibility_monitor_test PRIVATE
+    include ${EIGEN3_INCLUDE_DIRS})
+  target_link_libraries(correction_feasibility_monitor_test backend_core)
+  add_test(NAME correction_feasibility_monitor_test
+    COMMAND correction_feasibility_monitor_test)
+
+  add_executable(low_frequency_correction_field_test
+    tests/low_frequency_correction_field_test.cpp)
+  target_include_directories(low_frequency_correction_field_test PRIVATE
+    include ${EIGEN3_INCLUDE_DIRS})
+  target_link_libraries(low_frequency_correction_field_test backend_core)
+  add_test(NAME low_frequency_correction_field_test
+    COMMAND low_frequency_correction_field_test)
+
+  add_executable(regularized_correction_field_4d_test
+    tests/regularized_correction_field_4d_test.cpp)
+  target_include_directories(regularized_correction_field_4d_test PRIVATE
+    include ${EIGEN3_INCLUDE_DIRS})
+  target_link_libraries(regularized_correction_field_4d_test backend_core)
+  add_test(NAME regularized_correction_field_4d_test
+    COMMAND regularized_correction_field_4d_test)
 
   add_executable(pose_graph_optimizer_test
     tests/pose_graph_optimizer_test.cpp)
@@ -167,6 +219,27 @@ if(BUILD_TESTING)
   ament_target_dependencies(rtk_observation_buffer_test diagnostic_msgs)
   target_link_libraries(rtk_observation_buffer_test backend_core)
   add_test(NAME rtk_observation_buffer_test COMMAND rtk_observation_buffer_test)
+
+  add_executable(rtk_velocity_guard_test tests/rtk_velocity_guard_test.cpp)
+  target_include_directories(rtk_velocity_guard_test PRIVATE
+    include ${EIGEN3_INCLUDE_DIRS})
+  target_link_libraries(rtk_velocity_guard_test backend_core)
+  add_test(NAME rtk_velocity_guard_test COMMAND rtk_velocity_guard_test)
+
+  add_executable(rigid_relocalization_monitor_test
+    tests/rigid_relocalization_monitor_test.cpp)
+  target_include_directories(rigid_relocalization_monitor_test PRIVATE
+    include ${EIGEN3_INCLUDE_DIRS})
+  target_link_libraries(rigid_relocalization_monitor_test backend_core)
+  add_test(NAME rigid_relocalization_monitor_test
+    COMMAND rigid_relocalization_monitor_test)
+
+  add_executable(rtk_fusion_diagnostics_test
+    tests/rtk_fusion_diagnostics_test.cpp)
+  target_include_directories(rtk_fusion_diagnostics_test PRIVATE
+    include ${EIGEN3_INCLUDE_DIRS} ${PCL_INCLUDE_DIRS})
+  target_link_libraries(rtk_fusion_diagnostics_test backend_core)
+  add_test(NAME rtk_fusion_diagnostics_test COMMAND rtk_fusion_diagnostics_test)
 endif()
 
 install(TARGETS fastlivo_mapping DESTINATION lib/${PROJECT_NAME})
@@ -182,6 +255,7 @@ install(PROGRAMS scripts/play_all_bags.sh scripts/generate_mine_calibration.py
         scripts/validate_loop_pose_graph.py
         scripts/validate_optimized_global_map.py
         scripts/validate_rtk_fusion.py
+        scripts/validate_rtk_diagnostics.py
         DESTINATION lib/${PROJECT_NAME})
 
 ament_package()

@@ -8,16 +8,15 @@
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
 #include <gtsam/nonlinear/PriorFactor.h>
 #include <gtsam/nonlinear/Values.h>
-#include <gtsam/navigation/GPSFactor.h>
 #include <gtsam/slam/BetweenFactor.h>
 
 #include <Eigen/Core>
-#include <Eigen/Eigenvalues>
 #include <Eigen/Geometry>
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -82,28 +81,6 @@ gtsam::SharedNoiseModel RobustPoseNoise(
   else
     throw std::invalid_argument(
         "Pose-graph robust kernel must be 'cauchy' or 'huber'.");
-  return gtsam::noiseModel::Robust::Create(robust, base);
-}
-
-gtsam::SharedNoiseModel RobustPositionNoise(
-    const Eigen::Matrix3d &covariance, const std::string &kernel,
-    double delta)
-{
-  if (!covariance.allFinite())
-    throw std::invalid_argument("RTK covariance is not finite.");
-  Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eigensolver(covariance);
-  if (eigensolver.info() != Eigen::Success ||
-      eigensolver.eigenvalues().minCoeff() <= 0.0)
-    throw std::invalid_argument("RTK covariance must be positive definite.");
-  const auto base = gtsam::noiseModel::Gaussian::Covariance(covariance);
-  gtsam::noiseModel::mEstimator::Base::shared_ptr robust;
-  if (kernel == "cauchy")
-    robust = gtsam::noiseModel::mEstimator::Cauchy::Create(delta);
-  else if (kernel == "huber")
-    robust = gtsam::noiseModel::mEstimator::Huber::Create(delta);
-  else
-    throw std::invalid_argument(
-        "RTK robust kernel must be 'cauchy' or 'huber'.");
   return gtsam::noiseModel::Robust::Create(robust, base);
 }
 
@@ -265,6 +242,7 @@ public:
              "optimization_time_ms,variables_relinearized,"
              "variables_reeliminated\n";
     }
+    InitializeOptimizedTrajectoryLocked();
   }
 
   ~Impl()
@@ -286,7 +264,7 @@ public:
       throw std::logic_error(
           "Pose-graph keyframe timestamps must be strictly increasing.");
     if (!keyframe->T_odom_body().isFinite() ||
-        !keyframe->T_map_body().isFinite())
+        !keyframe->T_slam_body().isFinite())
       throw std::invalid_argument("Pose-graph keyframe pose is not finite.");
 
     gtsam::NonlinearFactorGraph new_factors;
@@ -296,11 +274,11 @@ public:
     if (keyframe->id() == 0U)
     {
       // A tight prior removes the six-dimensional gauge freedom. The prior
-      // measurement is immutable raw odometry, while T_map_body is only the
+      // measurement is immutable raw odometry, while T_slam_body is only the
       // initial value; this distinction is exercised by the unit test.
       new_factors.emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(
           current_key, ToGtsam(keyframe->T_odom_body()), prior_noise);
-      new_values.insert(current_key, ToGtsam(keyframe->T_map_body()));
+      new_values.insert(current_key, ToGtsam(keyframe->T_slam_body()));
     }
     else
     {
@@ -371,10 +349,10 @@ public:
 
     // An odometry-only append introduces no new constraint on historical
     // poses. Extracting every pose here would make normal graph growth O(N^2)
-    // over a long mission; global Loop/RTK updates still refresh all poses.
-    keyframe->set_T_map_body(FromGtsam(
+    // over a long mission; loop updates still refresh all poses.
+    keyframe->set_T_slam_body(FromGtsam(
         isam2.calculateEstimate<gtsam::Pose3>(current_key)));
-    result.latest_pose = keyframe->T_map_body();
+    result.latest_pose = keyframe->T_slam_body();
     result.solution_usable = result.latest_pose.isFinite();
     if (!result.solution_usable)
     {
@@ -384,6 +362,7 @@ public:
           std::to_string(keyframe->id()) + '.');
     }
     WriteCsvLocked(*keyframe, result);
+    AppendOptimizedTrajectoryLocked(*keyframe);
     return result;
   }
 
@@ -407,8 +386,8 @@ public:
     result.historical_id = historical_id;
     result.current_id = current_id;
     const Pose3d historical_before =
-        keyframes[historical_id]->T_map_body();
-    const Pose3d current_before = keyframes[current_id]->T_map_body();
+        keyframes[historical_id]->T_slam_body();
+    const Pose3d current_before = keyframes[current_id]->T_slam_body();
     const RelativeResidual residual_before = RelativePoseResidual(
         historical_before, current_before, T_historical_current);
     result.residual_translation_before_m = residual_before.translation_m;
@@ -416,7 +395,7 @@ public:
     std::vector<Pose3d> poses_before;
     poses_before.reserve(keyframes.size());
     for (const auto &keyframe : keyframes)
-      poses_before.push_back(keyframe->T_map_body());
+      poses_before.push_back(keyframe->T_slam_body());
 
     gtsam::NonlinearFactorGraph new_factors;
     new_factors.emplace_shared<gtsam::BetweenFactor<gtsam::Pose3>>(
@@ -469,15 +448,15 @@ public:
           std::to_string(current_id) + '.');
     }
     const Pose3d historical_after =
-        keyframes[historical_id]->T_map_body();
-    const Pose3d current_after = keyframes[current_id]->T_map_body();
+        keyframes[historical_id]->T_slam_body();
+    const Pose3d current_after = keyframes[current_id]->T_slam_body();
     const RelativeResidual residual_after = RelativePoseResidual(
         historical_after, current_after, T_historical_current);
     result.residual_translation_after_m = residual_after.translation_m;
     result.residual_rotation_after_deg = residual_after.rotation_deg;
     for (std::size_t index = 0; index < keyframes.size(); ++index)
     {
-      const Pose3d pose_after = keyframes[index]->T_map_body();
+      const Pose3d pose_after = keyframes[index]->T_slam_body();
       result.maximum_pose_correction_m = std::max(
           result.maximum_pose_correction_m,
           PositionDifference(poses_before[index], pose_after));
@@ -487,98 +466,7 @@ public:
     }
     result.added = true;
     WriteLoopCsvLocked(T_historical_current, result);
-    return result;
-  }
-
-  RtkUpdateResult AddRtkPositionFactor(
-      std::uint64_t keyframe_id,
-      const Eigen::Vector3d &position_map,
-      const Eigen::Matrix3d &position_covariance)
-  {
-    std::lock_guard<std::mutex> lock(mutex);
-    if (keyframe_id >= keyframes.size())
-      throw std::invalid_argument(
-          "RTK factor keyframe ID does not exist in the graph.");
-    if (!position_map.allFinite())
-      throw std::invalid_argument("RTK position is not finite.");
-    if (rtk_factor_ids.count(keyframe_id) != 0U)
-      throw std::logic_error("Duplicate RTK factor for keyframe " +
-                             std::to_string(keyframe_id) + '.');
-
-    RtkUpdateResult result;
-    result.keyframe_id = keyframe_id;
-    const Pose3d pose_before = keyframes[keyframe_id]->T_map_body();
-    result.innovation_before_m = pose_before.translation - position_map;
-    std::vector<Pose3d> poses_before;
-    poses_before.reserve(keyframes.size());
-    for (const auto &keyframe : keyframes)
-      poses_before.push_back(keyframe->T_map_body());
-
-    const auto noise = RobustPositionNoise(
-        position_covariance, options.rtk_robust_kernel,
-        options.rtk_robust_delta);
-    gtsam::NonlinearFactorGraph new_factors;
-    new_factors.emplace_shared<gtsam::GPSFactor>(
-        PoseKey(keyframe_id),
-        gtsam::Point3(position_map.x(), position_map.y(), position_map.z()),
-        noise);
-    const auto start = std::chrono::steady_clock::now();
-    try
-    {
-      gtsam::ISAM2Result update_result =
-          isam2.update(new_factors, gtsam::Values());
-      result.initial_cost = OptionalError(update_result.errorBefore);
-      result.final_cost = OptionalError(update_result.errorAfter);
-      AccumulateWork(update_result, &result);
-      for (int step = 0; step < options.rtk_additional_update_steps; ++step)
-      {
-        update_result = isam2.update();
-        result.final_cost = OptionalError(update_result.errorAfter);
-        AccumulateWork(update_result, &result);
-      }
-    }
-    catch (const std::exception &error)
-    {
-      ++statistics.failed_optimizations;
-      throw std::runtime_error(
-          "GTSAM iSAM2 RTK update failed for keyframe " +
-          std::to_string(keyframe_id) + ": " + error.what());
-    }
-    result.optimization_time_ms = MillisecondsSince(start);
-    result.updates = 1 + options.rtk_additional_update_steps;
-    rtk_factor_ids.insert(keyframe_id);
-    ++statistics.rtk_factors;
-    ++statistics.rtk_optimization_runs;
-    statistics.variables_relinearized += result.variables_relinearized;
-    statistics.variables_reeliminated += result.variables_reeliminated;
-    statistics.last_optimization_time_ms = result.optimization_time_ms;
-    statistics.maximum_optimization_time_ms = std::max(
-        statistics.maximum_optimization_time_ms,
-        result.optimization_time_ms);
-
-    UpdateKeyframePosesLocked();
-    result.solution_usable = ValidateEstimateLocked();
-    if (!result.solution_usable)
-    {
-      ++statistics.failed_optimizations;
-      throw std::runtime_error(
-          "GTSAM returned an invalid estimate after RTK factor " +
-          std::to_string(keyframe_id) + '.');
-    }
-    result.innovation_after_m =
-        keyframes[keyframe_id]->T_map_body().translation - position_map;
-    for (std::size_t index = 0; index < keyframes.size(); ++index)
-    {
-      const Pose3d pose_after = keyframes[index]->T_map_body();
-      result.maximum_pose_correction_m = std::max(
-          result.maximum_pose_correction_m,
-          PositionDifference(poses_before[index], pose_after));
-      result.maximum_pose_correction_deg = std::max(
-          result.maximum_pose_correction_deg,
-          RotationDifferenceDegrees(poses_before[index], pose_after));
-    }
-    result.added = true;
-    WriteRtkCsvLocked(position_map, position_covariance, result);
+    WriteOptimizedTrajectoryLocked();
     return result;
   }
 
@@ -588,7 +476,7 @@ public:
     std::vector<Pose3d> poses;
     poses.reserve(keyframes.size());
     for (const auto &keyframe : keyframes)
-      poses.push_back(keyframe->T_map_body());
+      poses.push_back(keyframe->T_slam_body());
     return poses;
   }
 
@@ -624,8 +512,6 @@ private:
                      "Loop rotation sigma");
     require_positive(options.loop_robust_delta,
                      "Loop robust delta");
-    require_positive(options.rtk_robust_delta,
-                     "RTK robust delta");
     if (options.odometry_rotation_sigma_deg > 180.0 ||
         options.prior_rotation_sigma_deg > 180.0 ||
         options.loop_rotation_sigma_deg > 180.0)
@@ -640,31 +526,24 @@ private:
     if (options.loop_additional_update_steps < 0)
       throw std::invalid_argument(
           "iSAM2 loop additional update steps must be non-negative.");
-    if (options.rtk_additional_update_steps < 0)
-      throw std::invalid_argument(
-          "iSAM2 RTK additional update steps must be non-negative.");
     if (options.loop_robust_kernel != "cauchy" &&
         options.loop_robust_kernel != "huber")
       throw std::invalid_argument(
           "Loop robust kernel must be 'cauchy' or 'huber'.");
-    if (options.rtk_robust_kernel != "cauchy" &&
-        options.rtk_robust_kernel != "huber")
-      throw std::invalid_argument(
-          "RTK robust kernel must be 'cauchy' or 'huber'.");
   }
 
   void UpdateKeyframePosesLocked()
   {
     const gtsam::Values estimate = isam2.calculateEstimate();
     for (const auto &keyframe : keyframes)
-      keyframe->set_T_map_body(
+      keyframe->set_T_slam_body(
           FromGtsam(estimate.at<gtsam::Pose3>(PoseKey(keyframe->id()))));
   }
 
   bool ValidateEstimateLocked() const
   {
     for (const auto &keyframe : keyframes)
-      if (!keyframe->T_map_body().isFinite()) return false;
+      if (!keyframe->T_slam_body().isFinite()) return false;
     return true;
   }
 
@@ -673,7 +552,7 @@ private:
   {
     if (!csv_stream.is_open()) return;
     const Pose3d &raw = keyframe.T_odom_body();
-    const Pose3d optimized = keyframe.T_map_body();
+    const Pose3d optimized = keyframe.T_slam_body();
     csv_stream << std::setprecision(17) << "gtsam_isam2," << keyframe.id()
                << ',' << keyframe.timestamp() << ',' << statistics.nodes
                << ',' << statistics.odometry_factors << ','
@@ -724,61 +603,101 @@ private:
     loop_csv_stream.flush();
   }
 
-  void WriteOptimizedTrajectoryLocked()
+  static void WriteOptimizedTrajectoryHeader(std::ostream &stream)
+  {
+    stream << "id,timestamp,raw_tx,raw_ty,raw_tz,raw_qx,raw_qy,raw_qz,"
+              "raw_qw,opt_tx,opt_ty,opt_tz,opt_qx,opt_qy,opt_qz,opt_qw,"
+              "position_delta_m,angle_delta_deg\n";
+  }
+
+  static void WriteOptimizedTrajectoryRow(
+      std::ostream &stream, const Keyframe &keyframe)
+  {
+    const Pose3d &raw = keyframe.T_odom_body();
+    const Pose3d optimized = keyframe.T_slam_body();
+    stream << std::setprecision(17) << keyframe.id() << ','
+           << keyframe.timestamp() << ',' << raw.translation.x() << ','
+           << raw.translation.y() << ',' << raw.translation.z() << ','
+           << raw.rotation.x() << ',' << raw.rotation.y() << ','
+           << raw.rotation.z() << ',' << raw.rotation.w() << ','
+           << optimized.translation.x() << ','
+           << optimized.translation.y() << ','
+           << optimized.translation.z() << ',' << optimized.rotation.x()
+           << ',' << optimized.rotation.y() << ','
+           << optimized.rotation.z() << ',' << optimized.rotation.w()
+           << ',' << PositionDifference(raw, optimized) << ','
+           << RotationDifferenceDegrees(raw, optimized) << '\n';
+  }
+
+  void InitializeOptimizedTrajectoryLocked()
   {
     if (options.optimized_trajectory_csv_path.empty()) return;
     const std::filesystem::path path(
         options.optimized_trajectory_csv_path);
     if (path.has_parent_path())
       std::filesystem::create_directories(path.parent_path());
-    std::ofstream stream(path, std::ios::out | std::ios::trunc);
-    if (!stream.is_open()) return;
-    stream << "id,timestamp,raw_tx,raw_ty,raw_tz,raw_qx,raw_qy,raw_qz,"
-              "raw_qw,opt_tx,opt_ty,opt_tz,opt_qx,opt_qy,opt_qz,opt_qw,"
-              "position_delta_m,angle_delta_deg\n";
-    for (const auto &keyframe : keyframes)
-    {
-      const Pose3d &raw = keyframe->T_odom_body();
-      const Pose3d optimized = keyframe->T_map_body();
-      stream << std::setprecision(17) << keyframe->id() << ','
-             << keyframe->timestamp() << ',' << raw.translation.x() << ','
-             << raw.translation.y() << ',' << raw.translation.z() << ','
-             << raw.rotation.x() << ',' << raw.rotation.y() << ','
-             << raw.rotation.z() << ',' << raw.rotation.w() << ','
-             << optimized.translation.x() << ','
-             << optimized.translation.y() << ','
-             << optimized.translation.z() << ',' << optimized.rotation.x()
-             << ',' << optimized.rotation.y() << ','
-             << optimized.rotation.z() << ',' << optimized.rotation.w()
-             << ',' << PositionDifference(raw, optimized) << ','
-             << RotationDifferenceDegrees(raw, optimized) << '\n';
-    }
+    optimized_trajectory_csv_stream.open(
+        path, std::ios::out | std::ios::trunc);
+    if (!optimized_trajectory_csv_stream.is_open())
+      throw std::runtime_error("Cannot open optimized-trajectory CSV: " +
+                               path.string());
+    WriteOptimizedTrajectoryHeader(optimized_trajectory_csv_stream);
+    optimized_trajectory_csv_stream.flush();
   }
 
-  void WriteRtkCsvLocked(
-      const Eigen::Vector3d &measurement,
-      const Eigen::Matrix3d &covariance,
-      const RtkUpdateResult &result)
+  void AppendOptimizedTrajectoryLocked(const Keyframe &keyframe)
   {
-    if (!rtk_csv_stream.is_open()) return;
-    rtk_csv_stream << std::setprecision(17) << result.keyframe_id << ','
-        << options.rtk_robust_kernel << ',' << options.rtk_robust_delta << ','
-        << std::sqrt(covariance(0, 0)) << ','
-        << std::sqrt(covariance(1, 1)) << ','
-        << std::sqrt(covariance(2, 2)) << ',' << measurement.x() << ','
-        << measurement.y() << ',' << measurement.z() << ','
-        << result.innovation_before_m.x() << ','
-        << result.innovation_before_m.y() << ','
-        << result.innovation_before_m.z() << ','
-        << result.innovation_after_m.x() << ','
-        << result.innovation_after_m.y() << ','
-        << result.innovation_after_m.z() << ',' << result.initial_cost << ','
-        << result.final_cost << ',' << result.maximum_pose_correction_m << ','
-        << result.maximum_pose_correction_deg << ','
-        << result.optimization_time_ms << ','
-        << result.variables_relinearized << ','
-        << result.variables_reeliminated << '\n';
-    rtk_csv_stream.flush();
+    if (!optimized_trajectory_csv_stream.is_open()) return;
+    WriteOptimizedTrajectoryRow(optimized_trajectory_csv_stream, keyframe);
+    optimized_trajectory_csv_stream.flush();
+  }
+
+  void ReopenOptimizedTrajectoryForAppendLocked(
+      const std::filesystem::path &path)
+  {
+    optimized_trajectory_csv_stream.clear();
+    optimized_trajectory_csv_stream.open(path, std::ios::out | std::ios::app);
+  }
+
+  void WriteOptimizedTrajectoryLocked()
+  {
+    if (options.optimized_trajectory_csv_path.empty()) return;
+    const std::filesystem::path path(
+        options.optimized_trajectory_csv_path);
+    std::filesystem::path temporary_path = path;
+    temporary_path += ".tmp";
+    std::ofstream temporary_stream(
+        temporary_path, std::ios::out | std::ios::trunc);
+    if (!temporary_stream.is_open()) return;
+    WriteOptimizedTrajectoryHeader(temporary_stream);
+    for (const auto &keyframe : keyframes)
+    {
+      WriteOptimizedTrajectoryRow(temporary_stream, *keyframe);
+    }
+    temporary_stream.flush();
+    if (!temporary_stream.good())
+    {
+      temporary_stream.close();
+      std::error_code error;
+      std::filesystem::remove(temporary_path, error);
+      return;
+    }
+    temporary_stream.close();
+
+    if (optimized_trajectory_csv_stream.is_open())
+    {
+      optimized_trajectory_csv_stream.flush();
+      optimized_trajectory_csv_stream.close();
+    }
+    // std::rename atomically replaces an existing file on the POSIX target
+    // platform.  Validators therefore see either the previous complete
+    // snapshot or the new complete snapshot, never a truncated rewrite.
+    if (std::rename(temporary_path.c_str(), path.c_str()) != 0)
+    {
+      std::error_code error;
+      std::filesystem::remove(temporary_path, error);
+    }
+    ReopenOptimizedTrajectoryForAppendLocked(path);
   }
 
   Options options;
@@ -789,11 +708,11 @@ private:
   gtsam::SharedNoiseModel loop_noise;
   std::vector<Keyframe::Ptr> keyframes;
   std::set<std::pair<std::uint64_t, std::uint64_t>> loop_factor_pairs;
-  std::set<std::uint64_t> rtk_factor_ids;
   Statistics statistics;
   std::ofstream csv_stream;
   std::ofstream loop_csv_stream;
   std::ofstream rtk_csv_stream;
+  std::ofstream optimized_trajectory_csv_stream;
 };
 
 PoseGraphOptimizer::PoseGraphOptimizer(const Options &options)
@@ -815,16 +734,6 @@ PoseGraphOptimizer::LoopUpdateResult PoseGraphOptimizer::AddLoopFactor(
 {
   return impl_->AddLoopFactor(
       historical_id, current_id, T_historical_current);
-}
-
-PoseGraphOptimizer::RtkUpdateResult
-PoseGraphOptimizer::AddRtkPositionFactor(
-    std::uint64_t keyframe_id,
-    const Eigen::Vector3d &position_map,
-    const Eigen::Matrix3d &position_covariance)
-{
-  return impl_->AddRtkPositionFactor(
-      keyframe_id, position_map, position_covariance);
 }
 
 std::vector<Pose3d> PoseGraphOptimizer::optimized_poses() const

@@ -37,6 +37,23 @@ Keyframe::Ptr MakeKeyframe(std::uint64_t id, double x)
       cloud, Matrix6d::Identity(), 0U);
 }
 
+Keyframe::Ptr MakeObservedPointKeyframe(std::uint64_t id, double pose_x,
+                                        double point_x)
+{
+  KeyframeCloud::Ptr cloud(new KeyframeCloud());
+  KeyframePoint point;
+  point.x = static_cast<float>(point_x);
+  point.y = 0.0F;
+  point.z = 0.0F;
+  point.intensity = static_cast<float>(id + 1);
+  cloud->push_back(point);
+  return std::make_shared<Keyframe>(
+      id, static_cast<double>(id),
+      Pose3d(Eigen::Quaterniond::Identity(),
+             Eigen::Vector3d(pose_x, 0, 0)),
+      cloud, Matrix6d::Identity(), 0U);
+}
+
 double MaximumX(const KeyframeCloud::ConstPtr &cloud)
 {
   double maximum_x = -1.0e9;
@@ -45,12 +62,21 @@ double MaximumX(const KeyframeCloud::ConstPtr &cloud)
   return maximum_x;
 }
 
+double XForIntensity(const KeyframeCloud::ConstPtr &cloud, float intensity)
+{
+  for (const auto &point : cloud->points)
+    if (std::abs(point.intensity - intensity) < 1.0e-5F)
+      return point.x;
+  throw std::runtime_error("point intensity was not found");
+}
+
 void TestOptimizedGlobalMapUsesGraphSnapshot()
 {
   OptimizedGlobalMap::Options options;
   options.voxel_leaf_size_m = 0.1;
   options.tile_size_m = 10.0;
   options.periodic_keyframe_interval = 2;
+  options.preserve_rigid_local_submaps = false;
   OptimizedGlobalMap map(options);
   const std::vector<Keyframe::Ptr> keyframes{
       MakeKeyframe(0, 0.0), MakeKeyframe(1, 10.0)};
@@ -79,6 +105,7 @@ void TestTiledIncrementalUpdateAndCorrectionThreshold()
   options.periodic_keyframe_interval = 1;
   options.incremental_max_pose_change_m = 0.10;
   options.incremental_max_pose_change_deg = 0.25;
+  options.preserve_rigid_local_submaps = false;
   OptimizedGlobalMap map(options);
 
   std::vector<Keyframe::Ptr> keyframes{
@@ -118,6 +145,131 @@ void TestTiledIncrementalUpdateAndCorrectionThreshold()
           "small correction incorrectly requested a full rebuild");
 }
 
+void TestQuarantinedKeyframesAreRemoved()
+{
+  OptimizedGlobalMap::Options options;
+  options.voxel_leaf_size_m = 0.1;
+  options.tile_size_m = 10.0;
+  options.periodic_keyframe_interval = 1;
+  options.preserve_rigid_local_submaps = false;
+  OptimizedGlobalMap map(options);
+  const std::vector<Keyframe::Ptr> keyframes{
+      MakeKeyframe(0, 0.0), MakeKeyframe(1, 11.0),
+      MakeKeyframe(2, 21.0)};
+  const std::vector<Pose3d> poses{
+      Pose3d(),
+      Pose3d(Eigen::Quaterniond::Identity(), Eigen::Vector3d(11, 0, 0)),
+      Pose3d(Eigen::Quaterniond::Identity(), Eigen::Vector3d(21, 0, 0))};
+  const auto complete = map.Build(keyframes, poses, "periodic");
+  Require(complete.output_points == 3,
+          "complete map did not contain every keyframe");
+
+  const std::vector<std::uint8_t> eligible{1U, 1U, 0U};
+  const auto quarantined =
+      map.Build(keyframes, poses, eligible, "graph_update");
+  Require(quarantined.build_mode == "full",
+          "eligibility change did not rebuild the map");
+  Require(quarantined.included_keyframes == 2 &&
+              quarantined.quarantined_keyframes == 1 &&
+              quarantined.output_points == 2,
+          "quarantined cloud remained in the trusted map");
+  Require(std::abs(MaximumX(quarantined.cloud) - 12.0) < 1.0e-5,
+          "trusted map retained a point from the quarantined tail");
+}
+
+void TestRigidLocalSubmapsSuppressPerKeyframeWarp()
+{
+  OptimizedGlobalMap::Options options;
+  options.voxel_leaf_size_m = 0.1;
+  options.tile_size_m = 10.0;
+  options.rigid_submap_length_m = 10.0;
+  options.rigid_submap_boundary_position_change_m = 0.50;
+  options.rigid_submap_boundary_angle_change_deg = 0.50;
+  OptimizedGlobalMap map(options);
+  std::vector<Keyframe::Ptr> keyframes{
+      MakeKeyframe(0, 0.0), MakeKeyframe(1, 4.0),
+      MakeKeyframe(2, 8.0), MakeKeyframe(3, 12.0)};
+  keyframes[1]->set_T_slam_body(Pose3d(
+      Eigen::Quaterniond::Identity(), Eigen::Vector3d(4.1, 0, 0)));
+  keyframes[2]->set_T_slam_body(Pose3d(
+      Eigen::Quaterniond::Identity(), Eigen::Vector3d(8.2, 0, 0)));
+  keyframes[3]->set_T_slam_body(Pose3d(
+      Eigen::Quaterniond::Identity(), Eigen::Vector3d(12.3, 0, 0)));
+  const std::vector<Pose3d> global_poses{
+      Pose3d(),
+      Pose3d(Eigen::Quaterniond::Identity(), Eigen::Vector3d(4.3, 0, 0)),
+      Pose3d(Eigen::Quaterniond::Identity(), Eigen::Vector3d(8.6, 0, 0)),
+      Pose3d(Eigen::Quaterniond::Identity(), Eigen::Vector3d(12.9, 0, 0))};
+  const auto result = map.Build(keyframes, global_poses, "periodic");
+  Require(result.rigid_submaps == 2,
+          "ten-metre local trajectory was partitioned incorrectly");
+  Require(std::abs(XForIntensity(result.cloud, 2.0F) - 5.1) < 1.0e-5 &&
+              std::abs(XForIntensity(result.cloud, 3.0F) - 9.2) < 1.0e-5,
+          "map did not preserve the local-SLAM relative structure");
+  Require(std::abs(XForIntensity(result.cloud, 4.0F) - 13.9) < 1.0e-5,
+          "new rigid submap did not use its global elastic anchor");
+  Require(std::abs(result.maximum_suppressed_position_warp_m - 0.4) <
+              1.0e-10,
+          "suppressed per-keyframe warp diagnostic differs");
+}
+
+void TestSpatialDeformationDeduplicatesBeforeGlobalWarp()
+{
+  OptimizedGlobalMap::Options options;
+  options.voxel_leaf_size_m = 0.1;
+  options.tile_size_m = 10.0;
+  options.preserve_rigid_local_submaps = false;
+  options.spatial_deformation_enabled = true;
+  options.spatial_deformation_neighbors = 2;
+  options.spatial_deformation_sigma_m = 5.0;
+  OptimizedGlobalMap map(options);
+
+  // Both scans observe exactly the same local-map point at x=5 m. Their
+  // global corrections disagree by 0.2 m; scan-wise warping would produce a
+  // double surface, while local-first voxelization must retain one point.
+  const std::vector<Keyframe::Ptr> keyframes{
+      MakeObservedPointKeyframe(0, 0.0, 5.0),
+      MakeObservedPointKeyframe(1, 1.0, 4.0)};
+  const std::vector<Pose3d> global_poses{
+      Pose3d(),
+      Pose3d(Eigen::Quaterniond::Identity(),
+             Eigen::Vector3d(1.2, 0, 0))};
+  const auto result = map.Build(keyframes, global_poses, "periodic");
+  Require(result.build_mode == "full",
+          "spatial deformation was not rebuilt atomically");
+  Require(result.local_voxel_points == 1 && result.output_points == 1,
+          "spatial deformation duplicated one local surface");
+  Require(result.spatial_deformation_nodes == 2,
+          "spatial deformation did not use all eligible nodes");
+  const double x = result.cloud->front().x;
+  Require(x >= 5.0 && x <= 5.2,
+          "spatial deformation produced an invalid blended correction");
+}
+
+void TestSpatialDeformationDoesNotBlendAcrossQuarantine()
+{
+  OptimizedGlobalMap::Options options;
+  options.voxel_leaf_size_m = 0.1;
+  options.tile_size_m = 10.0;
+  options.preserve_rigid_local_submaps = false;
+  options.spatial_deformation_enabled = true;
+  options.spatial_deformation_neighbors = 2;
+  OptimizedGlobalMap map(options);
+  const std::vector<Keyframe::Ptr> keyframes{
+      MakeObservedPointKeyframe(0, 0.0, 5.0),
+      MakeObservedPointKeyframe(1, 1.0, 4.0),
+      MakeObservedPointKeyframe(2, 2.0, 3.0)};
+  const std::vector<Pose3d> global_poses{
+      Pose3d(),
+      Pose3d(Eigen::Quaterniond::Identity(), Eigen::Vector3d(1, 0, 0)),
+      Pose3d(Eigen::Quaterniond::Identity(), Eigen::Vector3d(4, 0, 0))};
+  const auto result = map.Build(
+      keyframes, global_poses, std::vector<std::uint8_t>{1U, 0U, 1U},
+      "graph_update");
+  Require(result.local_voxel_points == 2 && result.output_points == 2,
+          "spatial deformation blended across a quarantined topology gap");
+}
+
 void TestMapToOdomComposition()
 {
   const Pose3d T_odom_body(
@@ -144,6 +296,10 @@ int main()
   {
     TestOptimizedGlobalMapUsesGraphSnapshot();
     TestTiledIncrementalUpdateAndCorrectionThreshold();
+    TestQuarantinedKeyframesAreRemoved();
+    TestRigidLocalSubmapsSuppressPerKeyframeWarp();
+    TestSpatialDeformationDeduplicatesBeforeGlobalWarp();
+    TestSpatialDeformationDoesNotBlendAcrossQuarantine();
     TestMapToOdomComposition();
     std::cout << "optimized_global_map_test passed\n";
     return 0;

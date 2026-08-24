@@ -48,6 +48,25 @@ void ImuProcess::Reset()
   stale_lidar_overlap_reported = false;
 }
 
+void ImuProcess::Reset(
+    double start_timestamp,
+    const sensor_msgs::Imu::ConstSharedPtr &lastimu)
+{
+  if (!std::isfinite(start_timestamp) || start_timestamp < 0.0 || !lastimu)
+    throw std::invalid_argument("Invalid IMU segment rebase input");
+
+  // Preserve the already initialized gravity, biases and noise statistics.
+  // Only the propagation clock and cached scan state are discontinuous.  The
+  // missing interval is handled by LIVMapper's explicit motion model and is
+  // never presented to UndistortPcl as if IMU samples covered it.
+  IMUpose.clear();
+  pcl_wait_proc.clear();
+  cur_pcl_un_->clear();
+  last_imu = lastimu;
+  last_prop_end_time = start_timestamp;
+  stale_lidar_overlap_reported = false;
+}
+
 void ImuProcess::disable_imu()
 {
   cout << "IMU Disabled !!!!!" << endl;

@@ -12,6 +12,40 @@ which is included as part of this source code package.
 
 #include "voxel_map.h"
 
+#include <stdexcept>
+
+VoxelMapManager::~VoxelMapManager()
+{
+  for (auto &voxel : voxel_map_) delete voxel.second;
+  voxel_map_.clear();
+}
+
+std::size_t VoxelMapManager::ResetLocalMap(
+    const StatesGroup &seed_state)
+{
+  if (!seed_state.rot_end.allFinite() ||
+      !seed_state.pos_end.allFinite() ||
+      !seed_state.vel_end.allFinite() ||
+      !seed_state.bias_g.allFinite() ||
+      !seed_state.bias_a.allFinite() ||
+      !seed_state.gravity.allFinite() ||
+      !seed_state.cov.allFinite())
+    throw std::invalid_argument("Local-map reset seed state is invalid.");
+
+  const std::size_t deleted_voxels = voxel_map_.size();
+  for (auto &voxel : voxel_map_) delete voxel.second;
+  voxel_map_.clear();
+  state_ = seed_state;
+  position_last_ = seed_state.pos_end;
+  last_slide_position = seed_state.pos_end;
+  current_frame_id_ = 0;
+  scan_count = 0;
+  ave_build_residual_time = 0.0F;
+  ave_ekf_time = 0.0F;
+  ptpl_list_.clear();
+  return deleted_voxels;
+}
+
 void calcBodyCov(Eigen::Vector3d &pb, const float range_inc, const float degree_inc, Eigen::Matrix3d &cov)
 {
   if (pb[2] == 0) pb[2] = 0.0001;

@@ -100,7 +100,7 @@ LoopCandidateDetector::DetectionResult LoopCandidateDetector::AddKeyframe(
       keyframe->timestamp() <= keyframes_.back()->timestamp())
     throw std::logic_error(
         "Loop-candidate keyframe timestamps must be strictly increasing.");
-  if (!keyframe->T_map_body().isFinite())
+  if (!keyframe->T_slam_body().isFinite())
     throw std::invalid_argument(
         "Loop-candidate keyframe optimized pose is not finite.");
 
@@ -121,7 +121,7 @@ LoopCandidateDetector::DetectionResult LoopCandidateDetector::AddKeyframe(
     last_checked_id_ = keyframe->id();
     ++statistics_.detection_checks;
 
-    const Pose3d current_pose = keyframe->T_map_body();
+    const Pose3d current_pose = keyframe->T_slam_body();
     std::vector<RankedCandidate> nearby;
     for (const auto &historical : keyframes_)
     {
@@ -134,7 +134,7 @@ LoopCandidateDetector::DetectionResult LoopCandidateDetector::AddKeyframe(
         continue;
 
       ++result.eligible_history;
-      const Pose3d historical_pose = historical->T_map_body();
+      const Pose3d historical_pose = historical->T_slam_body();
       const Eigen::Vector3d delta =
           current_pose.translation - historical_pose.translation;
       const double planar_distance = delta.head<2>().norm();
@@ -174,7 +174,7 @@ LoopCandidateDetector::DetectionResult LoopCandidateDetector::AddKeyframe(
       }
       if (!separated) continue;
 
-      const Pose3d candidate_pose = ranked.keyframe->T_map_body();
+      const Pose3d candidate_pose = ranked.keyframe->T_slam_body();
       LoopCandidate candidate;
       candidate.current_id = keyframe->id();
       candidate.candidate_id = ranked.keyframe->id();

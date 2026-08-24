@@ -27,6 +27,20 @@ public:
     std::size_t minimum_graph_rebuild_keyframe_interval = 10;
     double incremental_max_pose_change_m = 0.10;
     double incremental_max_pose_change_deg = 0.25;
+    // Global corrections are sampled once per short local-SLAM submap. Every
+    // cloud inside a submap shares one rigid transform, preventing keyframe-
+    // rate RTK motion from thickening otherwise sharp local geometry.
+    bool preserve_rigid_local_submaps = true;
+    double rigid_submap_length_m = 10.0;
+    double rigid_submap_boundary_position_change_m = 0.50;
+    double rigid_submap_boundary_angle_change_deg = 0.50;
+    // Fuse repeated observations in the immutable local-SLAM frame first,
+    // then deform each unique voxel with a spatially interpolated global<-local
+    // correction. This prevents different keyframe corrections from creating
+    // multiple copies of the same local surface.
+    bool spatial_deformation_enabled = false;
+    std::size_t spatial_deformation_neighbors = 4;
+    double spatial_deformation_sigma_m = 5.0;
     std::string csv_path;
     std::string pcd_path;
   };
@@ -36,11 +50,18 @@ public:
     KeyframeCloud::ConstPtr cloud;
     std::size_t revision = 0;
     std::size_t keyframes = 0;
+    std::size_t included_keyframes = 0;
+    std::size_t quarantined_keyframes = 0;
     std::size_t input_points = 0;
     std::size_t output_points = 0;
     std::size_t processed_keyframes = 0;
     std::size_t updated_tiles = 0;
     std::size_t total_tiles = 0;
+    std::size_t rigid_submaps = 0;
+    std::size_t local_voxel_points = 0;
+    std::size_t spatial_deformation_nodes = 0;
+    double maximum_suppressed_position_warp_m = 0.0;
+    double maximum_suppressed_angle_warp_deg = 0.0;
     std::string build_mode;
     double build_time_ms = 0.0;
   };
@@ -54,6 +75,10 @@ public:
                                      double angle_change_deg) const;
   BuildResult Build(const std::vector<Keyframe::Ptr> &keyframes,
                     const std::vector<Pose3d> &optimized_poses,
+                    const std::string &reason);
+  BuildResult Build(const std::vector<Keyframe::Ptr> &keyframes,
+                    const std::vector<Pose3d> &optimized_poses,
+                    const std::vector<std::uint8_t> &eligible,
                     const std::string &reason);
   bool SaveLatest() const;
   BuildResult latest() const;
@@ -75,11 +100,24 @@ private:
 
   static void ValidateOptions(const Options &options);
 
+  struct RigidSubmapResult
+  {
+    std::vector<Pose3d> poses;
+    std::size_t count = 0;
+    double maximum_suppressed_position_warp_m = 0.0;
+    double maximum_suppressed_angle_warp_deg = 0.0;
+  };
+  RigidSubmapResult PreserveRigidLocalSubmaps(
+      const std::vector<Keyframe::Ptr> &keyframes,
+      const std::vector<Pose3d> &optimized_poses,
+      const std::vector<std::uint8_t> &eligible) const;
+
   Options options_;
   mutable std::mutex mutex_;
   mutable std::mutex build_mutex_;
   BuildResult latest_;
   std::vector<Pose3d> latest_poses_;
+  std::vector<std::uint8_t> latest_eligibility_;
   std::map<TileKey, KeyframeCloud::ConstPtr> tiles_;
   std::ofstream csv_stream_;
 };

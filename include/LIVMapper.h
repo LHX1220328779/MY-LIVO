@@ -14,13 +14,16 @@ which is included as part of this source code package.
 #define LIV_MAPPER_H
 
 #include "IMU_Processing.h"
+#include "backend/global_pose_layer.h"
 #include "backend/keyframe_manager.h"
 #include "backend/loop_candidate_detector.h"
 #include "backend/loop_registration.h"
 #include "backend/loop_verifier.h"
 #include "backend/optimized_global_map.h"
 #include "backend/pose_graph_optimizer.h"
+#include "backend/rtk_fusion_diagnostics.h"
 #include "backend/rtk_observation_buffer.h"
+#include "backend/rtk_velocity_guard.h"
 #include "vio.h"
 #include "preprocess.h"
 #include <cv_bridge/cv_bridge.h>
@@ -58,13 +61,16 @@ public:
   void requestBackendGlobalMapBuild(
       const std::vector<my_livo::backend::Keyframe::Ptr> &keyframes,
       const std::vector<my_livo::backend::Pose3d> &optimized_poses,
+      const std::vector<std::uint8_t> &eligible,
       const std::string &reason, double timestamp);
   void backendGlobalMapWorkerLoop();
   void stopBackendGlobalMapWorker();
   void handleRtkForKeyframe(
       const my_livo::backend::Keyframe::Ptr &keyframe);
+  bool executePendingFrontendSegmentRestart();
+  void publishBackendCurrentFrame();
   void savePCD();
-  void processImu();
+  bool processImu();
   
   bool sync_packages(LidarMeasureGroup &meas);
   void prop_imu_once(StatesGroup &imu_prop_state, const double dt, V3D acc_avr, V3D angvel_avr);
@@ -144,6 +150,9 @@ public:
   double imu_time_offset = 0.0;
   double lidar_time_offset = 0.0;
   double imu_max_time_gap = 0.2;
+  double imu_max_recoverable_gap = 2.0;
+  double minimum_lidar_time_after_imu_gap = -1.0;
+  std::uint64_t imu_gap_recovery_count = 0;
 
   bool gravity_align_en = false, gravity_align_finished = false;
 
@@ -247,9 +256,15 @@ public:
   std::size_t backend_global_map_request_coalesce_ms = 50;
   std::atomic<std::size_t> backend_last_optimized_path_count{0};
   bool backend_rtk_input_enabled = false;
-  bool backend_rtk_factors_enabled = false;
+  bool backend_rtk_fusion_enabled = false;
+  bool backend_frontend_segment_restart_enabled = false;
+  std::size_t backend_frontend_segment_minimum_seed_points = 1000;
+  std::size_t backend_frontend_segment_maximum_automatic_restarts = 1;
+  double backend_frontend_segment_position_sigma_floor_m = 0.10;
+  double backend_frontend_segment_rotation_sigma_floor_deg = 1.0;
+  string backend_frontend_segment_csv_path;
+  string backend_frontend_restart_supervisor_csv_path;
   double backend_rtk_innovation_prediction_sigma_m = 2.0;
-  double backend_rtk_innovation_gate_chi2 = 16.27;
   string backend_rtk_decision_csv_path;
   std::uint64_t backend_rtk_candidates = 0;
   std::uint64_t backend_rtk_selected = 0;
@@ -272,6 +287,21 @@ public:
       backend_rtk_buffer_options;
   my_livo::backend::RtkFactorSelector::Options
       backend_rtk_selector_options;
+  my_livo::backend::RtkFactorSelector::Options
+      backend_rtk_velocity_selector_options;
+  my_livo::backend::RtkFusionDiagnostics::Options
+      backend_rtk_diagnostics_options;
+  my_livo::backend::RtkVelocityGuard::Options
+      backend_rtk_velocity_guard_options;
+  double backend_rtk_velocity_evidence_max_age_sec = 1.5;
+  double backend_rtk_velocity_covariance_floor_mps = 0.50;
+  my_livo::backend::CorrectionRegime backend_rtk_velocity_regime =
+      my_livo::backend::CorrectionRegime::kWarmup;
+  bool backend_have_latest_rtk_velocity_result = false;
+  my_livo::backend::RtkVelocityGuard::Result
+      backend_latest_rtk_velocity_result;
+  my_livo::backend::GlobalPoseLayer::Options
+      backend_global_pose_options;
   std::unique_ptr<my_livo::backend::KeyframeManager> keyframe_manager;
   std::unique_ptr<my_livo::backend::PoseGraphOptimizer>
       pose_graph_optimizer;
@@ -286,10 +316,32 @@ public:
       rtk_observation_buffer;
   std::unique_ptr<my_livo::backend::RtkFactorSelector>
       rtk_factor_selector;
+  std::unique_ptr<my_livo::backend::RtkFactorSelector>
+      rtk_velocity_selector;
+  std::unique_ptr<my_livo::backend::RtkFusionDiagnostics>
+      rtk_fusion_diagnostics;
+  std::unique_ptr<my_livo::backend::RtkVelocityGuard> rtk_velocity_guard;
+  std::unique_ptr<my_livo::backend::GlobalPoseLayer>
+      global_pose_layer;
+  struct PendingFrontendSegmentRestart
+  {
+    std::uint64_t trigger_keyframe_id = 0;
+    double request_timestamp = 0.0;
+    std::string reason;
+    double evidence_span_m = 0.0;
+    bool reset_velocity = false;
+    V3D target_velocity = V3D::Zero();
+    V3D rtk_anchor_position = V3D::Zero();
+  };
+  std::optional<PendingFrontendSegmentRestart>
+      backend_pending_frontend_segment_restart;
+  std::uint64_t backend_frontend_segment_id = 0;
+  std::uint64_t backend_frontend_restart_request_count = 0;
   struct BackendGlobalMapRequest
   {
     std::vector<my_livo::backend::Keyframe::Ptr> keyframes;
     std::vector<my_livo::backend::Pose3d> optimized_poses;
+    std::vector<std::uint8_t> eligible;
     std::string reason;
     double timestamp = 0.0;
   };
@@ -314,6 +366,8 @@ public:
 
   ofstream fout_pre, fout_out, fout_visual_pos, fout_lidar_pos, fout_points;
   ofstream backend_rtk_decision_stream;
+  ofstream backend_frontend_segment_stream;
+  ofstream backend_frontend_restart_supervisor_stream;
 
   pcl::VoxelGrid<PointType> downSizeFilterSurf;
 
@@ -365,10 +419,19 @@ public:
   rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr
       pubBackendKeyframeCloud;
   rclcpp::Publisher<nav_msgs::Path>::SharedPtr pubBackendOptimizedPath;
+  rclcpp::Publisher<nav_msgs::Path>::SharedPtr pubBackendLocalSlamPath;
+  rclcpp::Publisher<nav_msgs::Path>::SharedPtr
+      pubBackendQuarantinedPath;
+  rclcpp::Publisher<visualization_msgs::MarkerArray>::SharedPtr
+      pubBackendRelocalizationStatus;
+  rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr
+      pubBackendFrontendRestartRequest;
   rclcpp::Publisher<nav_msgs::Odometry>::SharedPtr
       pubBackendOptimizedOdometry;
   rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr
       pubBackendOptimizedGlobalMap;
+  rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr
+      pubBackendCurrentFrameGlobal;
   rclcpp::Publisher<visualization_msgs::MarkerArray>::SharedPtr
       pubBackendLoopCandidates;
   rclcpp::Publisher<visualization_msgs::MarkerArray>::SharedPtr

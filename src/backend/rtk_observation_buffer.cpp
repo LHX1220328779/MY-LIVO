@@ -84,10 +84,23 @@ RtkObservationBuffer::RtkObservationBuffer(const Options &options)
   OpenCsv(options_.status_csv_path, &status_csv_stream_,
           "timestamp,parsed,ins_pos_mode");
   OpenCsv(options_.solution_csv_path, &solution_csv_stream_,
-          "timestamp,x,y,z,qx,qy,qz,qw,sigma_x,sigma_y,sigma_z");
+          "timestamp,x,y,z,qx,qy,qz,qw,sigma_x,sigma_y,sigma_z,"
+          "raw_x,raw_y,raw_z,lever_correction_x,lever_correction_y,"
+          "lever_correction_z,reported_variance_x,reported_variance_y,"
+          "reported_variance_z,velocity_valid,velocity_x,velocity_y,"
+          "velocity_z,velocity_sigma_x,velocity_sigma_y,velocity_sigma_z,"
+          "reported_velocity_variance_x,reported_velocity_variance_y,"
+          "reported_velocity_variance_z");
   OpenCsv(options_.query_csv_path, &query_csv_stream_,
           "timestamp,accepted,reason,lower_timestamp,upper_timestamp,alpha,"
-          "x,y,z,sigma_x,sigma_y,sigma_z");
+          "x,y,z,sigma_x,sigma_y,sigma_z,raw_x,raw_y,raw_z,"
+          "lever_correction_x,lever_correction_y,lever_correction_z,"
+          "reported_variance_x,reported_variance_y,reported_variance_z,"
+          "lower_ins_pos_mode,upper_ins_pos_mode,health,velocity_valid,"
+          "velocity_x,velocity_y,velocity_z,velocity_sigma_x,"
+          "velocity_sigma_y,velocity_sigma_z,"
+          "reported_velocity_variance_x,reported_velocity_variance_y,"
+          "reported_velocity_variance_z");
 }
 
 void RtkObservationBuffer::ValidateOptions(const Options &options)
@@ -99,7 +112,11 @@ void RtkObservationBuffer::ValidateOptions(const Options &options)
       !FinitePositive(options.configured_sigma_xy_m) ||
       !FinitePositive(options.configured_sigma_z_m) ||
       !FinitePositive(options.minimum_sigma_xy_m) ||
-      !FinitePositive(options.minimum_sigma_z_m))
+      !FinitePositive(options.minimum_sigma_z_m) ||
+      !FinitePositive(options.configured_velocity_sigma_xy_mps) ||
+      !FinitePositive(options.configured_velocity_sigma_z_mps) ||
+      !FinitePositive(options.minimum_velocity_sigma_xy_mps) ||
+      !FinitePositive(options.minimum_velocity_sigma_z_mps))
     throw std::invalid_argument("RTK buffer time/noise options must be positive.");
   if (options.maximum_endpoint_distance_sec > options.retention_sec ||
       options.maximum_interpolation_gap_sec > options.retention_sec)
@@ -149,8 +166,27 @@ bool RtkObservationBuffer::AddSolution(const RtkSolution &solution)
   }
   RtkSolution normalized = solution;
   normalized.orientation.normalize();
+  normalized.reported_position_covariance = solution.position_covariance;
   normalized.position_covariance =
       SanitizedCovariance(solution.position_covariance);
+  if (normalized.has_velocity)
+  {
+    if (!normalized.velocity.allFinite()) return false;
+    normalized.reported_velocity_covariance =
+        solution.velocity_covariance;
+    normalized.velocity_covariance =
+        SanitizedVelocityCovariance(solution.velocity_covariance);
+  }
+  if (!normalized.has_raw_position)
+  {
+    normalized.raw_position = normalized.position;
+    normalized.lever_arm_correction.setZero();
+  }
+  else if (!normalized.raw_position.allFinite() ||
+           !normalized.lever_arm_correction.allFinite())
+  {
+    return false;
+  }
   if (!solution_buffer_.empty() &&
       solution.timestamp == solution_buffer_.back().timestamp)
     solution_buffer_.back() = normalized;
@@ -170,7 +206,31 @@ bool RtkObservationBuffer::AddSolution(const RtkSolution &solution)
         << ',' << normalized.orientation.w() << ','
         << std::sqrt(normalized.position_covariance(0, 0)) << ','
         << std::sqrt(normalized.position_covariance(1, 1)) << ','
-        << std::sqrt(normalized.position_covariance(2, 2)) << '\n';
+        << std::sqrt(normalized.position_covariance(2, 2)) << ','
+        << normalized.raw_position.x() << ','
+        << normalized.raw_position.y() << ','
+        << normalized.raw_position.z() << ','
+        << normalized.lever_arm_correction.x() << ','
+        << normalized.lever_arm_correction.y() << ','
+        << normalized.lever_arm_correction.z() << ','
+        << normalized.reported_position_covariance(0, 0) << ','
+        << normalized.reported_position_covariance(1, 1) << ','
+        << normalized.reported_position_covariance(2, 2) << ','
+        << static_cast<int>(normalized.has_velocity) << ',';
+  if (solution_csv_stream_.is_open())
+  {
+    if (normalized.has_velocity)
+      solution_csv_stream_ << normalized.velocity.x() << ','
+          << normalized.velocity.y() << ',' << normalized.velocity.z()
+          << ',' << std::sqrt(normalized.velocity_covariance(0, 0)) << ','
+          << std::sqrt(normalized.velocity_covariance(1, 1)) << ','
+          << std::sqrt(normalized.velocity_covariance(2, 2)) << ','
+          << normalized.reported_velocity_covariance(0, 0) << ','
+          << normalized.reported_velocity_covariance(1, 1) << ','
+          << normalized.reported_velocity_covariance(2, 2) << '\n';
+    else
+      solution_csv_stream_ << ",,,,,,,,\n";
+  }
   return true;
 }
 
@@ -227,6 +287,30 @@ Eigen::Matrix3d RtkObservationBuffer::SanitizedCovariance(
       options_.minimum_sigma_xy_m,
       options_.minimum_sigma_xy_m,
       options_.minimum_sigma_z_m};
+  for (int axis = 0; axis < 3; ++axis)
+  {
+    double sigma = configured[axis];
+    const double variance = reported(axis, axis);
+    if (std::isfinite(variance) && variance > 0.0)
+      sigma = std::sqrt(variance);
+    sigma = std::max(sigma, floors[axis]);
+    covariance(axis, axis) = sigma * sigma;
+  }
+  return covariance;
+}
+
+Eigen::Matrix3d RtkObservationBuffer::SanitizedVelocityCovariance(
+    const Eigen::Matrix3d &reported) const
+{
+  Eigen::Matrix3d covariance = Eigen::Matrix3d::Zero();
+  const double configured[3] = {
+      options_.configured_velocity_sigma_xy_mps,
+      options_.configured_velocity_sigma_xy_mps,
+      options_.configured_velocity_sigma_z_mps};
+  const double floors[3] = {
+      options_.minimum_velocity_sigma_xy_mps,
+      options_.minimum_velocity_sigma_xy_mps,
+      options_.minimum_velocity_sigma_z_mps};
   for (int axis = 0; axis < 3; ++axis)
   {
     double sigma = configured[axis];
@@ -328,11 +412,37 @@ RtkObservationQuery RtkObservationBuffer::GetObservationAt(double timestamp)
   observation.interpolation_alpha = alpha;
   observation.position = (1.0 - alpha) * lower_solution->position +
                          alpha * upper_solution->position;
+  observation.raw_position =
+      (1.0 - alpha) * lower_solution->raw_position +
+      alpha * upper_solution->raw_position;
+  observation.lever_arm_correction =
+      (1.0 - alpha) * lower_solution->lever_arm_correction +
+      alpha * upper_solution->lever_arm_correction;
   observation.orientation = lower_solution->orientation.slerp(
       alpha, upper_solution->orientation).normalized();
+  observation.has_velocity = lower_solution->has_velocity &&
+      upper_solution->has_velocity;
+  if (observation.has_velocity)
+  {
+    observation.velocity =
+        (1.0 - alpha) * lower_solution->velocity +
+        alpha * upper_solution->velocity;
+    observation.reported_velocity_covariance =
+        (1.0 - alpha) * lower_solution->reported_velocity_covariance +
+        alpha * upper_solution->reported_velocity_covariance;
+    observation.velocity_covariance =
+        (1.0 - alpha) * lower_solution->velocity_covariance +
+        alpha * upper_solution->velocity_covariance;
+  }
+  observation.reported_position_covariance =
+      (1.0 - alpha) * lower_solution->reported_position_covariance +
+      alpha * upper_solution->reported_position_covariance;
   observation.position_covariance =
       (1.0 - alpha) * lower_solution->position_covariance +
       alpha * upper_solution->position_covariance;
+  observation.lower_ins_pos_mode = *lower_mode;
+  observation.upper_ins_pos_mode = *upper_mode;
+  observation.health = 1.0;
   query.observation = observation;
   query.reason = RtkObservationRejectReason::kAccepted;
   ++statistics_.observations;
@@ -349,7 +459,13 @@ void RtkObservationBuffer::RecordQueryLocked(
                     << RtkObservationRejectReasonToString(query.reason);
   if (!query.observation)
   {
-    query_csv_stream_ << ",,,,,,,,,\n";
+    // 31 fields follow reason in the current schema.
+    query_csv_stream_ << std::string(31, ',') << '\n';
+    // Queries are produced at keyframe rate and are part of the validation
+    // contract: every keyframe must have one durable query record.  Do not
+    // leave the tail in the C++ stream buffer, because ROS launch may stop the
+    // process without running all destructors.
+    query_csv_stream_.flush();
     return;
   }
   const auto &observation = *query.observation;
@@ -361,7 +477,39 @@ void RtkObservationBuffer::RecordQueryLocked(
                     << observation.position.z() << ','
                     << std::sqrt(observation.position_covariance(0, 0)) << ','
                     << std::sqrt(observation.position_covariance(1, 1)) << ','
-                    << std::sqrt(observation.position_covariance(2, 2)) << '\n';
+                    << std::sqrt(observation.position_covariance(2, 2)) << ','
+                    << observation.raw_position.x() << ','
+                    << observation.raw_position.y() << ','
+                    << observation.raw_position.z() << ','
+                    << observation.lever_arm_correction.x() << ','
+                    << observation.lever_arm_correction.y() << ','
+                    << observation.lever_arm_correction.z() << ','
+                    << observation.reported_position_covariance(0, 0) << ','
+                    << observation.reported_position_covariance(1, 1) << ','
+                    << observation.reported_position_covariance(2, 2) << ','
+                    << observation.lower_ins_pos_mode << ','
+                    << observation.upper_ins_pos_mode << ','
+                    << observation.health << ','
+                    << static_cast<int>(observation.has_velocity) << ',';
+  if (observation.has_velocity)
+    query_csv_stream_ << observation.velocity.x() << ','
+                      << observation.velocity.y() << ','
+                      << observation.velocity.z() << ','
+                      << std::sqrt(
+                             observation.velocity_covariance(0, 0)) << ','
+                      << std::sqrt(
+                             observation.velocity_covariance(1, 1)) << ','
+                      << std::sqrt(
+                             observation.velocity_covariance(2, 2)) << ','
+                      << observation.reported_velocity_covariance(0, 0)
+                      << ','
+                      << observation.reported_velocity_covariance(1, 1)
+                      << ','
+                      << observation.reported_velocity_covariance(2, 2)
+                      << '\n';
+  else
+    query_csv_stream_ << ",,,,,,,,\n";
+  query_csv_stream_.flush();
 }
 
 RtkObservationBuffer::Statistics RtkObservationBuffer::statistics() const

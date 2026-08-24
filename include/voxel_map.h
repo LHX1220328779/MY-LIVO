@@ -224,6 +224,12 @@ public:
     feats_down_world_.reset(new PointCloudXYZI());
   };
 
+  ~VoxelMapManager();
+
+  // Delete the active local submap while preserving the current scan caches,
+  // so the caller can seed a new submap at the same LiDAR boundary.
+  std::size_t ResetLocalMap(const StatesGroup &seed_state);
+
   void StateEstimation(StatesGroup &state_propagat);
   void TransformLidar(const Eigen::Matrix3d rot, const Eigen::Vector3d t, const PointCloudXYZI::Ptr &input_cloud,
                       pcl::PointCloud<pcl::PointXYZI>::Ptr &trans_cloud);

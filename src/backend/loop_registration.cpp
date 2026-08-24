@@ -279,7 +279,7 @@ private:
       *diagnostic = "null keyframe";
       return false;
     }
-    const Pose3d pose = keyframe->T_map_body();
+    const Pose3d pose = keyframe->T_slam_body();
     // KeyframeManager already performs a full finite-point validation before
     // storing an immutable cloud. Repeating that O(points) scan here would put
     // NDT preparation work back onto the FAST-LIVO2 thread.

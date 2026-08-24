@@ -26,6 +26,15 @@ void Require(bool condition, const std::string &message)
   if (!condition) throw std::runtime_error(message);
 }
 
+int CountFileLines(const std::filesystem::path &path)
+{
+  std::ifstream stream(path);
+  std::string line;
+  int lines = 0;
+  while (std::getline(stream, line)) ++lines;
+  return lines;
+}
+
 Pose3d MakePose(double x, double y, double z, double yaw_degrees)
 {
   return Pose3d(
@@ -64,10 +73,10 @@ void TestChainOptimizationAndStatistics()
   auto keyframe1 = MakeKeyframe(1, 101.0, MakePose(1.0, 0.2, 0.1, 5.0));
   auto keyframe2 = MakeKeyframe(2, 102.0, MakePose(2.0, 0.6, 0.2, 12.0));
 
-  // Deliberately perturb the first node's initial T_map_body while keeping its
+  // Deliberately perturb the first node's initial T_slam_body while keeping its
   // immutable raw pose as the prior measurement. This proves iSAM2 performs
   // an update instead of merely returning identical initial values.
-  keyframe0->set_T_map_body(MakePose(0.4, -0.2, 0.3, 8.0));
+  keyframe0->set_T_slam_body(MakePose(0.4, -0.2, 0.3, 8.0));
 
   const auto result0 = optimizer.AddKeyframe(keyframe0);
   Require(!result0.optimization_ran,
@@ -94,7 +103,7 @@ void TestChainOptimizationAndStatistics()
   for (const auto &keyframe : {keyframe0, keyframe1, keyframe2})
   {
     const Pose3d raw = keyframe->T_odom_body();
-    const Pose3d optimized = keyframe->T_map_body();
+    const Pose3d optimized = keyframe->T_slam_body();
     Require((raw.translation - optimized.translation).norm() < 1.0e-8,
             "optimized chain translation differs from raw odometry");
     Require(raw.rotation.angularDistance(optimized.rotation) < 1.0e-9,
@@ -169,6 +178,8 @@ void TestRobustLoopFactorUpdate()
           MakePose(1.1 * static_cast<double>(id), 0.0, 0.0, 0.0)));
       (void)optimizer.AddKeyframe(keyframes.back());
     }
+    Require(CountFileLines(trajectory_path) == 5,
+            "live trajectory snapshot is missing odometry keyframes");
     const auto loop = optimizer.AddLoopFactor(
         0, 3, MakePose(3.0, 0.0, 0.0, 0.0));
     Require(loop.added && loop.solution_usable,
@@ -186,6 +197,11 @@ void TestRobustLoopFactorUpdate()
     Require(statistics.loop_factors == 1 &&
                 statistics.loop_optimization_runs == 1,
             "loop-factor statistics are incorrect");
+    Require(CountFileLines(trajectory_path) == 5,
+            "live trajectory snapshot was truncated by loop rewrite");
+    Require(!std::filesystem::exists(
+                std::filesystem::path(trajectory_path.string() + ".tmp")),
+            "atomic trajectory rewrite left a temporary file");
 
     bool duplicate_rejected = false;
     try
@@ -215,81 +231,29 @@ void TestRobustLoopFactorUpdate()
   std::filesystem::remove(trajectory_path);
 }
 
-void TestRobustRtkPositionFactorUpdate()
+void TestLocalGraphRtkAuditRemainsEmpty()
 {
   const auto path = std::filesystem::temp_directory_path() /
-                    "my_livo_rtk_factor_test.csv";
+                    "my_livo_local_graph_rtk_audit_test.csv";
   {
     PoseGraphOptimizer::Options options;
-    options.rtk_robust_kernel = "huber";
-    options.rtk_robust_delta = 10.0;
-    options.rtk_additional_update_steps = 2;
     options.rtk_csv_path = path.string();
     PoseGraphOptimizer optimizer(options);
-    std::vector<Keyframe::Ptr> keyframes;
     for (std::uint64_t id = 0; id < 4; ++id)
     {
-      keyframes.push_back(MakeKeyframe(
+      const auto keyframe = MakeKeyframe(
           id, static_cast<double>(id),
-          MakePose(1.1 * static_cast<double>(id), 0, 0, 0)));
-      (void)optimizer.AddKeyframe(keyframes.back());
+          MakePose(1.1 * static_cast<double>(id), 0, 0, 0));
+      (void)optimizer.AddKeyframe(keyframe);
     }
-    const Eigen::Matrix3d covariance =
-        0.01 * Eigen::Matrix3d::Identity();
-    const auto update = optimizer.AddRtkPositionFactor(
-        3, Eigen::Vector3d(3.0, 0, 0), covariance);
-    Require(update.added && update.solution_usable,
-            "valid RTK position factor was not added");
-    Require(update.innovation_before_m.norm() > 0.29 &&
-                update.innovation_after_m.norm() <
-                    update.innovation_before_m.norm(),
-            "RTK position factor did not reduce its residual");
-    Require(std::abs(keyframes.back()->T_odom_body().translation.x() - 3.3) <
-                1.0e-12,
-            "RTK optimization modified immutable raw odometry");
-    Require(optimizer.statistics().rtk_factors == 1,
-            "RTK factor statistics are incorrect");
-    bool duplicate_rejected = false;
-    try
-    {
-      (void)optimizer.AddRtkPositionFactor(
-          3, Eigen::Vector3d(3.0, 0, 0), covariance);
-    }
-    catch (const std::logic_error &)
-    {
-      duplicate_rejected = true;
-    }
-    Require(duplicate_rejected, "duplicate RTK factor was not rejected");
   }
   std::ifstream csv(path);
   std::string line;
   int lines = 0;
   while (std::getline(csv, line)) ++lines;
-  Require(lines == 2, "RTK factor CSV row count is incorrect");
+  Require(lines == 1,
+          "local graph unexpectedly wrote an absolute RTK factor");
   std::filesystem::remove(path);
-}
-
-void TestRobustRtkOutlierDoesNotCollapseGraph()
-{
-  PoseGraphOptimizer::Options options;
-  options.rtk_robust_kernel = "cauchy";
-  options.rtk_robust_delta = 1.0;
-  options.rtk_additional_update_steps = 2;
-  PoseGraphOptimizer optimizer(options);
-  std::vector<Keyframe::Ptr> keyframes;
-  for (std::uint64_t id = 0; id < 10; ++id)
-  {
-    keyframes.push_back(MakeKeyframe(
-        id, static_cast<double>(id), MakePose(id, 0, 0, 0)));
-    (void)optimizer.AddKeyframe(keyframes.back());
-  }
-  const Eigen::Matrix3d covariance =
-      0.09 * Eigen::Matrix3d::Identity();
-  const auto update = optimizer.AddRtkPositionFactor(
-      9, Eigen::Vector3d(100, 100, 100), covariance);
-  Require(update.added, "robust RTK outlier factor was not processed");
-  Require(update.maximum_pose_correction_m < 0.1,
-          "Cauchy RTK outlier collapsed the odometry graph");
 }
 }  // namespace
 
@@ -300,8 +264,7 @@ int main()
     TestChainOptimizationAndStatistics();
     TestIdInvariant();
     TestRobustLoopFactorUpdate();
-    TestRobustRtkPositionFactorUpdate();
-    TestRobustRtkOutlierDoesNotCollapseGraph();
+    TestLocalGraphRtkAuditRemainsEmpty();
   }
   catch (const std::exception &error)
   {

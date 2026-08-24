@@ -25,9 +25,27 @@ struct RtkSolution
 {
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
   double timestamp = 0.0;
+  // position is the measurement expressed at the same physical body point
+  // used by LIO. raw_position preserves the driver-provided reference point
+  // (the CGI-610 rear axle in the mine data contract) for lever-arm audits.
   Eigen::Vector3d position = Eigen::Vector3d::Zero();
+  Eigen::Vector3d raw_position = Eigen::Vector3d::Zero();
+  Eigen::Vector3d lever_arm_correction = Eigen::Vector3d::Zero();
+  bool has_raw_position = false;
   Eigen::Quaterniond orientation = Eigen::Quaterniond::Identity();
+  // CGI-610 Odometry twist is expressed in child/body coordinates by the
+  // ROS contract. The adapter rotates it into the mine/world frame before
+  // populating this field. When unavailable, the velocity guard falls back
+  // to position differencing.
+  bool has_velocity = false;
+  Eigen::Vector3d velocity = Eigen::Vector3d::Zero();
+  // The receiver currently reports a zero covariance. Keep it separately
+  // from the sanitized covariance so diagnostics can distinguish receiver
+  // metadata from the covariance actually used by the backend.
+  Eigen::Matrix3d reported_position_covariance = Eigen::Matrix3d::Zero();
   Eigen::Matrix3d position_covariance = Eigen::Matrix3d::Zero();
+  Eigen::Matrix3d reported_velocity_covariance = Eigen::Matrix3d::Zero();
+  Eigen::Matrix3d velocity_covariance = Eigen::Matrix3d::Zero();
 };
 
 struct RtkObservation
@@ -35,11 +53,21 @@ struct RtkObservation
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
   double timestamp = 0.0;
   Eigen::Vector3d position = Eigen::Vector3d::Zero();
+  Eigen::Vector3d raw_position = Eigen::Vector3d::Zero();
+  Eigen::Vector3d lever_arm_correction = Eigen::Vector3d::Zero();
   Eigen::Quaterniond orientation = Eigen::Quaterniond::Identity();
+  bool has_velocity = false;
+  Eigen::Vector3d velocity = Eigen::Vector3d::Zero();
+  Eigen::Matrix3d reported_position_covariance = Eigen::Matrix3d::Zero();
   Eigen::Matrix3d position_covariance = Eigen::Matrix3d::Identity();
+  Eigen::Matrix3d reported_velocity_covariance = Eigen::Matrix3d::Zero();
+  Eigen::Matrix3d velocity_covariance = Eigen::Matrix3d::Identity();
   double lower_timestamp = 0.0;
   double upper_timestamp = 0.0;
   double interpolation_alpha = 0.0;
+  int lower_ins_pos_mode = 0;
+  int upper_ins_pos_mode = 0;
+  double health = 0.0;
 };
 
 enum class RtkObservationRejectReason
@@ -76,6 +104,10 @@ public:
     double configured_sigma_z_m = 0.50;
     double minimum_sigma_xy_m = 0.10;
     double minimum_sigma_z_m = 0.20;
+    double configured_velocity_sigma_xy_mps = 0.25;
+    double configured_velocity_sigma_z_mps = 0.40;
+    double minimum_velocity_sigma_xy_mps = 0.05;
+    double minimum_velocity_sigma_z_mps = 0.10;
     std::string status_csv_path;
     std::string solution_csv_path;
     std::string query_csv_path;
@@ -116,6 +148,8 @@ private:
   std::optional<int> ModeAtLocked(double timestamp) const;
   bool HasIneligibleStatusLocked(double begin, double end) const;
   Eigen::Matrix3d SanitizedCovariance(
+      const Eigen::Matrix3d &reported) const;
+  Eigen::Matrix3d SanitizedVelocityCovariance(
       const Eigen::Matrix3d &reported) const;
   void PruneLocked(double newest_timestamp);
   void RecordQueryLocked(double timestamp,

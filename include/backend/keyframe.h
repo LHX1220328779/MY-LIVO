@@ -101,7 +101,8 @@ public:
         cloud_body_(cloud_body),
         odom_covariance_(odom_covariance),
         trigger_mask_(trigger_mask),
-        T_map_body_(T_odom_body)
+        T_slam_body_(T_odom_body),
+        T_global_body_(T_odom_body)
   {
   }
 
@@ -112,16 +113,28 @@ public:
   const Matrix6d &odom_covariance() const { return odom_covariance_; }
   std::uint8_t trigger_mask() const { return trigger_mask_; }
 
-  Pose3d T_map_body() const
+  Pose3d T_slam_body() const
   {
     std::lock_guard<std::mutex> lock(optimized_pose_mutex_);
-    return T_map_body_;
+    return T_slam_body_;
   }
 
-  void set_T_map_body(const Pose3d &pose)
+  void set_T_slam_body(const Pose3d &pose)
   {
     std::lock_guard<std::mutex> lock(optimized_pose_mutex_);
-    T_map_body_ = pose;
+    T_slam_body_ = pose;
+  }
+
+  Pose3d T_global_body() const
+  {
+    std::lock_guard<std::mutex> lock(optimized_pose_mutex_);
+    return T_global_body_;
+  }
+
+  void set_T_global_body(const Pose3d &pose)
+  {
+    std::lock_guard<std::mutex> lock(optimized_pose_mutex_);
+    T_global_body_ = pose;
   }
 
 private:
@@ -133,7 +146,8 @@ private:
   const std::uint8_t trigger_mask_;
 
   mutable std::mutex optimized_pose_mutex_;
-  Pose3d T_map_body_;
+  Pose3d T_slam_body_;
+  Pose3d T_global_body_;
 };
 
 }  // namespace my_livo::backend

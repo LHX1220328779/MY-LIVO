@@ -12,7 +12,9 @@ laser_mapping:
     multi_lidar:
       enabled: true
       # calibration_file: "/home/project/data/haibo/huaining/03/sensor-imu_calibration/perception_truck03.json"
+      # calibration_file: "/home/project/data/haibo/huaining/05/sensor-imu_calibration/perception_truck05.json"
       calibration_file: "/home/project/data/haibo/wuhu_livo/sensor-imu_calibration/perception_truck29.json" # wuhu_29
+      # calibration_file: "/home/project/data/haibo/chizhou/10/sensor-imu_calibration/perception_truck10.json" # wuhu_29
       # topics and transform_keys are paired by index. Keep only the desired
       # pairs to run with any subset of the available LiDAR sources.
       topics: ["/front_right_lidar", "/back_lidar", "/front_left_lidar", "/front_lidar"]
@@ -94,7 +96,11 @@ laser_mapping:
       gyr_cov: 0.01
       # 100 Hz source: allow one missing sample, but never interpolate across
       # a long hole while deskewing a scan.
-      maximum_time_gap: 0.025
+      maximum_time_gap: 0.020
+      # Separate recorded bag chunks can contain a short sensor-wide hole.
+      # Rebase the estimator clock and drop straddling scans instead of
+      # interpolating missing IMU data or terminating the entire mission.
+      maximum_recoverable_gap: 2.0
       gravity_est_en: true
       ba_bg_est_en: true
 
@@ -162,7 +168,7 @@ laser_mapping:
       # Candidate generation is spatially gated and runs only at keyframe
       # cadence; accepted candidates continue through registration/verification.
       loop_detection:
-        enabled: true
+        enabled: false
         check_interval_keyframes: 20
         minimum_id_separation_keyframes: 50
         minimum_time_separation_sec: 30.0
@@ -174,7 +180,7 @@ laser_mapping:
         candidate_csv_path: "/home/project/MY-LIVO2.0/Log/backend/loop_candidates.csv"
       # Multi-resolution NDT runs on a bounded background worker.
       loop_registration:
-        enabled: true
+        enabled: false
         target_submap_half_width_keyframes: 40
         target_submap_stride_keyframes: 4
         resolutions_m: [10.0, 5.0, 2.0, 1.0]
@@ -191,7 +197,7 @@ laser_mapping:
         level_csv_path: "/home/project/MY-LIVO2.0/Log/backend/loop_registration_levels.csv"
       # Only quality- and neighbor-consistent registrations enter GTSAM.
       loop_verification:
-        enabled: true
+        enabled: false
         require_final_convergence: true
         minimum_converged_levels: 4
         minimum_transformation_probability: 0.35
@@ -207,7 +213,7 @@ laser_mapping:
         minimum_consistent_neighbors: 1
         csv_path: "/home/project/MY-LIVO2.0/Log/backend/loop_verification.csv"
       loop_pose_graph:
-        enabled: true
+        enabled: false
         translation_sigma_m: 0.20
         rotation_sigma_deg: 3.0
         robust_kernel: "cauchy"
@@ -215,6 +221,114 @@ laser_mapping:
         additional_update_steps: 2
         csv_path: "/home/project/MY-LIVO2.0/Log/backend/loop_factors.csv"
       optimized_trajectory_csv_path: "/home/project/MY-LIVO2.0/Log/backend/optimized_trajectory.csv"
+      global_pose:
+        # Startup already supplies A0; C(s) only changes the global layer.
+        trajectory_csv_path: "/home/project/MY-LIVO2.0/Log/backend/global_trajectory.csv"
+        observation_csv_path: "/home/project/MY-LIVO2.0/Log/backend/global_rtk_observations.csv"
+        correction_monitor:
+          minimum_baseline_m: 20.0
+          elastic_gradient_limit_m_per_m: 0.02
+          relocalization_gradient_m_per_m: 0.15
+          relocalization_consecutive_observations: 2
+          csv_path: "/home/project/MY-LIVO2.0/Log/backend/correction_feasibility.csv"
+        correction_field:
+          enabled: true
+          knot_spacing_m: 15.0
+          spatial_low_pass_length_m: 40.0
+          # Quintic distance-adaptive radial elastic stiffness. Magnetic
+          # spheres are visualization only and use this same continuous law.
+          elastic_soft_radius_m: 0.20
+          elastic_full_radius_m: 0.28
+          elastic_minimum_stiffness: 0.05
+          elastic_maximum_stiffness: 1.0
+          maximum_planar_gradient_m_per_m: 0.005
+          maximum_vertical_gradient_m_per_m: 0.003
+          maximum_yaw_gradient_deg_per_m: 0.01
+          maximum_planar_update_m: 0.05
+          maximum_vertical_update_m: 0.03
+          maximum_yaw_update_deg: 0.15
+          csv_path: "/home/project/MY-LIVO2.0/Log/backend/correction_field.csv"
+        # Production causal C2 field. Only about-1Hz status-4 positions form
+        # robust sliding-window 4DOF targets; receiver attitude is excluded.
+        regularized_field:
+          position_observation_weight: 1.0
+          yaw_observation_weight: 10.0
+          position_second_difference_lambda: 10.0
+          yaw_second_difference_lambda: 10.0
+          yaw_window_m: 30.0
+          minimum_yaw_confidence: 0.05
+          # Production rubber-band law: |F| is proportional to alpha(d)*d.
+          # It is zero in the inner tolerance and increases monotonically.
+          elastic_soft_radius_m: 0.20
+          elastic_full_radius_m: 1.00
+          elastic_minimum_stiffness: 0.0
+          elastic_maximum_stiffness: 1.0
+          alignment_window_length_m: 30.0
+          minimum_alignment_path_length_m: 10.0
+          alignment_huber_delta_m: 0.15
+          maximum_alignment_planar_rms_m: 0.30
+          maximum_planar_gradient_m_per_m: 0.20
+          maximum_vertical_gradient_m_per_m: 0.18
+          maximum_yaw_gradient_deg_per_m: 0.10
+          extrapolation_regression_knots: 3
+          maximum_extrapolation_distance_m: 8.0
+          maximum_planar_extrapolation_slope_m_per_m: 0.25
+          maximum_vertical_extrapolation_slope_m_per_m: 0.15
+          csv_path: "/home/project/MY-LIVO2.0/Log/backend/regularized_correction_field.csv"
+        elastic_acceptance:
+          minimum_position_observations: 6
+          minimum_path_length_m: 30.0
+          maximum_position_residual_m: 0.30
+          maximum_yaw_residual_deg: 0.50
+          maximum_post_velocity_error_mps: 0.80
+          maximum_field_gradient_m_per_m: 0.30
+          maximum_yaw_gradient_deg_per_m: 0.20
+          maximum_outlier_fraction: 0.25
+          csv_path: "/home/project/MY-LIVO2.0/Log/backend/elastic_segment_acceptance.csv"
+        # New global segments remain shadow-only until velocity, no-scale
+        # path consistency and a gravity-constrained 4DOF fit all agree.
+        relocalization_monitor:
+          enabled: true
+          maximum_post_velocity_error_mps: 0.8
+          minimum_observations: 4
+          minimum_path_length_m: 30.0
+          maximum_window_length_m: 80.0
+          maximum_path_scale_error: 0.05
+          maximum_planar_rms_m: 0.35
+          maximum_vertical_rms_m: 0.50
+          required_consecutive_candidates: 2
+          # Escalate only after repeated non-rigid evidence over real travel.
+          restart_after_consecutive_structural_rejections: 3
+          restart_minimum_rejection_span_m: 15.0
+          diagnostic_minimum_condition_ratio: 0.01
+          diagnostic_minimum_scale_error: 0.03
+          diagnostic_minimum_nonyaw_rotation_deg: 1.0
+          diagnostic_maximum_similarity_rms_m: 0.40
+          csv_path: "/home/project/MY-LIVO2.0/Log/backend/rigid_relocalization.csv"
+        # After a dynamic restart, use the independent ~1 Hz status-4 stream
+        # to find the first stable no-scale 4DOF subsegment. This changes only
+        # the quarantined global frame; it never writes the local graph.
+        recovery_monitor:
+          maximum_post_velocity_error_mps: 0.8
+          minimum_observations: 4
+          minimum_path_length_m: 30.0
+          maximum_window_length_m: 80.0
+          maximum_path_scale_error: 0.05
+          maximum_planar_rms_m: 0.75
+          maximum_vertical_rms_m: 1.0
+          required_consecutive_candidates: 2
+          select_best_valid_suffix: true
+          csv_path: "/home/project/MY-LIVO2.0/Log/backend/recovery_relocalization.csv"
+      frontend_segment_restart:
+        # LIO-only: preserve the continuous IMU state and rebuild only the
+        # corrupted local voxel submap at a latched structural failure.
+        enabled: true
+        minimum_seed_points: 1000
+        maximum_automatic_restarts: 1
+        position_sigma_floor_m: 0.10
+        rotation_sigma_floor_deg: 1.0
+        csv_path: "/home/project/MY-LIVO2.0/Log/backend/frontend_segments.csv"
+        supervisor_csv_path: "/home/project/MY-LIVO2.0/Log/backend/frontend_restart_supervisor.csv"
       global_map:
         enabled: true
         voxel_leaf_size_m: 0.2
@@ -228,14 +342,24 @@ laser_mapping:
         # next periodic snapshot instead of rebuilding after every RTK factor.
         incremental_max_pose_change_m: 0.10
         incremental_max_pose_change_deg: 0.25
+        # Each short map block uses one global<-local transform. The elastic
+        # field moves blocks globally but cannot warp individual scans inside.
+        preserve_rigid_local_submaps: true
+        rigid_submap_length_m: 10.0
+        rigid_submap_boundary_position_change_m: 0.50
+        rigid_submap_boundary_angle_change_deg: 0.50
+        # Deduplicate in the sharp LIO frame, then warp unique voxels with a
+        # continuous global correction field.
+        spatial_deformation_enabled: true
+        spatial_deformation_neighbors: 4
+        spatial_deformation_sigma_m: 5.0
         csv_path: "/home/project/MY-LIVO2.0/Log/backend/global_map_updates.csv"
         pcd_path: "/home/project/MY-LIVO2.0/Log/backend/optimized_global_map.pcd"
-      # Keyframe-driven CGI-610 fusion. The 100 Hz callbacks only populate a
-      # bounded buffer; factors are selected and inserted exclusively here at
-      # keyframe cadence, and only when ins_pos_mode is exactly 4.
+      # Keyframe-driven CGI-610 fusion. Selected status-4 observations enter
+      # only the independent global layer, never the local SLAM pose graph.
       rtk:
         input_enabled: true
-        factor_enabled: true
+        fusion_enabled: true
         required_ins_pos_mode: 4
         maximum_status_age_sec: 0.03
         maximum_interpolation_gap_sec: 0.05
@@ -245,19 +369,72 @@ laser_mapping:
         configured_sigma_z_m: 0.50
         minimum_sigma_xy_m: 0.10
         minimum_sigma_z_m: 0.20
+        # CGI-610 twist covariance is zero in the recorded bags; these are
+        # conservative effective floors for the receiver navigation velocity.
+        configured_velocity_sigma_xy_mps: 0.25
+        configured_velocity_sigma_z_mps: 0.40
+        minimum_velocity_sigma_xy_mps: 0.05
+        minimum_velocity_sigma_z_mps: 0.10
         factor_minimum_time_interval_sec: 2.0
         factor_maximum_time_interval_sec: 10.0
         factor_minimum_translation_m: 5.0
+        # Used only to normalize the logged innovation statistic.
         innovation_prediction_sigma_m: 2.0
-        innovation_gate_chi2: 16.27
-        robust_kernel: "cauchy"
-        robust_delta: 2.0
-        additional_update_steps: 1
         status_csv_path: "/home/project/MY-LIVO2.0/Log/backend/rtk_status.csv"
         solution_csv_path: "/home/project/MY-LIVO2.0/Log/backend/rtk_solutions.csv"
         query_csv_path: "/home/project/MY-LIVO2.0/Log/backend/rtk_queries.csv"
         factor_csv_path: "/home/project/MY-LIVO2.0/Log/backend/rtk_factors.csv"
         decision_csv_path: "/home/project/MY-LIVO2.0/Log/backend/rtk_decisions.csv"
+        # Phase-1 observation-only audit. These logs do not affect factors or
+        # poses and remain useful when fusion_enabled is false.
+        diagnostics_csv_path: "/home/project/MY-LIVO2.0/Log/backend/rtk_diagnostics.csv"
+        initial_alignment_csv_path: "/home/project/MY-LIVO2.0/Log/backend/rtk_initial_alignment.csv"
+        velocity_guard:
+          enabled: true
+          # Independent ~1 Hz failure observer; it does not increase the
+          # global position-observation or correction-field cadence.
+          minimum_time_interval_sec: 0.8
+          maximum_time_interval_sec: 1.2
+          minimum_translation_m: 0.5
+          evidence_max_age_sec: 1.5
+          low_pass_time_constant_sec: 2.0
+          # Receiver twist is already an INS-filtered 100 Hz velocity. Keep
+          # only a short low pass; 2 s is retained for position-difference
+          # fallback and would create large direction lag through turns.
+          receiver_low_pass_time_constant_sec: 0.25
+          # Reject absent/mislabeled receiver twist using an independent
+          # one-second displacement check; then fall back without aborting.
+          maximum_receiver_position_difference_error_mps: 1.5
+          activation_velocity_error_mps: 1.0
+          activation_speed_ratio: 1.35
+          activation_consecutive_observations: 2
+          recovery_velocity_error_mps: 0.5
+          recovery_consecutive_observations: 3
+          correction_time_constant_sec: 0.8
+          maximum_planar_correction_mps: 2.0
+          maximum_vertical_correction_mps: 0.75
+          maximum_planar_correction_acceleration_mps2: 0.30
+          maximum_vertical_correction_acceleration_mps2: 0.15
+          # Disabled in healthy LIO: replay showed that this did not remove the
+          # position drift and unnecessarily modified a locally sharp state.
+          healthy_vertical_aiding_enabled: false
+          healthy_vertical_activation_error_mps: 0.08
+          healthy_vertical_activation_observations: 5
+          healthy_vertical_time_constant_sec: 8.0
+          healthy_vertical_maximum_acceleration_mps2: 0.03
+          # Used only inside the quarantined segment after the one-time map
+          # reset; position is never injected into the frontend.
+          recovery_tracking_time_constant_sec: 0.35
+          recovery_tracking_planar_acceleration_mps2: 1.50
+          recovery_tracking_vertical_acceleration_mps2: 0.75
+          # A slow bounded controller must not spend tens of metres repairing
+          # an already-corrupted propagation state. Three independent status-4
+          # receiver samples trigger one controlled recovery segment.
+          emergency_restart_enabled: true
+          emergency_restart_velocity_error_mps: 2.0
+          emergency_restart_consecutive_observations: 3
+          state_velocity_covariance_floor_mps: 0.50
+          csv_path: "/home/project/MY-LIVO2.0/Log/backend/rtk_velocity_guard.csv"
 
     uav:
       imu_rate_odom: false
