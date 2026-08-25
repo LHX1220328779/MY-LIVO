@@ -78,10 +78,10 @@ void TestStatusOrderingAndAnchorOptions()
 {
   RegularizedCorrectionField4d anchored;
   Require(
-      std::abs(anchored.ElasticStiffness(0.0)) < 1.0e-12 &&
-          std::abs(anchored.ElasticStiffness(0.30) - 1.0) < 1.0e-12 &&
-          anchored.ElasticStiffness(0.25) >
-              anchored.ElasticStiffness(0.22),
+      std::abs(anchored.ElasticStiffness(0.15)) < 1.0e-12 &&
+          std::abs(anchored.ElasticStiffness(0.60) - 1.0) < 1.0e-12 &&
+          anchored.ElasticStiffness(0.40) >
+              anchored.ElasticStiffness(0.30),
       "distance-adaptive elastic stiffness is not monotonic");
   const Pose3d nominal = Pose(0.0, 0.0, 0.0, 0.0);
   const auto rejected = anchored.AddObservation(
@@ -371,10 +371,10 @@ void TestCausalRigidElasticField()
     previous_force = force;
   }
   Require(
-      std::abs(field.ElasticStiffness(0.19)) < 1.0e-12 &&
-          field.ElasticStiffness(0.30) < 0.05 &&
-          std::abs(field.ElasticStiffness(1.0) - 1.0) < 1.0e-12 &&
-          field.ElasticStiffness(0.8) > field.ElasticStiffness(0.3),
+      std::abs(field.ElasticStiffness(0.14)) < 1.0e-12 &&
+          field.ElasticStiffness(0.20) < 0.05 &&
+          std::abs(field.ElasticStiffness(0.60) - 1.0) < 1.0e-12 &&
+          field.ElasticStiffness(0.50) > field.ElasticStiffness(0.20),
       "elastic soft core or monotonic stiffness is incorrect");
 
   const double yaw = 5.0 * kDegreesToRadians;
@@ -466,6 +466,78 @@ void TestCausalRigidElasticField()
        Eigen::Vector3d(2.0, 1.0, 1.0)).norm() < 1.0e-12,
       "degraded elastic target lagged behind the current radial error");
 }
+
+void TestAxisIndependentElasticFieldAndPeakAudit()
+{
+  RegularizedCorrectionField4d::Options options;
+  options.anchor_first_knot_identity = false;
+  options.maximum_planar_gradient_m_per_m = 10.0;
+  options.maximum_vertical_gradient_m_per_m = 10.0;
+  options.maximum_yaw_gradient_deg_per_m = 10.0;
+  RegularizedCorrectionField4d field(options);
+
+  const auto first = field.AddObservation(
+      0, 1.0, 0.0, Pose(0.0, 0.0, 0.0, 0.0),
+      Observation(1.0, Eigen::Vector3d(0.10, 0.0, 1.0), 0.0));
+  Require(
+      first.planar_elastic_stiffness < 1.0e-12 &&
+          std::abs(first.vertical_elastic_stiffness - 1.0) < 1.0e-12 &&
+          first.fitted_correction.displacement.head<2>().norm() < 1.0e-12 &&
+          first.fitted_correction.displacement.z() > 0.9,
+      "vertical drift incorrectly opened the planar elastic band");
+
+  const auto second = field.AddObservation(
+      1, 2.0, 5.0, Pose(5.0, 0.0, 0.0, 0.0),
+      Observation(2.0, Eigen::Vector3d(5.10, 0.0, 2.0), 0.0));
+  Require(
+      second.planar_elastic_stiffness < 1.0e-12 &&
+          second.interval_peak_planar_gradient_m_per_m < 1.0e-12 &&
+          second.interval_peak_vertical_gradient_m_per_m > 0.1,
+      "axis-specific interval peak gradients are incorrect");
+  Require(
+      field.YawElasticStiffness(0.24) < 1.0e-12 &&
+          field.YawElasticStiffness(0.50) > 0.0 &&
+          std::abs(field.YawElasticStiffness(1.0) - 1.0) < 1.0e-12,
+      "yaw tolerance did not remain independent of position error");
+
+  RegularizedCorrectionField4d nominal_gain(options);
+  RegularizedCorrectionField4d weak_geometry_gain(options);
+  const Pose3d gain_pose = Pose(0.0, 0.0, 0.0, 0.0);
+  const RtkObservation gain_observation = Observation(
+      3.0, Eigen::Vector3d(0.35, 0.0, 0.0), 0.0);
+  const auto nominal_update = nominal_gain.AddObservation(
+      0, 3.0, 0.0, gain_pose, gain_observation, true, 1.0);
+  const auto weak_update = weak_geometry_gain.AddObservation(
+      0, 3.0, 0.0, gain_pose, gain_observation, true, 3.0);
+  Require(
+      weak_update.planar_elastic_stiffness >
+              nominal_update.planar_elastic_stiffness &&
+          weak_update.fitted_correction.displacement.x() >
+              nominal_update.fitted_correction.displacement.x() &&
+          weak_update.fitted_correction.displacement.x() <= 0.35,
+      "weak LIO geometry did not strengthen the bounded radial force");
+
+  RegularizedCorrectionField4d::Options adaptive_options;
+  RegularizedCorrectionField4d adaptive(adaptive_options);
+  adaptive.AddObservation(
+      0, 10.0, 0.0, Pose(0.0, 0.0, 0.0, 0.0),
+      Observation(10.0, Eigen::Vector3d::Zero(), 0.0), true, 1.0);
+  const auto far_update = adaptive.AddObservation(
+      1, 11.0, 5.0, Pose(5.0, 0.0, 0.0, 0.0),
+      Observation(11.0, Eigen::Vector3d(10.0, 0.0, 0.0), 0.0),
+      true, 3.0);
+  Require(
+      std::abs(far_update.planar_gradient_gain-
+               adaptive_options.adaptive_position_gradient_maximum_gain) <
+              1.0e-12 &&
+          far_update.interval_peak_planar_gradient_m_per_m >
+              adaptive_options.maximum_planar_gradient_m_per_m &&
+          far_update.interval_peak_planar_gradient_m_per_m <=
+              adaptive_options.adaptive_position_gradient_maximum_gain *
+                  adaptive_options.maximum_planar_gradient_m_per_m+
+                  1.0e-12,
+      "far elastic error did not open its causal gradient envelope");
+}
 }  // namespace
 
 int main()
@@ -473,6 +545,7 @@ int main()
   try
   {
     TestCausalRigidElasticField();
+    TestAxisIndependentElasticFieldAndPeakAudit();
   }
   catch (const std::exception &error)
   {

@@ -40,11 +40,15 @@ public:
   Keyframe::Ptr TryCreate(double timestamp,
                           const Pose3d &T_odom_body,
                           const CloudFactory &cloud_factory,
-                          const Matrix6d &odom_covariance);
+                          const Matrix6d &odom_covariance,
+                          const LioObservability &lio_observability =
+                              LioObservability());
   Keyframe::Ptr TryCreate(double timestamp,
                           const Pose3d &T_odom_body,
                           const KeyframeCloud::ConstPtr &cloud_body,
-                          const Matrix6d &odom_covariance);
+                          const Matrix6d &odom_covariance,
+                          const LioObservability &lio_observability =
+                              LioObservability());
 
   std::vector<Keyframe::Ptr> keyframes() const;
   Keyframe::Ptr latest_keyframe() const;

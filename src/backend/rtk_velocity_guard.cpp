@@ -16,6 +16,15 @@ Eigen::Vector2d LimitNorm(const Eigen::Vector2d &value, double limit)
   if (norm <= limit || norm <= 1.0e-15) return value;
   return value * (limit / norm);
 }
+
+double RadialStiffness(double distance, double soft_radius,
+                       double full_radius)
+{
+  const double normalized = std::clamp(
+      (distance - soft_radius) / (full_radius - soft_radius), 0.0, 1.0);
+  return normalized * normalized * normalized *
+      (10.0 + normalized * (-15.0 + 6.0 * normalized));
+}
 }  // namespace
 
 const char *RtkVelocityGuardDecisionToString(
@@ -73,6 +82,12 @@ RtkVelocityGuard::RtkVelocityGuard(const Options &options)
            "raw_rtk_vx,raw_rtk_vy,raw_rtk_vz,filtered_rtk_vx,"
            "filtered_rtk_vy,filtered_rtk_vz,lio_before_vx,lio_before_vy,"
            "lio_before_vz,lio_after_vx,lio_after_vy,lio_after_vz,"
+           "global_error_x,global_error_y,global_error_z,closure_vx,"
+           "closure_vy,closure_vz,tracking_target_vx,"
+           "tracking_target_vy,tracking_target_vz,"
+           "recovery_planar_stiffness,recovery_vertical_stiffness,"
+           "recovery_planar_capture_active,"
+           "recovery_vertical_capture_active,"
            "velocity_error_mps,speed_ratio,applied_gain,correction_x,"
            "correction_y,correction_z,emergency_restart_required,"
            "emergency_restart_state_changed,emergency_restart_evidence,"
@@ -109,6 +124,20 @@ void RtkVelocityGuard::ValidateOptions(const Options &options)
       !positive(options.recovery_tracking_time_constant_sec) ||
       !positive(options.recovery_tracking_planar_acceleration_mps2) ||
       !positive(options.recovery_tracking_vertical_acceleration_mps2) ||
+      !std::isfinite(options.recovery_position_soft_radius_m) ||
+      options.recovery_position_soft_radius_m < 0.0 ||
+      !positive(options.recovery_position_full_radius_m) ||
+      options.recovery_position_full_radius_m <=
+          options.recovery_position_soft_radius_m ||
+      !std::isfinite(options.recovery_position_release_radius_m) ||
+      options.recovery_position_release_radius_m < 0.0 ||
+      options.recovery_position_release_radius_m >=
+          options.recovery_position_soft_radius_m ||
+      !positive(options.recovery_position_capture_minimum_stiffness) ||
+      options.recovery_position_capture_minimum_stiffness > 1.0 ||
+      !positive(options.recovery_position_time_constant_sec) ||
+      !positive(options.recovery_maximum_planar_closure_velocity_mps) ||
+      !positive(options.recovery_maximum_vertical_closure_velocity_mps) ||
       !positive(options.emergency_restart_velocity_error_mps) ||
       options.emergency_restart_velocity_error_mps <=
           options.activation_velocity_error_mps ||
@@ -119,10 +148,12 @@ void RtkVelocityGuard::ValidateOptions(const Options &options)
 RtkVelocityGuard::Result RtkVelocityGuard::AddObservation(
     std::uint64_t keyframe_id, double timestamp,
     const Eigen::Vector3d &rtk_position,
+    const Eigen::Vector3d &global_position,
     const Eigen::Vector3d &lio_velocity, CorrectionRegime regime,
     const std::optional<Eigen::Vector3d> &receiver_velocity)
 {
   if (!std::isfinite(timestamp) || !rtk_position.allFinite() ||
+      !global_position.allFinite() ||
       !lio_velocity.allFinite() ||
       (receiver_velocity && !receiver_velocity->allFinite()))
     throw std::invalid_argument("RTK velocity-guard input is invalid.");
@@ -137,6 +168,7 @@ RtkVelocityGuard::Result RtkVelocityGuard::AddObservation(
   result.timestamp = timestamp;
   result.lio_velocity_before = lio_velocity;
   result.lio_velocity_after = lio_velocity;
+  result.global_position_error = global_position - rtk_position;
   result.active = active_;
   result.recovery_tracking = recovery_tracking_;
 
@@ -179,6 +211,61 @@ RtkVelocityGuard::Result RtkVelocityGuard::AddObservation(
         alpha * (result.raw_rtk_velocity - filtered_rtk_velocity_);
   }
   result.filtered_rtk_velocity = filtered_rtk_velocity_;
+  result.tracking_target_velocity = filtered_rtk_velocity_;
+  if (recovery_tracking_)
+  {
+    const double planar_distance =
+        result.global_position_error.head<2>().norm();
+    const double vertical_distance =
+        std::abs(result.global_position_error.z());
+    if (!recovery_planar_capture_active_ &&
+        planar_distance > options_.recovery_position_soft_radius_m)
+      recovery_planar_capture_active_ = true;
+    else if (recovery_planar_capture_active_ &&
+             planar_distance <=
+                 options_.recovery_position_release_radius_m)
+      recovery_planar_capture_active_ = false;
+    if (!recovery_vertical_capture_active_ &&
+        vertical_distance > options_.recovery_position_soft_radius_m)
+      recovery_vertical_capture_active_ = true;
+    else if (recovery_vertical_capture_active_ &&
+             vertical_distance <=
+                 options_.recovery_position_release_radius_m)
+      recovery_vertical_capture_active_ = false;
+
+    result.recovery_planar_stiffness = RadialStiffness(
+        planar_distance, options_.recovery_position_soft_radius_m,
+        options_.recovery_position_full_radius_m);
+    result.recovery_vertical_stiffness = RadialStiffness(
+        vertical_distance, options_.recovery_position_soft_radius_m,
+        options_.recovery_position_full_radius_m);
+    if (recovery_planar_capture_active_)
+      result.recovery_planar_stiffness = std::max(
+          result.recovery_planar_stiffness,
+          options_.recovery_position_capture_minimum_stiffness);
+    if (recovery_vertical_capture_active_)
+      result.recovery_vertical_stiffness = std::max(
+          result.recovery_vertical_stiffness,
+          options_.recovery_position_capture_minimum_stiffness);
+    result.recovery_planar_capture_active =
+        recovery_planar_capture_active_;
+    result.recovery_vertical_capture_active =
+        recovery_vertical_capture_active_;
+
+    result.recovery_closure_velocity.head<2>() = LimitNorm(
+        -result.recovery_planar_stiffness *
+            result.global_position_error.head<2>() /
+            options_.recovery_position_time_constant_sec,
+        options_.recovery_maximum_planar_closure_velocity_mps);
+    result.recovery_closure_velocity.z() = std::clamp(
+        -result.recovery_vertical_stiffness *
+            result.global_position_error.z() /
+            options_.recovery_position_time_constant_sec,
+        -options_.recovery_maximum_vertical_closure_velocity_mps,
+        options_.recovery_maximum_vertical_closure_velocity_mps);
+    result.tracking_target_velocity +=
+        result.recovery_closure_velocity;
+  }
   result.decision = RtkVelocityGuardDecision::kMonitoring;
   result.velocity_error_mps =
       (lio_velocity - filtered_rtk_velocity_).norm();
@@ -197,8 +284,7 @@ RtkVelocityGuard::Result RtkVelocityGuard::AddObservation(
         regime == CorrectionRegime::kRelocalizationRequired;
     const bool evidence = failure_regime &&
         result.velocity_error_mps >=
-            options_.activation_velocity_error_mps &&
-        result.speed_ratio >= options_.activation_speed_ratio;
+            options_.activation_velocity_error_mps;
     if (!active_)
     {
       activation_evidence_ = evidence ? activation_evidence_ + 1 : 0;
@@ -285,7 +371,7 @@ RtkVelocityGuard::Result RtkVelocityGuard::AddObservation(
         result.applied_gain = 1.0 - std::exp(
             -result.interval_sec / correction_time_constant);
         Eigen::Vector3d correction = result.applied_gain *
-            (filtered_rtk_velocity_ - lio_velocity);
+            (result.tracking_target_velocity - lio_velocity);
         const double planar_acceleration = recovery_tracking_
             ? options_.recovery_tracking_planar_acceleration_mps2
             : options_.maximum_planar_correction_acceleration_mps2;
@@ -354,7 +440,21 @@ void RtkVelocityGuard::AcknowledgeEmergencyRestart(
   emergency_restart_required_ = false;
   emergency_restart_acknowledged_ = true;
   emergency_restart_evidence_ = 0;
+  BeginRecoveryTracking(keyframe_id);
+}
+
+void RtkVelocityGuard::BeginRecoveryTracking(
+    std::uint64_t keyframe_id)
+{
+  if (!have_previous_ || keyframe_id != previous_keyframe_id_)
+    throw std::logic_error(
+        "RTK recovery tracking must start at the latest observation.");
   recovery_tracking_ = true;
+  recovery_planar_capture_active_ = false;
+  recovery_vertical_capture_active_ = false;
+  active_ = true;
+  activation_evidence_ = 0;
+  recovery_evidence_ = 0;
 }
 
 void RtkVelocityGuard::CompleteRecoveryTracking(
@@ -365,6 +465,8 @@ void RtkVelocityGuard::CompleteRecoveryTracking(
     throw std::logic_error(
         "RTK recovery tracking completion is invalid.");
   recovery_tracking_ = false;
+  recovery_planar_capture_active_ = false;
+  recovery_vertical_capture_active_ = false;
   active_ = false;
   activation_evidence_ = 0;
   recovery_evidence_ = 0;
@@ -397,6 +499,21 @@ void RtkVelocityGuard::WriteCsv(
               << result.lio_velocity_after.x() << ','
               << result.lio_velocity_after.y() << ','
               << result.lio_velocity_after.z() << ','
+              << result.global_position_error.x() << ','
+              << result.global_position_error.y() << ','
+              << result.global_position_error.z() << ','
+              << result.recovery_closure_velocity.x() << ','
+              << result.recovery_closure_velocity.y() << ','
+              << result.recovery_closure_velocity.z() << ','
+              << result.tracking_target_velocity.x() << ','
+              << result.tracking_target_velocity.y() << ','
+              << result.tracking_target_velocity.z() << ','
+              << result.recovery_planar_stiffness << ','
+              << result.recovery_vertical_stiffness << ','
+              << static_cast<int>(result.recovery_planar_capture_active)
+              << ','
+              << static_cast<int>(result.recovery_vertical_capture_active)
+              << ','
               << result.velocity_error_mps << ',' << result.speed_ratio << ','
               << result.applied_gain << ',' << result.applied_correction.x() << ','
               << result.applied_correction.y() << ','

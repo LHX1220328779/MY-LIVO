@@ -67,6 +67,15 @@ public:
   void stopBackendGlobalMapWorker();
   void handleRtkForKeyframe(
       const my_livo::backend::Keyframe::Ptr &keyframe);
+  struct FrontendHistorySeedStatistics
+  {
+    std::size_t keyframes = 0;
+    std::size_t points = 0;
+    double path_length_m = 0.0;
+  };
+  FrontendHistorySeedStatistics seedFrontendLocalMapFromHistory(
+      std::uint64_t trigger_keyframe_id);
+  void applyBackendRecoveryFrameVelocityTracking(double timestamp);
   bool executePendingFrontendSegmentRestart();
   void publishBackendCurrentFrame();
   void savePCD();
@@ -260,10 +269,27 @@ public:
   bool backend_frontend_segment_restart_enabled = false;
   std::size_t backend_frontend_segment_minimum_seed_points = 1000;
   std::size_t backend_frontend_segment_maximum_automatic_restarts = 1;
+  double backend_frontend_segment_history_seed_path_m = 20.0;
+  std::size_t backend_frontend_segment_maximum_history_seed_keyframes = 20;
+  double backend_frontend_segment_history_seed_point_sigma_m = 0.10;
   double backend_frontend_segment_position_sigma_floor_m = 0.10;
   double backend_frontend_segment_rotation_sigma_floor_deg = 1.0;
   string backend_frontend_segment_csv_path;
   string backend_frontend_restart_supervisor_csv_path;
+  bool backend_lio_observability_guard_enabled = true;
+  double backend_lio_observability_translation_soft_ratio = 0.15;
+  double backend_lio_observability_translation_full_ratio = 0.05;
+  double backend_lio_observability_rotation_soft_ratio = 0.25;
+  double backend_lio_observability_rotation_full_ratio = 0.08;
+  double backend_lio_observability_maximum_constraint_gain = 3.0;
+  double backend_lio_observability_restart_score = 0.65;
+  double backend_lio_observability_restart_residual_m = 1.0;
+  double backend_lio_observability_restart_velocity_error_mps = 0.8;
+  int backend_lio_observability_restart_required_observations = 3;
+  bool backend_elastic_saturation_restart_enabled = false;
+  double backend_elastic_saturation_restart_residual_m = 0.50;
+  double backend_elastic_saturation_restart_gradient_ratio = 0.95;
+  int backend_lio_observability_restart_evidence = 0;
   double backend_rtk_innovation_prediction_sigma_m = 2.0;
   string backend_rtk_decision_csv_path;
   std::uint64_t backend_rtk_candidates = 0;
@@ -295,6 +321,13 @@ public:
       backend_rtk_velocity_guard_options;
   double backend_rtk_velocity_evidence_max_age_sec = 1.5;
   double backend_rtk_velocity_covariance_floor_mps = 0.50;
+  bool backend_rtk_recovery_frame_tracking_enabled = true;
+  double backend_rtk_recovery_frame_tracking_maximum_age_sec = 1.5;
+  double backend_rtk_recovery_frame_tracking_planar_acceleration_mps2 = 3.0;
+  double backend_rtk_recovery_frame_tracking_vertical_acceleration_mps2 = 2.0;
+  bool backend_have_recovery_frame_tracking_time = false;
+  double backend_last_recovery_frame_tracking_time = 0.0;
+  string backend_rtk_recovery_frame_tracking_csv_path;
   my_livo::backend::CorrectionRegime backend_rtk_velocity_regime =
       my_livo::backend::CorrectionRegime::kWarmup;
   bool backend_have_latest_rtk_velocity_result = false;
@@ -366,6 +399,7 @@ public:
 
   ofstream fout_pre, fout_out, fout_visual_pos, fout_lidar_pos, fout_points;
   ofstream backend_rtk_decision_stream;
+  ofstream backend_rtk_recovery_frame_tracking_stream;
   ofstream backend_frontend_segment_stream;
   ofstream backend_frontend_restart_supervisor_stream;
 

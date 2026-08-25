@@ -46,6 +46,9 @@ int main()
   try
   {
     GlobalPoseLayer::Options options;
+    // This test audits legacy fixed-envelope continuity. Adaptive far-field
+    // scaling has its own deterministic unit test.
+    options.regularized_field.adaptive_gradient_enabled = false;
     options.T_global_slam = MakePose(5.0, -2.0);
     GlobalPoseLayer layer(options);
     std::vector<Keyframe::Ptr> keyframes{
@@ -168,26 +171,80 @@ int main()
                 "stable recovery window did not reanchor the segment");
     }
     const auto recovered_poses = segment_layer.global_poses();
+    for (std::uint64_t id = 2; id <= 4; ++id)
+      Require(
+          (recovered_poses[id].translation -
+           provisional_before_fit[id].translation).norm() < 1.0e-12 &&
+              recovered_poses[id].rotation.angularDistance(
+                  provisional_before_fit[id].rotation) < 1.0e-12,
+          "recovery gate changed the continuous quarantined history");
+
+    RtkObservation first_elastic;
+    first_elastic.timestamp = 34.0;
+    first_elastic.position = Eigen::Vector3d(100.0, 42.0, 3.0);
+    first_elastic.position_covariance =
+        Eigen::Matrix3d::Identity() * 0.01;
+    first_elastic.lower_ins_pos_mode = 4;
+    first_elastic.upper_ins_pos_mode = 4;
+    segment_layer.AddElasticObservation(4, first_elastic, true);
     Require(
-        (recovered_poses[2].translation -
-         provisional_before_fit[2].translation).norm() < 1.0e-12 &&
-            (recovered_poses[3].translation -
-             provisional_before_fit[3].translation).norm() < 1.0e-12 &&
-            recovered_poses[2].rotation.angularDistance(
-                provisional_before_fit[2].rotation) < 1.0e-12 &&
-            recovered_poses[3].rotation.angularDistance(
-                provisional_before_fit[3].rotation) < 1.0e-12,
-        "recovery fit retrospectively changed quarantined history");
-    Require((recovered_poses[4].translation -
-             Eigen::Vector3d(100.0, 42.0, 3.0)).norm() < 1.0e-10,
-            "fitted 4DOF recovery transform was not applied");
-    Require(recovered_poses[4].rotation.angularDistance(
-                Eigen::Quaterniond(Eigen::AngleAxisd(
-                    0.5 * std::acos(-1.0),
-                    Eigen::Vector3d::UnitZ()))) < 1.0e-12,
-            "recovery segment was not one rigid 4DOF transform");
+        (segment_layer.global_poses()[4].translation -
+         provisional_before_fit[4].translation).norm() < 1.0e-12,
+        "first recovery elastic knot did not preserve continuity");
+
+    const auto recovered_5 = MakeKeyframe(5, MakePose(42.0));
+    segment_layer.AppendKeyframe(recovered_5);
+    RtkObservation second_elastic;
+    second_elastic.timestamp = 35.0;
+    second_elastic.position = Eigen::Vector3d(100.0, 52.0, 3.0);
+    second_elastic.position_covariance =
+        Eigen::Matrix3d::Identity() * 0.01;
+    second_elastic.lower_ins_pos_mode = 4;
+    second_elastic.upper_ins_pos_mode = 4;
+    segment_layer.AddRecoveryObservation(5, second_elastic, true, true, 0.1);
+    segment_layer.AddElasticObservation(5, second_elastic, true);
+    const auto after_elastic = segment_layer.global_poses();
+    const Eigen::Vector3d carried_position =
+        provisional_before_fit[4].translation + Eigen::Vector3d(10.0, 0.0, 0.0);
+    const double released_correction =
+        (after_elastic[5].translation - carried_position).norm();
+    Require(released_correction > 1.0e-6 && released_correction < 0.6,
+            "recovery elastic field was either frozen or discontinuous");
     Require(segment_layer.statistics().recovery_reanchors == 1,
             "recovery reanchor statistics differ");
+
+    GlobalPoseLayer immediate_layer(options);
+    immediate_layer.AppendKeyframe(MakeKeyframe(0, MakePose(0.0)));
+    immediate_layer.AppendKeyframe(MakeKeyframe(1, MakePose(10.0)));
+    immediate_layer.StartEmergencyGlobalSegment(
+        1, Eigen::Vector3d(100.0, 20.0, 3.0));
+    immediate_layer.AppendKeyframe(MakeKeyframe(2, MakePose(20.0)));
+    immediate_layer.AppendKeyframe(MakeKeyframe(3, MakePose(30.0)));
+    RtkObservation immediate_observation;
+    immediate_observation.timestamp = 32.0;
+    immediate_observation.position = Eigen::Vector3d(100.0, 22.0, 3.0);
+    immediate_observation.position_covariance =
+        Eigen::Matrix3d::Identity() * 0.01;
+    immediate_observation.lower_ins_pos_mode = 4;
+    immediate_observation.upper_ins_pos_mode = 4;
+    immediate_layer.AddRecoveryObservation(
+        2, immediate_observation, true, true, 0.1);
+    immediate_layer.AddElasticObservation(2, immediate_observation, true);
+    const Pose3d carried_before = immediate_layer.global_poses()[3];
+    immediate_observation.timestamp = 33.0;
+    immediate_observation.position = Eigen::Vector3d(100.0, 32.0, 3.0);
+    const auto immediate_recovery = immediate_layer.AddRecoveryObservation(
+        3, immediate_observation, true, true, 0.1);
+    const auto immediate_elastic = immediate_layer.AddElasticObservation(
+        3, immediate_observation, true);
+    const double immediate_release =
+        (immediate_layer.global_poses()[3].translation -
+         carried_before.translation).norm();
+    Require(!immediate_recovery.segment_reanchored &&
+                immediate_elastic.field_changed &&
+                immediate_release > 1.0e-6 && immediate_release < 0.6 &&
+                immediate_layer.global_map_snapshot().eligible.back() == 0U,
+            "quarantined elastic recovery waited for or escaped its gate");
   }
   catch (const std::exception &error)
   {

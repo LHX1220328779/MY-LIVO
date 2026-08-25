@@ -97,8 +97,20 @@ GlobalPoseLayer::GlobalPoseLayer(const Options &options) : options_(options)
         << "keyframe_id,timestamp,segment_id,recovery_segment,decision,"
            "distance_m,knot_count,elastic_distance_m,elastic_stiffness,"
            "radial_force_proxy_m,"
+           "planar_elastic_distance_m,vertical_elastic_distance_m,"
+           "yaw_elastic_distance_deg,planar_elastic_stiffness,"
+           "vertical_elastic_stiffness,yaw_elastic_stiffness,"
+           "planar_force_proxy_m,vertical_force_proxy_m,"
+           "yaw_force_proxy_deg,"
+           "constraint_gain,translation_condition_ratio,"
+           "rotation_condition_ratio,"
            "correction_x,correction_y,correction_z,correction_yaw_deg,"
            "gradient_m_per_m,yaw_gradient_deg_per_m,curvature_per_m,"
+           "peak_planar_gradient_m_per_m,"
+           "peak_vertical_gradient_m_per_m,"
+           "peak_yaw_gradient_deg_per_m,"
+           "planar_gradient_gain,vertical_gradient_gain,"
+           "yaw_gradient_gain,"
            "residual_after_m,elastic_probation,position_observation\n";
     regularized_field_stream_.flush();
   }
@@ -197,7 +209,7 @@ Pose3d GlobalPoseLayer::ToGlobal(
   if (!active_anchor)
     return regularized_field_->Apply(
         cumulative_distance_m_.at(index), nominal_pose);
-  if (active_anchor->fitted && active_anchor->elastic_field)
+  if (active_anchor->elastic_field)
     return active_anchor->elastic_field->Apply(
         cumulative_distance_m_.at(index), nominal_pose);
   return nominal_pose;
@@ -468,12 +480,36 @@ void GlobalPoseLayer::StartEmergencyGlobalSegment(
           emergency_segment_anchors_.back().trigger_keyframe_id)
     throw std::logic_error(
         "Emergency global segment boundaries must be strictly ordered.");
-  // A provisional quarantined segment must be continuous with the trusted
-  // predecessor. RTK is evidence for the later robust 4DOF fit, not an
-  // instantaneous anchor that may teleport the path by many metres.
-  emergency_segment_anchors_.push_back(EmergencySegmentAnchor{
-      trigger_keyframe_id, trigger_keyframe_id + 1U,
-      0U, 0U, global_poses_.at(trigger_keyframe_id).translation});
+  // Carry the exact previous global<-local transform across the boundary.
+  // A fresh identity-anchored elastic field starts immediately in quarantine;
+  // the later rigid fit only authorizes probation and never commands a pose.
+  EmergencySegmentAnchor anchor;
+  anchor.trigger_keyframe_id = trigger_keyframe_id;
+  anchor.start_keyframe_id = trigger_keyframe_id + 1U;
+  anchor.rtk_anchor_position =
+      global_poses_.at(trigger_keyframe_id).translation;
+  const Pose3d trigger_base = BaseGlobal(
+      local_slam_poses_.at(trigger_keyframe_id));
+  const Pose3d trigger_global = ToGlobal(
+      trigger_keyframe_id,
+      local_slam_poses_.at(trigger_keyframe_id));
+  const Eigen::Matrix3d carried_rotation =
+      (trigger_global.rotation * trigger_base.rotation.conjugate())
+          .toRotationMatrix();
+  anchor.position_yaw_rad = std::atan2(
+      carried_rotation(1, 0), carried_rotation(0, 0));
+  anchor.orientation_yaw_rad = anchor.position_yaw_rad;
+  const Eigen::Matrix3d carried_yaw_rotation =
+      Eigen::AngleAxisd(anchor.position_yaw_rad,
+                        Eigen::Vector3d::UnitZ()).toRotationMatrix();
+  anchor.translation = trigger_global.translation -
+      carried_yaw_rotation * trigger_base.translation;
+  auto recovery_field_options = options_.regularized_field;
+  recovery_field_options.anchor_first_knot_identity = true;
+  anchor.elastic_field =
+      std::make_shared<RegularizedCorrectionField4d>(
+          recovery_field_options);
+  emergency_segment_anchors_.push_back(anchor);
   recovery_observations_.clear();
   recovery_monitor_ =
       std::make_unique<RigidRelocalizationMonitor>(
@@ -526,56 +562,21 @@ GlobalPoseLayer::RecoveryUpdate GlobalPoseLayer::AddRecoveryObservation(
       !update.relocalization.ready)
     return update;
 
-  EmergencySegmentAnchor fitted_anchor;
   if (emergency_segment_anchors_.empty() ||
       emergency_segment_anchors_.back().fitted)
     throw std::logic_error(
         "Recovery fit lacks its provisional segment boundary.");
-  // The provisional history is immutable.  A validated fit starts a new
-  // rigid segment at the current keyframe; it must never morph the whole
-  // quarantined baseline that was needed to estimate this transform.
-  fitted_anchor.trigger_keyframe_id =
-      emergency_segment_anchors_.back().trigger_keyframe_id;
-  fitted_anchor.start_keyframe_id = update.relocalization.keyframe_id;
-  fitted_anchor.trusted_start_keyframe_id =
-      update.relocalization.keyframe_id;
-  fitted_anchor.transition_end_keyframe_id =
-      update.relocalization.keyframe_id;
-  fitted_anchor.fitted = true;
-  fitted_anchor.position_yaw_rad = update.relocalization.yaw_rad;
-  fitted_anchor.translation = update.relocalization.translation;
-  if (fitted_anchor.start_keyframe_id == 0 ||
-      fitted_anchor.start_keyframe_id >= global_poses_.size() ||
-      (!emergency_segment_anchors_.empty() &&
-       fitted_anchor.start_keyframe_id <
-           emergency_segment_anchors_.back().start_keyframe_id))
+  EmergencySegmentAnchor &anchor = emergency_segment_anchors_.back();
+  if (!anchor.elastic_field ||
+      update.relocalization.keyframe_id < anchor.start_keyframe_id)
     throw std::logic_error(
-        "Recovery fit produced an invalid segment boundary.");
-
-  // A gravity-constrained 4DOF segment is one rigid transform: the robust
-  // long-baseline position yaw rotates both translations and attitudes.
-  // Receiver quaternion/yaw is deliberately not a production input.
-  fitted_anchor.orientation_yaw_rad = update.relocalization.yaw_rad;
-  update.orientation_yaw_rad = fitted_anchor.orientation_yaw_rad;
-  auto recovery_field_options = options_.regularized_field;
-  recovery_field_options.anchor_first_knot_identity = true;
-  fitted_anchor.elastic_field =
-      std::make_shared<RegularizedCorrectionField4d>(
-          recovery_field_options);
-  emergency_segment_anchors_.push_back(fitted_anchor);
-  for (const auto &elastic : elastic_observations_)
-  {
-    if (elastic.keyframe_id < fitted_anchor.start_keyframe_id ||
-        elastic.keyframe_id > update.relocalization.keyframe_id)
-      continue;
-    const Pose3d nominal = SegmentNominal(
-        elastic.keyframe_id,
-        local_slam_poses_.at(elastic.keyframe_id));
-    emergency_segment_anchors_.back().elastic_field->AddObservation(
-        elastic.keyframe_id, elastic.observation.timestamp,
-        cumulative_distance_m_.at(elastic.keyframe_id), nominal,
-        elastic.observation, elastic.use_position_observation);
-  }
+        "Recovery gate lacks its continuous elastic segment.");
+  // Keep the carried transform and all causal field knots. The fit is only a
+  // no-scale/geometry gate for entering elastic probation.
+  anchor.trusted_start_keyframe_id = update.relocalization.keyframe_id;
+  anchor.transition_end_keyframe_id = update.relocalization.keyframe_id;
+  anchor.fitted = true;
+  update.orientation_yaw_rad = update.relocalization.yaw_rad;
   // Rigid ready starts elastic probation; it is not proof that the frontend
   // remains stable without velocity support.
   recovery_elastic_probation_ = true;
@@ -591,11 +592,18 @@ GlobalPoseLayer::RecoveryUpdate GlobalPoseLayer::AddRecoveryObservation(
 
 GlobalPoseLayer::ElasticUpdate GlobalPoseLayer::AddElasticObservation(
     std::uint64_t keyframe_id, const RtkObservation &observation,
-    bool use_position_observation)
+    bool use_position_observation, double constraint_gain,
+    double translation_condition_ratio,
+    double rotation_condition_ratio)
 {
   if (!std::isfinite(observation.timestamp) ||
       !observation.position.allFinite() ||
-      !observation.orientation.coeffs().allFinite())
+      !observation.orientation.coeffs().allFinite() ||
+      !std::isfinite(constraint_gain) || constraint_gain < 1.0 ||
+      !std::isfinite(translation_condition_ratio) ||
+      translation_condition_ratio < 0.0 ||
+      !std::isfinite(rotation_condition_ratio) ||
+      rotation_condition_ratio < 0.0)
     throw std::invalid_argument(
         "Elastic observation is not finite.");
   std::lock_guard<std::mutex> lock(mutex_);
@@ -607,7 +615,8 @@ GlobalPoseLayer::ElasticUpdate GlobalPoseLayer::AddElasticObservation(
     throw std::logic_error(
         "Elastic observations must be strictly ordered.");
   elastic_observations_.push_back(
-      {keyframe_id, observation, use_position_observation});
+      {keyframe_id, observation, use_position_observation, constraint_gain,
+       translation_condition_ratio, rotation_condition_ratio});
 
   ElasticUpdate update;
   update.observation_used = true;
@@ -617,10 +626,10 @@ GlobalPoseLayer::ElasticUpdate GlobalPoseLayer::AddElasticObservation(
        ++index)
   {
     const auto &anchor = emergency_segment_anchors_[index];
-    if (!anchor.fitted) ++segment_id;
     if (anchor.start_keyframe_id > keyframe_id)
       break;
     active_anchor = &emergency_segment_anchors_[index];
+    segment_id = static_cast<std::uint64_t>(index + 1U);
   }
   RegularizedCorrectionField4d *field = nullptr;
   if (!active_anchor)
@@ -633,7 +642,7 @@ GlobalPoseLayer::ElasticUpdate GlobalPoseLayer::AddElasticObservation(
         keyframe_id < *quarantine_start_keyframe_id_)
       field = regularized_field_.get();
   }
-  else if (active_anchor->fitted && active_anchor->elastic_field)
+  else if (active_anchor->elastic_field)
   {
     field = active_anchor->elastic_field.get();
   }
@@ -649,7 +658,7 @@ GlobalPoseLayer::ElasticUpdate GlobalPoseLayer::AddElasticObservation(
     update.field = field->AddObservation(
         keyframe_id, observation.timestamp,
         cumulative_distance_m_.at(keyframe_id), nominal, observation,
-        use_position_observation);
+        use_position_observation, constraint_gain);
     update.field_changed = update.field.decision ==
             RegularizedCorrectionField4d::AddDecision::kAccepted ||
         update.field.decision ==
@@ -661,13 +670,9 @@ GlobalPoseLayer::ElasticUpdate GlobalPoseLayer::AddElasticObservation(
   }
   update.residual_after_m =
       (corrected.translation - observation.position).norm();
-  // Acceptance checks lag to the robust position-path yaw target, never the
+  // This residual is against the robust position-path yaw target, never the
   // CGI-610 attitude quaternion. Receiver attitude remains diagnostic-only.
-  const double yaw_lag = update.field.fitted_correction.yaw_rad -
-      update.evaluation.correction.yaw_rad;
-  update.yaw_residual_after_deg = std::abs(
-      std::atan2(std::sin(yaw_lag), std::cos(yaw_lag))) *
-      kRadiansToDegrees;
+  update.yaw_residual_after_deg = update.field.yaw_residual_after_deg;
   if (recovery_elastic_probation_ && use_position_observation &&
       active_anchor && active_anchor->fitted)
   {
@@ -688,9 +693,9 @@ GlobalPoseLayer::ElasticUpdate GlobalPoseLayer::AddElasticObservation(
         update.yaw_residual_after_deg,
         velocity.post_velocity_error_mps,
         velocity.velocity_baseline_available, velocity.guard_active,
-        update.evaluation.first_derivative.displacement.norm(),
-        std::abs(update.evaluation.first_derivative.yaw_rad) *
-            kRadiansToDegrees);
+        std::hypot(update.field.interval_peak_planar_gradient_m_per_m,
+                   update.field.interval_peak_vertical_gradient_m_per_m),
+        update.field.interval_peak_yaw_gradient_deg_per_m);
     if (elastic_acceptance_stream_.is_open())
     {
       elastic_acceptance_stream_ << std::setprecision(17)
@@ -705,9 +710,10 @@ GlobalPoseLayer::ElasticUpdate GlobalPoseLayer::AddElasticObservation(
           << update.residual_after_m << ','
           << update.yaw_residual_after_deg << ','
           << velocity.post_velocity_error_mps << ','
-          << update.evaluation.first_derivative.displacement.norm() << ','
-          << std::abs(update.evaluation.first_derivative.yaw_rad) *
-                 kRadiansToDegrees
+          << std::hypot(
+                 update.field.interval_peak_planar_gradient_m_per_m,
+                 update.field.interval_peak_vertical_gradient_m_per_m)
+          << ',' << update.field.interval_peak_yaw_gradient_deg_per_m
           << ',' << static_cast<int>(update.acceptance.accepted) << ','
           << static_cast<int>(update.acceptance.state_changed) << ','
           << active_anchor->trusted_start_keyframe_id << '\n';
@@ -768,14 +774,35 @@ GlobalPoseLayer::ElasticUpdate GlobalPoseLayer::AddElasticObservation(
         << update.field.elastic_stiffness << ','
         << update.field.elastic_stiffness * update.field.elastic_distance_m
         << ','
+        << update.field.planar_elastic_distance_m << ','
+        << update.field.vertical_elastic_distance_m << ','
+        << update.field.yaw_elastic_distance_deg << ','
+        << update.field.planar_elastic_stiffness << ','
+        << update.field.vertical_elastic_stiffness << ','
+        << update.field.yaw_elastic_stiffness << ','
+        << update.field.planar_elastic_stiffness *
+               update.field.planar_elastic_distance_m
+        << ',' << update.field.vertical_elastic_stiffness *
+               update.field.vertical_elastic_distance_m
+        << ',' << update.field.yaw_elastic_stiffness *
+               update.field.yaw_elastic_distance_deg
+        << ',' << constraint_gain << ',' << translation_condition_ratio
+        << ',' << rotation_condition_ratio << ','
         << update.evaluation.correction.displacement.x() << ','
         << update.evaluation.correction.displacement.y() << ','
         << update.evaluation.correction.displacement.z() << ','
         << update.evaluation.correction.yaw_rad * 180.0 / std::acos(-1.0)
-        << ',' << update.evaluation.first_derivative.displacement.norm()
-        << ',' << std::abs(update.evaluation.first_derivative.yaw_rad) *
-            180.0 / std::acos(-1.0)
+        << ',' << std::hypot(
+               update.field.interval_peak_planar_gradient_m_per_m,
+               update.field.interval_peak_vertical_gradient_m_per_m)
+        << ',' << update.field.interval_peak_yaw_gradient_deg_per_m
         << ',' << update.evaluation.second_derivative.displacement.norm()
+        << ',' << update.field.interval_peak_planar_gradient_m_per_m
+        << ',' << update.field.interval_peak_vertical_gradient_m_per_m
+        << ',' << update.field.interval_peak_yaw_gradient_deg_per_m
+        << ',' << update.field.planar_gradient_gain
+        << ',' << update.field.vertical_gradient_gain
+        << ',' << update.field.yaw_gradient_gain
         << ',' << update.residual_after_m << ','
         << static_cast<int>(recovery_elastic_probation_) << ','
         << static_cast<int>(use_position_observation) << '\n';
@@ -838,14 +865,13 @@ void GlobalPoseLayer::RebuildGlobalCorrectionLocked()
             selected.keyframe_id);
     }
   }
-  emergency_segment_anchors_.erase(
-      std::remove_if(
-          emergency_segment_anchors_.begin(),
-          emergency_segment_anchors_.end(),
-          [](const EmergencySegmentAnchor &anchor) {
-            return anchor.fitted;
-          }),
-      emergency_segment_anchors_.end());
+  for (auto &anchor : emergency_segment_anchors_)
+  {
+    StartQuarantineLocked(anchor.trigger_keyframe_id);
+    anchor.fitted = false;
+    anchor.trusted_start_keyframe_id = 0;
+    anchor.transition_end_keyframe_id = 0;
+  }
   recovery_monitor_active_ = !emergency_segment_anchors_.empty();
   recovery_elastic_probation_ = false;
   for (const auto &recovery : recovery_observations_)
@@ -862,22 +888,14 @@ void GlobalPoseLayer::RebuildGlobalCorrectionLocked()
     if (!recovery_elastic_probation_ &&
         result.state_changed && result.ready)
     {
-      EmergencySegmentAnchor fitted_anchor;
       if (emergency_segment_anchors_.empty() ||
           emergency_segment_anchors_.back().fitted)
         throw std::logic_error(
             "Recovery replay lacks its provisional segment boundary.");
-      fitted_anchor.trigger_keyframe_id =
-          emergency_segment_anchors_.back().trigger_keyframe_id;
-      fitted_anchor.start_keyframe_id = result.keyframe_id;
-      fitted_anchor.trusted_start_keyframe_id =
-          result.keyframe_id;
-      fitted_anchor.transition_end_keyframe_id = result.keyframe_id;
-      fitted_anchor.fitted = true;
-      fitted_anchor.position_yaw_rad = result.yaw_rad;
-      fitted_anchor.translation = result.translation;
-      fitted_anchor.orientation_yaw_rad = result.yaw_rad;
-      emergency_segment_anchors_.push_back(fitted_anchor);
+      EmergencySegmentAnchor &anchor = emergency_segment_anchors_.back();
+      anchor.trusted_start_keyframe_id = result.keyframe_id;
+      anchor.transition_end_keyframe_id = result.keyframe_id;
+      anchor.fitted = true;
       recovery_elastic_probation_ = true;
     }
   }
@@ -892,9 +910,8 @@ void GlobalPoseLayer::RebuildRegularizedFieldsLocked()
   recovery_options.anchor_first_knot_identity = true;
   for (auto &anchor : emergency_segment_anchors_)
   {
-    anchor.elastic_field = anchor.fitted
-        ? std::make_shared<RegularizedCorrectionField4d>(recovery_options)
-        : nullptr;
+    anchor.elastic_field =
+        std::make_shared<RegularizedCorrectionField4d>(recovery_options);
   }
 
   for (const auto &elastic : elastic_observations_)
@@ -912,7 +929,7 @@ void GlobalPoseLayer::RebuildRegularizedFieldsLocked()
           elastic.keyframe_id < *quarantine_start_keyframe_id_)
         field = regularized_field_.get();
     }
-    else if (active_anchor->fitted && active_anchor->elastic_field)
+    else if (active_anchor->elastic_field)
       field = active_anchor->elastic_field.get();
     if (!field) continue;
     const Pose3d nominal = SegmentNominal(
@@ -921,7 +938,8 @@ void GlobalPoseLayer::RebuildRegularizedFieldsLocked()
     field->AddObservation(
         elastic.keyframe_id, elastic.observation.timestamp,
         cumulative_distance_m_.at(elastic.keyframe_id), nominal,
-        elastic.observation, elastic.use_position_observation);
+        elastic.observation, elastic.use_position_observation,
+        elastic.constraint_gain);
   }
 }
 

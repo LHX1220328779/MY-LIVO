@@ -33,7 +33,15 @@ KeyframeManager::KeyframeManager(const Options &options)
                                csv_path.string());
     csv_stream_
         << "id,timestamp,trigger,tx,ty,tz,qx,qy,qz,qw,cloud_points,"
-           "sigma_x,sigma_y,sigma_z,sigma_roll,sigma_pitch,sigma_yaw\n";
+           "sigma_x,sigma_y,sigma_z,sigma_roll,sigma_pitch,sigma_yaw,"
+           "lio_observability_valid,downsampled_features,effective_features,"
+           "effective_feature_ratio,mean_abs_residual_m,"
+           "translation_info_min,translation_info_mid,translation_info_max,"
+           "translation_condition_ratio,translation_weak_x,"
+           "translation_weak_y,translation_weak_z,"
+           "rotation_info_min,rotation_info_mid,rotation_info_max,"
+           "rotation_condition_ratio,rotation_weak_x,rotation_weak_y,"
+           "rotation_weak_z\n";
   }
 }
 
@@ -112,7 +120,8 @@ KeyframeCloud::ConstPtr KeyframeManager::PrepareCloud(
 Keyframe::Ptr KeyframeManager::TryCreate(
     double timestamp, const Pose3d &T_odom_body,
     const CloudFactory &cloud_factory,
-    const Matrix6d &odom_covariance)
+    const Matrix6d &odom_covariance,
+    const LioObservability &lio_observability)
 {
   ValidateInput(timestamp, T_odom_body, odom_covariance);
   if (!cloud_factory)
@@ -165,7 +174,7 @@ Keyframe::Ptr KeyframeManager::TryCreate(
   const KeyframeCloud::ConstPtr stored_cloud = PrepareCloud(cloud_body);
   auto keyframe = std::make_shared<Keyframe>(
       keyframes_.size(), timestamp, T_odom_body, stored_cloud,
-      odom_covariance, trigger_mask);
+      odom_covariance, trigger_mask, lio_observability);
   keyframes_.push_back(keyframe);
   statistics_.keyframes = keyframes_.size();
   WriteCsv(*keyframe);
@@ -175,11 +184,12 @@ Keyframe::Ptr KeyframeManager::TryCreate(
 Keyframe::Ptr KeyframeManager::TryCreate(
     double timestamp, const Pose3d &T_odom_body,
     const KeyframeCloud::ConstPtr &cloud_body,
-    const Matrix6d &odom_covariance)
+    const Matrix6d &odom_covariance,
+    const LioObservability &lio_observability)
 {
   return TryCreate(timestamp, T_odom_body,
                    [cloud_body]() { return cloud_body; },
-                   odom_covariance);
+                   odom_covariance, lio_observability);
 }
 
 std::vector<Keyframe::Ptr> KeyframeManager::keyframes() const
@@ -239,6 +249,24 @@ void KeyframeManager::WriteCsv(const Keyframe &keyframe)
               << pose.rotation.w() << ',' << keyframe.cloud_body()->size();
   for (int index = 0; index < 6; ++index)
     csv_stream_ << ',' << standard_deviation(index);
+  const LioObservability &observability = keyframe.lio_observability();
+  csv_stream_ << ',' << static_cast<int>(observability.valid)
+              << ',' << observability.downsampled_features
+              << ',' << observability.effective_features
+              << ',' << observability.effective_feature_ratio
+              << ',' << observability.mean_absolute_residual_m;
+  for (int index = 0; index < 3; ++index)
+    csv_stream_ << ','
+                << observability.translation_information_eigenvalues[index];
+  csv_stream_ << ',' << observability.translation_condition_ratio;
+  for (int index = 0; index < 3; ++index)
+    csv_stream_ << ',' << observability.weakest_translation_direction[index];
+  for (int index = 0; index < 3; ++index)
+    csv_stream_ << ','
+                << observability.rotation_information_eigenvalues[index];
+  csv_stream_ << ',' << observability.rotation_condition_ratio;
+  for (int index = 0; index < 3; ++index)
+    csv_stream_ << ',' << observability.weakest_rotation_direction[index];
   csv_stream_ << '\n';
   csv_stream_.flush();
 }

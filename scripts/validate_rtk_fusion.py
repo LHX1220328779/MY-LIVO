@@ -45,6 +45,43 @@ def distance(a, b):
     return norm(tuple(x-y for x, y in zip(a, b)))
 
 
+def elastic_stiffness(distance_value, soft_radius, full_radius,
+                      minimum_stiffness, maximum_stiffness):
+    if distance_value <= soft_radius:
+        return minimum_stiffness
+    if distance_value >= full_radius:
+        return maximum_stiffness
+    x = (distance_value-soft_radius)/(full_radius-soft_radius)
+    smooth = x*x*x*(10+x*(-15+6*x))
+    return minimum_stiffness + \
+        (maximum_stiffness-minimum_stiffness)*smooth
+
+
+def observability_weakness(condition_ratio, soft_ratio, full_ratio):
+    if condition_ratio >= soft_ratio:
+        return 0.0
+    if condition_ratio <= full_ratio:
+        return 1.0
+    x = (soft_ratio-condition_ratio)/(soft_ratio-full_ratio)
+    return x*x*x*(10+x*(-15+6*x))
+
+
+def adaptive_gradient_gain(distance_value, elastic_full_radius,
+                           adaptive_full_distance, maximum_gain,
+                           stiffness, constraint_gain):
+    if distance_value <= elastic_full_radius:
+        distance_gain = 1.0
+    elif distance_value >= adaptive_full_distance:
+        distance_gain = maximum_gain
+    else:
+        x = (distance_value-elastic_full_radius) / \
+            (adaptive_full_distance-elastic_full_radius)
+        smooth = x*x*x*(10+x*(-15+6*x))
+        distance_gain = 1.0+(maximum_gain-1.0)*smooth
+    observability_gain = 1.0+(constraint_gain-1.0)*stiffness
+    return min(maximum_gain, max(distance_gain, observability_gain))
+
+
 def quaternion_angle_deg(left, right):
     left_norm = norm(left)
     right_norm = norm(right)
@@ -102,6 +139,9 @@ def main():
         default=Path("Log/backend/elastic_segment_acceptance.csv"))
     parser.add_argument("--velocity-guard", type=Path,
                         default=Path("Log/backend/rtk_velocity_guard.csv"))
+    parser.add_argument(
+        "--recovery-frame-tracking", type=Path,
+        default=Path("Log/backend/rtk_recovery_frame_tracking.csv"))
     parser.add_argument("--relocalization-monitor", type=Path,
                         default=Path("Log/backend/rigid_relocalization.csv"))
     parser.add_argument("--recovery-monitor", type=Path,
@@ -113,16 +153,40 @@ def main():
                         default=Path(
                             "Log/backend/frontend_restart_supervisor.csv"))
     parser.add_argument("--field-knot-spacing", type=float, default=15.0)
-    parser.add_argument("--elastic-soft-radius", type=float, default=0.10)
+    parser.add_argument("--elastic-soft-radius", type=float, default=0.20)
     parser.add_argument("--elastic-full-radius", type=float, default=0.28)
     parser.add_argument("--elastic-minimum-stiffness", type=float,
                         default=0.05)
     parser.add_argument("--elastic-maximum-stiffness", type=float,
                         default=1.0)
     parser.add_argument("--regularized-elastic-soft-radius", type=float,
-                        default=0.20)
+                        default=0.15)
     parser.add_argument("--regularized-elastic-full-radius", type=float,
+                        default=0.50)
+    parser.add_argument("--regularized-vertical-soft-radius", type=float,
+                        default=0.15)
+    parser.add_argument("--regularized-vertical-full-radius", type=float,
+                        default=0.60)
+    parser.add_argument("--regularized-yaw-soft-radius-deg", type=float,
+                        default=0.25)
+    parser.add_argument("--regularized-yaw-full-radius-deg", type=float,
                         default=1.00)
+    parser.add_argument("--maximum-observability-constraint-gain",
+                        type=float, default=3.0)
+    parser.add_argument("--observability-translation-soft-ratio",
+                        type=float, default=0.15)
+    parser.add_argument("--observability-translation-full-ratio",
+                        type=float, default=0.05)
+    parser.add_argument("--observability-rotation-soft-ratio",
+                        type=float, default=0.25)
+    parser.add_argument("--observability-rotation-full-ratio",
+                        type=float, default=0.08)
+    parser.add_argument("--observability-minimum-effective-features",
+                        type=int, default=1000)
+    parser.add_argument("--saturation-restart-residual", type=float,
+                        default=0.50)
+    parser.add_argument("--saturation-restart-gradient-ratio", type=float,
+                        default=0.95)
     parser.add_argument("--regularized-elastic-minimum-stiffness", type=float,
                         default=0.0)
     parser.add_argument("--regularized-elastic-maximum-stiffness", type=float,
@@ -138,9 +202,19 @@ def main():
     parser.add_argument("--maximum-field-yaw-update-deg", type=float,
                         default=0.15)
     parser.add_argument("--maximum-regularized-planar-gradient", type=float,
-                        default=0.20)
+                        default=0.05)
     parser.add_argument("--maximum-regularized-vertical-gradient", type=float,
-                        default=0.18)
+                        default=0.08)
+    parser.add_argument("--maximum-regularized-yaw-gradient", type=float,
+                        default=0.10)
+    parser.add_argument("--adaptive-position-gradient-full-distance",
+                        type=float, default=1.50)
+    parser.add_argument("--adaptive-yaw-gradient-full-distance-deg",
+                        type=float, default=3.00)
+    parser.add_argument("--adaptive-position-gradient-maximum-gain",
+                        type=float, default=1.5)
+    parser.add_argument("--adaptive-yaw-gradient-maximum-gain",
+                        type=float, default=2.0)
     parser.add_argument("--acceptance-minimum-observations", type=int,
                         default=6)
     parser.add_argument("--acceptance-minimum-path", type=float, default=30.0)
@@ -151,9 +225,9 @@ def main():
     parser.add_argument("--acceptance-maximum-post-velocity", type=float,
                         default=0.80)
     parser.add_argument("--acceptance-maximum-gradient", type=float,
-                        default=0.30)
+                        default=0.10)
     parser.add_argument("--acceptance-maximum-yaw-gradient", type=float,
-                        default=0.20)
+                        default=0.10)
     parser.add_argument("--acceptance-maximum-outlier-fraction", type=float,
                         default=0.25)
     parser.add_argument("--velocity-low-pass-time-constant", type=float,
@@ -175,15 +249,39 @@ def main():
     parser.add_argument("--maximum-vertical-velocity-correction", type=float,
                         default=0.75)
     parser.add_argument("--maximum-planar-velocity-acceleration", type=float,
-                        default=0.30)
+                        default=0.75)
     parser.add_argument("--maximum-vertical-velocity-acceleration",
-                        type=float, default=0.15)
+                        type=float, default=0.30)
+    parser.add_argument("--healthy-vertical-time-constant", type=float,
+                        default=4.0)
+    parser.add_argument("--healthy-vertical-maximum-acceleration",
+                        type=float, default=0.08)
     parser.add_argument("--recovery-tracking-time-constant", type=float,
                         default=0.35)
     parser.add_argument("--recovery-tracking-planar-acceleration",
                         type=float, default=1.50)
     parser.add_argument("--recovery-tracking-vertical-acceleration",
                         type=float, default=0.75)
+    parser.add_argument("--recovery-frame-tracking-maximum-age", type=float,
+                        default=1.5)
+    parser.add_argument("--recovery-frame-tracking-planar-acceleration",
+                        type=float, default=3.0)
+    parser.add_argument("--recovery-frame-tracking-vertical-acceleration",
+                        type=float, default=2.0)
+    parser.add_argument("--recovery-position-soft-radius", type=float,
+                        default=0.15)
+    parser.add_argument("--recovery-position-full-radius", type=float,
+                        default=1.50)
+    parser.add_argument("--recovery-position-release-radius", type=float,
+                        default=0.10)
+    parser.add_argument("--recovery-capture-minimum-stiffness", type=float,
+                        default=0.50)
+    parser.add_argument("--recovery-position-time-constant", type=float,
+                        default=4.0)
+    parser.add_argument("--recovery-maximum-planar-closure-velocity",
+                        type=float, default=0.60)
+    parser.add_argument("--recovery-maximum-vertical-closure-velocity",
+                        type=float, default=0.60)
     parser.add_argument("--emergency-restart-velocity-error", type=float,
                         default=2.0)
     parser.add_argument("--emergency-restart-observations", type=int,
@@ -210,6 +308,10 @@ def main():
                         default=15.0)
     parser.add_argument("--frontend-segment-minimum-seed-points", type=int,
                         default=1000)
+    parser.add_argument("--frontend-history-seed-path", type=float,
+                        default=20.0)
+    parser.add_argument("--frontend-history-seed-minimum-keyframes", type=int,
+                        default=3)
     parser.add_argument("--maximum-automatic-restarts", type=int, default=1)
     parser.add_argument("--diagnostic-minimum-condition-ratio", type=float,
                         default=0.01)
@@ -261,7 +363,10 @@ def main():
         (decision_fields, {"keyframe_id", "timestamp", "decision", "factor_added", "measurement_x", "measurement_y", "measurement_z", "innovation_chi2"}, "decision"),
         (keyframe_fields, {
             "id", "timestamp", "tx", "ty", "tz", "qx", "qy", "qz",
-            "qw"}, "keyframe"),
+            "qw", "lio_observability_valid", "downsampled_features",
+            "effective_features", "effective_feature_ratio",
+            "mean_abs_residual_m", "translation_condition_ratio",
+            "rotation_condition_ratio"}, "keyframe"),
         (trajectory_fields, {
             "id", "timestamp", "raw_tx", "raw_ty", "raw_tz", "raw_qx",
             "raw_qy", "raw_qz", "raw_qw", "opt_tx", "opt_ty", "opt_tz",
@@ -282,6 +387,31 @@ def main():
             f"decisions={len(decisions)}, trajectory={len(trajectory)}; "
             "rebuild and rerun so all keyframe-rate files come from the "
             "same mapping process")
+
+    observable_keyframes = []
+    for row in keyframes:
+        valid = int(row["lio_observability_valid"])
+        downsampled = int(row["downsampled_features"])
+        effective = int(row["effective_features"])
+        feature_ratio = float(row["effective_feature_ratio"])
+        translation_condition = float(row["translation_condition_ratio"])
+        rotation_condition = float(row["rotation_condition_ratio"])
+        residual = float(row["mean_abs_residual_m"])
+        if valid not in (0, 1) or downsampled < 0 or not \
+                0 <= effective <= downsampled or any(not math.isfinite(value)
+                for value in (feature_ratio, translation_condition,
+                              rotation_condition, residual)):
+            raise RuntimeError("keyframe LIO observability is invalid")
+        if valid:
+            if not 0 <= translation_condition <= 1 or not \
+                    0 <= rotation_condition <= 1:
+                raise RuntimeError("LIO observability condition is invalid")
+            observable_keyframes.append((
+                int(row["id"]), effective, feature_ratio,
+                translation_condition, rotation_condition, residual))
+    if not observable_keyframes:
+        raise RuntimeError("no keyframe has valid LIO observability")
+    keyframe_by_id = {int(row["id"]): row for row in keyframes}
 
     status_timeline = []
     parsed_statuses = 0
@@ -384,6 +514,8 @@ def main():
         maximum_global_angle = 0.0
         local_positions = []
         global_positions = []
+        local_rotations = []
+        global_rotations = []
         map_eligibility = []
         for index, (keyframe, local_row, global_row) in enumerate(
                 zip(keyframes, trajectory, global_trajectory)):
@@ -402,6 +534,9 @@ def main():
                 ("local_qx", "local_qy", "local_qz", "local_qw"))
             global_position = vector(
                 global_row, ("global_tx", "global_ty", "global_tz"))
+            global_rotation = vector(
+                global_row,
+                ("global_qx", "global_qy", "global_qz", "global_qw"))
             eligible = int(global_row["map_eligible"])
             if eligible not in (0, 1):
                 raise RuntimeError("global-map eligibility is not binary")
@@ -415,6 +550,8 @@ def main():
                 local_row, ("raw_qx", "raw_qy", "raw_qz", "raw_qw"))
             local_positions.append(local_from_global)
             global_positions.append(global_position)
+            local_rotations.append(local_rotation_from_global)
+            global_rotations.append(global_rotation)
             maximum_raw_input_error = max(
                 maximum_raw_input_error,
                 distance(raw_from_keyframe, raw_from_graph))
@@ -446,6 +583,7 @@ def main():
         maximum_planar_gradient = 0.0
         maximum_vertical_gradient = 0.0
         emergency_segment_starts = set()
+        preliminary_segments = []
         if args.frontend_segments.is_file():
             preliminary_segment_fields, preliminary_segments = read(
                 args.frontend_segments)
@@ -453,15 +591,15 @@ def main():
                 emergency_segment_starts = {
                     int(row["trigger_keyframe_id"])+1
                     for row in preliminary_segments
-                    if row["restart_kind"] == "velocity"}
+                    if row["restart_kind"] in {
+                        "velocity", "observability", "saturation"}}
         corrections = [tuple(global_value-local_value
                              for global_value, local_value in zip(global_pose, local_pose))
                        for local_pose, global_pose in
                        zip(local_positions, global_positions)]
         for index in range(1, len(corrections)):
-            # A recovery segment uses one constant 4DOF frame transform, not
-            # C(s). Its boundary jump and carried yaw must therefore not be
-            # interpreted as elastic-field spatial gradient.
+            # Recovery segments have their own distance origin and audited
+            # C2 field; do not differentiate across that segment boundary.
             if emergency_segment_starts and \
                     index >= min(emergency_segment_starts):
                 continue
@@ -486,6 +624,22 @@ def main():
         print(f"pose provenance: keyframe/raw_graph="
               f"{maximum_raw_input_error:.3g}m/"
               f"{maximum_raw_input_angle:.3g}deg")
+        weakest_translation = min(
+            observable_keyframes, key=lambda item: item[3])
+        weakest_rotation = min(
+            observable_keyframes, key=lambda item: item[4])
+        print(
+            "LIO geometric observability (diagnostic): "
+            f"valid={len(observable_keyframes)}/{len(keyframes)}, "
+            f"effective_features="
+            f"{min(item[1] for item in observable_keyframes)}.."
+            f"{max(item[1] for item in observable_keyframes)}, "
+            f"translation_condition_p50="
+            f"{statistics.median(item[3] for item in observable_keyframes):.6g} "
+            f"(min={weakest_translation[3]:.6g}@KF{weakest_translation[0]}), "
+            f"rotation_condition_p50="
+            f"{statistics.median(item[4] for item in observable_keyframes):.6g} "
+            f"(min={weakest_rotation[4]:.6g}@KF{weakest_rotation[0]})")
         print(f"local/global isolation: max_local_input_error="
               f"{maximum_local_input_error:.3g}m/"
               f"{maximum_local_input_angle:.3g}deg, global_correction="
@@ -566,13 +720,24 @@ def main():
             print(f"correction feasibility: states={monitor_counts}, "
                   f"max_gradient={maximum_gradient:.4f}m/m, "
                   f"first_relocalization_kf={first_relocalization}")
-        expected_quarantine_start = first_relocalization
+        proactive_quarantine_starts = []
+        if args.frontend_segments.is_file():
+            proactive_quarantine_starts = [
+                int(row["trigger_keyframe_id"])
+                for row in preliminary_segments
+                if row.get("restart_kind", "structural") in {
+                    "velocity", "observability", "saturation"}]
+        quarantine_candidates = proactive_quarantine_starts + (
+            [first_relocalization] if first_relocalization is not None else [])
+        expected_quarantine_start = min(quarantine_candidates) \
+            if quarantine_candidates else None
         actual_quarantine_start = next(
             (index for index, eligible in enumerate(map_eligibility)
              if not eligible), None)
         if actual_quarantine_start != expected_quarantine_start:
             raise RuntimeError(
-                "global-map quarantine does not start at relocalization latch")
+                "global-map quarantine does not start at the earliest "
+                "relocalization or proactive restart latch")
         acceptance_rows = []
         trusted_resume = None
         if args.elastic_acceptance.is_file():
@@ -703,17 +868,11 @@ def main():
                 elastic_distance = float(row["elastic_distance_m"])
                 stiffness = float(row["elastic_stiffness"])
                 force_proxy = float(row["radial_force_proxy_m"])
-                if elastic_distance <= args.elastic_soft_radius:
-                    expected_stiffness = args.elastic_minimum_stiffness
-                elif elastic_distance >= args.elastic_full_radius:
-                    expected_stiffness = args.elastic_maximum_stiffness
-                else:
-                    x = (elastic_distance-args.elastic_soft_radius) / \
-                        (args.elastic_full_radius-args.elastic_soft_radius)
-                    smooth = x*x*x*(10+x*(-15+6*x))
-                    expected_stiffness = args.elastic_minimum_stiffness + \
-                        (args.elastic_maximum_stiffness-
-                         args.elastic_minimum_stiffness)*smooth
+                expected_stiffness = elastic_stiffness(
+                    elastic_distance, args.elastic_soft_radius,
+                    args.elastic_full_radius,
+                    args.elastic_minimum_stiffness,
+                    args.elastic_maximum_stiffness)
                 if abs(stiffness-expected_stiffness) > 1e-9:
                     raise RuntimeError(
                         "radial elastic stiffness is inconsistent")
@@ -797,7 +956,15 @@ def main():
                 "raw_rtk_vy", "raw_rtk_vz", "filtered_rtk_vx",
                 "filtered_rtk_vy", "filtered_rtk_vz", "lio_before_vx",
                 "lio_before_vy", "lio_before_vz", "lio_after_vx",
-                "lio_after_vy", "lio_after_vz", "velocity_error_mps",
+                "lio_after_vy", "lio_after_vz", "global_error_x",
+                "global_error_y", "global_error_z", "closure_vx",
+                "closure_vy", "closure_vz", "tracking_target_vx",
+                "tracking_target_vy", "tracking_target_vz",
+                "recovery_planar_stiffness",
+                "recovery_vertical_stiffness",
+                "recovery_planar_capture_active",
+                "recovery_vertical_capture_active",
+                "velocity_error_mps",
                 "speed_ratio", "applied_gain", "correction_x", "correction_y",
                 "correction_z",
             }
@@ -858,6 +1025,7 @@ def main():
             guard_counts = {}
             maximum_velocity_error = 0.0
             maximum_velocity_correction = 0.0
+            maximum_recovery_closure_velocity = 0.0
             first_activation = None
             expected_filtered = None
             guard_intervals = []
@@ -865,6 +1033,8 @@ def main():
             recovery_tracking_updates = 0
             emergency_evidence = 0
             emergency_completed = False
+            recovery_planar_capture_active = False
+            recovery_vertical_capture_active = False
             for index, row in enumerate(guard_rows):
                 row_id = int(row["keyframe_id"])
                 observation = decisions_by_id[row_id]
@@ -962,6 +1132,89 @@ def main():
                     "filtered_rtk_vz"))
                 if distance(expected_filtered, logged_filtered) > 1e-8:
                     raise RuntimeError("velocity low-pass is inconsistent")
+                global_error = vector(row, (
+                    "global_error_x", "global_error_y", "global_error_z"))
+                closure = vector(
+                    row, ("closure_vx", "closure_vy", "closure_vz"))
+                tracking_target = vector(row, (
+                    "tracking_target_vx", "tracking_target_vy",
+                    "tracking_target_vz"))
+                expected_closure = [0.0, 0.0, 0.0]
+                if recovery_tracking:
+                    planar_distance = norm(global_error[:2])
+                    vertical_distance = abs(global_error[2])
+                    if (not recovery_planar_capture_active and
+                            planar_distance >
+                            args.recovery_position_soft_radius):
+                        recovery_planar_capture_active = True
+                    elif (recovery_planar_capture_active and
+                          planar_distance <=
+                          args.recovery_position_release_radius):
+                        recovery_planar_capture_active = False
+                    if (not recovery_vertical_capture_active and
+                            vertical_distance >
+                            args.recovery_position_soft_radius):
+                        recovery_vertical_capture_active = True
+                    elif (recovery_vertical_capture_active and
+                          vertical_distance <=
+                          args.recovery_position_release_radius):
+                        recovery_vertical_capture_active = False
+                    planar_stiffness = elastic_stiffness(
+                        planar_distance,
+                        args.recovery_position_soft_radius,
+                        args.recovery_position_full_radius, 0.0, 1.0)
+                    vertical_stiffness = elastic_stiffness(
+                        vertical_distance,
+                        args.recovery_position_soft_radius,
+                        args.recovery_position_full_radius, 0.0, 1.0)
+                    if recovery_planar_capture_active:
+                        planar_stiffness = max(
+                            planar_stiffness,
+                            args.recovery_capture_minimum_stiffness)
+                    if recovery_vertical_capture_active:
+                        vertical_stiffness = max(
+                            vertical_stiffness,
+                            args.recovery_capture_minimum_stiffness)
+                    expected_closure[:2] = [
+                        -planar_stiffness*value /
+                        args.recovery_position_time_constant
+                        for value in global_error[:2]]
+                    planar_closure_norm = norm(expected_closure[:2])
+                    if planar_closure_norm > \
+                            args.recovery_maximum_planar_closure_velocity:
+                        scale = \
+                            args.recovery_maximum_planar_closure_velocity / \
+                            planar_closure_norm
+                        expected_closure[0] *= scale
+                        expected_closure[1] *= scale
+                    expected_closure[2] = max(
+                        -args.recovery_maximum_vertical_closure_velocity,
+                        min(args.recovery_maximum_vertical_closure_velocity,
+                            -vertical_stiffness*global_error[2] /
+                            args.recovery_position_time_constant))
+                else:
+                    recovery_planar_capture_active = False
+                    recovery_vertical_capture_active = False
+                    planar_stiffness = 0.0
+                    vertical_stiffness = 0.0
+                if (abs(float(row["recovery_planar_stiffness"])-
+                        planar_stiffness) > 1e-8 or
+                        abs(float(row["recovery_vertical_stiffness"])-
+                            vertical_stiffness) > 1e-8 or
+                        int(row["recovery_planar_capture_active"]) !=
+                            int(recovery_planar_capture_active) or
+                        int(row["recovery_vertical_capture_active"]) !=
+                            int(recovery_vertical_capture_active)):
+                    raise RuntimeError(
+                        "recovery capture hysteresis is inconsistent")
+                if distance(expected_closure, closure) > 1e-8 or \
+                        distance(tracking_target, tuple(
+                            value+delta for value, delta in
+                            zip(logged_filtered, closure))) > 1e-8:
+                    raise RuntimeError(
+                        "radial recovery velocity target is inconsistent")
+                maximum_recovery_closure_velocity = max(
+                    maximum_recovery_closure_velocity, norm(closure))
                 before = vector(
                     row, ("lio_before_vx", "lio_before_vy", "lio_before_vz"))
                 after = vector(
@@ -969,13 +1222,19 @@ def main():
                 correction = vector(
                     row, ("correction_x", "correction_y", "correction_z"))
                 gain = float(row["applied_gain"])
-                correction_time_constant = \
-                    args.recovery_tracking_time_constant if \
-                    recovery_tracking else \
-                    args.velocity_correction_time_constant
+                healthy_vertical_aiding = \
+                    decision == "healthy_vertical_aiding"
+                correction_time_constant = (
+                    args.healthy_vertical_time_constant
+                    if healthy_vertical_aiding else
+                    args.recovery_tracking_time_constant
+                    if recovery_tracking else
+                    args.velocity_correction_time_constant)
                 expected_gain = 1-math.exp(
                     -dt/correction_time_constant)
-                if int(row["active"]) == 1 and decision != "recovered":
+                if ((int(row["active"]) == 1 and
+                     decision != "recovered") or
+                        healthy_vertical_aiding):
                     if abs(gain-expected_gain) > 1e-8:
                         raise RuntimeError(
                             "velocity correction gain is not time-scaled")
@@ -985,24 +1244,35 @@ def main():
                 if distance(after, tuple(value+delta for value, delta in
                                          zip(before, correction))) > 1e-9:
                     raise RuntimeError("velocity correction arithmetic differs")
-                expected_correction = tuple(
-                    gain*(target-value) for target, value in
-                    zip(logged_filtered, before))
-                expected_planar_norm = norm(expected_correction[:2])
-                if expected_planar_norm > \
-                        args.maximum_planar_velocity_correction:
-                    planar_scale = args.maximum_planar_velocity_correction / \
-                        expected_planar_norm
+                if healthy_vertical_aiding:
+                    vertical_limit = \
+                        args.healthy_vertical_maximum_acceleration*dt
                     expected_correction = (
-                        expected_correction[0]*planar_scale,
-                        expected_correction[1]*planar_scale,
-                        expected_correction[2])
-                expected_correction = (
-                    expected_correction[0], expected_correction[1],
-                    max(-args.maximum_vertical_velocity_correction,
-                        min(args.maximum_vertical_velocity_correction,
-                            expected_correction[2])))
-                if have_receiver_velocity_schema:
+                        0.0, 0.0,
+                        max(-vertical_limit, min(
+                            vertical_limit,
+                            gain*(logged_filtered[2]-before[2]))))
+                else:
+                    expected_correction = tuple(
+                        gain*(target-value) for target, value in
+                        zip(tracking_target, before))
+                    expected_planar_norm = norm(expected_correction[:2])
+                    if expected_planar_norm > \
+                            args.maximum_planar_velocity_correction:
+                        planar_scale = \
+                            args.maximum_planar_velocity_correction / \
+                            expected_planar_norm
+                        expected_correction = (
+                            expected_correction[0]*planar_scale,
+                            expected_correction[1]*planar_scale,
+                            expected_correction[2])
+                    expected_correction = (
+                        expected_correction[0], expected_correction[1],
+                        max(-args.maximum_vertical_velocity_correction,
+                            min(args.maximum_vertical_velocity_correction,
+                                expected_correction[2])))
+                if have_receiver_velocity_schema and not \
+                        healthy_vertical_aiding:
                     planar_acceleration = \
                         args.recovery_tracking_planar_acceleration if \
                         recovery_tracking else \
@@ -1042,14 +1312,21 @@ def main():
                     raise RuntimeError("velocity correction exceeded its bound")
                 error_before = distance(before, logged_filtered)
                 error_after = distance(after, logged_filtered)
+                controller_error_before = distance(
+                    before, tracking_target)
+                controller_error_after = distance(
+                    after, tracking_target)
                 if abs(error_before-float(row["velocity_error_mps"])) > 1e-8:
                     raise RuntimeError("velocity error log is inconsistent")
-                if error_after > error_before+1e-10:
-                    raise RuntimeError("velocity guard increased disagreement")
+                if controller_error_after > \
+                        controller_error_before+1e-10:
+                    raise RuntimeError(
+                        "velocity guard increased controller disagreement")
                 applied = int(row["correction_applied"]) == 1
                 if applied != (norm(correction) > 1e-12):
                     raise RuntimeError("velocity correction flag differs")
-                if applied and int(row["active"]) != 1:
+                if applied and int(row["active"]) != 1 and not \
+                        healthy_vertical_aiding:
                     raise RuntimeError("inactive velocity guard changed LIO")
                 if decision == "activated" and first_activation is None:
                     first_activation = int(row["keyframe_id"])
@@ -1091,9 +1368,88 @@ def main():
                   f"first_activation_kf={first_activation}, "
                   f"max_error={maximum_velocity_error:.3f}m/s, "
                   f"max_correction={maximum_velocity_correction:.3f}m/s, "
+                  f"max_radial_closure="
+                  f"{maximum_recovery_closure_velocity:.3f}m/s, "
                   f"recovery_tracking_updates={recovery_tracking_updates}, "
                   f"emergency_restart_kf="
                   f"{min(velocity_restart_transition_ids) if velocity_restart_transition_ids else None}")
+
+        if args.recovery_frame_tracking.is_file():
+            frame_fields, frame_rows = read(args.recovery_frame_tracking)
+            required_frame = {
+                "timestamp", "source_keyframe_id", "target_timestamp",
+                "target_age_sec", "interval_sec", "target_vx",
+                "target_vy", "target_vz", "before_vx", "before_vy",
+                "before_vz", "after_vx", "after_vy", "after_vz",
+                "correction_vx", "correction_vy", "correction_vz",
+            }
+            if not required_frame.issubset(frame_fields):
+                raise RuntimeError(
+                    "recovery frame-tracking CSV is incomplete")
+            guard_by_id = {
+                int(row["keyframe_id"]): row for row in guard_rows}
+            previous_frame_time = None
+            maximum_frame_correction = 0.0
+            for row in frame_rows:
+                timestamp = float(row["timestamp"])
+                interval = float(row["interval_sec"])
+                age = float(row["target_age_sec"])
+                source_id = int(row["source_keyframe_id"])
+                source = guard_by_id.get(source_id)
+                if (previous_frame_time is not None and
+                        timestamp <= previous_frame_time):
+                    raise RuntimeError(
+                        "recovery frame-tracking timestamps are unordered")
+                previous_frame_time = timestamp
+                if interval <= 0.0 or age < -1e-8 or age > \
+                        args.recovery_frame_tracking_maximum_age+1e-8:
+                    raise RuntimeError(
+                        "recovery frame-tracking time gate differs")
+                if source is None or int(source.get(
+                        "recovery_tracking", "0")) != 1:
+                    raise RuntimeError(
+                        "recovery frame tracking lacks a low-rate source")
+                target = vector(row, (
+                    "target_vx", "target_vy", "target_vz"))
+                expected_target = vector(source, (
+                    "tracking_target_vx", "tracking_target_vy",
+                    "tracking_target_vz"))
+                if distance(target, expected_target) > 1e-8 or abs(
+                        float(row["target_timestamp"])-
+                        float(source["timestamp"])) > 1e-8:
+                    raise RuntimeError(
+                        "recovery frame tracking changed its held target")
+                before = vector(row, (
+                    "before_vx", "before_vy", "before_vz"))
+                after = vector(row, (
+                    "after_vx", "after_vy", "after_vz"))
+                correction = vector(row, (
+                    "correction_vx", "correction_vy", "correction_vz"))
+                if distance(after, tuple(a+b for a, b in
+                                         zip(before, correction))) > 1e-9:
+                    raise RuntimeError(
+                        "recovery frame-tracking arithmetic differs")
+                if (norm(correction[:2]) >
+                        args.recovery_frame_tracking_planar_acceleration *
+                        interval+1e-8 or
+                        abs(correction[2]) >
+                        args.recovery_frame_tracking_vertical_acceleration *
+                        interval+1e-8):
+                    raise RuntimeError(
+                        "recovery frame tracking exceeded acceleration")
+                if distance(after, target) > distance(before, target)+1e-9:
+                    raise RuntimeError(
+                        "recovery frame tracking moved away from target")
+                maximum_frame_correction = max(
+                    maximum_frame_correction, norm(correction))
+            if guard_rows and any(int(row.get(
+                    "recovery_tracking", "0")) == 1 for row in guard_rows) \
+                    and not frame_rows:
+                raise RuntimeError(
+                    "quarantined recovery has no frame-rate velocity hold")
+            print(
+                f"recovery frame velocity hold: updates={len(frame_rows)}, "
+                f"max_step={maximum_frame_correction:.3f}m/s")
 
         if args.regularized_field.is_file():
             regularized_fields, regularized_rows = read(
@@ -1103,9 +1459,21 @@ def main():
                 "recovery_segment", "decision", "distance_m",
                 "knot_count", "elastic_distance_m", "elastic_stiffness",
                 "radial_force_proxy_m",
+                "planar_elastic_distance_m", "vertical_elastic_distance_m",
+                "yaw_elastic_distance_deg", "planar_elastic_stiffness",
+                "vertical_elastic_stiffness", "yaw_elastic_stiffness",
+                "planar_force_proxy_m", "vertical_force_proxy_m",
+                "yaw_force_proxy_deg",
+                "constraint_gain", "translation_condition_ratio",
+                "rotation_condition_ratio",
                 "correction_x", "correction_y", "correction_z",
                 "correction_yaw_deg", "gradient_m_per_m",
                 "yaw_gradient_deg_per_m", "curvature_per_m",
+                "peak_planar_gradient_m_per_m",
+                "peak_vertical_gradient_m_per_m",
+                "peak_yaw_gradient_deg_per_m",
+                "planar_gradient_gain", "vertical_gradient_gain",
+                "yaw_gradient_gain",
                 "residual_after_m", "elastic_probation",
                 "position_observation",
             }
@@ -1140,6 +1508,11 @@ def main():
             maximum_regularized_yaw_gradient = 0.0
             maximum_regularized_curvature = 0.0
             maximum_regularized_residual = 0.0
+            maximum_planar_gradient_gain = 1.0
+            maximum_vertical_gradient_gain = 1.0
+            maximum_yaw_gradient_gain = 1.0
+            minimum_constraint_gain = math.inf
+            maximum_constraint_gain = 0.0
             for row in regularized_rows:
                 decision = row["decision"]
                 if decision not in {
@@ -1176,56 +1549,207 @@ def main():
                     raise RuntimeError(
                         "rejected regularized observation changed its field")
                 stiffness = float(row["elastic_stiffness"])
+                constraint_gain = float(row["constraint_gain"])
+                if not 1.0 <= constraint_gain <= \
+                        args.maximum_observability_constraint_gain+1e-9:
+                    raise RuntimeError(
+                        "production observability gain is out of bounds")
+                minimum_constraint_gain = min(
+                    minimum_constraint_gain, constraint_gain)
+                maximum_constraint_gain = max(
+                    maximum_constraint_gain, constraint_gain)
+                source_keyframe = keyframe_by_id.get(
+                    int(row["keyframe_id"]))
+                if source_keyframe is None:
+                    raise RuntimeError(
+                        "production elastic row lacks its LIO keyframe")
+                translation_condition = float(
+                    source_keyframe["translation_condition_ratio"])
+                rotation_condition = float(
+                    source_keyframe["rotation_condition_ratio"])
+                if (abs(float(row["translation_condition_ratio"])-
+                        translation_condition) > 1e-12 or
+                        abs(float(row["rotation_condition_ratio"])-
+                            rotation_condition) > 1e-12):
+                    raise RuntimeError(
+                        "production elastic observability provenance differs")
+                observability_score = 0.0
+                if (int(source_keyframe["lio_observability_valid"]) == 1 and
+                        int(source_keyframe["effective_features"]) >=
+                        args.observability_minimum_effective_features):
+                    observability_score = min(
+                        observability_weakness(
+                            translation_condition,
+                            args.observability_translation_soft_ratio,
+                            args.observability_translation_full_ratio),
+                        observability_weakness(
+                            rotation_condition,
+                            args.observability_rotation_soft_ratio,
+                            args.observability_rotation_full_ratio))
+                expected_gain = 1.0 + (
+                    args.maximum_observability_constraint_gain-1.0) * \
+                    observability_score
+                if abs(constraint_gain-expected_gain) > 1e-9:
+                    raise RuntimeError(
+                        "production observability-adaptive gain differs")
                 if decision in {"accepted", "alignment_rejected",
                                 "translation_fallback"}:
                     elastic_distance = float(row["elastic_distance_m"])
-                    if elastic_distance <= args.regularized_elastic_soft_radius:
-                        expected_stiffness = \
-                            args.regularized_elastic_minimum_stiffness
-                    elif elastic_distance >= \
-                            args.regularized_elastic_full_radius:
-                        expected_stiffness = \
-                            args.regularized_elastic_maximum_stiffness
-                    else:
-                        x = (elastic_distance-
-                             args.regularized_elastic_soft_radius) / \
-                            (args.regularized_elastic_full_radius-
-                             args.regularized_elastic_soft_radius)
-                        smooth = x*x*x*(10+x*(-15+6*x))
-                        expected_stiffness = \
-                            args.regularized_elastic_minimum_stiffness + \
-                            (args.regularized_elastic_maximum_stiffness-
-                             args.regularized_elastic_minimum_stiffness)*smooth
-                    if abs(stiffness-expected_stiffness) > 1e-9:
+                    axis_specs = (
+                        ("planar", "planar_elastic_distance_m",
+                         "planar_elastic_stiffness", "planar_force_proxy_m",
+                         args.regularized_elastic_soft_radius,
+                         args.regularized_elastic_full_radius,
+                         "planar_gradient_gain",
+                         args.adaptive_position_gradient_full_distance,
+                         args.adaptive_position_gradient_maximum_gain),
+                        ("vertical", "vertical_elastic_distance_m",
+                         "vertical_elastic_stiffness",
+                         "vertical_force_proxy_m",
+                         args.regularized_vertical_soft_radius,
+                         args.regularized_vertical_full_radius,
+                         "vertical_gradient_gain",
+                         args.adaptive_position_gradient_full_distance,
+                         args.adaptive_position_gradient_maximum_gain),
+                        ("yaw", "yaw_elastic_distance_deg",
+                         "yaw_elastic_stiffness", "yaw_force_proxy_deg",
+                         args.regularized_yaw_soft_radius_deg,
+                         args.regularized_yaw_full_radius_deg,
+                         "yaw_gradient_gain",
+                         args.adaptive_yaw_gradient_full_distance_deg,
+                         args.adaptive_yaw_gradient_maximum_gain),
+                    )
+                    axis_stiffness = []
+                    for axis, distance_name, stiffness_name, force_name, \
+                            soft_radius, full_radius, gain_name, \
+                            adaptive_full_distance, maximum_gain in axis_specs:
+                        axis_distance = float(row[distance_name])
+                        axis_value = float(row[stiffness_name])
+                        expected = elastic_stiffness(
+                            axis_distance, soft_radius, full_radius,
+                            args.regularized_elastic_minimum_stiffness,
+                            args.regularized_elastic_maximum_stiffness)
+                        expected = 1.0-(1.0-expected)**constraint_gain
+                        if abs(axis_value-expected) > 1e-9:
+                            raise RuntimeError(
+                                f"production {axis} elastic stiffness is "
+                                "inconsistent")
+                        if abs(float(row[force_name])-
+                               axis_value*axis_distance) > 1e-9:
+                            raise RuntimeError(
+                                f"production {axis} elastic force proxy is "
+                                "inconsistent")
+                        expected_gradient_gain = adaptive_gradient_gain(
+                            axis_distance, full_radius,
+                            adaptive_full_distance, maximum_gain,
+                            axis_value, constraint_gain)
+                        if abs(float(row[gain_name])-
+                               expected_gradient_gain) > 1e-9:
+                            raise RuntimeError(
+                                f"production {axis} adaptive gradient gain "
+                                "is inconsistent")
+                        axis_stiffness.append(axis_value)
+                    if abs(stiffness-max(axis_stiffness)) > 1e-9:
                         raise RuntimeError(
-                            "production radial elastic stiffness is inconsistent")
+                            "production aggregate elastic stiffness is inconsistent")
                     force_proxy = float(row["radial_force_proxy_m"])
                     if abs(force_proxy-stiffness*elastic_distance) > 1e-9:
                         raise RuntimeError(
-                            "production radial elastic force proxy is inconsistent")
+                            "production aggregate elastic force proxy is inconsistent")
                 numeric = [float(row[name]) for name in (
                     "distance_m", "elastic_distance_m", "elastic_stiffness",
                     "radial_force_proxy_m",
+                    "planar_elastic_distance_m",
+                    "vertical_elastic_distance_m",
+                    "yaw_elastic_distance_deg", "planar_elastic_stiffness",
+                    "vertical_elastic_stiffness", "yaw_elastic_stiffness",
+                    "planar_force_proxy_m", "vertical_force_proxy_m",
+                    "yaw_force_proxy_deg",
+                    "constraint_gain", "translation_condition_ratio",
+                    "rotation_condition_ratio",
                     "correction_x", "correction_y", "correction_z",
                     "correction_yaw_deg", "gradient_m_per_m",
                     "yaw_gradient_deg_per_m", "curvature_per_m",
+                    "peak_planar_gradient_m_per_m",
+                    "peak_vertical_gradient_m_per_m",
+                    "peak_yaw_gradient_deg_per_m",
+                    "planar_gradient_gain", "vertical_gradient_gain",
+                    "yaw_gradient_gain",
                     "residual_after_m")]
                 if any(not math.isfinite(value) for value in numeric):
                     raise RuntimeError(
                         "regularized correction-field contains non-finite data")
-                if any(value < -1e-12 for value in (
-                        numeric[0], numeric[1], numeric[2], numeric[3],
-                        numeric[8], numeric[9], numeric[10], numeric[11])):
+                nonnegative_names = (
+                    "distance_m", "elastic_distance_m", "elastic_stiffness",
+                    "radial_force_proxy_m", "planar_elastic_distance_m",
+                    "vertical_elastic_distance_m",
+                    "yaw_elastic_distance_deg", "planar_elastic_stiffness",
+                    "vertical_elastic_stiffness", "yaw_elastic_stiffness",
+                    "planar_force_proxy_m", "vertical_force_proxy_m",
+                    "yaw_force_proxy_deg", "gradient_m_per_m",
+                    "yaw_gradient_deg_per_m", "curvature_per_m",
+                    "peak_planar_gradient_m_per_m",
+                    "peak_vertical_gradient_m_per_m",
+                    "peak_yaw_gradient_deg_per_m", "residual_after_m")
+                if any(float(row[name]) < -1e-12
+                       for name in nonnegative_names):
                     raise RuntimeError(
                         "regularized correction-field magnitude is negative")
                 maximum_regularized_gradient = max(
-                    maximum_regularized_gradient, numeric[8])
+                    maximum_regularized_gradient,
+                    math.hypot(
+                        float(row["peak_planar_gradient_m_per_m"]),
+                        float(row["peak_vertical_gradient_m_per_m"])))
                 maximum_regularized_yaw_gradient = max(
-                    maximum_regularized_yaw_gradient, numeric[9])
+                    maximum_regularized_yaw_gradient,
+                    float(row["peak_yaw_gradient_deg_per_m"]))
                 maximum_regularized_curvature = max(
-                    maximum_regularized_curvature, numeric[10])
+                    maximum_regularized_curvature,
+                    float(row["curvature_per_m"]))
                 maximum_regularized_residual = max(
-                    maximum_regularized_residual, numeric[11])
+                    maximum_regularized_residual,
+                    float(row["residual_after_m"]))
+                planar_limit = args.maximum_regularized_planar_gradient
+                planar_limit *= float(row["planar_gradient_gain"])
+                vertical_limit = args.maximum_regularized_vertical_gradient * \
+                    float(row["vertical_gradient_gain"])
+                yaw_limit = args.maximum_regularized_yaw_gradient * \
+                    float(row["yaw_gradient_gain"])
+                if (float(row["peak_planar_gradient_m_per_m"]) >
+                        planar_limit+2e-8 or
+                        float(row["peak_vertical_gradient_m_per_m"]) >
+                        vertical_limit+2e-8 or
+                        float(row["peak_yaw_gradient_deg_per_m"]) >
+                        yaw_limit+2e-8):
+                    raise RuntimeError(
+                        "production elastic interval exceeded its axis bound")
+                maximum_planar_gradient_gain = max(
+                    maximum_planar_gradient_gain,
+                    float(row["planar_gradient_gain"]))
+                maximum_vertical_gradient_gain = max(
+                    maximum_vertical_gradient_gain,
+                    float(row["vertical_gradient_gain"]))
+                maximum_yaw_gradient_gain = max(
+                    maximum_yaw_gradient_gain,
+                    float(row["yaw_gradient_gain"]))
+            recovery_position_rows = [
+                row for row in regularized_rows
+                if int(row["recovery_segment"]) == 1 and
+                int(row["position_observation"]) == 1 and
+                row["decision"] in {"accepted", "translation_fallback"}]
+            if any(int(row["recovery_segment"]) == 1
+                   for row in regularized_rows):
+                if not recovery_position_rows:
+                    raise RuntimeError(
+                        "recovery segment has no elastic position knot")
+                first_recovery_knot = recovery_position_rows[0]
+                if (norm(vector(first_recovery_knot, (
+                        "correction_x", "correction_y", "correction_z"))) >
+                        1e-10 or
+                        abs(float(first_recovery_knot[
+                            "correction_yaw_deg"])) > 1e-10):
+                    raise RuntimeError(
+                        "recovery elastic field lacks an identity boundary")
             print(
                 "production C2 elastic field: "
                 f"decisions={regularized_counts}, "
@@ -1235,6 +1759,11 @@ def main():
                 f"max_gradient={maximum_regularized_gradient:.4f}m/m, "
                 f"yaw_gradient={maximum_regularized_yaw_gradient:.4f}deg/m, "
                 f"curvature={maximum_regularized_curvature:.5f}/m, "
+                f"gradient_gain={maximum_planar_gradient_gain:.2f}/"
+                f"{maximum_vertical_gradient_gain:.2f}/"
+                f"{maximum_yaw_gradient_gain:.2f}, "
+                f"observability_gain={minimum_constraint_gain:.3f}.."
+                f"{maximum_constraint_gain:.3f}, "
                 f"observation_residual_max={maximum_regularized_residual:.3f}m")
         segment_rows = []
         if args.relocalization_monitor.is_file():
@@ -1245,6 +1774,8 @@ def main():
                     "segment_id", "trigger_keyframe_id",
                     "request_timestamp", "restart_timestamp", "reason",
                     "evidence_span_m", "seed_points", "deleted_voxels",
+                    "current_seed_points", "history_seed_keyframes",
+                    "history_seed_path_m", "history_seed_points",
                     "map_voxels_after", "pose_delta_m",
                     "rotation_delta_deg", "velocity_delta_mps",
                     "bias_g_delta", "bias_a_delta", "gravity_delta",
@@ -1274,15 +1805,32 @@ def main():
                             float(segment["request_timestamp"]):
                         raise RuntimeError(
                             "frontend segment predates its request")
-                    if int(segment["seed_points"]) < \
+                    current_seed_points = int(
+                        segment["current_seed_points"])
+                    history_seed_points = int(
+                        segment["history_seed_points"])
+                    history_seed_keyframes = int(
+                        segment["history_seed_keyframes"])
+                    history_seed_path = float(
+                        segment["history_seed_path_m"])
+                    if int(segment["seed_points"]) != \
+                            current_seed_points+history_seed_points or \
+                            current_seed_points < \
                             args.frontend_segment_minimum_seed_points or \
+                            history_seed_points <= 0 or \
+                            history_seed_keyframes < \
+                            args.frontend_history_seed_minimum_keyframes or \
+                            history_seed_path+1e-8 < \
+                            args.frontend_history_seed_path or \
                             int(segment["deleted_voxels"]) <= 0 or \
                             int(segment["map_voxels_after"]) <= 0:
                         raise RuntimeError(
-                            "frontend segment was not safely seeded")
+                            "frontend segment lacks a stable history seed")
                     restart_kind = segment.get(
                         "restart_kind", "structural")
-                    if restart_kind not in {"structural", "velocity"}:
+                    if restart_kind not in {
+                            "structural", "velocity", "observability",
+                            "saturation"}:
                         raise RuntimeError(
                             "frontend segment restart kind is unknown")
                     preserved = (
@@ -1296,18 +1844,25 @@ def main():
                             abs(float(segment["velocity_delta_mps"])) > 1e-10:
                         raise RuntimeError(
                             "structural frontend segment changed velocity")
-                    if restart_kind == "velocity":
+                    if restart_kind in {
+                            "velocity", "observability", "saturation"}:
+                        expected_reason = {
+                            "velocity": "velocity_divergence",
+                            "observability": "lio_observability",
+                            "saturation": "elastic_tracking_saturation",
+                        }[restart_kind]
                         if not have_recovery_segment_schema or \
-                                segment["reason"] != "velocity_divergence":
+                                segment["reason"] != expected_reason:
                             raise RuntimeError(
-                                "velocity recovery segment lacks its audit")
+                                "recovery segment lacks its trigger audit")
                         guard = next((row for row in guard_rows
                                       if int(row["keyframe_id"]) ==
                                       trigger_id), None)
-                        if guard is None or trigger_id not in \
-                                velocity_restart_transition_ids:
+                        if guard is None or (restart_kind == "velocity" and
+                                trigger_id not in
+                                velocity_restart_transition_ids):
                             raise RuntimeError(
-                                "velocity segment lacks a guard transition")
+                                "recovery segment lacks velocity evidence")
                         target = vector(segment, (
                             "target_velocity_x", "target_velocity_y",
                             "target_velocity_z"))
@@ -1699,13 +2254,24 @@ def main():
             restart_transition_ids = {
                 int(row["keyframe_id"]) for row in reloc_rows
                 if int(row["restart_state_changed"]) == 1}
+            observability_restart_transition_ids = {
+                int(row["trigger_keyframe_id"])
+                for row in supervisor_rows
+                if row["reason"] == "lio_observability"}
+            saturation_restart_transition_ids = {
+                int(row["trigger_keyframe_id"])
+                for row in supervisor_rows
+                if row["reason"] == "elastic_tracking_saturation"}
             all_restart_transition_ids = restart_transition_ids | \
-                velocity_restart_transition_ids
+                velocity_restart_transition_ids | \
+                observability_restart_transition_ids | \
+                saturation_restart_transition_ids
             if set(segment_by_trigger) - all_restart_transition_ids:
                 raise RuntimeError(
                     "frontend segment lacks a matching restart request")
             for trigger_id, segment in segment_by_trigger.items():
-                if segment.get("restart_kind", "structural") == "velocity":
+                if segment.get("restart_kind", "structural") in {
+                        "velocity", "observability", "saturation"}:
                     continue
                 reloc = next(row for row in reloc_rows
                              if int(row["keyframe_id"]) == trigger_id)
@@ -1759,6 +2325,29 @@ def main():
                             raise RuntimeError(
                                 "velocity restart-supervisor evidence differs")
                         continue
+                    if event["reason"] == "lio_observability":
+                        if (trigger_id not in
+                                observability_restart_transition_ids or
+                                event["geometry_failure"] !=
+                                "lio_observability" or
+                                not 0.0 <= float(
+                                    event["condition_ratio"]) <= 1.0):
+                            raise RuntimeError(
+                                "observability restart-supervisor evidence "
+                                "differs")
+                        continue
+                    if event["reason"] == "elastic_tracking_saturation":
+                        if (trigger_id not in
+                                saturation_restart_transition_ids or
+                                event["geometry_failure"] !=
+                                "elastic_tracking_saturation" or
+                                float(event["condition_ratio"])+1e-9 <
+                                    args.saturation_restart_gradient_ratio or
+                                float(event["similarity_rms_m"])+1e-9 <
+                                    args.saturation_restart_residual):
+                            raise RuntimeError(
+                                "elastic-saturation restart evidence differs")
+                        continue
                     reloc = reloc_by_id[trigger_id]
                     if abs(float(event["timestamp"])-
                            float(reloc["timestamp"])) > 1e-8 or \
@@ -1799,7 +2388,11 @@ def main():
                 print(f"frontend local segments: count={len(segment_rows)}, "
                       f"triggers={sorted(segment_by_trigger)}, "
                       f"seed_points={min(int(row['seed_points']) for row in segment_rows)}.."
-                      f"{max(int(row['seed_points']) for row in segment_rows)}")
+                      f"{max(int(row['seed_points']) for row in segment_rows)}, "
+                      f"history={min(int(row['history_seed_keyframes']) for row in segment_rows)}.."
+                      f"{max(int(row['history_seed_keyframes']) for row in segment_rows)} KFs, "
+                      f"path={min(float(row['history_seed_path_m']) for row in segment_rows):.1f}.."
+                      f"{max(float(row['history_seed_path_m']) for row in segment_rows):.1f}m")
             if supervisor_rows:
                 supervisor_counts = {}
                 for event in supervisor_rows:
@@ -1820,14 +2413,15 @@ def main():
             }
             if not required_recovery.issubset(recovery_fields):
                 raise RuntimeError("recovery-relocalization CSV is incomplete")
-            velocity_segments = [
+            recovery_segments = [
                 row for row in segment_rows
-                if row.get("restart_kind", "structural") == "velocity"]
-            if recovery_rows and not velocity_segments:
+                if row.get("restart_kind", "structural") in {
+                    "velocity", "observability", "saturation"}]
+            if recovery_rows and not recovery_segments:
                 raise RuntimeError(
                     "recovery monitor ran without a dynamic segment")
-            if velocity_segments:
-                trigger_id = int(velocity_segments[-1][
+            if recovery_segments:
+                trigger_id = int(recovery_segments[-1][
                     "trigger_keyframe_id"])
                 expected_ids = [
                     int(row["keyframe_id"]) for row in guard_rows
@@ -1843,21 +2437,23 @@ def main():
                     int(row["ready"]) != 1 for row in ready_rows):
                 raise RuntimeError(
                     "recovery reanchor transition is inconsistent")
-            if velocity_segments and have_recovery_tracking_schema:
-                trigger_id = int(velocity_segments[-1][
+            if recovery_segments and have_recovery_tracking_schema:
+                trigger_id = int(recovery_segments[-1][
                     "trigger_keyframe_id"])
+                acceptance_id = int(accepted_rows[0]["keyframe_id"]) \
+                    if accepted_rows else None
                 for guard in guard_rows:
                     guard_id = int(guard["keyframe_id"])
                     if guard_id <= trigger_id:
                         continue
-                    # Rigid-ready starts an elastic probation; it no longer
-                    # releases the velocity support that made the fit valid.
-                    expected_tracking = True
+                    # The guard row at the acceptance KF is written before
+                    # the successful elastic window releases strong tracking.
+                    expected_tracking = acceptance_id is None or \
+                        guard_id <= acceptance_id
                     if (int(guard["recovery_tracking"]) == 1) != \
                             expected_tracking:
                         raise RuntimeError(
-                            "recovery velocity tracking ended before "
-                            "elastic-segment acceptance")
+                            "recovery velocity-tracking lifecycle differs")
             recovery_counts = {}
             for row in recovery_rows:
                 recovery_counts[row["decision"]] = \
@@ -1869,26 +2465,48 @@ def main():
                 if start_id <= 0 or start_id > end_id:
                     raise RuntimeError(
                         "recovery fit window boundary is invalid")
-                yaw = math.radians(float(fit["transform_yaw_deg"]))
-                cosine, sine = math.cos(yaw), math.sin(yaw)
-                translation = vector(
-                    fit, ("transform_x", "transform_y", "transform_z"))
                 if args.regularized_field.is_file():
                     field_at_ready = next((
                         row for row in regularized_rows
                         if int(row["keyframe_id"]) == end_id), None)
                     if field_at_ready is None or \
                             int(field_at_ready["recovery_segment"]) != 1 or \
-                            field_at_ready["decision"] != "accepted" or \
+                            field_at_ready["decision"] not in {
+                                "accepted", "translation_fallback"} or \
                             int(field_at_ready["elastic_probation"]) != 1 or \
                             int(field_at_ready["position_observation"]) != 1:
                         raise RuntimeError(
                             "stable 4DOF recovery did not enter audited "
                             "elastic probation")
-                    if float(field_at_ready["residual_after_m"]) > 0.30:
+                    # The field has already been closing the quarantined
+                    # segment. Rigid-ready may change only gate state, so its
+                    # ordinary interval remains inside the same C2 envelope.
+                    local_increment = distance(
+                        local_positions[end_id-1], local_positions[end_id])
+                    global_increment = distance(
+                        global_positions[end_id-1], global_positions[end_id])
+                    local_rotation_increment = quaternion_angle_deg(
+                        local_rotations[end_id-1], local_rotations[end_id])
+                    global_rotation_increment = quaternion_angle_deg(
+                        global_rotations[end_id-1], global_rotations[end_id])
+                    allowed_translation_change = local_increment * \
+                        math.hypot(
+                            args.maximum_regularized_planar_gradient,
+                            args.maximum_regularized_vertical_gradient)
+                    allowed_rotation_change = local_increment * \
+                        args.acceptance_maximum_yaw_gradient
+                    if (abs(local_increment-global_increment) >
+                            allowed_translation_change+1e-7 or
+                            abs(local_rotation_increment-
+                                global_rotation_increment) >
+                            allowed_rotation_change+1e-7):
                         raise RuntimeError(
-                            "recovery reanchor exceeded the RTK outer bound")
+                            "recovery gate broke pose continuity")
                 else:
+                    yaw = math.radians(float(fit["transform_yaw_deg"]))
+                    cosine, sine = math.cos(yaw), math.sin(yaw)
+                    translation = vector(
+                        fit, ("transform_x", "transform_y", "transform_z"))
                     maximum_reanchor_error = 0.0
                     for index in range(start_id, len(global_positions)):
                         local = local_positions[index]
@@ -1902,7 +2520,7 @@ def main():
                     if maximum_reanchor_error > 1e-7:
                         raise RuntimeError(
                             "stable 4DOF recovery transform was not applied")
-                print("high-rate recovery 4DOF: "
+                print("continuous high-rate recovery 4DOF: "
                       f"decisions={recovery_counts}, "
                       f"window={start_id}..{end_id}, "
                       f"path={float(fit['local_path_length_m']):.1f}/"

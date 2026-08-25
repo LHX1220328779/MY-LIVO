@@ -60,15 +60,15 @@ public:
     double correction_time_constant_sec = 0.8;
     double maximum_planar_correction_mps = 2.0;
     double maximum_vertical_correction_mps = 0.75;
-    double maximum_planar_correction_acceleration_mps2 = 0.30;
-    double maximum_vertical_correction_acceleration_mps2 = 0.15;
+    double maximum_planar_correction_acceleration_mps2 = 0.75;
+    double maximum_vertical_correction_acceleration_mps2 = 0.30;
     // Slow status-4 receiver-twist aid for a sustained vertical propagation
     // bias. It never uses RTK position and never changes pose directly.
-    bool healthy_vertical_aiding_enabled = false;
+    bool healthy_vertical_aiding_enabled = true;
     double healthy_vertical_activation_error_mps = 0.08;
     int healthy_vertical_activation_observations = 5;
-    double healthy_vertical_time_constant_sec = 8.0;
-    double healthy_vertical_maximum_acceleration_mps2 = 0.03;
+    double healthy_vertical_time_constant_sec = 4.0;
+    double healthy_vertical_maximum_acceleration_mps2 = 0.08;
     // Stronger limits are used only after the old voxel map has been
     // discarded and while the new segment is quarantined. Position is still
     // untouched; this prevents propagation velocity from immediately
@@ -76,6 +76,17 @@ public:
     double recovery_tracking_time_constant_sec = 0.35;
     double recovery_tracking_planar_acceleration_mps2 = 1.50;
     double recovery_tracking_vertical_acceleration_mps2 = 0.75;
+    // During quarantined recovery, a radial position outer loop biases the
+    // velocity target and never writes pose.  A hysteretic capture latch
+    // removes the proportional controller's steady-state error without
+    // reacting to RTK jitter while ordinary local LIO is healthy.
+    double recovery_position_soft_radius_m = 0.15;
+    double recovery_position_full_radius_m = 1.50;
+    double recovery_position_release_radius_m = 0.10;
+    double recovery_position_capture_minimum_stiffness = 0.50;
+    double recovery_position_time_constant_sec = 4.0;
+    double recovery_maximum_planar_closure_velocity_mps = 0.60;
+    double recovery_maximum_vertical_closure_velocity_mps = 0.60;
     // A bounded correction is intentionally slow.  If a status-4 receiver
     // velocity still disagrees strongly after several low-rate updates, the
     // frontend propagation has already left the elastic-recovery envelope and
@@ -107,6 +118,13 @@ public:
     double applied_gain = 0.0;
     Eigen::Vector3d raw_rtk_velocity = Eigen::Vector3d::Zero();
     Eigen::Vector3d filtered_rtk_velocity = Eigen::Vector3d::Zero();
+    Eigen::Vector3d global_position_error = Eigen::Vector3d::Zero();
+    Eigen::Vector3d recovery_closure_velocity = Eigen::Vector3d::Zero();
+    double recovery_planar_stiffness = 0.0;
+    double recovery_vertical_stiffness = 0.0;
+    bool recovery_planar_capture_active = false;
+    bool recovery_vertical_capture_active = false;
+    Eigen::Vector3d tracking_target_velocity = Eigen::Vector3d::Zero();
     Eigen::Vector3d lio_velocity_before = Eigen::Vector3d::Zero();
     Eigen::Vector3d lio_velocity_after = Eigen::Vector3d::Zero();
     Eigen::Vector3d applied_correction = Eigen::Vector3d::Zero();
@@ -116,12 +134,14 @@ public:
 
   Result AddObservation(std::uint64_t keyframe_id, double timestamp,
                         const Eigen::Vector3d &rtk_position,
+                        const Eigen::Vector3d &global_position,
                         const Eigen::Vector3d &lio_velocity,
                         CorrectionRegime regime,
                         const std::optional<Eigen::Vector3d> &
                             receiver_velocity = std::nullopt);
 
   bool active() const { return active_; }
+  void BeginRecoveryTracking(std::uint64_t keyframe_id);
   void AcknowledgeEmergencyRestart(std::uint64_t keyframe_id);
   void CompleteRecoveryTracking(std::uint64_t keyframe_id);
 
@@ -145,6 +165,8 @@ private:
   bool emergency_restart_required_ = false;
   bool emergency_restart_acknowledged_ = false;
   bool recovery_tracking_ = false;
+  bool recovery_planar_capture_active_ = false;
+  bool recovery_vertical_capture_active_ = false;
   std::uint64_t emergency_restart_keyframe_id_ = 0;
   std::ofstream csv_stream_;
 };

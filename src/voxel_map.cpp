@@ -12,7 +12,98 @@ which is included as part of this source code package.
 
 #include "voxel_map.h"
 
+#include <Eigen/Eigenvalues>
+
+#include <algorithm>
+#include <cmath>
 #include <stdexcept>
+
+namespace
+{
+Eigen::Matrix3d SymmetricPseudoInverse(const Eigen::Matrix3d &matrix)
+{
+  const Eigen::Matrix3d symmetric = 0.5 * (matrix + matrix.transpose());
+  const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(symmetric);
+  if (solver.info() != Eigen::Success)
+    return Eigen::Matrix3d::Zero();
+  const double largest = std::max(0.0, solver.eigenvalues().maxCoeff());
+  const double threshold = std::max(1.0e-12, largest * 1.0e-9);
+  Eigen::Vector3d inverse = Eigen::Vector3d::Zero();
+  for (int index = 0; index < 3; ++index)
+    if (solver.eigenvalues()[index] > threshold)
+      inverse[index] = 1.0 / solver.eigenvalues()[index];
+  return solver.eigenvectors() * inverse.asDiagonal() *
+      solver.eigenvectors().transpose();
+}
+
+void FillSpectrum(const Eigen::Matrix3d &information,
+                  Eigen::Vector3d *eigenvalues,
+                  Eigen::Vector3d *weakest_direction,
+                  double *condition_ratio)
+{
+  const Eigen::Matrix3d symmetric =
+      0.5 * (information + information.transpose());
+  const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(symmetric);
+  if (solver.info() != Eigen::Success)
+  {
+    eigenvalues->setZero();
+    weakest_direction->setZero();
+    *condition_ratio = 0.0;
+    return;
+  }
+  *eigenvalues = solver.eigenvalues().cwiseMax(0.0);
+  *weakest_direction = solver.eigenvectors().col(0);
+  const double largest = (*eigenvalues)[2];
+  *condition_ratio = largest > 1.0e-12
+      ? (*eigenvalues)[0] / largest : 0.0;
+}
+
+my_livo::backend::LioObservability ComputeObservability(
+    const Eigen::Matrix<double, 6, 6> &information,
+    std::size_t downsampled_features, std::size_t effective_features,
+    double total_absolute_residual_m)
+{
+  my_livo::backend::LioObservability result;
+  result.downsampled_features = downsampled_features;
+  result.effective_features = effective_features;
+  result.effective_feature_ratio = downsampled_features > 0
+      ? static_cast<double>(effective_features) /
+            static_cast<double>(downsampled_features)
+      : 0.0;
+  result.mean_absolute_residual_m = effective_features > 0
+      ? total_absolute_residual_m / static_cast<double>(effective_features)
+      : 0.0;
+  if (effective_features < 6 || !information.allFinite()) return result;
+
+  // Schur complements measure translation after allowing attitude to adjust,
+  // and attitude after allowing translation to adjust. This exposes corridor
+  // and planar degeneracy hidden by a large raw feature count.
+  const Eigen::Matrix3d rotation = information.topLeftCorner<3, 3>();
+  const Eigen::Matrix3d cross = information.topRightCorner<3, 3>();
+  const Eigen::Matrix3d translation = information.bottomRightCorner<3, 3>();
+  Eigen::Matrix3d conditional_translation =
+      translation - cross.transpose() *
+          SymmetricPseudoInverse(rotation) * cross;
+  Eigen::Matrix3d conditional_rotation =
+      rotation - cross * SymmetricPseudoInverse(translation) *
+          cross.transpose();
+  conditional_translation /= static_cast<double>(effective_features);
+  conditional_rotation /= static_cast<double>(effective_features);
+  FillSpectrum(
+      conditional_translation, &result.translation_information_eigenvalues,
+      &result.weakest_translation_direction,
+      &result.translation_condition_ratio);
+  FillSpectrum(
+      conditional_rotation, &result.rotation_information_eigenvalues,
+      &result.weakest_rotation_direction,
+      &result.rotation_condition_ratio);
+  result.valid = result.translation_information_eigenvalues.allFinite() &&
+      result.rotation_information_eigenvalues.allFinite() &&
+      result.weakest_translation_direction.allFinite() &&
+      result.weakest_rotation_direction.allFinite();
+  return result;
+}
+}  // namespace
 
 VoxelMapManager::~VoxelMapManager()
 {
@@ -372,6 +463,7 @@ VoxelOctoTree *VoxelOctoTree::Insert(const pointWithVar &pv)
 
 void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
 {
+  latest_observability_ = my_livo::backend::LioObservability();
   cross_mat_list_.clear();
   cross_mat_list_.reserve(feats_down_size_);
   body_cov_list_.clear();
@@ -441,8 +533,17 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
       total_residual += fabs(ptpl_list_[i].dis_to_plane_);
     }
     effct_feat_num_ = ptpl_list_.size();
+    const double average_residual = effct_feat_num_ > 0
+        ? total_residual / static_cast<double>(effct_feat_num_) : 0.0;
     cout << "[ LIO ] Raw feature num: " << feats_undistort_->size() << ", downsampled feature num:" << feats_down_size_ 
-         << " effective feature num: " << effct_feat_num_ << " average residual: " << total_residual / effct_feat_num_ << endl;
+         << " effective feature num: " << effct_feat_num_ << " average residual: " << average_residual << endl;
+
+    if (effct_feat_num_ == 0)
+    {
+      latest_observability_.downsampled_features =
+          static_cast<std::size_t>(std::max(0, feats_down_size_));
+      break;
+    }
 
     /*** Computation of Measuremnt Jacobian matrix H and measurents covarience
      * ***/
@@ -504,6 +605,10 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
     auto &&HTz = Hsub_T_R_inv * meas_vec;
     // fout_dbg<<"HTz: "<<HTz<<endl;
     H_T_H.block<6, 6>(0, 0) = Hsub_T_R_inv * Hsub;
+    latest_observability_ = ComputeObservability(
+        H_T_H.block<6, 6>(0, 0),
+        static_cast<std::size_t>(std::max(0, feats_down_size_)),
+        static_cast<std::size_t>(effct_feat_num_), total_residual);
     // EigenSolver<Matrix<double, 6, 6>> es(H_T_H.block<6,6>(0,0));
     MD(DIM_STATE, DIM_STATE) &&K_1 = (H_T_H.block<DIM_STATE, DIM_STATE>(0, 0) + state_.cov.block<DIM_STATE, DIM_STATE>(0, 0).inverse()).inverse();
     G.block<DIM_STATE, 6>(0, 0) = K_1.block<DIM_STATE, 6>(0, 0) * H_T_H.block<6, 6>(0, 0);

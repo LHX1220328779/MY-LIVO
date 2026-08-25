@@ -1,6 +1,8 @@
 #ifndef MY_LIVO_BACKEND_KEYFRAME_H
 #define MY_LIVO_BACKEND_KEYFRAME_H
 
+#include "backend/lio_observability.h"
+
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <pcl/point_cloud.h>
@@ -94,13 +96,15 @@ public:
            const Pose3d &T_odom_body,
            const KeyframeCloud::ConstPtr &cloud_body,
            const Matrix6d &odom_covariance,
-           std::uint8_t trigger_mask)
+           std::uint8_t trigger_mask,
+           const LioObservability &lio_observability = LioObservability())
       : id_(id),
         timestamp_(timestamp),
         T_odom_body_(T_odom_body),
         cloud_body_(cloud_body),
         odom_covariance_(odom_covariance),
         trigger_mask_(trigger_mask),
+        lio_observability_(lio_observability),
         T_slam_body_(T_odom_body),
         T_global_body_(T_odom_body)
   {
@@ -112,6 +116,10 @@ public:
   const KeyframeCloud::ConstPtr &cloud_body() const { return cloud_body_; }
   const Matrix6d &odom_covariance() const { return odom_covariance_; }
   std::uint8_t trigger_mask() const { return trigger_mask_; }
+  const LioObservability &lio_observability() const
+  {
+    return lio_observability_;
+  }
 
   Pose3d T_slam_body() const
   {
@@ -144,6 +152,7 @@ private:
   const KeyframeCloud::ConstPtr cloud_body_;
   const Matrix6d odom_covariance_;
   const std::uint8_t trigger_mask_;
+  const LioObservability lio_observability_;
 
   mutable std::mutex optimized_pose_mutex_;
   Pose3d T_slam_body_;

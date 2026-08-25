@@ -14,6 +14,7 @@ which is included as part of this source code package.
 #define VOXEL_MAP_H_
 
 #include "common_lib.h"
+#include "backend/lio_observability.h"
 #include <Eigen/Dense>
 #include <fstream>
 #include <math.h>
@@ -210,6 +211,7 @@ public:
 
   int feats_down_size_;
   int effct_feat_num_;
+  my_livo::backend::LioObservability latest_observability_;
   std::vector<M3D> cross_mat_list_;
   std::vector<M3D> body_cov_list_;
   std::vector<pointWithVar> pv_list_;

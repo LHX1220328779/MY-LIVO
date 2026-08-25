@@ -5,7 +5,23 @@ import argparse
 import bisect
 import csv
 import math
+import os
 from pathlib import Path
+
+
+def active_mapping_processes():
+    project_root = str(Path(__file__).resolve().parent.parent)
+    active = []
+    for process in Path("/proc").glob("[0-9]*"):
+        try:
+            command = (process / "cmdline").read_bytes().replace(
+                b"\0", b" ").decode(errors="replace")
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        if "fastlivo_mapping" in command and project_root in command and \
+                int(process.name) != os.getpid():
+            active.append(int(process.name))
+    return sorted(active)
 
 
 def read_csv(path, required):
@@ -133,7 +149,14 @@ def main():
     parser.add_argument("--position-target", type=float, default=0.30)
     parser.add_argument("--yaw-target-deg", type=float, default=0.50)
     parser.add_argument("--enforce-target", action="store_true")
+    parser.add_argument("--allow-live-logs", action="store_true")
     args = parser.parse_args()
+
+    active = active_mapping_processes()
+    if active and not args.allow_live_logs:
+        raise RuntimeError(
+            "fastlivo_mapping is still writing the audit files (PID " +
+            ",".join(str(pid) for pid in active) + "); stop it first")
 
     trajectory = read_csv(args.trajectory, {
         "id", "timestamp", "local_tx", "local_ty", "local_tz",

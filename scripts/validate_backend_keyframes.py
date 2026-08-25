@@ -12,6 +12,14 @@ from statistics import median
 REQUIRED_COLUMNS = {
     "id", "timestamp", "trigger", "tx", "ty", "tz",
     "qx", "qy", "qz", "qw", "cloud_points",
+    "lio_observability_valid", "downsampled_features",
+    "effective_features", "effective_feature_ratio",
+    "mean_abs_residual_m", "translation_info_min",
+    "translation_info_mid", "translation_info_max",
+    "translation_condition_ratio", "translation_weak_x",
+    "translation_weak_y", "translation_weak_z", "rotation_info_min",
+    "rotation_info_mid", "rotation_info_max", "rotation_condition_ratio",
+    "rotation_weak_x", "rotation_weak_y", "rotation_weak_z",
 }
 
 
@@ -41,6 +49,27 @@ def load_keyframes(path):
                 "position": tuple(float(row[name]) for name in ("tx", "ty", "tz")),
                 "quaternion": tuple(float(row[name]) for name in ("qx", "qy", "qz", "qw")),
                 "cloud_points": int(row["cloud_points"]),
+                "observability_valid": int(row["lio_observability_valid"]),
+                "downsampled_features": int(row["downsampled_features"]),
+                "effective_features": int(row["effective_features"]),
+                "effective_feature_ratio": float(row["effective_feature_ratio"]),
+                "mean_abs_residual_m": float(row["mean_abs_residual_m"]),
+                "translation_info": tuple(float(row[name]) for name in (
+                    "translation_info_min", "translation_info_mid",
+                    "translation_info_max")),
+                "translation_condition_ratio": float(
+                    row["translation_condition_ratio"]),
+                "translation_weak": tuple(float(row[name]) for name in (
+                    "translation_weak_x", "translation_weak_y",
+                    "translation_weak_z")),
+                "rotation_info": tuple(float(row[name]) for name in (
+                    "rotation_info_min", "rotation_info_mid",
+                    "rotation_info_max")),
+                "rotation_condition_ratio": float(
+                    row["rotation_condition_ratio"]),
+                "rotation_weak": tuple(float(row[name]) for name in (
+                    "rotation_weak_x", "rotation_weak_y",
+                    "rotation_weak_z")),
             }
         except ValueError as error:
             fail(f"invalid numeric value on CSV row {row_index}: {error}")
@@ -52,6 +81,24 @@ def load_keyframes(path):
             fail(f"non-finite value on CSV row {row_index}")
         if keyframe["cloud_points"] <= 0:
             fail(f"non-positive cloud size on CSV row {row_index}")
+        if keyframe["observability_valid"] not in (0, 1):
+            fail(f"invalid observability flag on CSV row {row_index}")
+        if keyframe["downsampled_features"] < 0 or \
+                not 0 <= keyframe["effective_features"] <= \
+                keyframe["downsampled_features"]:
+            fail(f"invalid LIO feature counts on CSV row {row_index}")
+        observability_values = (
+            keyframe["effective_feature_ratio"],
+            keyframe["mean_abs_residual_m"], *keyframe["translation_info"],
+            keyframe["translation_condition_ratio"],
+            *keyframe["translation_weak"], *keyframe["rotation_info"],
+            keyframe["rotation_condition_ratio"], *keyframe["rotation_weak"])
+        if not all(math.isfinite(value) for value in observability_values):
+            fail(f"non-finite LIO observability on CSV row {row_index}")
+        if keyframe["observability_valid"] and (
+                not 0 <= keyframe["translation_condition_ratio"] <= 1 or
+                not 0 <= keyframe["rotation_condition_ratio"] <= 1):
+            fail(f"invalid LIO condition ratio on CSV row {row_index}")
         quaternion_norm = math.sqrt(sum(value * value for value in keyframe["quaternion"]))
         if abs(quaternion_norm - 1.0) > 1.0e-6:
             fail(f"non-unit quaternion on CSV row {row_index}: norm={quaternion_norm}")
@@ -173,6 +220,16 @@ def main():
         f"min={min(item['cloud_points'] for item in keyframes)}, "
         f"median={median(item['cloud_points'] for item in keyframes):.0f}, "
         f"max={max(item['cloud_points'] for item in keyframes)}")
+    observable = [item for item in keyframes if item["observability_valid"]]
+    if not observable:
+        fail("no keyframe has valid LIO observability")
+    print(
+        "LIO observability: "
+        f"valid={len(observable)}/{len(keyframes)}, "
+        f"effective_features={min(item['effective_features'] for item in observable)}.."
+        f"{max(item['effective_features'] for item in observable)}, "
+        f"translation_condition_p50={median(item['translation_condition_ratio'] for item in observable):.6g}, "
+        f"rotation_condition_p50={median(item['rotation_condition_ratio'] for item in observable):.6g}")
     print("triggers: " + ", ".join(
         f"{name}={count}" for name, count in sorted(trigger_counts.items())))
 

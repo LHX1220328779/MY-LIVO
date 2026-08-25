@@ -259,17 +259,29 @@ laser_mapping:
           minimum_yaw_confidence: 0.05
           # Production rubber-band law: |F| is proportional to alpha(d)*d.
           # It is zero in the inner tolerance and increases monotonically.
-          elastic_soft_radius_m: 0.20
-          elastic_full_radius_m: 1.00
+          # Independent deadbands prevent a vertical/yaw error from opening
+          # the planar rubber band. This preserves the local LIO map while
+          # still correcting a persistent height or heading drift.
+          elastic_soft_radius_m: 0.15
+          elastic_full_radius_m: 0.50
+          vertical_elastic_soft_radius_m: 0.15
+          vertical_elastic_full_radius_m: 0.60
+          yaw_elastic_soft_radius_deg: 0.25
+          yaw_elastic_full_radius_deg: 1.00
           elastic_minimum_stiffness: 0.0
           elastic_maximum_stiffness: 1.0
           alignment_window_length_m: 30.0
           minimum_alignment_path_length_m: 10.0
           alignment_huber_delta_m: 0.15
           maximum_alignment_planar_rms_m: 0.30
-          maximum_planar_gradient_m_per_m: 0.20
-          maximum_vertical_gradient_m_per_m: 0.18
+          maximum_planar_gradient_m_per_m: 0.05
+          maximum_vertical_gradient_m_per_m: 0.08
           maximum_yaw_gradient_deg_per_m: 0.10
+          adaptive_gradient_enabled: true
+          adaptive_position_gradient_full_distance_m: 1.50
+          adaptive_yaw_gradient_full_distance_deg: 3.00
+          adaptive_position_gradient_maximum_gain: 1.5
+          adaptive_yaw_gradient_maximum_gain: 2.0
           extrapolation_regression_knots: 3
           maximum_extrapolation_distance_m: 8.0
           maximum_planar_extrapolation_slope_m_per_m: 0.25
@@ -281,8 +293,8 @@ laser_mapping:
           maximum_position_residual_m: 0.30
           maximum_yaw_residual_deg: 0.50
           maximum_post_velocity_error_mps: 0.80
-          maximum_field_gradient_m_per_m: 0.30
-          maximum_yaw_gradient_deg_per_m: 0.20
+          maximum_field_gradient_m_per_m: 0.10
+          maximum_yaw_gradient_deg_per_m: 0.10
           maximum_outlier_fraction: 0.25
           csv_path: "/home/project/MY-LIVO2.0/Log/backend/elastic_segment_acceptance.csv"
         # New global segments remain shadow-only until velocity, no-scale
@@ -325,8 +337,30 @@ laser_mapping:
         enabled: true
         minimum_seed_points: 1000
         maximum_automatic_restarts: 1
+        # Rebuild from a recent local-LIO window, not one geometrically weak
+        # frame. Historical poses remain immutable odometry measurements.
+        history_seed_path_length_m: 20.0
+        maximum_history_seed_keyframes: 20
+        history_seed_point_sigma_m: 0.10
         position_sigma_floor_m: 0.10
         rotation_sigma_floor_deg: 1.0
+        observability_guard:
+          enabled: true
+          translation_soft_ratio: 0.15
+          translation_full_ratio: 0.05
+          rotation_soft_ratio: 0.25
+          rotation_full_ratio: 0.08
+          maximum_gain: 3.0
+          restart_score: 0.65
+          restart_residual_m: 1.0
+          restart_velocity_error_mps: 0.8
+          restart_required_observations: 3
+        # Restart before a saturated causal field accumulates metres of
+        # error, even when feature count alone still looks acceptable.
+        elastic_saturation_guard:
+          enabled: false
+          restart_residual_m: 0.50
+          restart_gradient_ratio: 0.95
         csv_path: "/home/project/MY-LIVO2.0/Log/backend/frontend_segments.csv"
         supervisor_csv_path: "/home/project/MY-LIVO2.0/Log/backend/frontend_restart_supervisor.csv"
       global_map:
@@ -413,20 +447,37 @@ laser_mapping:
           correction_time_constant_sec: 0.8
           maximum_planar_correction_mps: 2.0
           maximum_vertical_correction_mps: 0.75
-          maximum_planar_correction_acceleration_mps2: 0.30
-          maximum_vertical_correction_acceleration_mps2: 0.15
-          # Disabled in healthy LIO: replay showed that this did not remove the
-          # position drift and unnecessarily modified a locally sharp state.
-          healthy_vertical_aiding_enabled: false
+          maximum_planar_correction_acceleration_mps2: 0.75
+          maximum_vertical_correction_acceleration_mps2: 0.30
+          # Slow vertical-velocity bias removal only after five consistent
+          # receiver-twist/position-difference checks; no RTK height is used.
+          healthy_vertical_aiding_enabled: true
           healthy_vertical_activation_error_mps: 0.08
           healthy_vertical_activation_observations: 5
-          healthy_vertical_time_constant_sec: 8.0
-          healthy_vertical_maximum_acceleration_mps2: 0.03
+          healthy_vertical_time_constant_sec: 4.0
+          healthy_vertical_maximum_acceleration_mps2: 0.08
           # Used only inside the quarantined segment after the one-time map
           # reset; position is never injected into the frontend.
           recovery_tracking_time_constant_sec: 0.35
           recovery_tracking_planar_acceleration_mps2: 1.50
           recovery_tracking_vertical_acceleration_mps2: 0.75
+          # Hold the latest validated ~1 Hz velocity target after every scan
+          # only inside quarantined recovery; no high-rate RTK pose is read.
+          recovery_frame_tracking_enabled: true
+          recovery_frame_tracking_maximum_age_sec: 1.5
+          recovery_frame_tracking_planar_acceleration_mps2: 3.0
+          recovery_frame_tracking_vertical_acceleration_mps2: 2.0
+          recovery_frame_tracking_csv_path: "/home/project/MY-LIVO2.0/Log/backend/rtk_recovery_frame_tracking.csv"
+          # Quarantine-only radial outer loop. Inside 0.15 m it is free; once
+          # outside, a hysteretic capture remains active until 0.10 m so a
+          # parallel steady-state offset cannot remain near the boundary.
+          recovery_position_soft_radius_m: 0.15
+          recovery_position_full_radius_m: 1.50
+          recovery_position_release_radius_m: 0.10
+          recovery_position_capture_minimum_stiffness: 0.50
+          recovery_position_time_constant_sec: 4.0
+          recovery_maximum_planar_closure_velocity_mps: 0.60
+          recovery_maximum_vertical_closure_velocity_mps: 0.60
           # A slow bounded controller must not spend tens of metres repairing
           # an already-corrupted propagation state. Three independent status-4
           # receiver samples trigger one controlled recovery segment.

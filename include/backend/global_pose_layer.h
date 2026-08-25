@@ -105,8 +105,8 @@ public:
       bool guard_active, double post_velocity_error_mps);
   void AcknowledgeFrontendRestart(std::uint64_t keyframe_id);
   // Starts a new path-preserving global segment after a controlled frontend
-  // recovery.  The trigger keyframe stays in the old quarantined segment;
-  // subsequent poses are attached to RTK by translation plus carried yaw.
+  // recovery. The trigger stays in the old segment; a continuous elastic
+  // field starts immediately while rigid validation remains quarantine-only.
   void StartEmergencyGlobalSegment(
       std::uint64_t trigger_keyframe_id,
       const Eigen::Vector3d &rtk_anchor_position);
@@ -118,7 +118,10 @@ public:
   // field.  This never changes T_slam or the frontend state.
   ElasticUpdate AddElasticObservation(
       std::uint64_t keyframe_id, const RtkObservation &observation,
-      bool use_position_observation = true);
+      bool use_position_observation = true,
+      double constraint_gain = 1.0,
+      double translation_condition_ratio = 1.0,
+      double rotation_condition_ratio = 1.0);
 
   std::vector<Pose3d> global_poses() const;
   GlobalMapSnapshot global_map_snapshot() const;
@@ -190,6 +193,9 @@ private:
     std::uint64_t keyframe_id = 0;
     RtkObservation observation;
     bool use_position_observation = true;
+    double constraint_gain = 1.0;
+    double translation_condition_ratio = 1.0;
+    double rotation_condition_ratio = 1.0;
   };
 
   Options options_;

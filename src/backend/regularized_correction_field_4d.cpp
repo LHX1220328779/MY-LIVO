@@ -68,6 +68,14 @@ void RegularizedCorrectionField4d::ValidateOptions(const Options &options)
       options.elastic_maximum_stiffness <
           options.elastic_minimum_stiffness ||
       options.elastic_maximum_stiffness > 1.0 ||
+      !nonnegative(options.vertical_elastic_soft_radius_m) ||
+      !positive(options.vertical_elastic_full_radius_m) ||
+      options.vertical_elastic_full_radius_m <=
+          options.vertical_elastic_soft_radius_m ||
+      !nonnegative(options.yaw_elastic_soft_radius_deg) ||
+      !positive(options.yaw_elastic_full_radius_deg) ||
+      options.yaw_elastic_full_radius_deg <=
+          options.yaw_elastic_soft_radius_deg ||
       !positive(options.alignment_window_length_m) ||
       !positive(options.minimum_alignment_path_length_m) ||
       options.minimum_alignment_path_length_m >
@@ -77,6 +85,17 @@ void RegularizedCorrectionField4d::ValidateOptions(const Options &options)
       !positive(options.maximum_planar_gradient_m_per_m) ||
       !positive(options.maximum_vertical_gradient_m_per_m) ||
       !positive(options.maximum_yaw_gradient_deg_per_m) ||
+      !positive(options.adaptive_position_gradient_full_distance_m) ||
+      options.adaptive_position_gradient_full_distance_m <=
+          std::max(options.elastic_full_radius_m,
+                   options.vertical_elastic_full_radius_m) ||
+      !positive(options.adaptive_yaw_gradient_full_distance_deg) ||
+      options.adaptive_yaw_gradient_full_distance_deg <=
+          options.yaw_elastic_full_radius_deg ||
+      !std::isfinite(options.adaptive_position_gradient_maximum_gain) ||
+      options.adaptive_position_gradient_maximum_gain < 1.0 ||
+      !std::isfinite(options.adaptive_yaw_gradient_maximum_gain) ||
+      options.adaptive_yaw_gradient_maximum_gain < 1.0 ||
       options.extrapolation_regression_knots < 2 ||
       !nonnegative(options.maximum_extrapolation_distance_m) ||
       !positive(options.maximum_planar_extrapolation_slope_m_per_m) ||
@@ -107,16 +126,57 @@ double RegularizedCorrectionField4d::UnwrapNear(
 double RegularizedCorrectionField4d::ElasticStiffness(
     double distance_m) const
 {
-  if (!std::isfinite(distance_m) || distance_m < 0.0)
+  return SmoothElasticStiffness(
+      distance_m, options_.elastic_soft_radius_m,
+      options_.elastic_full_radius_m);
+}
+
+double RegularizedCorrectionField4d::VerticalElasticStiffness(
+    double distance_m) const
+{
+  return SmoothElasticStiffness(
+      distance_m, options_.vertical_elastic_soft_radius_m,
+      options_.vertical_elastic_full_radius_m);
+}
+
+double RegularizedCorrectionField4d::YawElasticStiffness(
+    double distance_deg) const
+{
+  return SmoothElasticStiffness(
+      distance_deg, options_.yaw_elastic_soft_radius_deg,
+      options_.yaw_elastic_full_radius_deg);
+}
+
+double RegularizedCorrectionField4d::SmoothElasticStiffness(
+    double distance, double soft_radius, double full_radius) const
+{
+  if (!std::isfinite(distance) || distance < 0.0)
     throw std::invalid_argument(
         "Elastic distance must be finite and non-negative.");
   const double normalized =
-      (distance_m - options_.elastic_soft_radius_m) /
-      (options_.elastic_full_radius_m - options_.elastic_soft_radius_m);
+      (distance - soft_radius) / (full_radius - soft_radius);
   return options_.elastic_minimum_stiffness +
       (options_.elastic_maximum_stiffness -
        options_.elastic_minimum_stiffness) *
           QuinticSmoothstep(normalized);
+}
+
+double RegularizedCorrectionField4d::AdaptiveGradientGain(
+    double distance, double elastic_full_radius,
+    double adaptive_full_distance, double maximum_gain,
+    double elastic_stiffness, double constraint_gain) const
+{
+  if (!options_.adaptive_gradient_enabled) return 1.0;
+  const double distance_gain = 1.0 + (maximum_gain - 1.0) *
+      QuinticSmoothstep(
+          (distance - elastic_full_radius) /
+          (adaptive_full_distance - elastic_full_radius));
+  // Weak scan geometry may open the envelope earlier, but only in
+  // proportion to the already distance-gated radial stiffness.
+  const double observability_gain = 1.0 +
+      (constraint_gain - 1.0) * elastic_stiffness;
+  return std::clamp(
+      std::max(distance_gain, observability_gain), 1.0, maximum_gain);
 }
 
 double RegularizedCorrectionField4d::LongWindowOrientationYawTarget(
@@ -147,7 +207,7 @@ RegularizedCorrectionField4d::AddObservation(
     std::uint64_t keyframe_id, double timestamp,
     double cumulative_distance_m, const Pose3d &nominal_pose,
     const RtkObservation &status4_observation,
-    bool use_position_observation)
+    bool use_position_observation, double constraint_gain)
 {
   if (!std::isfinite(timestamp) || !std::isfinite(cumulative_distance_m) ||
       cumulative_distance_m < 0.0 || !nominal_pose.isFinite() ||
@@ -155,11 +215,14 @@ RegularizedCorrectionField4d::AddObservation(
       !status4_observation.position.allFinite() ||
       !status4_observation.orientation.coeffs().allFinite() ||
       status4_observation.orientation.norm() <= 1.0e-9 ||
-      !status4_observation.position_covariance.allFinite())
+      !status4_observation.position_covariance.allFinite() ||
+      !std::isfinite(constraint_gain) || constraint_gain < 1.0 ||
+      constraint_gain > 10.0)
     throw std::invalid_argument(
         "Regularized correction-field observation is invalid.");
 
   UpdateResult result;
+  result.constraint_gain = constraint_gain;
   result.position_observation_used = use_position_observation;
   result.knot_count = knots_.size();
   if (options_.require_status4 &&
@@ -280,9 +343,8 @@ RegularizedCorrectionField4d::AddObservation(
   if (translation_fallback)
   {
     // A non-rigid/weak planar window must not disable the radial restoring
-    // force. Keep the last observable yaw and robustly estimate translation
-    // only; this remains low-frequency and cannot import receiver attitude.
-    fitted_yaw = knots_.empty() ? 0.0 : knots_.back().fitted[3];
+    // force. Keep the robust position-path yaw and estimate translation only;
+    // this remains low-frequency and cannot import receiver attitude.
     const Eigen::Matrix3d fallback_rotation =
         Eigen::AngleAxisd(fitted_yaw, Eigen::Vector3d::UnitZ())
             .toRotationMatrix();
@@ -319,6 +381,7 @@ RegularizedCorrectionField4d::AddObservation(
   const Eigen::Matrix3d fitted_rotation =
       Eigen::AngleAxisd(fitted_yaw, Eigen::Vector3d::UnitZ())
           .toRotationMatrix();
+  Eigen::Vector3d displacement_target;
   if (translation_fallback)
   {
     // A failed rigid fit is evidence that the required correction varies
@@ -328,15 +391,22 @@ RegularizedCorrectionField4d::AddObservation(
     // target is therefore the current time-corresponding RTK point. The
     // distance deadband, low-rate cadence and C2 gradient envelope still
     // prevent its local noise from becoming keyframe-rate map motion.
-    knot.displacement_target =
+    displacement_target =
         status4_observation.position - nominal_pose.translation;
   }
   else
   {
-    knot.displacement_target =
+    displacement_target =
         fitted_rotation * nominal_pose.translation + fitted_translation -
         nominal_pose.translation;
   }
+  // Height is only one scalar and is not made more reliable by a planar
+  // rigid-window centroid. Use the simultaneous RTK height as the radial
+  // target; its larger deadband and bounded spatial release reject local
+  // receiver noise without introducing half-window vertical lag.
+  displacement_target.z() =
+      status4_observation.position.z() - nominal_pose.translation.z();
+  knot.displacement_target = displacement_target;
   knot.raw_orientation_yaw_target_rad = fitted_yaw;
   knot.orientation_yaw_target_rad = fitted_yaw;
   knot.orientation_yaw_confidence =
@@ -349,45 +419,104 @@ RegularizedCorrectionField4d::AddObservation(
       nominal_pose.translation + prediction.displacement -
       status4_observation.position;
   result.elastic_distance_m = current_rtk_error.norm();
-  result.elastic_stiffness = ElasticStiffness(result.elastic_distance_m);
+  result.planar_elastic_distance_m = current_rtk_error.head<2>().norm();
+  result.vertical_elastic_distance_m = std::abs(current_rtk_error.z());
+  result.yaw_elastic_distance_deg = std::abs(
+      WrapRadians(fitted_yaw - prediction.yaw_rad)) /
+      kDegreesToRadians;
+  result.planar_elastic_stiffness =
+      ElasticStiffness(result.planar_elastic_distance_m);
+  result.vertical_elastic_stiffness =
+      VerticalElasticStiffness(result.vertical_elastic_distance_m);
+  result.yaw_elastic_stiffness =
+      YawElasticStiffness(result.yaw_elastic_distance_deg);
+  const auto amplify = [constraint_gain](double stiffness) {
+    return 1.0 - std::pow(1.0 - stiffness, constraint_gain);
+  };
+  result.planar_elastic_stiffness = amplify(
+      result.planar_elastic_stiffness);
+  result.vertical_elastic_stiffness = amplify(
+      result.vertical_elastic_stiffness);
+  result.yaw_elastic_stiffness = amplify(
+      result.yaw_elastic_stiffness);
+  result.planar_gradient_gain = AdaptiveGradientGain(
+      result.planar_elastic_distance_m, options_.elastic_full_radius_m,
+      options_.adaptive_position_gradient_full_distance_m,
+      options_.adaptive_position_gradient_maximum_gain,
+      result.planar_elastic_stiffness, constraint_gain);
+  result.vertical_gradient_gain = AdaptiveGradientGain(
+      result.vertical_elastic_distance_m,
+      options_.vertical_elastic_full_radius_m,
+      options_.adaptive_position_gradient_full_distance_m,
+      options_.adaptive_position_gradient_maximum_gain,
+      result.vertical_elastic_stiffness, constraint_gain);
+  result.yaw_gradient_gain = AdaptiveGradientGain(
+      result.yaw_elastic_distance_deg,
+      options_.yaw_elastic_full_radius_deg,
+      options_.adaptive_yaw_gradient_full_distance_deg,
+      options_.adaptive_yaw_gradient_maximum_gain,
+      result.yaw_elastic_stiffness, constraint_gain);
+  result.elastic_stiffness = std::max({
+      result.planar_elastic_stiffness,
+      result.vertical_elastic_stiffness,
+      result.yaw_elastic_stiffness});
   knot.elastic_stiffness = result.elastic_stiffness;
   knot.position_data_weight.setOnes();
 
   Eigen::Matrix<double, 4, 1> target;
-  target.head<3>() = prediction.displacement + result.elastic_stiffness *
-      (knot.displacement_target - prediction.displacement);
-  target[3] = prediction.yaw_rad + result.elastic_stiffness *
+  target.head<2>() = prediction.displacement.head<2>() +
+      result.planar_elastic_stiffness *
+      (knot.displacement_target.head<2>() -
+       prediction.displacement.head<2>());
+  target.z() = prediction.displacement.z() +
+      result.vertical_elastic_stiffness *
+      (knot.displacement_target.z() - prediction.displacement.z());
+  target[3] = prediction.yaw_rad + result.yaw_elastic_stiffness *
       WrapRadians(fitted_yaw - prediction.yaw_rad);
   if (knots_.empty())
   {
-    target.setZero();
+    if (options_.anchor_first_knot_identity) target.setZero();
   }
   else
   {
     const double spacing = cumulative_distance_m -
         knots_.back().cumulative_distance_m;
-    // The same alpha(d) that defines the elastic force also opens the spatial
-    // release envelope. Thus far-away states can actually respond more
-    // strongly, while the inner tolerance cannot be moved by a large cap.
-    const double release = result.elastic_stiffness;
+    // Geometry weakness strengthens the restoring force but never opens the
+    // spatial safety envelope. Far-away states reach this fixed C2 gradient
+    // bound earlier; they cannot create a locally sharper map deformation.
     Eigen::Vector3d delta = target.head<3>() - knots_.back().fitted.head<3>();
     delta.head<2>() = LimitNorm(
         delta.head<2>(),
-        release * options_.maximum_planar_gradient_m_per_m *
+        result.planar_elastic_stiffness *
+            result.planar_gradient_gain *
+            options_.maximum_planar_gradient_m_per_m *
             spacing / 1.875);
     delta.z() = std::clamp(
         delta.z(),
-        -release * options_.maximum_vertical_gradient_m_per_m *
+        -result.vertical_elastic_stiffness *
+            result.vertical_gradient_gain *
+            options_.maximum_vertical_gradient_m_per_m *
             spacing / 1.875,
-        release * options_.maximum_vertical_gradient_m_per_m *
+        result.vertical_elastic_stiffness *
+            result.vertical_gradient_gain *
+            options_.maximum_vertical_gradient_m_per_m *
             spacing / 1.875);
     target.head<3>() = knots_.back().fitted.head<3>() + delta;
-    const double yaw_limit = release *
+    const double yaw_limit = result.yaw_elastic_stiffness *
+        result.yaw_gradient_gain *
         options_.maximum_yaw_gradient_deg_per_m * kDegreesToRadians *
         spacing / 1.875;
     target[3] = knots_.back().fitted[3] + std::clamp(
         WrapRadians(target[3] - knots_.back().fitted[3]),
         -yaw_limit, yaw_limit);
+    result.interval_peak_planar_gradient_m_per_m =
+        1.875 * delta.head<2>().norm() / spacing;
+    result.interval_peak_vertical_gradient_m_per_m =
+        1.875 * std::abs(delta.z()) / spacing;
+    result.interval_peak_yaw_gradient_deg_per_m =
+        1.875 * std::abs(WrapRadians(
+            target[3] - knots_.back().fitted[3])) /
+        spacing / kDegreesToRadians;
   }
   knot.fitted = target;
   knot.spline_second_derivative.setZero();
@@ -395,6 +524,8 @@ RegularizedCorrectionField4d::AddObservation(
   result.knot_count = knots_.size();
   result.fitted_correction.displacement = target.head<3>();
   result.fitted_correction.yaw_rad = WrapRadians(target[3]);
+  result.yaw_residual_after_deg = std::abs(
+      WrapRadians(fitted_yaw - target[3])) / kDegreesToRadians;
   result.decision = translation_fallback
       ? AddDecision::kTranslationFallback : AddDecision::kAccepted;
   return result;

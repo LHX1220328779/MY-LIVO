@@ -45,10 +45,14 @@ public:
     double orientation_yaw_window_m = 30.0;
     double minimum_orientation_yaw_confidence = 0.05;
 
-    double elastic_soft_radius_m = 0.20;
-    double elastic_full_radius_m = 1.00;
+    double elastic_soft_radius_m = 0.15;
+    double elastic_full_radius_m = 0.50;
     double elastic_minimum_stiffness = 0.0;
     double elastic_maximum_stiffness = 1.0;
+    double vertical_elastic_soft_radius_m = 0.15;
+    double vertical_elastic_full_radius_m = 0.60;
+    double yaw_elastic_soft_radius_deg = 0.25;
+    double yaw_elastic_full_radius_deg = 1.00;
 
     // RTK only estimates a low-frequency rigid xyz+yaw alignment. Before the
     // yaw baseline becomes observable, the previous yaw is retained and only
@@ -61,13 +65,22 @@ public:
     // Bound the endpoint correction requested by one new low-rate knot. The
     // quintic interpolation has a peak derivative of 1.875 times its endpoint
     // delta divided by spacing.
-    double maximum_planar_gradient_m_per_m = 0.20;
-    double maximum_vertical_gradient_m_per_m = 0.18;
+    double maximum_planar_gradient_m_per_m = 0.05;
+    double maximum_vertical_gradient_m_per_m = 0.08;
     double maximum_yaw_gradient_deg_per_m = 0.10;
+    // The near-field limits above remain unchanged. Once an error is beyond
+    // the ordinary elastic band, the admissible causal slope increases
+    // smoothly so the implemented pull, not only its diagnostic force proxy,
+    // becomes stronger with distance. Completed intervals stay immutable.
+    bool adaptive_gradient_enabled = true;
+    double adaptive_position_gradient_full_distance_m = 1.50;
+    double adaptive_yaw_gradient_full_distance_deg = 3.00;
+    double adaptive_position_gradient_maximum_gain = 1.5;
+    double adaptive_yaw_gradient_maximum_gain = 2.0;
 
-    // The initial A0 segment uses an exact C(s0)=I gauge.  A segment already
-    // initialized by a noisy rigid recovery fit should set this false so its
-    // first residual can be corrected softly.
+    // Production segments use exact C(s0)=I so a recovery gate cannot
+    // teleport its boundary. The false option is retained for isolated
+    // analysis/tests, not for a fitted recovery pose command.
     bool anchor_first_knot_identity = true;
 
     // Past the newest knot, continue with the natural-spline endpoint slope,
@@ -117,6 +130,20 @@ public:
     bool position_observation_used = true;
     double alignment_path_length_m = 0.0;
     double alignment_planar_rms_m = 0.0;
+    double planar_elastic_distance_m = 0.0;
+    double vertical_elastic_distance_m = 0.0;
+    double yaw_elastic_distance_deg = 0.0;
+    double planar_elastic_stiffness = 0.0;
+    double vertical_elastic_stiffness = 0.0;
+    double yaw_elastic_stiffness = 0.0;
+    double interval_peak_planar_gradient_m_per_m = 0.0;
+    double interval_peak_vertical_gradient_m_per_m = 0.0;
+    double interval_peak_yaw_gradient_deg_per_m = 0.0;
+    double planar_gradient_gain = 1.0;
+    double vertical_gradient_gain = 1.0;
+    double yaw_gradient_gain = 1.0;
+    double yaw_residual_after_deg = 0.0;
+    double constraint_gain = 1.0;
     Correction fitted_correction;
   };
 
@@ -143,7 +170,8 @@ public:
       std::uint64_t keyframe_id, double timestamp,
       double cumulative_distance_m, const Pose3d &nominal_pose,
       const RtkObservation &status4_observation,
-      bool use_position_observation = true);
+      bool use_position_observation = true,
+      double constraint_gain = 1.0);
 
   Correction Evaluate(double cumulative_distance_m) const;
   Evaluation EvaluateWithDerivatives(double cumulative_distance_m) const;
@@ -151,6 +179,8 @@ public:
                const Pose3d &nominal_pose) const;
 
   double ElasticStiffness(double distance_m) const;
+  double VerticalElasticStiffness(double distance_m) const;
+  double YawElasticStiffness(double distance_deg) const;
   std::size_t knot_count() const { return knots_.size(); }
   std::vector<KnotState, Eigen::aligned_allocator<KnotState>> knots() const;
 
@@ -179,6 +209,12 @@ private:
   static double Yaw(const Eigen::Quaterniond &rotation);
   static double WrapRadians(double angle);
   static double UnwrapNear(double angle, double reference);
+  double SmoothElasticStiffness(double distance, double soft_radius,
+                                double full_radius) const;
+  double AdaptiveGradientGain(
+      double distance, double elastic_full_radius,
+      double adaptive_full_distance, double maximum_gain,
+      double elastic_stiffness, double constraint_gain) const;
 
   void Solve();
   Eigen::VectorXd SolveComponent(int component) const;

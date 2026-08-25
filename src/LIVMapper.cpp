@@ -17,6 +17,7 @@ which is included as part of this source code package.
 
 #include <Eigen/Cholesky>
 
+#include <algorithm>
 #include <fstream>
 #include <limits>
 #include <set>
@@ -54,6 +55,15 @@ struct DownsampleMetadata
   double intensity_sum = 0.0;
   std::size_t count = 0;
 };
+
+double SmoothWeakness(double condition_ratio, double soft_ratio,
+                      double full_ratio)
+{
+  const double x = std::clamp(
+      (soft_ratio - condition_ratio) / (soft_ratio - full_ratio),
+      0.0, 1.0);
+  return x * x * x * (10.0 + x * (-15.0 + 6.0 * x));
+}
 }  // namespace
 
 LIVMapper::LIVMapper(const rclcpp::Node::SharedPtr &node)
@@ -593,6 +603,29 @@ void LIVMapper::handleRtkForKeyframe(
   if (!global_pose_layer)
     throw std::logic_error("RTK fusion requires the global pose layer.");
 
+  const auto &lio_observability = keyframe->lio_observability();
+  double lio_observability_score = 0.0;
+  if (backend_lio_observability_guard_enabled &&
+      lio_observability.valid &&
+      lio_observability.effective_features >= 1000U)
+  {
+    const double translation_weakness = SmoothWeakness(
+        lio_observability.translation_condition_ratio,
+        backend_lio_observability_translation_soft_ratio,
+        backend_lio_observability_translation_full_ratio);
+    const double rotation_weakness = SmoothWeakness(
+        lio_observability.rotation_condition_ratio,
+        backend_lio_observability_rotation_soft_ratio,
+        backend_lio_observability_rotation_full_ratio);
+    // Both position and attitude geometry must be weak. A single flat-ground
+    // direction is not sufficient evidence for stronger global assistance.
+    lio_observability_score = std::min(
+        translation_weakness, rotation_weakness);
+  }
+  const double lio_constraint_gain = 1.0 +
+      (backend_lio_observability_maximum_constraint_gain - 1.0) *
+          lio_observability_score;
+
   const bool select_global_observation =
       rtk_factor_selector->ShouldSelect(
           keyframe->id(), *query.observation);
@@ -645,7 +678,8 @@ void LIVMapper::handleRtkForKeyframe(
       receiver_velocity = query.observation->velocity;
     const auto velocity_guard = rtk_velocity_guard->AddObservation(
         keyframe->id(), query.observation->timestamp,
-        query.observation->position, _state.vel_end,
+        query.observation->position,
+        keyframe->T_global_body().translation, _state.vel_end,
         backend_rtk_velocity_regime, receiver_velocity);
     rtk_velocity_selector->MarkSelected(
         keyframe->id(), *query.observation);
@@ -763,7 +797,10 @@ void LIVMapper::handleRtkForKeyframe(
   // position cadence may create a production correction knot. Receiver
   // quaternion is never a direct correction-field observation.
   const auto elastic_update = global_pose_layer->AddElasticObservation(
-      keyframe->id(), *query.observation, update_velocity_guard);
+      keyframe->id(), *query.observation, update_velocity_guard,
+      lio_constraint_gain,
+      lio_observability.translation_condition_ratio,
+      lio_observability.rotation_condition_ratio);
   if (elastic_update.field_changed)
   {
     backend_global_map_dirty.store(true);
@@ -781,17 +818,126 @@ void LIVMapper::handleRtkForKeyframe(
   }
   if (elastic_update.segment_accepted)
   {
+    if (!rtk_velocity_guard)
+      throw std::logic_error(
+          "Elastic recovery acceptance lacks its velocity guard.");
+    rtk_velocity_guard->CompleteRecoveryTracking(keyframe->id());
+    backend_latest_rtk_velocity_result.recovery_tracking = false;
+    backend_latest_rtk_velocity_result.active = false;
+    backend_have_recovery_frame_tracking_time = false;
     backend_global_map_dirty.store(true);
     RCLCPP_WARN(
         node_->get_logger(),
         "Elastic recovery segment accepted at KF %lu: trusted global-map "
         "output resumes from KF %lu after %zu low-rate position checks over "
-        "%.1f m. Status-4 velocity support remains active.",
+        "%.1f m; strong recovery velocity tracking is now released.",
         static_cast<unsigned long>(keyframe->id()),
         static_cast<unsigned long>(
             elastic_update.trusted_start_keyframe_id),
         elastic_update.acceptance.window_size,
         elastic_update.acceptance.window_path_length_m);
+  }
+
+  // A sustained simultaneous loss of translational and rotational geometry,
+  // confirmed while independent RTK velocity still agrees, is an earlier and
+  // safer restart trigger than waiting for a ten-metre position failure.
+  if (update_velocity_guard && backend_have_latest_rtk_velocity_result &&
+      backend_frontend_segment_id == 0 &&
+      !backend_pending_frontend_segment_restart)
+  {
+    const auto &velocity = backend_latest_rtk_velocity_result;
+    const double velocity_error_after = velocity.baseline_available
+        ? (velocity.lio_velocity_after - velocity.filtered_rtk_velocity).norm()
+        : std::numeric_limits<double>::infinity();
+    const bool geometry_failure =
+        backend_lio_observability_guard_enabled &&
+        backend_rtk_velocity_regime ==
+            my_livo::backend::CorrectionRegime::kDegraded &&
+        lio_observability_score >=
+            backend_lio_observability_restart_score &&
+        elastic_update.residual_after_m >=
+            backend_lio_observability_restart_residual_m;
+    const double planar_gradient_ratio =
+        elastic_update.field.interval_peak_planar_gradient_m_per_m /
+        backend_global_pose_options.regularized_field
+            .maximum_planar_gradient_m_per_m;
+    const double vertical_gradient_ratio =
+        elastic_update.field.interval_peak_vertical_gradient_m_per_m /
+        backend_global_pose_options.regularized_field
+            .maximum_vertical_gradient_m_per_m;
+    // A healthy-looking feature count is not sufficient when the causal
+    // correction field is already saturated and its residual keeps growing.
+    // This is direct evidence that frontend propagation is outrunning the
+    // admissible low-frequency deformation; restart before metres of error
+    // accumulate instead of increasing the map-warp gradient.
+    const bool elastic_tracking_saturation =
+        backend_elastic_saturation_restart_enabled &&
+        backend_rtk_velocity_regime ==
+            my_livo::backend::CorrectionRegime::kDegraded &&
+        elastic_update.residual_after_m >=
+            backend_elastic_saturation_restart_residual_m &&
+        std::max(planar_gradient_ratio, vertical_gradient_ratio) >=
+            backend_elastic_saturation_restart_gradient_ratio;
+    const bool velocity_evidence_valid =
+        velocity.baseline_available &&
+        velocity.velocity_source ==
+            my_livo::backend::RtkVelocitySource::kReceiverTwist &&
+        velocity_error_after <=
+            backend_lio_observability_restart_velocity_error_mps;
+    const bool proactive_evidence =
+        (geometry_failure || elastic_tracking_saturation) &&
+        velocity_evidence_valid;
+    backend_lio_observability_restart_evidence = proactive_evidence
+        ? backend_lio_observability_restart_evidence + 1 : 0;
+    if (backend_lio_observability_restart_evidence >=
+        backend_lio_observability_restart_required_observations)
+    {
+      const bool saturation_trigger = elastic_tracking_saturation;
+      const char *restart_reason = saturation_trigger
+          ? "elastic_tracking_saturation" : "lio_observability";
+      ++backend_frontend_restart_request_count;
+      const bool suppressed =
+          !backend_frontend_segment_restart_enabled ||
+          backend_frontend_segment_id >=
+              backend_frontend_segment_maximum_automatic_restarts;
+      if (!suppressed)
+        backend_pending_frontend_segment_restart =
+            PendingFrontendSegmentRestart{
+                keyframe->id(), query.observation->timestamp,
+                restart_reason, 0.0, true,
+                velocity.filtered_rtk_velocity,
+                query.observation->position};
+      if (backend_frontend_restart_supervisor_stream.is_open())
+      {
+        backend_frontend_restart_supervisor_stream << std::setprecision(17)
+            << backend_frontend_restart_request_count << ','
+            << keyframe->id() << ',' << query.observation->timestamp << ','
+            << (suppressed ? "suppressed" : "scheduled")
+            << ',' << restart_reason << ",0," << restart_reason << ','
+            << (saturation_trigger
+                    ? std::max(planar_gradient_ratio,
+                               vertical_gradient_ratio)
+                    : lio_observability_score)
+            << ",1,"
+            << elastic_update.residual_after_m << '\n';
+        backend_frontend_restart_supervisor_stream.flush();
+      }
+      RCLCPP_ERROR(
+          node_->get_logger(),
+          "Causal elastic tracking failure at KF %lu: reason=%s, score="
+          "%.3f, condition=%.5f/%.5f, global residual=%.3f m, velocity "
+          "error=%.3f m/s; proactive continuous recovery %s.",
+          static_cast<unsigned long>(keyframe->id()),
+          restart_reason,
+          saturation_trigger
+              ? std::max(planar_gradient_ratio, vertical_gradient_ratio)
+              : lio_observability_score,
+          lio_observability.translation_condition_ratio,
+          lio_observability.rotation_condition_ratio,
+          elastic_update.residual_after_m, velocity_error_after,
+          suppressed ? "suppressed" : "scheduled");
+      backend_lio_observability_restart_evidence = 0;
+    }
   }
 
   if (!select_global_observation)
@@ -997,6 +1143,134 @@ void LIVMapper::handleRtkForKeyframe(
   }
 }
 
+LIVMapper::FrontendHistorySeedStatistics
+LIVMapper::seedFrontendLocalMapFromHistory(
+    std::uint64_t trigger_keyframe_id)
+{
+  FrontendHistorySeedStatistics statistics;
+  if (!keyframe_manager || !voxelmap_manager)
+    return statistics;
+  const auto keyframes = keyframe_manager->keyframes();
+  if (trigger_keyframe_id >= keyframes.size())
+    throw std::logic_error(
+        "Frontend history seed references an unknown keyframe.");
+
+  std::vector<my_livo::backend::Keyframe::Ptr> selected;
+  std::size_t cursor = static_cast<std::size_t>(trigger_keyframe_id);
+  while (cursor > 0U &&
+         selected.size() <
+             backend_frontend_segment_maximum_history_seed_keyframes)
+  {
+    const auto &newer = keyframes.at(cursor);
+    const auto &older = keyframes.at(cursor - 1U);
+    statistics.path_length_m +=
+        (newer->T_odom_body().translation -
+         older->T_odom_body().translation).norm();
+    selected.push_back(older);
+    --cursor;
+    if (statistics.path_length_m + 1.0e-9 >=
+        backend_frontend_segment_history_seed_path_m)
+      break;
+  }
+  std::reverse(selected.begin(), selected.end());
+
+  std::size_t point_count = 0;
+  for (const auto &keyframe : selected)
+    point_count += keyframe->cloud_body()->size();
+  std::vector<pointWithVar> history_points;
+  history_points.reserve(point_count);
+  const double point_variance =
+      backend_frontend_segment_history_seed_point_sigma_m *
+      backend_frontend_segment_history_seed_point_sigma_m;
+  const M3D seed_covariance = M3D::Identity() * point_variance;
+  for (const auto &keyframe : selected)
+  {
+    const auto T_odom_body = keyframe->T_odom_body();
+    for (const auto &stored : keyframe->cloud_body()->points)
+    {
+      pointWithVar point;
+      point.point_b = V3D(stored.x, stored.y, stored.z);
+      point.point_w = T_odom_body * point.point_b;
+      point.body_var = seed_covariance;
+      point.var = seed_covariance;
+      history_points.push_back(point);
+    }
+  }
+  if (!history_points.empty())
+    voxelmap_manager->UpdateVoxelMap(history_points);
+  statistics.keyframes = selected.size();
+  statistics.points = history_points.size();
+  return statistics;
+}
+
+void LIVMapper::applyBackendRecoveryFrameVelocityTracking(double timestamp)
+{
+  if (!backend_rtk_recovery_frame_tracking_enabled ||
+      !backend_have_latest_rtk_velocity_result ||
+      !backend_latest_rtk_velocity_result.recovery_tracking ||
+      !backend_latest_rtk_velocity_result.active)
+  {
+    backend_have_recovery_frame_tracking_time = false;
+    return;
+  }
+  const double target_age =
+      timestamp - backend_latest_rtk_velocity_result.timestamp;
+  if (!std::isfinite(timestamp) || target_age < -1.0e-6 ||
+      target_age > backend_rtk_recovery_frame_tracking_maximum_age_sec)
+  {
+    backend_have_recovery_frame_tracking_time = false;
+    return;
+  }
+  if (!backend_have_recovery_frame_tracking_time)
+  {
+    backend_last_recovery_frame_tracking_time = timestamp;
+    backend_have_recovery_frame_tracking_time = true;
+    return;
+  }
+  const double interval =
+      timestamp - backend_last_recovery_frame_tracking_time;
+  if (interval <= 0.0) return;
+  backend_last_recovery_frame_tracking_time = timestamp;
+
+  const V3D before = _state.vel_end;
+  V3D correction =
+      backend_latest_rtk_velocity_result.tracking_target_velocity - before;
+  const double planar_limit =
+      backend_rtk_recovery_frame_tracking_planar_acceleration_mps2 *
+      interval;
+  const double planar_norm = correction.head<2>().norm();
+  if (planar_norm > planar_limit && planar_norm > 1.0e-12)
+    correction.head<2>() *= planar_limit / planar_norm;
+  const double vertical_limit =
+      backend_rtk_recovery_frame_tracking_vertical_acceleration_mps2 *
+      interval;
+  correction.z() = std::clamp(
+      correction.z(), -vertical_limit, vertical_limit);
+  _state.vel_end += correction;
+  // Preserve the frontend covariance and all cross-correlations. This is a
+  // bounded mean-state hold after scan matching, not an RTK measurement
+  // update and not a pose correction.
+  state_propagat.vel_end = _state.vel_end;
+  voxelmap_manager->state_.vel_end = _state.vel_end;
+
+  if (backend_rtk_recovery_frame_tracking_stream.is_open())
+  {
+    const V3D &target =
+        backend_latest_rtk_velocity_result.tracking_target_velocity;
+    backend_rtk_recovery_frame_tracking_stream << std::setprecision(17)
+        << timestamp << ','
+        << backend_latest_rtk_velocity_result.keyframe_id << ','
+        << backend_latest_rtk_velocity_result.timestamp << ','
+        << target_age << ',' << interval << ',' << target.x() << ','
+        << target.y() << ',' << target.z() << ',' << before.x() << ','
+        << before.y() << ',' << before.z() << ',' << _state.vel_end.x()
+        << ',' << _state.vel_end.y() << ',' << _state.vel_end.z() << ','
+        << correction.x() << ',' << correction.y() << ','
+        << correction.z() << '\n';
+    backend_rtk_recovery_frame_tracking_stream.flush();
+  }
+}
+
 bool LIVMapper::executePendingFrontendSegmentRestart()
 {
   if (!backend_pending_frontend_segment_restart) return false;
@@ -1063,6 +1337,10 @@ bool LIVMapper::executePendingFrontendSegmentRestart()
   const std::size_t deleted_voxels =
       voxelmap_manager->ResetLocalMap(_state);
   voxelmap_manager->BuildVoxelMap();
+  const FrontendHistorySeedStatistics history_seed =
+      seedFrontendLocalMapFromHistory(request.trigger_keyframe_id);
+  const std::size_t total_seed_points =
+      feats_down_body->size() + history_seed.points;
   lidar_map_inited = true;
   if (request.reset_velocity)
   {
@@ -1071,9 +1349,14 @@ bool LIVMapper::executePendingFrontendSegmentRestart()
     if (!rtk_velocity_guard)
       throw std::logic_error(
           "Velocity recovery lacks its RTK velocity guard.");
-    rtk_velocity_guard->AcknowledgeEmergencyRestart(
-        request.trigger_keyframe_id);
+    if (request.reason == "velocity_divergence")
+      rtk_velocity_guard->AcknowledgeEmergencyRestart(
+          request.trigger_keyframe_id);
+    else
+      rtk_velocity_guard->BeginRecoveryTracking(
+          request.trigger_keyframe_id);
     backend_global_map_dirty.store(true);
+    backend_have_recovery_frame_tracking_time = false;
   }
   else
   {
@@ -1113,12 +1396,20 @@ bool LIVMapper::executePendingFrontendSegmentRestart()
         << request.trigger_keyframe_id << ','
         << request.request_timestamp << ','
         << LidarMeasures.last_lio_update_time << ',' << request.reason << ','
-        << request.evidence_span_m << ',' << feats_down_body->size() << ','
+        << request.evidence_span_m << ',' << total_seed_points << ','
+        << feats_down_body->size() << ',' << history_seed.keyframes << ','
+        << history_seed.path_length_m << ',' << history_seed.points << ','
         << deleted_voxels << ',' << voxelmap_manager->voxel_map_.size()
         << ',' << pose_delta_m << ',' << rotation_delta_deg << ','
         << velocity_delta_mps << ',' << bias_g_delta << ','
         << bias_a_delta << ',' << gravity_delta << ",1,"
-        << (request.reset_velocity ? "velocity" : "structural") << ','
+        << (request.reason == "lio_observability"
+                ? "observability"
+                : (request.reason == "elastic_tracking_saturation"
+                    ? "saturation"
+                : (request.reset_velocity ? "velocity" : "structural"))
+                )
+        << ','
         << request.target_velocity.x() << ','
         << request.target_velocity.y() << ','
         << request.target_velocity.z() << ','
@@ -1181,7 +1472,8 @@ bool LIVMapper::executePendingFrontendSegmentRestart()
     status.name = "backend/frontend_restart_required";
     status.hardware_id = "fast_livo_backend";
     status.message = request.reset_velocity
-        ? "local voxel submap rebuilt; velocity reset; global segment anchored"
+        ? "local voxel submap rebuilt; velocity stabilized; continuous "
+          "global recovery started"
         : "local voxel submap rebuilt; recovery gate restarted";
     diagnostic_msgs::msg::KeyValue segment_value;
     segment_value.key = "segment_id";
@@ -1194,15 +1486,17 @@ bool LIVMapper::executePendingFrontendSegmentRestart()
   RCLCPP_WARN(
       node_->get_logger(),
       "Started LIO local segment %lu at KF %lu: %s, deleted %zu old voxels "
-      "and seeded %zu points into %zu voxels; the segment remains "
+      "and seeded %zu current plus %zu historical points from %zu "
+      "keyframes/%.1f m into %zu voxels; the segment remains "
       "quarantined pending a fresh rigid gate.",
       static_cast<unsigned long>(backend_frontend_segment_id),
       static_cast<unsigned long>(request.trigger_keyframe_id),
       request.reset_velocity
-          ? "preserved pose/attitude/IMU biases, reset propagation velocity "
-            "and opened a path-preserving RTK global anchor"
+          ? "preserved pose/attitude/IMU biases, stabilized propagation "
+            "velocity and opened a path-continuous recovery field"
           : "preserved pose/IMU state",
-      deleted_voxels, feats_down_body->size(),
+      deleted_voxels, feats_down_body->size(), history_seed.points,
+      history_seed.keyframes, history_seed.path_length_m,
       voxelmap_manager->voxel_map_.size());
   backend_pending_frontend_segment_restart.reset();
   return true;
@@ -2122,10 +2416,22 @@ void LIVMapper::readParameters()
       regularized_field.minimum_orientation_yaw_confidence, 1.0);
   nh.param<double>(
       "backend/global_pose/regularized_field/elastic_soft_radius_m",
-      regularized_field.elastic_soft_radius_m, 0.20);
+      regularized_field.elastic_soft_radius_m, 0.15);
   nh.param<double>(
       "backend/global_pose/regularized_field/elastic_full_radius_m",
-      regularized_field.elastic_full_radius_m, 1.00);
+      regularized_field.elastic_full_radius_m, 0.50);
+  nh.param<double>(
+      "backend/global_pose/regularized_field/vertical_elastic_soft_radius_m",
+      regularized_field.vertical_elastic_soft_radius_m, 0.15);
+  nh.param<double>(
+      "backend/global_pose/regularized_field/vertical_elastic_full_radius_m",
+      regularized_field.vertical_elastic_full_radius_m, 0.60);
+  nh.param<double>(
+      "backend/global_pose/regularized_field/yaw_elastic_soft_radius_deg",
+      regularized_field.yaw_elastic_soft_radius_deg, 0.25);
+  nh.param<double>(
+      "backend/global_pose/regularized_field/yaw_elastic_full_radius_deg",
+      regularized_field.yaw_elastic_full_radius_deg, 1.00);
   nh.param<double>(
       "backend/global_pose/regularized_field/elastic_minimum_stiffness",
       regularized_field.elastic_minimum_stiffness, 0.0);
@@ -2146,13 +2452,32 @@ void LIVMapper::readParameters()
       regularized_field.maximum_alignment_planar_rms_m, 0.30);
   nh.param<double>(
       "backend/global_pose/regularized_field/maximum_planar_gradient_m_per_m",
-      regularized_field.maximum_planar_gradient_m_per_m, 0.20);
+      regularized_field.maximum_planar_gradient_m_per_m, 0.05);
   nh.param<double>(
       "backend/global_pose/regularized_field/maximum_vertical_gradient_m_per_m",
-      regularized_field.maximum_vertical_gradient_m_per_m, 0.18);
+      regularized_field.maximum_vertical_gradient_m_per_m, 0.08);
   nh.param<double>(
       "backend/global_pose/regularized_field/maximum_yaw_gradient_deg_per_m",
       regularized_field.maximum_yaw_gradient_deg_per_m, 0.10);
+  nh.param<bool>(
+      "backend/global_pose/regularized_field/adaptive_gradient_enabled",
+      regularized_field.adaptive_gradient_enabled, true);
+  nh.param<double>(
+      "backend/global_pose/regularized_field/"
+      "adaptive_position_gradient_full_distance_m",
+      regularized_field.adaptive_position_gradient_full_distance_m, 1.50);
+  nh.param<double>(
+      "backend/global_pose/regularized_field/"
+      "adaptive_yaw_gradient_full_distance_deg",
+      regularized_field.adaptive_yaw_gradient_full_distance_deg, 3.00);
+  nh.param<double>(
+      "backend/global_pose/regularized_field/"
+      "adaptive_position_gradient_maximum_gain",
+      regularized_field.adaptive_position_gradient_maximum_gain, 1.5);
+  nh.param<double>(
+      "backend/global_pose/regularized_field/"
+      "adaptive_yaw_gradient_maximum_gain",
+      regularized_field.adaptive_yaw_gradient_maximum_gain, 2.0);
   nh.param<int>(
       "backend/global_pose/regularized_field/extrapolation_regression_knots",
       regularized_field.extrapolation_regression_knots, 3);
@@ -2195,10 +2520,10 @@ void LIVMapper::readParameters()
       elastic_acceptance.maximum_post_velocity_error_mps, 0.80);
   nh.param<double>(
       "backend/global_pose/elastic_acceptance/maximum_field_gradient_m_per_m",
-      elastic_acceptance.maximum_field_gradient_m_per_m, 0.30);
+      elastic_acceptance.maximum_field_gradient_m_per_m, 0.10);
   nh.param<double>(
       "backend/global_pose/elastic_acceptance/maximum_yaw_gradient_deg_per_m",
-      elastic_acceptance.maximum_yaw_gradient_deg_per_m, 0.20);
+      elastic_acceptance.maximum_yaw_gradient_deg_per_m, 0.10);
   nh.param<double>(
       "backend/global_pose/elastic_acceptance/maximum_outlier_fraction",
       elastic_acceptance.maximum_outlier_fraction, 0.25);
@@ -2362,6 +2687,28 @@ void LIVMapper::readParameters()
       static_cast<std::size_t>(
           frontend_segment_maximum_automatic_restarts);
   nh.param<double>(
+      "backend/frontend_segment_restart/history_seed_path_length_m",
+      backend_frontend_segment_history_seed_path_m, 20.0);
+  int frontend_segment_maximum_history_seed_keyframes = 20;
+  nh.param<int>(
+      "backend/frontend_segment_restart/maximum_history_seed_keyframes",
+      frontend_segment_maximum_history_seed_keyframes, 20);
+  nh.param<double>(
+      "backend/frontend_segment_restart/history_seed_point_sigma_m",
+      backend_frontend_segment_history_seed_point_sigma_m, 0.10);
+  if (!std::isfinite(backend_frontend_segment_history_seed_path_m) ||
+      backend_frontend_segment_history_seed_path_m <= 0.0 ||
+      frontend_segment_maximum_history_seed_keyframes <= 0 ||
+      !std::isfinite(
+          backend_frontend_segment_history_seed_point_sigma_m) ||
+      backend_frontend_segment_history_seed_point_sigma_m <= 0.0)
+    throw std::runtime_error(
+        "backend.frontend_segment_restart history-seed parameters must be "
+        "positive.");
+  backend_frontend_segment_maximum_history_seed_keyframes =
+      static_cast<std::size_t>(
+          frontend_segment_maximum_history_seed_keyframes);
+  nh.param<double>(
       "backend/frontend_segment_restart/position_sigma_floor_m",
       backend_frontend_segment_position_sigma_floor_m, 0.10);
   nh.param<double>(
@@ -2383,6 +2730,71 @@ void LIVMapper::readParameters()
       backend_frontend_restart_supervisor_csv_path,
       std::string(ROOT_DIR) +
           "Log/backend/frontend_restart_supervisor.csv");
+  nh.param<bool>(
+      "backend/frontend_segment_restart/observability_guard/enabled",
+      backend_lio_observability_guard_enabled, true);
+  nh.param<double>(
+      "backend/frontend_segment_restart/observability_guard/"
+      "translation_soft_ratio",
+      backend_lio_observability_translation_soft_ratio, 0.15);
+  nh.param<double>(
+      "backend/frontend_segment_restart/observability_guard/"
+      "translation_full_ratio",
+      backend_lio_observability_translation_full_ratio, 0.05);
+  nh.param<double>(
+      "backend/frontend_segment_restart/observability_guard/"
+      "rotation_soft_ratio",
+      backend_lio_observability_rotation_soft_ratio, 0.25);
+  nh.param<double>(
+      "backend/frontend_segment_restart/observability_guard/"
+      "rotation_full_ratio",
+      backend_lio_observability_rotation_full_ratio, 0.08);
+  nh.param<double>(
+      "backend/frontend_segment_restart/observability_guard/maximum_gain",
+      backend_lio_observability_maximum_constraint_gain, 3.0);
+  nh.param<double>(
+      "backend/frontend_segment_restart/observability_guard/restart_score",
+      backend_lio_observability_restart_score, 0.65);
+  nh.param<double>(
+      "backend/frontend_segment_restart/observability_guard/"
+      "restart_residual_m",
+      backend_lio_observability_restart_residual_m, 1.0);
+  nh.param<double>(
+      "backend/frontend_segment_restart/observability_guard/"
+      "restart_velocity_error_mps",
+      backend_lio_observability_restart_velocity_error_mps, 0.8);
+  nh.param<int>(
+      "backend/frontend_segment_restart/observability_guard/"
+      "restart_required_observations",
+      backend_lio_observability_restart_required_observations, 3);
+  nh.param<bool>(
+      "backend/frontend_segment_restart/elastic_saturation_guard/enabled",
+      backend_elastic_saturation_restart_enabled, false);
+  nh.param<double>(
+      "backend/frontend_segment_restart/elastic_saturation_guard/"
+      "restart_residual_m",
+      backend_elastic_saturation_restart_residual_m, 0.50);
+  nh.param<double>(
+      "backend/frontend_segment_restart/elastic_saturation_guard/"
+      "restart_gradient_ratio",
+      backend_elastic_saturation_restart_gradient_ratio, 0.95);
+  if (!(backend_lio_observability_translation_full_ratio > 0.0 &&
+        backend_lio_observability_translation_soft_ratio >
+            backend_lio_observability_translation_full_ratio &&
+        backend_lio_observability_rotation_full_ratio > 0.0 &&
+        backend_lio_observability_rotation_soft_ratio >
+            backend_lio_observability_rotation_full_ratio &&
+        backend_lio_observability_maximum_constraint_gain >= 1.0 &&
+        backend_lio_observability_restart_score > 0.0 &&
+        backend_lio_observability_restart_score <= 1.0 &&
+        backend_lio_observability_restart_residual_m > 0.0 &&
+        backend_lio_observability_restart_velocity_error_mps > 0.0 &&
+        backend_lio_observability_restart_required_observations > 0 &&
+        backend_elastic_saturation_restart_residual_m > 0.0 &&
+        backend_elastic_saturation_restart_gradient_ratio > 0.0 &&
+        backend_elastic_saturation_restart_gradient_ratio <= 1.0))
+    throw std::runtime_error(
+        "backend observability-guard parameters are invalid.");
   nh.param<bool>(
       "backend/rtk/velocity_guard/enabled",
       backend_rtk_velocity_guard_options.enabled, true);
@@ -2451,17 +2863,17 @@ void LIVMapper::readParameters()
       "maximum_planar_correction_acceleration_mps2",
       backend_rtk_velocity_guard_options
           .maximum_planar_correction_acceleration_mps2,
-      0.30);
+      0.75);
   nh.param<double>(
       "backend/rtk/velocity_guard/"
       "maximum_vertical_correction_acceleration_mps2",
       backend_rtk_velocity_guard_options
           .maximum_vertical_correction_acceleration_mps2,
-      0.15);
+      0.30);
   nh.param<bool>(
       "backend/rtk/velocity_guard/healthy_vertical_aiding_enabled",
       backend_rtk_velocity_guard_options.healthy_vertical_aiding_enabled,
-      false);
+      true);
   nh.param<double>(
       "backend/rtk/velocity_guard/"
       "healthy_vertical_activation_error_mps",
@@ -2478,13 +2890,13 @@ void LIVMapper::readParameters()
       "backend/rtk/velocity_guard/healthy_vertical_time_constant_sec",
       backend_rtk_velocity_guard_options
           .healthy_vertical_time_constant_sec,
-      8.0);
+      4.0);
   nh.param<double>(
       "backend/rtk/velocity_guard/"
       "healthy_vertical_maximum_acceleration_mps2",
       backend_rtk_velocity_guard_options
           .healthy_vertical_maximum_acceleration_mps2,
-      0.03);
+      0.08);
   nh.param<double>(
       "backend/rtk/velocity_guard/"
       "recovery_tracking_time_constant_sec",
@@ -2503,6 +2915,72 @@ void LIVMapper::readParameters()
       backend_rtk_velocity_guard_options
           .recovery_tracking_vertical_acceleration_mps2,
       0.75);
+  nh.param<bool>(
+      "backend/rtk/velocity_guard/recovery_frame_tracking_enabled",
+      backend_rtk_recovery_frame_tracking_enabled, true);
+  nh.param<double>(
+      "backend/rtk/velocity_guard/"
+      "recovery_frame_tracking_maximum_age_sec",
+      backend_rtk_recovery_frame_tracking_maximum_age_sec, 1.5);
+  nh.param<double>(
+      "backend/rtk/velocity_guard/"
+      "recovery_frame_tracking_planar_acceleration_mps2",
+      backend_rtk_recovery_frame_tracking_planar_acceleration_mps2, 3.0);
+  nh.param<double>(
+      "backend/rtk/velocity_guard/"
+      "recovery_frame_tracking_vertical_acceleration_mps2",
+      backend_rtk_recovery_frame_tracking_vertical_acceleration_mps2, 2.0);
+  nh.param<string>(
+      "backend/rtk/velocity_guard/recovery_frame_tracking_csv_path",
+      backend_rtk_recovery_frame_tracking_csv_path,
+      std::string(ROOT_DIR) +
+          "Log/backend/rtk_recovery_frame_tracking.csv");
+  if (!std::isfinite(
+          backend_rtk_recovery_frame_tracking_maximum_age_sec) ||
+      backend_rtk_recovery_frame_tracking_maximum_age_sec <= 0.0 ||
+      !std::isfinite(
+          backend_rtk_recovery_frame_tracking_planar_acceleration_mps2) ||
+      backend_rtk_recovery_frame_tracking_planar_acceleration_mps2 <= 0.0 ||
+      !std::isfinite(
+          backend_rtk_recovery_frame_tracking_vertical_acceleration_mps2) ||
+      backend_rtk_recovery_frame_tracking_vertical_acceleration_mps2 <= 0.0)
+    throw std::runtime_error(
+        "backend.rtk.velocity_guard recovery-frame tracking parameters "
+        "must be positive.");
+  nh.param<double>(
+      "backend/rtk/velocity_guard/recovery_position_soft_radius_m",
+      backend_rtk_velocity_guard_options.recovery_position_soft_radius_m,
+      0.15);
+  nh.param<double>(
+      "backend/rtk/velocity_guard/recovery_position_full_radius_m",
+      backend_rtk_velocity_guard_options.recovery_position_full_radius_m,
+      1.50);
+  nh.param<double>(
+      "backend/rtk/velocity_guard/recovery_position_release_radius_m",
+      backend_rtk_velocity_guard_options.recovery_position_release_radius_m,
+      0.10);
+  nh.param<double>(
+      "backend/rtk/velocity_guard/"
+      "recovery_position_capture_minimum_stiffness",
+      backend_rtk_velocity_guard_options
+          .recovery_position_capture_minimum_stiffness,
+      0.50);
+  nh.param<double>(
+      "backend/rtk/velocity_guard/recovery_position_time_constant_sec",
+      backend_rtk_velocity_guard_options.recovery_position_time_constant_sec,
+      4.0);
+  nh.param<double>(
+      "backend/rtk/velocity_guard/"
+      "recovery_maximum_planar_closure_velocity_mps",
+      backend_rtk_velocity_guard_options
+          .recovery_maximum_planar_closure_velocity_mps,
+      0.60);
+  nh.param<double>(
+      "backend/rtk/velocity_guard/"
+      "recovery_maximum_vertical_closure_velocity_mps",
+      backend_rtk_velocity_guard_options
+          .recovery_maximum_vertical_closure_velocity_mps,
+      0.60);
   nh.param<bool>(
       "backend/rtk/velocity_guard/emergency_restart_enabled",
       backend_rtk_velocity_guard_options.emergency_restart_enabled, true);
@@ -3089,6 +3567,22 @@ void LIVMapper::initializeFiles()
            "measurement_y,measurement_z,innovation_x,innovation_y,"
            "innovation_z,innovation_chi2\n";
   }
+  if (backend_rtk_input_enabled &&
+      !backend_rtk_recovery_frame_tracking_csv_path.empty())
+  {
+    backend_rtk_recovery_frame_tracking_stream.open(
+        backend_rtk_recovery_frame_tracking_csv_path,
+        std::ios::out | std::ios::trunc);
+    if (!backend_rtk_recovery_frame_tracking_stream.is_open())
+      throw std::runtime_error(
+          "Cannot open recovery frame-tracking CSV: " +
+          backend_rtk_recovery_frame_tracking_csv_path);
+    backend_rtk_recovery_frame_tracking_stream
+        << "timestamp,source_keyframe_id,target_timestamp,target_age_sec,"
+           "interval_sec,target_vx,target_vy,target_vz,before_vx,"
+           "before_vy,before_vz,after_vx,after_vy,after_vz,correction_vx,"
+           "correction_vy,correction_vz\n";
+  }
   if (backend_frontend_segment_restart_enabled &&
       !backend_frontend_segment_csv_path.empty())
   {
@@ -3102,6 +3596,8 @@ void LIVMapper::initializeFiles()
     backend_frontend_segment_stream
         << "segment_id,trigger_keyframe_id,request_timestamp,"
            "restart_timestamp,reason,evidence_span_m,seed_points,"
+           "current_seed_points,history_seed_keyframes,history_seed_path_m,"
+           "history_seed_points,"
            "deleted_voxels,map_voxels_after,pose_delta_m,"
            "rotation_delta_deg,velocity_delta_mps,bias_g_delta,"
            "bias_a_delta,gravity_delta,gate_acknowledged,restart_kind,"
@@ -3693,6 +4189,8 @@ void LIVMapper::handleLIO()
   voxelmap_manager->StateEstimation(state_propagat);
   _state = voxelmap_manager->state_;
   _pv_list = voxelmap_manager->pv_list_;
+  applyBackendRecoveryFrameVelocityTracking(
+      LidarMeasures.last_lio_update_time);
 
   double t2 = omp_get_wtime();
 
@@ -3847,7 +4345,7 @@ void LIVMapper::handleBackendKeyframe()
         }
         return cloud_body;
       },
-      odom_covariance);
+      odom_covariance, voxelmap_manager->latest_observability_);
   if (!keyframe) return;
 
   geometry_msgs::PoseStamped pose;

@@ -4,6 +4,7 @@
 import argparse
 import csv
 import math
+import os
 from pathlib import Path
 
 
@@ -13,6 +14,21 @@ def rows(path: Path):
     with path.open(newline="", encoding="utf-8") as stream:
         reader = csv.DictReader(stream)
         return reader.fieldnames or [], list(reader)
+
+
+def active_mapping_processes():
+    project_root = str(Path(__file__).resolve().parent.parent)
+    active = []
+    for process in Path("/proc").glob("[0-9]*"):
+        try:
+            command = (process / "cmdline").read_bytes().replace(
+                b"\0", b" ").decode(errors="replace")
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        if "fastlivo_mapping" in command and project_root in command and \
+                int(process.name) != os.getpid():
+            active.append(int(process.name))
+    return sorted(active)
 
 
 def norm(values):
@@ -119,7 +135,14 @@ def main():
     parser.add_argument("--rigid-submap-output", type=Path,
                         default=Path(
                             "Log/backend/rigid_submap_fidelity.csv"))
+    parser.add_argument("--allow-live-logs", action="store_true")
     args = parser.parse_args()
+
+    active = active_mapping_processes()
+    if active and not args.allow_live_logs:
+        raise RuntimeError(
+            "fastlivo_mapping is still writing the audit files (PID " +
+            ",".join(str(pid) for pid in active) + "); stop it first")
 
     fields, updates = rows(args.updates)
     trajectory_fields, trajectory = rows(args.trajectory)
