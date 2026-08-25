@@ -12,7 +12,6 @@ laser_mapping:
     multi_lidar:
       enabled: true
       # calibration_file: "/home/project/data/haibo/huaining/03/sensor-imu_calibration/perception_truck03.json"
-      # calibration_file: "/home/project/data/haibo/huaining/05/sensor-imu_calibration/perception_truck05.json"
       calibration_file: "/home/project/data/haibo/wuhu_livo/sensor-imu_calibration/perception_truck29.json" # wuhu_29
       # calibration_file: "/home/project/data/haibo/chizhou/10/sensor-imu_calibration/perception_truck10.json" # wuhu_29
       # topics and transform_keys are paired by index. Keep only the desired
@@ -96,7 +95,7 @@ laser_mapping:
       gyr_cov: 0.01
       # 100 Hz source: allow one missing sample, but never interpolate across
       # a long hole while deskewing a scan.
-      maximum_time_gap: 0.020
+      maximum_time_gap: 0.030
       # Separate recorded bag chunks can contain a short sensor-wide hole.
       # Rebase the estimator clock and drop straddling scans instead of
       # interpolating missing IMU data or terminating the entire mission.
@@ -262,10 +261,10 @@ laser_mapping:
           # Independent deadbands prevent a vertical/yaw error from opening
           # the planar rubber band. This preserves the local LIO map while
           # still correcting a persistent height or heading drift.
-          elastic_soft_radius_m: 0.15
-          elastic_full_radius_m: 0.50
-          vertical_elastic_soft_radius_m: 0.15
-          vertical_elastic_full_radius_m: 0.60
+          elastic_soft_radius_m: 0.10
+          elastic_full_radius_m: 0.25
+          vertical_elastic_soft_radius_m: 0.10
+          vertical_elastic_full_radius_m: 0.30
           yaw_elastic_soft_radius_deg: 0.25
           yaw_elastic_full_radius_deg: 1.00
           elastic_minimum_stiffness: 0.0
@@ -466,18 +465,18 @@ laser_mapping:
           recovery_frame_tracking_enabled: true
           recovery_frame_tracking_maximum_age_sec: 1.5
           recovery_frame_tracking_planar_acceleration_mps2: 3.0
-          recovery_frame_tracking_vertical_acceleration_mps2: 2.0
+          recovery_frame_tracking_vertical_acceleration_mps2: 12.0
           recovery_frame_tracking_csv_path: "/home/project/MY-LIVO2.0/Log/backend/rtk_recovery_frame_tracking.csv"
-          # Quarantine-only radial outer loop. Inside 0.15 m it is free; once
-          # outside, a hysteretic capture remains active until 0.10 m so a
+          # Quarantine-only radial outer loop. Inside 0.10 m it is free; once
+          # outside, a hysteretic capture remains active until 0.08 m so a
           # parallel steady-state offset cannot remain near the boundary.
-          recovery_position_soft_radius_m: 0.15
-          recovery_position_full_radius_m: 1.50
-          recovery_position_release_radius_m: 0.10
+          recovery_position_soft_radius_m: 0.10
+          recovery_position_full_radius_m: 0.50
+          recovery_position_release_radius_m: 0.08
           recovery_position_capture_minimum_stiffness: 0.50
-          recovery_position_time_constant_sec: 4.0
-          recovery_maximum_planar_closure_velocity_mps: 0.60
-          recovery_maximum_vertical_closure_velocity_mps: 0.60
+          recovery_position_time_constant_sec: 1.5
+          recovery_maximum_planar_closure_velocity_mps: 0.80
+          recovery_maximum_vertical_closure_velocity_mps: 0.80
           # A slow bounded controller must not spend tens of metres repairing
           # an already-corrupted propagation state. Three independent status-4
           # receiver samples trigger one controlled recovery segment.

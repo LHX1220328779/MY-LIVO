@@ -27,6 +27,7 @@ Eigen::Vector2d LimitNorm(const Eigen::Vector2d &value, double limit)
     return value;
   return value * (limit / norm);
 }
+
 }  // namespace
 
 RegularizedCorrectionField4d::RegularizedCorrectionField4d()

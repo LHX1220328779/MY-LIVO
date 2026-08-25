@@ -324,7 +324,7 @@ public:
   bool backend_rtk_recovery_frame_tracking_enabled = true;
   double backend_rtk_recovery_frame_tracking_maximum_age_sec = 1.5;
   double backend_rtk_recovery_frame_tracking_planar_acceleration_mps2 = 3.0;
-  double backend_rtk_recovery_frame_tracking_vertical_acceleration_mps2 = 2.0;
+  double backend_rtk_recovery_frame_tracking_vertical_acceleration_mps2 = 12.0;
   bool backend_have_recovery_frame_tracking_time = false;
   double backend_last_recovery_frame_tracking_time = 0.0;
   string backend_rtk_recovery_frame_tracking_csv_path;

@@ -160,13 +160,13 @@ def main():
     parser.add_argument("--elastic-maximum-stiffness", type=float,
                         default=1.0)
     parser.add_argument("--regularized-elastic-soft-radius", type=float,
-                        default=0.15)
+                        default=0.10)
     parser.add_argument("--regularized-elastic-full-radius", type=float,
-                        default=0.50)
+                        default=0.25)
     parser.add_argument("--regularized-vertical-soft-radius", type=float,
-                        default=0.15)
+                        default=0.10)
     parser.add_argument("--regularized-vertical-full-radius", type=float,
-                        default=0.60)
+                        default=0.30)
     parser.add_argument("--regularized-yaw-soft-radius-deg", type=float,
                         default=0.25)
     parser.add_argument("--regularized-yaw-full-radius-deg", type=float,
@@ -267,21 +267,21 @@ def main():
     parser.add_argument("--recovery-frame-tracking-planar-acceleration",
                         type=float, default=3.0)
     parser.add_argument("--recovery-frame-tracking-vertical-acceleration",
-                        type=float, default=2.0)
+                        type=float, default=12.0)
     parser.add_argument("--recovery-position-soft-radius", type=float,
-                        default=0.15)
-    parser.add_argument("--recovery-position-full-radius", type=float,
-                        default=1.50)
-    parser.add_argument("--recovery-position-release-radius", type=float,
                         default=0.10)
+    parser.add_argument("--recovery-position-full-radius", type=float,
+                        default=0.50)
+    parser.add_argument("--recovery-position-release-radius", type=float,
+                        default=0.08)
     parser.add_argument("--recovery-capture-minimum-stiffness", type=float,
                         default=0.50)
     parser.add_argument("--recovery-position-time-constant", type=float,
-                        default=4.0)
+                        default=1.5)
     parser.add_argument("--recovery-maximum-planar-closure-velocity",
-                        type=float, default=0.60)
+                        type=float, default=0.80)
     parser.add_argument("--recovery-maximum-vertical-closure-velocity",
-                        type=float, default=0.60)
+                        type=float, default=0.80)
     parser.add_argument("--emergency-restart-velocity-error", type=float,
                         default=2.0)
     parser.add_argument("--emergency-restart-observations", type=int,
@@ -1830,7 +1830,7 @@ def main():
                         "restart_kind", "structural")
                     if restart_kind not in {
                             "structural", "velocity", "observability",
-                            "saturation"}:
+                            "saturation", "quarantine"}:
                         raise RuntimeError(
                             "frontend segment restart kind is unknown")
                     preserved = (
@@ -1845,11 +1845,13 @@ def main():
                         raise RuntimeError(
                             "structural frontend segment changed velocity")
                     if restart_kind in {
-                            "velocity", "observability", "saturation"}:
+                            "velocity", "observability", "saturation",
+                            "quarantine"}:
                         expected_reason = {
                             "velocity": "velocity_divergence",
                             "observability": "lio_observability",
                             "saturation": "elastic_tracking_saturation",
+                            "quarantine": "correction_quarantine",
                         }[restart_kind]
                         if not have_recovery_segment_schema or \
                                 segment["reason"] != expected_reason:
@@ -1858,6 +1860,15 @@ def main():
                         guard = next((row for row in guard_rows
                                       if int(row["keyframe_id"]) ==
                                       trigger_id), None)
+                        if guard is None and restart_kind == "quarantine":
+                            previous_guards = [
+                                row for row in guard_rows
+                                if int(row["keyframe_id"]) < trigger_id and
+                                float(segment["request_timestamp"])-
+                                float(row["timestamp"]) <=
+                                args.velocity_evidence_max_age]
+                            guard = previous_guards[-1] \
+                                if previous_guards else None
                         if guard is None or (restart_kind == "velocity" and
                                 trigger_id not in
                                 velocity_restart_transition_ids):

@@ -80,13 +80,13 @@ public:
     // velocity target and never writes pose.  A hysteretic capture latch
     // removes the proportional controller's steady-state error without
     // reacting to RTK jitter while ordinary local LIO is healthy.
-    double recovery_position_soft_radius_m = 0.15;
-    double recovery_position_full_radius_m = 1.50;
-    double recovery_position_release_radius_m = 0.10;
+    double recovery_position_soft_radius_m = 0.10;
+    double recovery_position_full_radius_m = 0.50;
+    double recovery_position_release_radius_m = 0.08;
     double recovery_position_capture_minimum_stiffness = 0.50;
-    double recovery_position_time_constant_sec = 4.0;
-    double recovery_maximum_planar_closure_velocity_mps = 0.60;
-    double recovery_maximum_vertical_closure_velocity_mps = 0.60;
+    double recovery_position_time_constant_sec = 1.5;
+    double recovery_maximum_planar_closure_velocity_mps = 0.80;
+    double recovery_maximum_vertical_closure_velocity_mps = 0.80;
     // A bounded correction is intentionally slow.  If a status-4 receiver
     // velocity still disagrees strongly after several low-rate updates, the
     // frontend propagation has already left the elastic-recovery envelope and

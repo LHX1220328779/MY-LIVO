@@ -78,10 +78,10 @@ void TestStatusOrderingAndAnchorOptions()
 {
   RegularizedCorrectionField4d anchored;
   Require(
-      std::abs(anchored.ElasticStiffness(0.15)) < 1.0e-12 &&
-          std::abs(anchored.ElasticStiffness(0.60) - 1.0) < 1.0e-12 &&
-          anchored.ElasticStiffness(0.40) >
-              anchored.ElasticStiffness(0.30),
+      std::abs(anchored.ElasticStiffness(0.10)) < 1.0e-12 &&
+          std::abs(anchored.ElasticStiffness(0.25) - 1.0) < 1.0e-12 &&
+          anchored.ElasticStiffness(0.18) >
+              anchored.ElasticStiffness(0.14),
       "distance-adaptive elastic stiffness is not monotonic");
   const Pose3d nominal = Pose(0.0, 0.0, 0.0, 0.0);
   const auto rejected = anchored.AddObservation(
@@ -371,10 +371,10 @@ void TestCausalRigidElasticField()
     previous_force = force;
   }
   Require(
-      std::abs(field.ElasticStiffness(0.14)) < 1.0e-12 &&
-          field.ElasticStiffness(0.20) < 0.05 &&
-          std::abs(field.ElasticStiffness(0.60) - 1.0) < 1.0e-12 &&
-          field.ElasticStiffness(0.50) > field.ElasticStiffness(0.20),
+      std::abs(field.ElasticStiffness(0.09)) < 1.0e-12 &&
+          field.ElasticStiffness(0.12) < 0.05 &&
+          std::abs(field.ElasticStiffness(0.25) - 1.0) < 1.0e-12 &&
+          field.ElasticStiffness(0.20) > field.ElasticStiffness(0.12),
       "elastic soft core or monotonic stiffness is incorrect");
 
   const double yaw = 5.0 * kDegreesToRadians;
@@ -504,7 +504,7 @@ void TestAxisIndependentElasticFieldAndPeakAudit()
   RegularizedCorrectionField4d weak_geometry_gain(options);
   const Pose3d gain_pose = Pose(0.0, 0.0, 0.0, 0.0);
   const RtkObservation gain_observation = Observation(
-      3.0, Eigen::Vector3d(0.35, 0.0, 0.0), 0.0);
+      3.0, Eigen::Vector3d(0.16, 0.0, 0.0), 0.0);
   const auto nominal_update = nominal_gain.AddObservation(
       0, 3.0, 0.0, gain_pose, gain_observation, true, 1.0);
   const auto weak_update = weak_geometry_gain.AddObservation(
@@ -514,7 +514,7 @@ void TestAxisIndependentElasticFieldAndPeakAudit()
               nominal_update.planar_elastic_stiffness &&
           weak_update.fitted_correction.displacement.x() >
               nominal_update.fitted_correction.displacement.x() &&
-          weak_update.fitted_correction.displacement.x() <= 0.35,
+          weak_update.fitted_correction.displacement.x() <= 0.16,
       "weak LIO geometry did not strengthen the bounded radial force");
 
   RegularizedCorrectionField4d::Options adaptive_options;
@@ -538,6 +538,7 @@ void TestAxisIndependentElasticFieldAndPeakAudit()
                   1.0e-12,
       "far elastic error did not open its causal gradient envelope");
 }
+
 }  // namespace
 
 int main()

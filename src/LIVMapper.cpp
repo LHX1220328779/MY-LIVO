@@ -838,6 +838,58 @@ void LIVMapper::handleRtkForKeyframe(
         elastic_update.acceptance.window_path_length_m);
   }
 
+  // Quarantine is already proof that the current causal field can no longer
+  // follow the frontend without violating its local-shape envelope. Open a
+  // continuous recovery segment at that boundary immediately; waiting for a
+  // later rigid-fit rejection leaves the global field frozen for tens of
+  // metres. The boundary pose is still carried exactly, so this is not an RTK
+  // pose jump.
+  if (rtk_update.quarantine_started &&
+      backend_frontend_segment_id == 0 &&
+      !backend_pending_frontend_segment_restart)
+  {
+    ++backend_frontend_restart_request_count;
+    const bool velocity_support_available =
+        backend_have_latest_rtk_velocity_result &&
+        backend_latest_rtk_velocity_result.baseline_available &&
+        query.observation->timestamp + 1.0e-9 >=
+            backend_latest_rtk_velocity_result.timestamp &&
+        query.observation->timestamp -
+                backend_latest_rtk_velocity_result.timestamp <=
+            backend_rtk_velocity_evidence_max_age_sec;
+    const bool suppressed =
+        !backend_frontend_segment_restart_enabled ||
+        backend_frontend_segment_id >=
+            backend_frontend_segment_maximum_automatic_restarts ||
+        !velocity_support_available;
+    const V3D recovery_velocity = velocity_support_available
+        ? backend_latest_rtk_velocity_result.filtered_rtk_velocity
+        : _state.vel_end;
+    if (!suppressed)
+      backend_pending_frontend_segment_restart =
+          PendingFrontendSegmentRestart{
+              keyframe->id(), query.observation->timestamp,
+              "correction_quarantine", 0.0, true,
+              recovery_velocity, query.observation->position};
+    if (backend_frontend_restart_supervisor_stream.is_open())
+    {
+      backend_frontend_restart_supervisor_stream << std::setprecision(17)
+          << backend_frontend_restart_request_count << ','
+          << keyframe->id() << ',' << query.observation->timestamp << ','
+          << (suppressed ? "suppressed" : "scheduled")
+          << ",correction_quarantine,0,correction_quarantine,"
+          << rtk_update.feasibility.correction_gradient_m_per_m
+          << ",1," << elastic_update.residual_after_m << '\n';
+      backend_frontend_restart_supervisor_stream.flush();
+    }
+    RCLCPP_ERROR(
+        node_->get_logger(),
+        "Global correction quarantine latched at KF %lu; continuous "
+        "frontend/global recovery %s at the same boundary.",
+        static_cast<unsigned long>(keyframe->id()),
+        suppressed ? "suppressed" : "scheduled");
+  }
+
   // A sustained simultaneous loss of translational and rotational geometry,
   // confirmed while independent RTK velocity still agrees, is an earlier and
   // safer restart trigger than waiting for a ten-metre position failure.
@@ -1407,7 +1459,10 @@ bool LIVMapper::executePendingFrontendSegmentRestart()
                 ? "observability"
                 : (request.reason == "elastic_tracking_saturation"
                     ? "saturation"
+                : (request.reason == "correction_quarantine"
+                    ? "quarantine"
                 : (request.reset_velocity ? "velocity" : "structural"))
+                )
                 )
         << ','
         << request.target_velocity.x() << ','
@@ -2416,16 +2471,16 @@ void LIVMapper::readParameters()
       regularized_field.minimum_orientation_yaw_confidence, 1.0);
   nh.param<double>(
       "backend/global_pose/regularized_field/elastic_soft_radius_m",
-      regularized_field.elastic_soft_radius_m, 0.15);
+      regularized_field.elastic_soft_radius_m, 0.10);
   nh.param<double>(
       "backend/global_pose/regularized_field/elastic_full_radius_m",
-      regularized_field.elastic_full_radius_m, 0.50);
+      regularized_field.elastic_full_radius_m, 0.25);
   nh.param<double>(
       "backend/global_pose/regularized_field/vertical_elastic_soft_radius_m",
-      regularized_field.vertical_elastic_soft_radius_m, 0.15);
+      regularized_field.vertical_elastic_soft_radius_m, 0.10);
   nh.param<double>(
       "backend/global_pose/regularized_field/vertical_elastic_full_radius_m",
-      regularized_field.vertical_elastic_full_radius_m, 0.60);
+      regularized_field.vertical_elastic_full_radius_m, 0.30);
   nh.param<double>(
       "backend/global_pose/regularized_field/yaw_elastic_soft_radius_deg",
       regularized_field.yaw_elastic_soft_radius_deg, 0.25);
@@ -2929,7 +2984,7 @@ void LIVMapper::readParameters()
   nh.param<double>(
       "backend/rtk/velocity_guard/"
       "recovery_frame_tracking_vertical_acceleration_mps2",
-      backend_rtk_recovery_frame_tracking_vertical_acceleration_mps2, 2.0);
+      backend_rtk_recovery_frame_tracking_vertical_acceleration_mps2, 12.0);
   nh.param<string>(
       "backend/rtk/velocity_guard/recovery_frame_tracking_csv_path",
       backend_rtk_recovery_frame_tracking_csv_path,
@@ -2950,15 +3005,15 @@ void LIVMapper::readParameters()
   nh.param<double>(
       "backend/rtk/velocity_guard/recovery_position_soft_radius_m",
       backend_rtk_velocity_guard_options.recovery_position_soft_radius_m,
-      0.15);
+      0.10);
   nh.param<double>(
       "backend/rtk/velocity_guard/recovery_position_full_radius_m",
       backend_rtk_velocity_guard_options.recovery_position_full_radius_m,
-      1.50);
+      0.50);
   nh.param<double>(
       "backend/rtk/velocity_guard/recovery_position_release_radius_m",
       backend_rtk_velocity_guard_options.recovery_position_release_radius_m,
-      0.10);
+      0.08);
   nh.param<double>(
       "backend/rtk/velocity_guard/"
       "recovery_position_capture_minimum_stiffness",
@@ -2968,19 +3023,19 @@ void LIVMapper::readParameters()
   nh.param<double>(
       "backend/rtk/velocity_guard/recovery_position_time_constant_sec",
       backend_rtk_velocity_guard_options.recovery_position_time_constant_sec,
-      4.0);
+      1.5);
   nh.param<double>(
       "backend/rtk/velocity_guard/"
       "recovery_maximum_planar_closure_velocity_mps",
       backend_rtk_velocity_guard_options
           .recovery_maximum_planar_closure_velocity_mps,
-      0.60);
+      0.80);
   nh.param<double>(
       "backend/rtk/velocity_guard/"
       "recovery_maximum_vertical_closure_velocity_mps",
       backend_rtk_velocity_guard_options
           .recovery_maximum_vertical_closure_velocity_mps,
-      0.60);
+      0.80);
   nh.param<bool>(
       "backend/rtk/velocity_guard/emergency_restart_enabled",
       backend_rtk_velocity_guard_options.emergency_restart_enabled, true);

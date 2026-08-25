@@ -45,12 +45,12 @@ public:
     double orientation_yaw_window_m = 30.0;
     double minimum_orientation_yaw_confidence = 0.05;
 
-    double elastic_soft_radius_m = 0.15;
-    double elastic_full_radius_m = 0.50;
+    double elastic_soft_radius_m = 0.10;
+    double elastic_full_radius_m = 0.25;
     double elastic_minimum_stiffness = 0.0;
     double elastic_maximum_stiffness = 1.0;
-    double vertical_elastic_soft_radius_m = 0.15;
-    double vertical_elastic_full_radius_m = 0.60;
+    double vertical_elastic_soft_radius_m = 0.10;
+    double vertical_elastic_full_radius_m = 0.30;
     double yaw_elastic_soft_radius_deg = 0.25;
     double yaw_elastic_full_radius_deg = 1.00;
 

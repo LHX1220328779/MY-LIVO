@@ -3,7 +3,6 @@ set -euo pipefail
 
 # BAG_ROOT="/home/project/data/haibo/huaining/03/ros2bag"
 BAG_ROOT="/home/project/data/haibo/wuhu_livo/ros2bag"
-# BAG_ROOT="/home/project/data/haibo/huaining/05/ros2bag"
 # BAG_ROOT="/home/project/data/haibo/chizhou/10/ros2bag"
 START_OFFSET="0.0"
 PLAY_RATE="1.0"

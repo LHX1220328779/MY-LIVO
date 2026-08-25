@@ -205,9 +205,9 @@ int main()
         Eigen::Vector3d(1.0, 0.0, 0.0));
     Require(
         std::abs(closing.global_position_error.x()-3.0) < 1.0e-12 &&
-            std::abs(closing.recovery_closure_velocity.x()+0.375) <
+            std::abs(closing.recovery_closure_velocity.x()+0.80) <
                 1.0e-12 &&
-            std::abs(closing.tracking_target_velocity.x()-0.625) <
+            std::abs(closing.tracking_target_velocity.x()-0.20) <
                 1.0e-12 &&
             closing.applied_correction.x() < 0.0,
         "radial recovery position error did not bias velocity inward");
@@ -228,7 +228,7 @@ int main()
         Eigen::Vector3d(1.0, 0.0, 0.0));
     const auto released = outer_loop_guard.AddObservation(
         4, 54.0, Eigen::Vector3d(4.0, 0.0, 0.0),
-        Eigen::Vector3d(4.09, 0.0, 0.0),
+        Eigen::Vector3d(4.07, 0.0, 0.0),
         Eigen::Vector3d(1.0, 0.0, 0.0), CorrectionRegime::kDegraded,
         Eigen::Vector3d(1.0, 0.0, 0.0));
     Require(
