@@ -139,7 +139,10 @@ double RotationDifferenceDegrees(const Pose3d &left, const Pose3d &right)
   return left.rotation.angularDistance(right.rotation) * 180.0 / kPi;
 }
 
-double OptionalError(const boost::optional<double> &error)
+// GTSAM >= 4.2 reports errorBefore/errorAfter as std::optional while older
+// releases use boost::optional; accept either.
+template <typename Optional>
+double OptionalError(const Optional &error)
 {
   return error ? *error : 0.0;
 }

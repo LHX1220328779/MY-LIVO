@@ -225,7 +225,9 @@ laser_mapping:
         trajectory_csv_path: "/home/project/MY-LIVO2.0/Log/backend/global_trajectory.csv"
         observation_csv_path: "/home/project/MY-LIVO2.0/Log/backend/global_rtk_observations.csv"
         correction_monitor:
-          minimum_baseline_m: 20.0
+          # A0 is initialized from the stationary RTK/INS mean. Keep that
+          # locally sharp LIO alignment until a full correction window exists.
+          minimum_baseline_m: 30.0
           elastic_gradient_limit_m_per_m: 0.02
           relocalization_gradient_m_per_m: 0.15
           relocalization_consecutive_observations: 2
@@ -261,6 +263,10 @@ laser_mapping:
           # Independent deadbands prevent a vertical/yaw error from opening
           # the planar rubber band. This preserves the local LIO map while
           # still correcting a persistent height or heading drift.
+          # Keep the 15 cm global-position target after startup. The short
+          # initial interval is protected by correction_monitor warmup rather
+          # than by widening this steady-state tolerance to the conservative
+          # covariance used when the receiver reports zero covariance.
           elastic_soft_radius_m: 0.10
           elastic_full_radius_m: 0.25
           vertical_elastic_soft_radius_m: 0.10
@@ -276,7 +282,10 @@ laser_mapping:
           maximum_planar_gradient_m_per_m: 0.05
           maximum_vertical_gradient_m_per_m: 0.08
           maximum_yaw_gradient_deg_per_m: 0.10
-          adaptive_gradient_enabled: true
+          # The adaptive 1.5x gain raised the possible xyz gradient to
+          # 0.1415 m/m, above the recovery acceptance limit of 0.10 m/m, so a
+          # quarantined segment could never become eligible again.
+          adaptive_gradient_enabled: false
           adaptive_position_gradient_full_distance_m: 1.50
           adaptive_yaw_gradient_full_distance_deg: 3.00
           adaptive_position_gradient_maximum_gain: 1.5
@@ -344,7 +353,11 @@ laser_mapping:
         position_sigma_floor_m: 0.10
         rotation_sigma_floor_deg: 1.0
         observability_guard:
-          enabled: true
+          # A low point-to-plane condition ratio is a degeneracy warning, not
+          # proof of a failed pose. In this log the automatic restart fired
+          # with 5436 effective features, 4.98 cm mean residual and agreeing
+          # RTK/LIO velocity, then unnecessarily reset the local voxel map.
+          enabled: false
           translation_soft_ratio: 0.15
           translation_full_ratio: 0.05
           rotation_soft_ratio: 0.25
@@ -450,7 +463,10 @@ laser_mapping:
           maximum_vertical_correction_acceleration_mps2: 0.30
           # Slow vertical-velocity bias removal only after five consistent
           # receiver-twist/position-difference checks; no RTK height is used.
-          healthy_vertical_aiding_enabled: true
+          # Preserve strict frontend/backend separation in normal operation.
+          # The recorded low-rate velocity injections did not arrest altitude
+          # drift and made the otherwise sharp local LIO state RTK-dependent.
+          healthy_vertical_aiding_enabled: false
           healthy_vertical_activation_error_mps: 0.08
           healthy_vertical_activation_observations: 5
           healthy_vertical_time_constant_sec: 4.0
@@ -462,7 +478,10 @@ laser_mapping:
           recovery_tracking_vertical_acceleration_mps2: 0.75
           # Hold the latest validated ~1 Hz velocity target after every scan
           # only inside quarantined recovery; no high-rate RTK pose is read.
-          recovery_frame_tracking_enabled: true
+          # Per-scan tracking of a held ~1 Hz RTK target amplified the false
+          # KF259 restart into a visible grey-trajectory excursion. Keep the
+          # bounded low-rate guard only for a genuinely quarantined recovery.
+          recovery_frame_tracking_enabled: false
           recovery_frame_tracking_maximum_age_sec: 1.5
           recovery_frame_tracking_planar_acceleration_mps2: 3.0
           recovery_frame_tracking_vertical_acceleration_mps2: 12.0

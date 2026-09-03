@@ -1,0 +1,3 @@
+[submodule "3rdparty/gtsam"]
+	path = 3rdparty/gtsam
+	url = https://github.com/borglab/gtsam.git

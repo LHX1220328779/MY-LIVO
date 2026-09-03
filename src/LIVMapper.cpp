@@ -794,10 +794,20 @@ void LIVMapper::handleRtkForKeyframe(
   }
 
   // Every valid query is audited, but only the independent ~1 Hz status-4
-  // position cadence may create a production correction knot. Receiver
-  // quaternion is never a direct correction-field observation.
+  // position cadence may create a production correction knot. Do not bypass
+  // the feasibility monitor during startup: A0 already aligns the local LIO
+  // frame, and a short-baseline RTK discrepancy is not yet evidence that the
+  // local trajectory should be deformed. Receiver quaternion is never a
+  // direct correction-field observation.
+  const bool elastic_position_allowed =
+      backend_rtk_velocity_regime !=
+          my_livo::backend::CorrectionRegime::kWarmup &&
+      (backend_rtk_velocity_regime !=
+           my_livo::backend::CorrectionRegime::kRelocalizationRequired ||
+       backend_frontend_segment_id > 0);
   const auto elastic_update = global_pose_layer->AddElasticObservation(
-      keyframe->id(), *query.observation, update_velocity_guard,
+      keyframe->id(), *query.observation,
+      update_velocity_guard && elastic_position_allowed,
       lio_constraint_gain,
       lio_observability.translation_condition_ratio,
       lio_observability.rotation_condition_ratio);
