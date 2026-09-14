@@ -11,6 +11,7 @@
 #include <pcl_conversions/pcl_conversions.h>
 #include <charconv>
 #include <set>
+#include <unordered_set>
 
 namespace
 {
@@ -46,10 +47,6 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
     throw std::runtime_error("Global correction requires unassisted native LIO; frontend_position_aiding must be false");
   parameters.param<double>("rtk/time_offset_sec", time_offset, 0.0);
   parameters.param("rtk/accepted_position_modes", accepted_modes, std::vector<int>{4});
-  parameters.param("rtk/overlap_baselines_m", overlap_baselines, std::vector<double>{10.0, 35.0});
-  if (overlap_baselines.size() > 3 || std::any_of(overlap_baselines.begin(), overlap_baselines.end(),
-      [](double distance) { return !std::isfinite(distance) || distance <= 0 || distance > 100; }))
-    throw std::runtime_error("RTK overlap baselines must contain at most three positive distances <= 100 m");
   const std::pair<const char *, double *> doubles[] = {
       {"status_max_age_sec", &status_age}, {"interpolation_max_gap_sec", &interpolation_gap},
       {"horizontal_sigma_m", &horizontal_sigma}, {"vertical_sigma_m", &vertical_sigma},
@@ -141,7 +138,7 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   // Persist effective parameters, not a copy of a possibly unrelated YAML.
   std::ofstream settings(directory / "parameters.txt");
   settings.exceptions(std::ios::badbit | std::ios::failbit);
-  settings << "model=native_lio_global_correction; scan_geometry=native_deskew_scan_end; surface_residual=common_support_mean_squared_point_distance; motion_residual=so3_and_endpoint_position; motion_rotation_loss=native_directional_curvature; motion_translation_loss=component_huber\n";
+  settings << "model=native_lio_global_correction; scan_geometry=native_deskew_scan_end; surface_residual=common_support_mean_squared_point_distance; motion_residual=so3_and_endpoint_position; motion_rotation_loss=component_huber; motion_translation_loss=component_huber; overlap_selection=observed_surface_covisibility\n";
   for (const auto &name : node->list_parameters({}, 0).names)
   {
     const auto parameter = node->get_parameter(name);
@@ -1118,6 +1115,7 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
           link.factor_index = rebuilt.newFactorsIndices.at(link.factor_index);
       updatePoses();
       spatial_keys.clear();
+      surface_keys.clear();
     }
     graph_in_enu = true;
   }
@@ -1195,8 +1193,7 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
     graph.emplace_shared<NativeMotionFactor>(
         gtsam::Symbol('x', index - 1), key, keyframes[index - 1].raw.between(frame.raw),
         motionSigmas(frame.stamp - keyframes[index - 1].stamp),
-        motion_huber_rate * std::sqrt(frame.stamp - keyframes[index - 1].stamp),
-        keyframes.back().angular_observability);
+        motion_huber_rate * std::sqrt(frame.stamp - keyframes[index - 1].stamp));
   // Late quality/position callbacks can fill an earlier keyframe. Never add
   // the same sample/factor twice and never extrapolate beyond the INS bracket.
   const std::size_t first_pending = index > 100 ? index - 100 : 0;
@@ -1255,30 +1252,50 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
     for (std::size_t i = 0; i < std::min<std::size_t>(2, candidates.size()); ++i)
       addGeometry(candidates[i].second, index, graph, GeometryKind::Revisit);
 
-    // Vehicle proximity is not cloud overlap: an object observed at 60 m and
-    // again at 20 m requires a long-baseline edge even without a loop closure.
-    // Select at most three distance-stratified historical scans, then require
-    // actual surface matches. No all-pairs registration or extra world prior.
-    std::vector<std::size_t> overlap_neighbors;
-    for (double baseline : overlap_baselines)
+    // Select by ACTUAL observed surfaces, not prescribed vehicle distances.
+    // Two scans 50-60 m apart may see the same object; the old 10/35 m
+    // nearest-body rule could never connect them. Occupancy only proposes
+    // candidates: independent surface fitting/common support/registration
+    // remain mandatory, with exactly the original residual and noise.
+    std::unordered_set<FusionVoxelKey, FusionVoxelKeyHash> occupied;
+    for (const auto &plane : keyframes.back().planes)
     {
-      double best_distance = 0.25 * baseline;
-      std::size_t best = index;
-      for (std::size_t i : geometry_anchors)
+      const V3D p = keyframes.back().optimized.transformFrom(plane.center) / (2 * plane_voxel);
+      occupied.insert({static_cast<std::int64_t>(std::floor(p.x())),
+          static_cast<std::int64_t>(std::floor(p.y())), static_cast<std::int64_t>(std::floor(p.z()))});
+    }
+    std::vector<int> counts(index, 0), visited(index, -1);
+    int cell_number = 0;
+    for (const auto &cell : occupied)
+    {
+      for (int x = -1; x <= 1; ++x) for (int y = -1; y <= 1; ++y) for (int z = -1; z <= 1; ++z)
       {
-        if (index - i <= static_cast<std::size_t>(local_neighbors) || frame.stamp - keyframes[i].stamp < 1)
-          continue;
-        const double error = std::abs((keyframes[i].optimized.translation() - position).norm() - baseline);
-        if (error < best_distance && std::find(overlap_neighbors.begin(), overlap_neighbors.end(), i) == overlap_neighbors.end())
-        { best_distance = error; best = i; }
+        const auto found = surface_keys.find({cell.x + x, cell.y + y, cell.z + z});
+        if (found == surface_keys.end()) continue;
+        for (const auto i : found->second)
+          if (visited[i] != cell_number) { ++counts[i]; visited[i] = cell_number; }
       }
-      if (best != index)
+      ++cell_number;
+    }
+    // One high-overlap edge and one long-baseline, high-overlap edge.
+    // Keep both matching work and graph degree bounded. A rejected best
+    // candidate no longer permanently hides other covisible observations.
+    for (bool long_baseline : {false, true})
+    {
+      std::vector<std::pair<double, std::size_t>> ranked;
+      for (auto i : geometry_anchors)
       {
-        const bool already_connected = std::any_of(new_links.begin(), new_links.end(),
-            [best](const GeometryLink &link) { return link.a == best; });
-        if (!already_connected) addGeometry(best, index, graph, GeometryKind::Overlap);
-        overlap_neighbors.push_back(best);
+        if (!counts[i] || index - i <= static_cast<std::size_t>(local_neighbors)) continue;
+        const double baseline = (keyframes[i].optimized.translation() - position).norm();
+        if (baseline < key_translation || std::any_of(new_links.begin(), new_links.end(),
+            [i](const GeometryLink &link) { return link.a == i; })) continue;
+        ranked.emplace_back(counts[i] * (long_baseline ? baseline : 1.), i);
       }
+      std::sort(ranked.begin(), ranked.end(), [](const auto &a, const auto &b) {
+        return a.first == b.first ? a.second < b.second : a.first > b.first;
+      });
+      for (std::size_t attempt = 0; attempt < std::min<std::size_t>(3, ranked.size()); ++attempt)
+        if (addGeometry(ranked[attempt].second, index, graph, GeometryKind::Overlap)) break;
     }
     geometry_anchors.push_back(index);
   }
@@ -1311,6 +1328,7 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
   timing(key_timings[3]);
   logOptimization("online", 0, std::numeric_limits<double>::quiet_NaN(), solver.getFactorsUnsafe().error(estimate));
   spatial_keys.clear();
+  surface_keys.clear();
   for (std::size_t i : geometry_anchors)
   {
     keyframes[i].optimized = estimate.at<gtsam::Pose3>(gtsam::Symbol('x', i));
@@ -1319,6 +1337,15 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
     spatial_keys[{static_cast<std::int64_t>(std::floor(p.x() / revisit_radius)),
                   static_cast<std::int64_t>(std::floor(p.y() / revisit_radius)),
                   static_cast<std::int64_t>(std::floor(p.z() / revisit_radius))}].push_back(i);
+    for (const auto &plane : keyframes[i].planes)
+    {
+      const V3D point = keyframes[i].optimized.transformFrom(plane.center) / (2 * plane_voxel);
+      auto &keys = surface_keys[{static_cast<std::int64_t>(std::floor(point.x())),
+          static_cast<std::int64_t>(std::floor(point.y())), static_cast<std::int64_t>(std::floor(point.z()))}];
+      // Each scan owns at most one vote per occupied cell, irrespective of
+      // how many extracted patches/returns it has in that cell.
+      if (keys.empty() || keys.back() != i) keys.push_back(i);
+    }
   }
 }
 

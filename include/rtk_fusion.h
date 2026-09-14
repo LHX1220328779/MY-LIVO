@@ -161,7 +161,6 @@ struct RtkFusion
   int local_neighbors = 3, local_map_frames = 30, queue_capacity = 8;
   int export_chunk_points = 1000000;
   std::vector<int> accepted_modes;
-  std::vector<double> overlap_baselines{10.0, 35.0};
   std::filesystem::path directory;
   std::ofstream archive, frame_index, diagnostics, optimization_log, history_log, association_log, geometry_history;
   std::vector<gtsam::Pose3> last_logged_poses;
@@ -181,6 +180,10 @@ struct RtkFusion
   std::size_t next_probe_slot = 8, last_probe_key = 0;
   std::unordered_map<FusionVoxelKey, std::vector<std::size_t>,
                      FusionVoxelKeyHash> spatial_keys;
+  // Coarse actual surface occupancy selects covisible scan candidates only.
+  // It is rebuilt from solved poses; it never moves or filters map returns.
+  std::unordered_map<FusionVoxelKey, std::vector<std::size_t>,
+                     FusionVoxelKeyHash> surface_keys;
   std::thread worker;
   std::exception_ptr failure;
   bool stopping = false;
