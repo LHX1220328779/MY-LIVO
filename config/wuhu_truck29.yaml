@@ -134,7 +134,8 @@ laser_mapping:
       max_planes_per_frame: 800
       max_factors_per_pair: 120
       local_neighbors: 3
-      # Same surfaces observed at different distances, beyond vehicle revisits.
+      # Overlap edges use actual surface covisibility; these two limits below
+      # concern vehicle-position revisits only, not long-range surface overlap.
       revisit_radius_m: 8.0
       revisit_min_age_sec: 15.0
       match_max_distance_m: 1.2

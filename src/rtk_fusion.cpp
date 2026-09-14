@@ -131,14 +131,14 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   history_log << "update_stamp,key_stamp,age_sec,translation_change_m,rotation_change_deg,rtk_residual_m\n";
   association_log.exceptions(std::ios::badbit | std::ios::failbit);
   association_log.open(directory / "geometry_association.csv");
-  association_log << "a_stamp,b_stamp,candidates,consistent,initial_rms_m,registered_rms_m,rejected_rms_m,registration_translation_m,registration_rotation_deg,coarse_candidates,shared_support_fraction\n";
+  association_log << "a_stamp,b_stamp,candidates,consistent,initial_rms_m,registered_rms_m,rejected_rms_m,registration_translation_m,registration_rotation_deg,coarse_candidates,shared_support_fraction,baseline_difference_m,baseline_sigma_m,factor_accepted\n";
   geometry_history.exceptions(std::ios::badbit | std::ios::failbit);
   geometry_history.open(directory / "geometry_history.csv");
   geometry_history << "update_stamp,phase,a_stamp,b_stamp,rows,rms_m,p95_m,max_m,initial_rms_m,native_rms_m,residual_change_rms_m,relative_motion_max_m,anchor_world_motion_max_m\n";
   // Persist effective parameters, not a copy of a possibly unrelated YAML.
   std::ofstream settings(directory / "parameters.txt");
   settings.exceptions(std::ios::badbit | std::ios::failbit);
-  settings << "model=native_lio_global_correction; scan_geometry=native_deskew_scan_end; surface_residual=common_support_mean_squared_point_distance; motion_residual=so3_and_endpoint_position; motion_rotation_loss=component_huber; motion_translation_loss=component_huber; overlap_selection=observed_surface_covisibility\n";
+  settings << "model=native_lio_global_correction; scan_geometry=native_deskew_scan_end; surface_residual=common_support_mean_squared_point_distance; motion_residual=so3_and_endpoint_position; motion_rotation_loss=component_huber; motion_translation_loss=component_huber; overlap_selection=observed_surface_covisibility; geometry_validation=observable_baseline_consistency\n";
   for (const auto &name : node->list_parameters({}, 0).names)
   {
     const auto parameter = node->get_parameter(name);
@@ -970,11 +970,10 @@ std::size_t RtkFusion::addGeometry(std::size_t a, std::size_t b,
   if (matches.size() < 12)
   {
     association_log << std::setprecision(17) << anchor.stamp << ',' << current.stamp << ','
-        << matches.size() << ",0,nan,nan,nan,nan,nan," << coarse_count << ',' << shared_fraction << '\n';
+        << matches.size() << ",0,nan,nan,nan,nan,nan," << coarse_count << ',' << shared_fraction << ",nan,nan,0\n";
     return 0;
   }
   if (!register_matches(registered)) return 0;
-  M3D normal_scatter = M3D::Zero();
   double before_squared = 0, consistent_squared = 0, rejected_squared = 0;
   std::vector<Match> consistent;
   consistent.reserve(matches.size());
@@ -987,27 +986,30 @@ std::size_t RtkFusion::addGeometry(std::size_t a, std::size_t b,
     {
       consistent.push_back(m);
       consistent_squared += after * after;
-      normal_scatter += m.a->projector();
     }
     else rejected_squared += after * after;
   }
   const auto change = relative.between(registered);
   const double translation_change = change.translation().norm();
   const double rotation_change = gtsam::Rot3::Logmap(change.rotation()).norm();
-  association_log << std::setprecision(17) << anchor.stamp << ',' << current.stamp << ','
-      << matches.size() << ',' << consistent.size() << ',' << std::sqrt(before_squared / matches.size()) << ','
-      << std::sqrt(consistent_squared / std::max<std::size_t>(1, consistent.size())) << ','
-      << std::sqrt(rejected_squared / std::max<std::size_t>(1, matches.size() - consistent.size())) << ','
-      << translation_change << ',' << rotation_change * 180 / M_PI << ','
-      << coarse_count << ',' << shared_fraction << '\n';
+  const auto matched_count = matches.size(), consistent_count = consistent.size();
+  double baseline_difference = std::numeric_limits<double>::quiet_NaN();
+  double baseline_sigma = std::numeric_limits<double>::quiet_NaN();
+  const auto record = [&](bool accepted) {
+    association_log << std::setprecision(17) << anchor.stamp << ',' << current.stamp << ','
+        << matched_count << ',' << consistent_count << ',' << std::sqrt(before_squared / matched_count) << ','
+        << std::sqrt(consistent_squared / std::max<std::size_t>(1, consistent_count)) << ','
+        << std::sqrt(rejected_squared / std::max<std::size_t>(1, matched_count - consistent_count)) << ','
+        << translation_change << ',' << rotation_change * 180 / M_PI << ','
+        << coarse_count << ',' << shared_fraction << ',' << baseline_difference << ',' << baseline_sigma << ',' << accepted << '\n';
+  };
   if (consistent.size() < 12 || consistent.size() < .5 * matches.size() ||
-      translation_change > match_distance || rotation_change > 3 * M_PI / 180) return 0;
+      translation_change > match_distance || rotation_change > 3 * M_PI / 180) { record(false); return 0; }
   matches = std::move(consistent);
-  if (kind != GeometryKind::Local)
-  {
-    Eigen::SelfAdjointEigenSolver<M3D> eig(normal_scatter / matches.size());
-    if (matches.size() < 40 || (kind == GeometryKind::Revisit && eig.eigenvalues()(1) < .03)) return 0;
-  }
+  // A few verified distant surfaces can observe tilt or yaw without
+  // observing all six axes. Do not reject these solely for having fewer
+  // than 40 patches or a rank-deficient normal scatter. Raw projected rows
+  // retain their actual nullspace, unlike a fabricated full-pose constraint.
   const std::size_t count = std::min(matches.size(), static_cast<std::size_t>(max_pair_factors));
   std::array<std::vector<std::size_t>, 4> directions;
   for (std::size_t i = 0; i < matches.size(); ++i)
@@ -1030,6 +1032,43 @@ std::size_t RtkFusion::addGeometry(std::size_t a, std::size_t b,
   }
   auto factor = std::make_shared<ScanPlaneBatchFactor>(gtsam::Symbol('x', a), gtsam::Symbol('x', b),
                                                       std::move(constraints));
+  if (anchor.has_position && current.has_position)
+  {
+    // Validate a rigid-registration invariant, not the graph's current yaw
+    // or a native estimate that can drift. The rear-axle baseline length
+    // must agree with TWO qualified fixes within measured uncertainty.
+    // Weak/unobserved baseline directions receive infinite uncertainty,
+    // never an artificial positive information floor or a hard RTK pose.
+    const V3D baseline = registered.transformFrom(lever) - lever;
+    const V3D reference = current.reference - anchor.reference;
+    if (baseline.norm() > 1e-6 && reference.norm() > 1e-6)
+    {
+      gtsam::Vector6 units; units << 1. / 30, 1. / 30, 1. / 30, 1, 1, 1;
+      gtsam::Matrix jacobian;
+      factor->evaluateError(gtsam::Pose3(), registered, nullptr, &jacobian);
+      jacobian = (jacobian * units.asDiagonal()).eval();
+      const Eigen::SelfAdjointEigenSolver<gtsam::Matrix6> spectrum(jacobian.transpose() * jacobian);
+      if (spectrum.info() != Eigen::Success) { record(false); return 0; }
+      Eigen::Matrix<double, 1, 6> derivative;
+      derivative.head<3>() = -baseline.normalized().transpose() * registered.rotation().matrix() *
+          gtsam::skewSymmetric(lever);
+      derivative.tail<3>() = baseline.normalized().transpose() * registered.rotation().matrix();
+      derivative = (derivative * units.asDiagonal()).eval();
+      double variance = reference.normalized().dot(
+          (anchor.reference_covariance + current.reference_covariance) * reference.normalized());
+      for (int i = 0; i < 6; ++i)
+      {
+        const double response = derivative.dot(spectrum.eigenvectors().col(i));
+        if (spectrum.eigenvalues()(i) > std::max(1e-9, 1e-6 * spectrum.eigenvalues()(5)))
+          variance += response * response / spectrum.eigenvalues()(i);
+        else if (std::abs(response) > 1e-6) variance = std::numeric_limits<double>::infinity();
+      }
+      baseline_difference = baseline.norm() - reference.norm();
+      baseline_sigma = std::sqrt(variance);
+      if (std::abs(baseline_difference) > 3 * baseline_sigma) { record(false); return 0; }
+    }
+  }
+  record(true);
   if (remember) new_links.push_back({a, b, graph.size(), relative, kind});
   graph.push_back(factor);
   return count;
@@ -1328,7 +1367,9 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
   timing(key_timings[3]);
   logOptimization("online", 0, std::numeric_limits<double>::quiet_NaN(), solver.getFactorsUnsafe().error(estimate));
   spatial_keys.clear();
-  surface_keys.clear();
+  // Reuse cell/vector storage during reindexing rather than allocating all
+  // observed-surface postings at every knot. Empty old cells carry no votes.
+  for (auto &cell : surface_keys) cell.second.clear();
   for (std::size_t i : geometry_anchors)
   {
     keyframes[i].optimized = estimate.at<gtsam::Pose3>(gtsam::Symbol('x', i));
