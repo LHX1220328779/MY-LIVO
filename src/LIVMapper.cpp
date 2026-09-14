@@ -1184,7 +1184,8 @@ void LIVMapper::handleLIO()
   publishReferenceTrajectory(LidarMeasures.last_lio_update_time);
   if (rtk_fusion_)
     rtk_fusion_->submit(LidarMeasures.last_lio_update_time,
-        LidarMeasures.lidar_frame_beg_time, _state, feats_undistort);
+        LidarMeasures.lidar_frame_beg_time, _state, feats_undistort,
+        voxelmap_manager->lidar_information_body_);
 
   frame_num++;
   aver_time_consu = aver_time_consu * (frame_num - 1) / frame_num + (t4 - t0) / frame_num;

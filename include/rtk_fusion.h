@@ -55,6 +55,7 @@ struct RtkFusion
     double frontend_residual = std::numeric_limits<double>::quiet_NaN();
     double frontend_speed = 0;
     V3D gravity = V3D(0, 0, -G_m_s2);
+    gtsam::Matrix6 lidar_information = gtsam::Matrix6::Zero();
   };
   struct Plane
   {
@@ -109,6 +110,7 @@ struct RtkFusion
     V3D reference = V3D::Zero();
     M3D reference_covariance = M3D::Zero();
     unsigned reference_covariance_source = 0;
+    M3D angular_observability = M3D::Zero();
   };
   enum class GeometryKind { Local, Overlap, Revisit };
   struct GeometryLink
@@ -200,7 +202,8 @@ struct RtkFusion
   bool frontendAlignment(gtsam::Pose3 &alignment);
   void initializeGravity(double stamp, const V3D &gravity, const M3D &covariance);
   void submit(double stamp, double begin, const StatesGroup &state,
-              const PointCloudXYZI::Ptr &deskewed_cloud);
+              const PointCloudXYZI::Ptr &deskewed_cloud,
+              const gtsam::Matrix6 &lidar_information);
   void finish();
   void process(Frame frame);
   void optimizeKeyframe(const Frame &frame);

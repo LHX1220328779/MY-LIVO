@@ -141,7 +141,7 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   // Persist effective parameters, not a copy of a possibly unrelated YAML.
   std::ofstream settings(directory / "parameters.txt");
   settings.exceptions(std::ios::badbit | std::ios::failbit);
-  settings << "model=native_lio_global_correction; scan_geometry=native_deskew_scan_end; surface_residual=common_support_mean_squared_point_distance; motion_residual=so3_and_endpoint_position; motion_rotation_loss=component_huber; motion_translation_loss=component_huber\n";
+  settings << "model=native_lio_global_correction; scan_geometry=native_deskew_scan_end; surface_residual=common_support_mean_squared_point_distance; motion_residual=so3_and_endpoint_position; motion_rotation_loss=native_directional_curvature; motion_translation_loss=component_huber\n";
   for (const auto &name : node->list_parameters({}, 0).names)
   {
     const auto parameter = node->get_parameter(name);
@@ -674,7 +674,7 @@ void RtkFusion::initializeGravity(double stamp, const V3D &gravity, const M3D &c
 }
 
 void RtkFusion::submit(double stamp, double begin, const StatesGroup &state,
-                       const PointCloudXYZI::Ptr &cloud)
+                       const PointCloudXYZI::Ptr &cloud, const gtsam::Matrix6 &lidar_information)
 {
   if (!std::isfinite(stamp) || !std::isfinite(begin) || begin > stamp ||
       stamp - begin > 2 || !state.pos_end.allFinite() || !state.rot_end.allFinite())
@@ -682,6 +682,8 @@ void RtkFusion::submit(double stamp, double begin, const StatesGroup &state,
   Frame frame{stamp, begin, gtsam::Pose3(gtsam::Rot3(state.rot_end), state.pos_end),
               std::make_shared<PointCloudXYZI>(*cloud)};
   frame.gravity = state.gravity;
+  if (!lidar_information.allFinite()) throw std::runtime_error("Nonfinite native LiDAR information");
+  frame.lidar_information = lidar_information;
   frame.frontend_speed = state.vel_end.norm();
   Observation reference;
   gtsam::Pose3 alignment;
@@ -1123,6 +1125,7 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
   Keyframe current;
   current.stamp = frame.stamp;
   current.raw = frame.raw;
+  current.angular_observability = nativeAngularObservability(frame.lidar_information);
   if (index == 0)
   {
     current.optimized = graph_in_enu ? alignment * frame.raw : frame.raw;
@@ -1192,7 +1195,8 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
     graph.emplace_shared<NativeMotionFactor>(
         gtsam::Symbol('x', index - 1), key, keyframes[index - 1].raw.between(frame.raw),
         motionSigmas(frame.stamp - keyframes[index - 1].stamp),
-        motion_huber_rate * std::sqrt(frame.stamp - keyframes[index - 1].stamp));
+        motion_huber_rate * std::sqrt(frame.stamp - keyframes[index - 1].stamp),
+        keyframes.back().angular_observability);
   // Late quality/position callbacks can fill an earlier keyframe. Never add
   // the same sample/factor twice and never extrapolate beyond the INS bracket.
   const std::size_t first_pending = index > 100 ? index - 100 : 0;
@@ -1620,7 +1624,10 @@ void RtkFusion::exportMap()
   }
   std::ofstream keys(directory / "keyframes.csv");
   keys.exceptions(std::ios::failbit | std::ios::badbit);
-  keys << "stamp,has_position,reference_failure,reference_x,reference_y,reference_z,rtk_residual_m,covariance_source,cov_xx,cov_xy,cov_xz,cov_yy,cov_yz,cov_zz,information_weight\n";
+  keys << "stamp,has_position,reference_failure,reference_x,reference_y,reference_z,rtk_residual_m,covariance_source,cov_xx,cov_xy,cov_xz,cov_yy,cov_yz,cov_zz,information_weight";
+  for (int row = 0; row < 3; ++row) for (int column = 0; column < 3; ++column)
+    keys << ",native_angular_observability_" << row << column;
+  keys << '\n';
   double maximum_key_residual = 0;
   for (const auto &key : keyframes)
   {
@@ -1634,7 +1641,10 @@ void RtkFusion::exportMap()
     for (int row = 0; row < 3; ++row) for (int column = row; column < 3; ++column)
       keys << ',' << (key.has_position ? key.reference_covariance(row, column) :
                      std::numeric_limits<double>::quiet_NaN());
-    keys << ',' << key.position_information_weight << '\n';
+    keys << ',' << key.position_information_weight;
+    for (int row = 0; row < 3; ++row) for (int column = 0; column < 3; ++column)
+      keys << ',' << key.angular_observability(row, column);
+    keys << '\n';
   }
   const auto rejected = std::count_if(keyframes.begin(), keyframes.end(),
       [](const Keyframe &key) { return !key.has_position; });

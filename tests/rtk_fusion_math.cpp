@@ -145,8 +145,12 @@ void auditSavedMotion(const std::filesystem::path &run, const std::filesystem::p
     gtsam::Vector6 sigmas;
     sigmas << .02 * M_PI / 180, .02 * M_PI / 180, .03 * M_PI / 180, .03, .03, .02;
     sigmas *= std::sqrt(dt / .5);
+    gtsam::Matrix3 angular_observability = gtsam::Matrix3::Zero();
+    if (row.size() >= 24)
+      for (int r = 0; r < 3; ++r) for (int c = 0; c < 3; ++c)
+        angular_observability(r, c) = row[15 + 3 * r + c];
     const auto factor = std::make_shared<NativeMotionFactor>(gtsam::Symbol('x', i - 1), gtsam::Symbol('x', i),
-        raw[i - 1].between(raw[i]), sigmas, std::sqrt(dt));
+        raw[i - 1].between(raw[i]), sigmas, std::sqrt(dt), angular_observability);
     gtsam::Matrix a, b;
     const auto r = factor->evaluateError(refined[i - 1], refined[i], &a, &b);
     const double displacement_error = factor->physicalError(refined[i - 1], refined[i]).tail<3>().norm();
@@ -924,6 +928,29 @@ int main(int argc, char **argv)
   const Pose3 b(Rot3::RzRyRx(0.13, -0.07, 1.21), Point3(-64, -278, 44.9));
   Vector6 motion_sigmas, motion_error;
   motion_sigmas << .0005, .0005, .0007, .03, .03, .02;
+  {
+    gtsam::Matrix6 information = gtsam::Matrix6::Zero();
+    information.diagonal() << 90, 60, 0, 5, 5, 5;
+    const auto observable = nativeAngularObservability(information);
+    require(observable(2, 2), 1e-14, "unobserved native yaw acquires no fabricated curvature");
+    require((observable - nativeAngularObservability(100 * information)).norm(), 1e-12,
+        "native angular strength is independent of duplicated point count");
+    information(0, 3) = information(3, 0) = std::sqrt(90 * 5.);
+    require(nativeAngularObservability(information)(0, 0), 1e-12,
+        "rotation explained by translation is not independent angular evidence");
+    const auto basis = Rot3::RzRyRx(.2, -.4, .3).matrix();
+    const gtsam::Matrix3 shape = basis * gtsam::Vector3(.05, .6, 1).asDiagonal() * basis.transpose();
+    const NativeMotionFactor factor(0, 1, a.between(b) * Pose3(Rot3::RzRyRx(.03, .01, -.1), gtsam::Vector3(.1, -.05, 2)),
+        motion_sigmas, .7, shape);
+    gtsam::Matrix ja, jb;
+    factor.evaluateError(a, b, &ja, &jb);
+    const std::function<gtsam::Vector(const Pose3 &, const Pose3 &)> error =
+        [&](const Pose3 &x, const Pose3 &y) { return factor.evaluateError(x, y); };
+    require((ja - numericalDerivative21(error, a, b, 1e-6)).norm(), 1e-4,
+        "native directional-curvature anchor Jacobian");
+    require((jb - numericalDerivative22(error, a, b, 1e-6)).norm(), 1e-4,
+        "native directional-curvature endpoint Jacobian");
+  }
   for (double bad_yaw : {0.0, .001, .25})
   {
     motion_error << .00001, -.00002, bad_yaw, .003, -.015, .2;
