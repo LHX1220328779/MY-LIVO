@@ -19,8 +19,13 @@ which is included as part of this source code package.
 #include <cv_bridge/cv_bridge.h>
 #include <image_transport/image_transport.h>
 #include <tf2_ros/transform_broadcaster.h>
+#include <tf2_ros/static_transform_broadcaster.h>
 #include <filesystem>
+#include <csignal>
 #include <memory>
+#include <diagnostic_msgs/msg/diagnostic_array.hpp>
+
+struct RtkFusion;
 
 class LIVMapper
 {
@@ -30,7 +35,7 @@ public:
   void initializeSubscribersAndPublishers();
   void initializeComponents();
   void initializeFiles();
-  void run();
+  void run(const volatile std::sig_atomic_t &stop_requested);
   void gravityAlignment();
   void handleFirstFrame();
   void stateEstimationAndMapping();
@@ -55,6 +60,7 @@ public:
   void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg_in);
   void imu_cbk(const sensor_msgs::Imu::ConstSharedPtr &msg_in);
   void ins_odom_cbk(const nav_msgs::Odometry::ConstSharedPtr &msg_in);
+  void ins_status_cbk(const diagnostic_msgs::msg::DiagnosticArray::ConstSharedPtr &msg);
   void img_cbk(const sensor_msgs::ImageConstPtr &msg_in);
   void publish_img_rgb(const image_transport::Publisher &pubImage, VIOManagerPtr vio_manager);
   void publish_frame_world(const rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr &publisher, VIOManagerPtr vio_manager);
@@ -93,6 +99,8 @@ public:
 
   double res_mean_last = 0.05;
   double gyr_cov = 0, acc_cov = 0, inv_expo_cov = 0;
+  double gyr_bias_rw_sigma = 0.001, acc_bias_rw_sigma = 0.001;
+  double initial_gyr_bias_sigma = std::sqrt(1e-5);
   double blind_rgb_points = 0.0;
   double last_timestamp_lidar = -1.0, last_timestamp_imu = -1.0, last_timestamp_img = -1.0;
   double filter_size_surf_min = 0;
@@ -137,6 +145,21 @@ public:
   double img_time_offset = 0.0;
   deque<PointCloudXYZI::Ptr> lid_raw_data_buffer;
   deque<double> lid_header_time_buffer;
+
+  struct MergedLidarTimestampInfo
+  {
+    struct SourceInfo
+    {
+      std::string topic;
+      double header_time = 0.0;
+      std::size_t point_count = 0;
+    };
+    std::vector<SourceInfo> sources;
+    double merged_header_time = 0.0;
+    double start_span_ms = 0.0;
+  };
+  deque<MergedLidarTimestampInfo> lid_timestamp_info_buffer;
+  MergedLidarTimestampInfo current_lidar_ts_info;
 
   struct PendingLidarFrame
   {
@@ -192,6 +215,8 @@ public:
   double IMG_POINT_COV;
 
   bool mine_frame_initialized = false;
+  std::string lio_world_frame = "mine";
+  bool local_alignment_published = false;
   bool imu_standard_rfu = false;
   bool imu_gyro_in_degrees = true;
   bool imu_acceleration_gravity_compensated = true;
@@ -215,6 +240,7 @@ public:
   PointCloudXYZI::Ptr pcl_wait_save_intensity;
 
   ofstream fout_pre, fout_out, fout_visual_pos, fout_lidar_pos, fout_points;
+  ofstream lio_geometry_log;
 
   pcl::VoxelGrid<PointType> downSizeFilterSurf;
 
@@ -237,6 +263,9 @@ public:
 
   rclcpp::Node::SharedPtr node_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+  std::unique_ptr<tf2_ros::StaticTransformBroadcaster> alignment_broadcaster_;
+  std::unique_ptr<RtkFusion> rtk_fusion_;
+  bool rtk_enabled = false;
 
   rclcpp::Publisher<visualization_msgs::Marker>::SharedPtr plane_pub;
   rclcpp::Publisher<visualization_msgs::MarkerArray>::SharedPtr voxel_pub;
@@ -244,8 +273,10 @@ public:
   vector<rclcpp::Subscription<sensor_msgs::PointCloud2>::SharedPtr> sub_pcls;
   rclcpp::Subscription<sensor_msgs::Imu>::SharedPtr sub_imu;
   rclcpp::Subscription<nav_msgs::Odometry>::SharedPtr sub_ins_odom;
+  rclcpp::Subscription<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr sub_ins_status;
   rclcpp::Subscription<sensor_msgs::Image>::SharedPtr sub_img;
   rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr pubLaserCloudFullRes;
+  rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr pubCurrentFrame;
   rclcpp::Publisher<visualization_msgs::MarkerArray>::SharedPtr pubNormal;
   rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr pubSubVisualMap;
   rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr pubLaserCloudEffect;

@@ -12,14 +12,19 @@ import os
 def generate_launch_description():
     share = get_package_share_directory("fast_livo")
     installed_config = os.path.join(share, "config", "wuhu_truck29.yaml")
-    source_config = "/home/project/MY-LIVO1.0/config/wuhu_truck29.yaml"
+    source_config = "/home/project/MY-LIVO/config/wuhu_truck29.yaml"
     default_config = (
         source_config if os.path.isfile(source_config) else installed_config
     )
     rviz_config = os.path.join(share, "rviz_cfg", "wuhu_truck29.rviz")
+    default_output_directory = os.environ.get(
+        "FAST_LIVO_OUTPUT_DIRECTORY",
+        "/home/project/MY-LIVO/results",
+    )
     config_file = LaunchConfiguration("config_file")
     use_camera = LaunchConfiguration("use_camera")
     use_rviz = LaunchConfiguration("use_rviz")
+    use_rtk = LaunchConfiguration("use_rtk")
     rear_axle_to_imu = LaunchConfiguration("rear_axle_to_imu")
 
     decoder = Node(
@@ -46,10 +51,14 @@ def generate_launch_description():
         executable="fastlivo_mapping",
         name="laser_mapping",
         output="screen",
+        sigterm_timeout=LaunchConfiguration("finalize_timeout_sec"),
         parameters=[
             config_file,
             {
                 "common.img_en": ParameterValue(use_camera, value_type=bool),
+                "rtk.enabled": ParameterValue(use_rtk, value_type=bool),
+                "rtk.save_map": ParameterValue(LaunchConfiguration("save_map"), value_type=bool),
+                "output.directory": LaunchConfiguration("output_directory"),
                 "reference_frame_conversion.enabled": ParameterValue(
                     rear_axle_to_imu, value_type=bool
                 ),
@@ -68,12 +77,21 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        SetEnvironmentVariable(
-            name="FASTDDS_BUILTIN_TRANSPORTS", value="UDPv4"),
+        # Match the bag player: preserve an explicitly selected transport.
+        # Unconditionally replacing SHM here made launch and direct runs use
+        # different communication paths in restricted/container environments.
+        SetEnvironmentVariable(name="FASTDDS_BUILTIN_TRANSPORTS",
+                               value=os.environ.get("FASTDDS_BUILTIN_TRANSPORTS") or "UDPv4"),
         DeclareLaunchArgument("use_camera", default_value="false"),
         DeclareLaunchArgument("use_rviz", default_value="false"),
+        DeclareLaunchArgument("use_rtk", default_value="true"),
+        DeclareLaunchArgument("save_map", default_value="false"),
+        DeclareLaunchArgument("finalize_timeout_sec", default_value="600.0"),
+        DeclareLaunchArgument("output_directory", default_value=default_output_directory),
         DeclareLaunchArgument("config_file", default_value=default_config),
         DeclareLaunchArgument("rear_axle_to_imu", default_value="true"),
+        SetEnvironmentVariable(name="ROS_LOG_DIR", value=os.environ.get(
+            "ROS_LOG_DIR") or "/home/project/MY-LIVO/results/roslog"),
         decoder,
         mapping,
         rviz,

@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
+repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 
-BAG_ROOT="/home/project/data/haibo/huaining/03/ros2bag"
-START_OFFSET="10"
+BAG_ROOT="/home/project/data/haibo/wuhu_livo/ros2bag"
+# BAG_ROOT="/home/project/data/haibo/huaining/03/ros2bag"
+START_OFFSET="0"
 PLAY_RATE="1.0"
 PLAY_ALL_TOPICS=0
 LIO_ONLY=1
 DRY_RUN=0
 PREPARED_BAG=""
+PREPARED_EXPLICIT=0
 
 usage() {
   echo "Usage: $0 [--bag-root DIR] [--prepared-bag DIR] [--start-offset SEC] [--rate RATE] [--lio-only | --with-camera | --all-topics] [--dry-run]"
@@ -16,7 +19,7 @@ usage() {
 while (($#)); do
   case "$1" in
     --bag-root) BAG_ROOT="$2"; shift 2 ;;
-    --prepared-bag) PREPARED_BAG="$2"; shift 2 ;;
+    --prepared-bag) PREPARED_BAG="$2"; PREPARED_EXPLICIT=1; shift 2 ;;
     --start-offset) START_OFFSET="$2"; shift 2 ;;
     --rate) PLAY_RATE="$2"; shift 2 ;;
     --lio-only) LIO_ONLY=1; shift ;;
@@ -52,29 +55,57 @@ unset CONDA_PREFIX CONDA_DEFAULT_ENV PYTHONHOME PYTHONPATH
 export PATH="/opt/ros/humble/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 set +u
 source /opt/ros/humble/setup.bash
-if [[ -f "$(dirname "$0")/../install/setup.bash" ]]; then
-  source "$(dirname "$0")/../install/setup.bash"
+if [[ -f "$repo_dir/install/fast_livo/share/fast_livo/local_setup.bash" ]]; then
+  source "$repo_dir/install/fast_livo/share/fast_livo/local_setup.bash"
 fi
 set -u
-export ROS_LOG_DIR="${ROS_LOG_DIR:-/tmp/my_livo_ros_log}"
+results_root=$(realpath -m -- "$repo_dir/results")
+export ROS_LOG_DIR=$(realpath -m -- "${ROS_LOG_DIR:-$results_root/roslog}")
+case "$ROS_LOG_DIR/" in
+  "$results_root/"*) ;;
+  *) echo "ROS_LOG_DIR must be inside $results_root" >&2; exit 2 ;;
+esac
 mkdir -p "$ROS_LOG_DIR"
 
-# Offline playback is local to this host. Avoid Fast DDS shared-memory port
-# lock conflicts left by another ROS 2 process or an unclean previous exit.
-export FASTDDS_BUILTIN_TRANSPORTS="UDPv4"
+# Prefer UDP locally, but preserve an explicitly selected transport (e.g.
+# SHM in a restricted environment); player and mapper must use the same one.
+export FASTDDS_BUILTIN_TRANSPORTS="${FASTDDS_BUILTIN_TRANSPORTS:-UDPv4}"
 
-if [[ -z "$PREPARED_BAG" ]]; then PREPARED_BAG="${BAG_ROOT%/}_my_livo"; fi
+# Reading an explicitly supplied historical bag is allowed. New prepared
+# data has a results-owned default; otherwise play the original split bags.
+if [[ -z "$PREPARED_BAG" ]]; then PREPARED_BAG="$results_root/prepared/wuhu_livo"; fi
+# A reusable LIO-only prepared bag must not silently break camera playback.
+# Check topic availability before selecting it; never rewrite its metadata.
+if [[ -f "$PREPARED_BAG/metadata.yaml" ]] && ((!LIO_ONLY && !PLAY_ALL_TOPICS)); then
+  if ! /usr/bin/python3 - "$PREPARED_BAG/metadata.yaml" <<'PY'
+import sys
+import yaml
+with open(sys.argv[1]) as stream:
+    info = yaml.safe_load(stream)["rosbag2_bagfile_information"]
+names = {entry["topic_metadata"]["name"].lstrip("/") for entry in info["topics_with_message_count"]}
+sys.exit(0 if "midrange_camera/ffmpeg" in names else 1)
+PY
+  then
+    if ((PREPARED_EXPLICIT)); then
+      echo "Requested prepared bag has no camera topic; use --lio-only or a camera-capable bag." >&2
+      exit 2
+    fi
+    echo "Default prepared bag is LIO-only; camera playback uses the original source bags." >&2
+    PREPARED_BAG=""
+  fi
+fi
 if [[ -f "$PREPARED_BAG/metadata.yaml" ]]; then
   if ((LIO_ONLY)); then
-    prepared_topic_args=(--topics front_left_lidar back_lidar front_right_lidar front_lidar imu_data imu_data/odometry)
+    prepared_topic_args=(--topics front_left_lidar back_lidar front_right_lidar front_lidar imu_data imu_data/odometry imu_data/ins_status imu_data/navsat_fix)
   else
-    prepared_topic_args=(--topics front_left_lidar back_lidar front_right_lidar front_lidar imu_data imu_data/odometry midrange_camera/ffmpeg)
+    prepared_topic_args=(--topics front_left_lidar back_lidar front_right_lidar front_lidar imu_data imu_data/odometry imu_data/ins_status imu_data/navsat_fix midrange_camera/ffmpeg)
   fi
   if ((PLAY_ALL_TOPICS)); then prepared_topic_args=(); fi
   echo "playing indexed runtime bag: $PREPARED_BAG start_offset=${START_OFFSET}s rate=${PLAY_RATE}"
   if ((DRY_RUN)); then exit 0; fi
   exec ros2 bag play "$PREPARED_BAG" --storage mcap --rate "$PLAY_RATE" \
-    --start-offset "$START_OFFSET" --disable-keyboard-controls "${prepared_topic_args[@]}"
+    --start-offset "$START_OFFSET" --clock --delay 1 --wait-for-all-acked 5000 \
+    --disable-keyboard-controls "${prepared_topic_args[@]}"
 fi
 echo "warning: indexed runtime bag not found at $PREPARED_BAG; using slower sequential fallback" >&2
 
@@ -114,14 +145,16 @@ run_stream() {
   local -n stream_metadata="$metadata_array_name"
   local first_selected=1
   local child_pid=""
-  local -a topic_args
+  local -a topic_args clock_args=()
+  # Only the perception stream publishes simulation time.
+  if [[ "$stream" == "perception" ]]; then clock_args=(--clock); fi
 
   if ((PLAY_ALL_TOPICS)); then
     topic_args=()
   elif [[ "$stream" == "camera" ]]; then
     topic_args=(--topics midrange_camera/ffmpeg)
   else
-    topic_args=(--topics front_left_lidar back_lidar front_right_lidar front_lidar imu_data imu_data/odometry)
+    topic_args=(--topics front_left_lidar back_lidar front_right_lidar front_lidar imu_data imu_data/odometry imu_data/ins_status imu_data/navsat_fix)
   fi
 
   trap 'if [[ -n "${child_pid:-}" ]]; then kill -TERM "$child_pid" 2>/dev/null || true; fi; exit 0' INT TERM
@@ -164,7 +197,8 @@ run_stream() {
       sleep "$launch_delay"
     fi
     ros2 bag play "$bag_dir" --storage mcap --rate "$PLAY_RATE" \
-      --start-offset "$local_offset" --disable-keyboard-controls "${topic_args[@]}" &
+      --start-offset "$local_offset" "${clock_args[@]}" --delay 1 --wait-for-all-acked 5000 \
+      --disable-keyboard-controls "${topic_args[@]}" &
     child_pid="$!"
     wait "$child_pid"
     child_pid=""

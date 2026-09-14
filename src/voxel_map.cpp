@@ -336,6 +336,32 @@ VoxelOctoTree *VoxelOctoTree::Insert(const pointWithVar &pv)
   return nullptr;
 }
 
+M3D VoxelMapManager::pointCovarianceWorld(const M3D &imu_point_cross, const M3D &lidar_covariance) const
+{
+  // p_w = R_wb (R_bl p_l + t_bl) + t_wb. The state uses RIGHT body-angle
+  // errors and WORLD position errors, hence J_pose = [-R_wb [p_b]x, I].
+  // All three mapping stages must use this same physical-IMU lever and basis.
+  const M3D rotation = state_.rot_end * extR_;
+  const M3D angle_jacobian = -state_.rot_end * imu_point_cross;
+  const M3D cross = angle_jacobian * state_.cov.block<3, 3>(0, 3);
+  const M3D covariance = rotation * lidar_covariance * rotation.transpose() +
+      angle_jacobian * state_.cov.block<3, 3>(0, 0) * angle_jacobian.transpose() +
+      cross + cross.transpose() + state_.cov.block<3, 3>(3, 3);
+  return (0.5 * (covariance + covariance.transpose())).eval();
+}
+
+Eigen::Matrix<double, 6, 6> VoxelMapManager::normalizedLidarInformation(double rotation_radius_m) const
+{
+  if (!std::isfinite(rotation_radius_m) || rotation_radius_m <= 0)
+    throw std::invalid_argument("LiDAR observability rotation radius must be positive");
+  Eigen::Matrix<double, 6, 6> information = lidar_information_body_ / std::max(1, effct_feat_num_);
+  // Coordinates are [radius * delta_theta_body, delta_position_body], both
+  // in metres. Per-return normalization separates geometry from point count.
+  information.topRows<3>() /= rotation_radius_m;
+  information.leftCols<3>() /= rotation_radius_m;
+  return (0.5 * (information + information.transpose())).eval();
+}
+
 void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
 {
   cross_mat_list_.clear();
@@ -380,18 +406,13 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
     double total_residual = 0.0;
     pcl::PointCloud<pcl::PointXYZI>::Ptr world_lidar(new pcl::PointCloud<pcl::PointXYZI>);
     TransformLidar(state_.rot_end, state_.pos_end, feats_down_body_, world_lidar);
-    M3D rot_var = state_.cov.block<3, 3>(0, 0);
-    M3D t_var = state_.cov.block<3, 3>(3, 3);
     for (size_t i = 0; i < feats_down_body_->size(); i++)
     {
       pointWithVar &pv = pv_list_[i];
       pv.point_b << feats_down_body_->points[i].x, feats_down_body_->points[i].y, feats_down_body_->points[i].z;
       pv.point_w << world_lidar->points[i].x, world_lidar->points[i].y, world_lidar->points[i].z;
 
-      M3D cov = body_cov_list_[i];
-      M3D point_crossmat = cross_mat_list_[i];
-      cov = state_.rot_end * cov * state_.rot_end.transpose() + (-point_crossmat) * rot_var * (-point_crossmat.transpose()) + t_var;
-      pv.var = cov;
+      pv.var = pointCovarianceWorld(cross_mat_list_[i], body_cov_list_[i]);
       pv.body_var = body_cov_list_[i];
     }
     ptpl_list_.clear();
@@ -408,7 +429,7 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
     }
     effct_feat_num_ = ptpl_list_.size();
     cout << "[ LIO ] Raw feature num: " << feats_undistort_->size() << ", downsampled feature num:" << feats_down_size_ 
-         << " effective feature num: " << effct_feat_num_ << " average residual: " << total_residual / effct_feat_num_ << endl;
+         << " effective feature num: " << effct_feat_num_ << " average residual: " << total_residual / std::max(1, effct_feat_num_) << endl;
 
     /*** Computation of Measuremnt Jacobian matrix H and measurents covarience
      * ***/
@@ -467,15 +488,28 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
     /*** Iterative Kalman Filter Update ***/
     MatrixXd K(DIM_STATE, effct_feat_num_);
     // auto &&Hsub_T = Hsub.transpose();
-    auto &&HTz = Hsub_T_R_inv * meas_vec;
+    VD(DIM_STATE) HTz = VD(DIM_STATE)::Zero();
+    HTz.head<6>() = Hsub_T_R_inv * meas_vec;
     // fout_dbg<<"HTz: "<<HTz<<endl;
+    H_T_H.setZero();
     H_T_H.block<6, 6>(0, 0) = Hsub_T_R_inv * Hsub;
+    if (collect_geometry_diagnostics_)
+    {
+      // IEKF uses body-angle/world-position increments. Rotate translation
+      // columns into the same RFU tangent frame BEFORE comparing directions.
+      // Capture at the actual LiDAR linearization, before the state update.
+      Eigen::Matrix<double, 6, 6> basis = Eigen::Matrix<double, 6, 6>::Identity();
+      basis.bottomRightCorner<3, 3>() = state_.rot_end;
+      lidar_information_body_ = basis.transpose() * H_T_H.topLeftCorner<6, 6>() * basis;
+      lidar_residual_rms_ = effct_feat_num_ ? meas_vec.norm() / std::sqrt(effct_feat_num_) :
+          std::numeric_limits<double>::quiet_NaN();
+    }
     // EigenSolver<Matrix<double, 6, 6>> es(H_T_H.block<6,6>(0,0));
     MD(DIM_STATE, DIM_STATE) &&K_1 = (H_T_H.block<DIM_STATE, DIM_STATE>(0, 0) + state_.cov.block<DIM_STATE, DIM_STATE>(0, 0).inverse()).inverse();
-    G.block<DIM_STATE, 6>(0, 0) = K_1.block<DIM_STATE, 6>(0, 0) * H_T_H.block<6, 6>(0, 0);
+    G = K_1 * H_T_H;
     auto vec = state_propagat - state_;
     VD(DIM_STATE)
-    solution = K_1.block<DIM_STATE, 6>(0, 0) * HTz + vec.block<DIM_STATE, 1>(0, 0) - G.block<DIM_STATE, 6>(0, 0) * vec.block<6, 1>(0, 0);
+    solution = K_1 * HTz + vec - G * vec;
     int minRow, minCol;
     state_ += solution;
     auto rot_add = solution.block<3, 1>(0, 0);
@@ -558,11 +592,10 @@ void VoxelMapManager::BuildVoxelMap()
     M3D var;
     calcBodyCov(measurement_ray, config_setting_.dept_err_,
                 config_setting_.beam_err_, var);
+    point_this = extR_ * point_this + extT_;
     M3D point_crossmat;
     point_crossmat << SKEW_SYM_MATRX(point_this);
-    var = (state_.rot_end * extR_) * var * (state_.rot_end * extR_).transpose() +
-          (-point_crossmat) * state_.cov.block<3, 3>(0, 0) * (-point_crossmat).transpose() + state_.cov.block<3, 3>(3, 3);
-    pv.var = var;
+    pv.var = pointCovarianceWorld(point_crossmat, var);
     input_points.push_back(pv);
   }
 
@@ -850,7 +883,7 @@ void VoxelMapManager::pubSinglePlane(visualization_msgs::MarkerArray &plane_pub,
                                      const float alpha, const Eigen::Vector3d rgb)
 {
   visualization_msgs::Marker plane;
-  plane.header.frame_id = "mine";
+  plane.header.frame_id = world_frame_;
   plane.header.stamp = builtin_interfaces::msg::Time();
   plane.ns = plane_ns;
   plane.id = single_plane.id_;

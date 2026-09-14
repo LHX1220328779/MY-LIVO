@@ -3,7 +3,10 @@
 
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
+#include <filesystem>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -47,6 +50,30 @@ namespace visualization_msgs
 using Marker = msg::Marker;
 using MarkerArray = msg::MarkerArray;
 }  // namespace visualization_msgs
+
+// Run products have one project-owned root. Resolve '..' and existing
+// symlinks before opening any output, including an explicit RTK override.
+inline std::filesystem::path projectResultDirectory(const std::filesystem::path &path)
+{
+  if (path.empty()) throw std::runtime_error("Result directory must not be empty");
+  const auto root = std::filesystem::weakly_canonical(std::filesystem::path(ROOT_DIR) / "results");
+  const auto resolved = std::filesystem::weakly_canonical(std::filesystem::absolute(path));
+  auto child = resolved.begin();
+  for (auto parent = root.begin(); parent != root.end(); ++parent, ++child)
+    if (child == resolved.end() || *child != *parent)
+      throw std::runtime_error("Run results must be inside " + root.string() + ": " + path.string());
+  return resolved;
+}
+
+inline void configureRosLogDirectory()
+{
+  const char *configured = std::getenv("ROS_LOG_DIR");
+  const auto directory = projectResultDirectory(configured && *configured ? configured :
+      std::string(ROOT_DIR) + "results/roslog");
+  std::filesystem::create_directories(directory);
+  if (setenv("ROS_LOG_DIR", directory.c_str(), 1) != 0)
+    throw std::runtime_error("Cannot configure ROS_LOG_DIR");
+}
 
 inline double stampToSec(const builtin_interfaces::msg::Time &stamp)
 {
@@ -96,7 +123,8 @@ public:
     {
       if (character == '/') character = '.';
     }
-    value = node_->declare_parameter<T>(name, default_value);
+    if (node_->has_parameter(name)) value = node_->get_parameter(name).get_value<T>();
+    else value = node_->declare_parameter<T>(name, default_value);
   }
 
   void param(const std::string &ros1_name, std::vector<int> &value,
@@ -108,7 +136,8 @@ public:
       if (character == '/') character = '.';
     }
     const std::vector<int64_t> defaults(default_value.begin(), default_value.end());
-    const auto values = node_->declare_parameter<std::vector<int64_t>>(name, defaults);
+    const auto values = node_->has_parameter(name) ? node_->get_parameter(name).as_integer_array()
+        : node_->declare_parameter<std::vector<int64_t>>(name, defaults);
     value.assign(values.begin(), values.end());
   }
 

@@ -187,6 +187,7 @@ class VoxelMapManager
 public:
   VoxelMapManager() = default;
   VoxelMapConfig config_setting_;
+  std::string world_frame_ = "mine";
   int current_frame_id_ = 0;
   rclcpp::Publisher<visualization_msgs::MarkerArray>::SharedPtr voxel_map_pub_;
   std::unordered_map<VOXEL_LOCATION, VoxelOctoTree *> voxel_map_;
@@ -209,7 +210,12 @@ public:
   geometry_msgs::Quaternion geoQuat_;
 
   int feats_down_size_;
-  int effct_feat_num_;
+  int effct_feat_num_ = 0;
+  // Conditional LiDAR-only information with the current map held fixed.
+  // This is NOT an independent LIO Between covariance or an IMU posterior.
+  bool collect_geometry_diagnostics_ = false;
+  Eigen::Matrix<double, 6, 6> lidar_information_body_ = Eigen::Matrix<double, 6, 6>::Zero();
+  double lidar_residual_rms_ = std::numeric_limits<double>::quiet_NaN();
   std::vector<M3D> cross_mat_list_;
   std::vector<M3D> body_cov_list_;
   std::vector<pointWithVar> pv_list_;
@@ -225,6 +231,8 @@ public:
   };
 
   void StateEstimation(StatesGroup &state_propagat);
+  Eigen::Matrix<double, 6, 6> normalizedLidarInformation(double rotation_radius_m) const;
+  M3D pointCovarianceWorld(const M3D &imu_point_cross, const M3D &lidar_covariance) const;
   void TransformLidar(const Eigen::Matrix3d rot, const Eigen::Vector3d t, const PointCloudXYZI::Ptr &input_cloud,
                       pcl::PointCloud<pcl::PointXYZI>::Ptr &trans_cloud);
 

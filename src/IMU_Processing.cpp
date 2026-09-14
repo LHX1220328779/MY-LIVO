@@ -42,6 +42,7 @@ void ImuProcess::Reset()
   imu_need_init = true;
   init_iter_num = 1;
   IMUpose.clear();
+  initial_gravity_covariance.setZero();
   last_imu.reset(new sensor_msgs::Imu());
   cur_pcl_un_.reset(new PointCloudXYZI());
   last_prop_end_time = -1.0;
@@ -149,6 +150,19 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, StatesGroup &state_inout, in
   // Ignoring the mean is especially harmful for the normalized raw CGI-610
   // channel, where even a small constant rate integrates into attitude drift.
   state_inout.bias_g = mean_gyr;
+  state_inout.cov.block<3, 3>(10, 10) =
+      initial_gyr_bias_sigma * initial_gyr_bias_sigma * M3D::Identity();
+
+  // The sample mean reduces independent accelerometer noise, not the common
+  // accelerometer bias. Project normalization onto the gravity tangent plane.
+  // Keep this separate from the EKF covariance: only the global initial
+  // orientation observation needs it, once, after initialization completes.
+  const V3D direction = mean_acc.normalized();
+  const M3D tangent = M3D::Identity() - direction * direction.transpose();
+  const M3D mean_covariance =
+      (cov_acc * (G_m_s2 * G_m_s2 / mean_acc.squaredNorm() / std::max(1, N - 1))).asDiagonal();
+  initial_gravity_covariance = tangent *
+      (mean_covariance + state_inout.cov.block<3, 3>(13, 13)) * tangent;
 
   last_imu = meas.imu.back();
 }
@@ -472,8 +486,8 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
       if (exposure_estimate_en) cov_w(6, 6) = cov_inv_expo * dt * dt;
       cov_w.block<3, 3>(0, 0).diagonal() = cov_gyr * dt * dt;
       cov_w.block<3, 3>(7, 7) = R_imu * cov_acc.asDiagonal() * R_imu.transpose() * dt * dt;
-      cov_w.block<3, 3>(10, 10).diagonal() = cov_bias_gyr * dt * dt; // bias gyro covariance
-      cov_w.block<3, 3>(13, 13).diagonal() = cov_bias_acc * dt * dt; // bias acc covariance
+      cov_w.block<3, 3>(10, 10).diagonal() = cov_bias_gyr * dt;
+      cov_w.block<3, 3>(13, 13).diagonal() = cov_bias_acc * dt;
 
       state_inout.cov = F_x * state_inout.cov * F_x.transpose() + cov_w;
       // state_inout.cov.block<18,18>(0,0) = F_x.block<18,18>(0,0) *
@@ -723,7 +737,8 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, Poin
       ROS_INFO("IMU Initials: ba covarience: %.8f %.8f %.8f; bg covarience: "
                "%.8f %.8f %.8f",
                cov_bias_acc[0], cov_bias_acc[1], cov_bias_acc[2], cov_bias_gyr[0], cov_bias_gyr[1], cov_bias_gyr[2]);
-      fout_imu.open(DEBUG_FILE_DIR("imu.txt"), ios::out);
+      // The mapper owns the run-specific log path; never write into the
+      // source-tree Log directory from this estimator component.
     }
 
     return;

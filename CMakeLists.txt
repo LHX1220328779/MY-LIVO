@@ -39,6 +39,7 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(pcl_conversions REQUIRED)
@@ -47,6 +48,8 @@ find_package(image_transport REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(Eigen3 REQUIRED)
+find_package(GTSAM CONFIG REQUIRED HINTS
+  "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/gtsam/install-system-eigen/lib/cmake/GTSAM")
 find_package(PCL REQUIRED COMPONENTS common filters io)
 find_package(OpenCV REQUIRED)
 find_package(Boost REQUIRED COMPONENTS thread)
@@ -57,14 +60,14 @@ if(NOT TARGET JsonCpp::JsonCpp)
 endif()
 
 set(ROS_DEPENDENCIES
-  rclcpp sensor_msgs nav_msgs geometry_msgs visualization_msgs
+  rclcpp sensor_msgs nav_msgs diagnostic_msgs geometry_msgs visualization_msgs
   pcl_conversions cv_bridge image_transport tf2 tf2_ros)
 
 add_library(vio src/vio.cpp src/frame.cpp src/visual_point.cpp)
 add_library(lio src/voxel_map.cpp)
 add_library(pre src/preprocess.cpp)
 add_library(imu_proc src/IMU_Processing.cpp)
-add_library(laser_mapping src/LIVMapper.cpp)
+add_library(laser_mapping src/LIVMapper.cpp src/rtk_fusion.cpp)
 
 foreach(target vio lio pre imu_proc laser_mapping)
   target_include_directories(${target} PUBLIC
@@ -79,13 +82,15 @@ target_link_libraries(lio ${PCL_LIBRARIES})
 target_link_libraries(pre ${PCL_LIBRARIES})
 target_link_libraries(imu_proc ${PCL_LIBRARIES})
 target_link_libraries(laser_mapping vio lio pre imu_proc ${PCL_LIBRARIES}
-                      ${OpenCV_LIBRARIES} Boost::thread JsonCpp::JsonCpp)
+                      ${OpenCV_LIBRARIES} Boost::thread JsonCpp::JsonCpp gtsam)
 
 add_executable(fastlivo_mapping src/main.cpp)
 target_include_directories(fastlivo_mapping PRIVATE include ${EIGEN3_INCLUDE_DIRS}
                            ${PCL_INCLUDE_DIRS} ${OpenCV_INCLUDE_DIRS})
 ament_target_dependencies(fastlivo_mapping ${ROS_DEPENDENCIES})
 target_link_libraries(fastlivo_mapping laser_mapping)
+set_target_properties(fastlivo_mapping PROPERTIES
+  INSTALL_RPATH "$<TARGET_FILE_DIR:gtsam>")
 
 if(OpenMP_CXX_FOUND)
   foreach(target vio lio pre imu_proc laser_mapping fastlivo_mapping)
@@ -103,3 +108,8 @@ install(PROGRAMS scripts/play_all_bags.sh scripts/generate_mine_calibration.py
         DESTINATION lib/${PROJECT_NAME})
 
 ament_package()
+
+# Focused estimator mathematics, explicitly invoked; no startup/smoke tests.
+add_executable(rtk_fusion_math EXCLUDE_FROM_ALL tests/rtk_fusion_math.cpp)
+target_include_directories(rtk_fusion_math PRIVATE include)
+target_link_libraries(rtk_fusion_math laser_mapping)

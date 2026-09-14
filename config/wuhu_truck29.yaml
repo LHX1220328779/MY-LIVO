@@ -10,15 +10,19 @@ laser_mapping:
 
     multi_lidar:
       enabled: true
-      calibration_file: "/home/project/data/haibo/huaining/03/sensor-imu_calibration/perception_truck03.json"
+      # calibration_file: "/home/project/data/haibo/huaining/03/sensor-imu_calibration/perception_truck03.json"
+      calibration_file: "/home/project/data/haibo/wuhu_livo/sensor-imu_calibration/perception_truck29.json"
       # topics and transform_keys are paired by index. Keep only the desired
       # pairs to run with any subset of the available LiDAR sources.
       topics: ["/front_right_lidar", "/back_lidar", "/front_left_lidar", "/front_lidar"]
       transform_keys: ["transform_matrix_lidar_1", "transform_matrix_lidar_2",
                        "transform_matrix_lidar_3", "transform_matrix_lidar_6"]
+      # topics: ["/front_right_lidar", "/front_left_lidar", "/front_lidar"]
+      # transform_keys: ["transform_matrix_lidar_1", "transform_matrix_lidar_3",
+      #                  "transform_matrix_lidar_6"]
       # topics: ["/front_lidar"]
       # transform_keys: ["transform_matrix_lidar_6"]
-      synchronization_tolerance_sec: 0.005
+      synchronization_tolerance_sec: 0.001
       queue_size: 5
       body_filter:
         # Each consecutive x1,y1,x2,y2 group defines one rectangle in that
@@ -62,6 +66,87 @@ laser_mapping:
       img_time_offset: 0.0
       exposure_time_init: 0.0
 
+    rtk:
+      # LIO only. CGI IMU and INS attitude are correlated: no duplicate
+      # attitude/IMU factors. Position factors predict the original rear axle.
+      enabled: true
+      status_topic: "/imu_data/ins_status"
+      # Effective timestamp correspondence verified on this Wuhu recording:
+      # scan t queries the original INS sample at t-0.1 s. Dataset-specific,
+      # NOT a universal CGI-610 hardware clock calibration.
+      time_offset_sec: -0.1
+      require_status: true
+      accepted_position_modes: [4]
+      minimum_satellites: 12
+      status_max_age_sec: 0.10
+      recovery_stable_interval_sec: 0.5
+      interpolation_max_gap_sec: 0.05
+      # TOTAL fallback sigmas for unknown/all-zero message covariance only.
+      # They are not added to a valid receiver covariance.
+      horizontal_sigma_m: 0.03
+      vertical_sigma_m: 0.05
+      # Effective reported covariance = covariance_scale * report + model.
+      # Model terms require calibration; do not silently invent lever/time
+      # uncertainty or count a covariance component twice.
+      reported_model_sigma_xy_m: 0.0
+      reported_model_sigma_z_m: 0.0
+      # Mode 4 is necessary, not sufficient. Large reported uncertainty is
+      # rejected even when the receiver still claims a fixed solution.
+      maximum_horizontal_sigma_m: 0.15
+      maximum_vertical_sigma_m: 0.25
+      covariance_scale: 1.0
+      huber_delta: 2.8
+      # Same production settings for launch and direct execution. On the
+      # 10 Hz source, 0.49 s gives ~0.5 s knots despite timestamp jitter.
+      keyframe_interval_sec: 0.49
+      keyframe_min_interval_sec: 0.49
+      keyframe_translation_m: 3.0
+      keyframe_rotation_deg: 3.0
+      # RFU relative-motion uncertainty per sqrt(second); engineering model,
+      # not the inverse of a fixed-map Hessian. Sigmas scale with sqrt(dt).
+      # At 0.5 s: rotation [0.02,0.02,0.03] deg, translation [3,3,2] cm.
+      # No raw IMU factors or duplicate neighboring scan constraints.
+      motion_rotation_sigma_deg_sqrt_sec: [0.028284271247, 0.028284271247, 0.042426406871]
+      motion_translation_sigma_m_sqrt_sec: [0.042426406871, 0.042426406871, 0.028284271247]
+      # Component-wise convex Huber on native correction RATE. Both sigma
+      # and whitened threshold scale with sqrt(dt): splitting a time interval
+      # does not change its cost at the same drift rate, including short tails.
+      # No redescending motion loss (failed native increments form false minima).
+      motion_huber_rate_per_sqrt_sec: 1.0
+      # Nominal independent-position interval. A node interval dt receives
+      # weight min(1,dt/interval), including short tails; no dropped valid
+      # tail and no multiplication of information when increasing node rate.
+      position_factor_interval_sec: 0.49
+      # Long-baseline edges connect only spaced LiDAR anchors. Local scan
+      # motion comes from native LIO increments, including during RTK loss.
+      geometry_anchor_interval_sec: 0.49
+      # Fit 2 m planar patches for reliable far-range overlap; nonplanar
+      # parents fall back to 1 m children. Export retains all original points.
+      plane_voxel_m: 2.0
+      # Feature-fit RMS only, NOT a map-thickness acceptance threshold.
+      # Tightening to 0.02 rejects supported native walls with 0.03..0.05 RMS.
+      plane_max_thickness_m: 0.05
+      # Effective SURFACE MODEL sigma, including calibration/normal/model
+      # uncertainty. It is not the single-return range noise or fit threshold.
+      plane_model_sigma_m: 0.05
+      # Each surface belongs to one native deskewed scan-end pose, exactly
+      # matching export. A multi-scan patch cannot stay rigid when C(t) changes.
+      max_planes_per_frame: 800
+      max_factors_per_pair: 120
+      local_neighbors: 3
+      # Same surfaces observed at different distances, beyond vehicle revisits.
+      overlap_baselines_m: [10.0, 35.0]
+      revisit_radius_m: 8.0
+      revisit_min_age_sec: 15.0
+      match_max_distance_m: 1.2
+      local_map_frames: 30
+      queue_capacity: 8
+      publish_interval_sec: 1.0
+      # Empty: output.directory/Log/fusion. Overrides must stay in results/.
+      output_directory: ""
+      save_map: false
+      export_chunk_points: 1000000
+
     reference_frame_conversion:
       # The Odometry child frame is vehicle_rear_axle_rfu. When enabled,
       # relocate both its pose and the LiDAR extrinsic to the physical IMU
@@ -88,11 +173,21 @@ laser_mapping:
       imu_en: true
       # About two seconds at 100 Hz; completes before the sampled motion begins.
       imu_int_frame: 200
+      sample_interval_sec: 0.01
       acc_cov: 0.1
-      gyr_cov: 0.01
+      # Discrete-sample gyro VARIANCE (rad/s)^2, used with dt^2. Local
+      # stationary data has std 0.0013..0.0017 rad/s; use conservative 0.005.
+      # Previous 0.01 meant std 0.1 rad/s and excessively weakened propagation.
+      gyr_cov: 0.000025
+      # Bias random-walk STD per sqrt(second), not discrete sample variance.
+      # Gyro-minus-INS-rate mean stays near [0.002,-0.0002,-0.0003] rad/s
+      # across the run; do not allow bias to absorb degree-per-second map errors.
+      gyr_bias_rw_sigma: 0.00001
+      acc_bias_rw_sigma: 0.001
+      initial_gyr_bias_sigma: 0.0005
       # 100 Hz source: allow one missing sample, but never interpolate across
       # a long hole while deskewing a scan.
-      maximum_time_gap: 0.025
+      maximum_time_gap: 0.011
       gravity_est_en: true
       ba_bg_est_en: true
 

@@ -28,6 +28,10 @@ public:
 
   ImuProcess();
   ~ImuProcess();
+  double initial_gyr_bias_sigma = std::sqrt(1e-5);
+  // Read-only export of the EXISTING stationary initialization measurement.
+  // It does not change the frontend state/covariance or repeat IMU factors.
+  M3D initial_gravity_covariance = M3D::Zero();
 
   void Reset();
   void Reset(double start_timestamp, const sensor_msgs::Imu::ConstSharedPtr &lastimu);

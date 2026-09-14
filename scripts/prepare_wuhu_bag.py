@@ -34,6 +34,8 @@ DEFAULT_TOPICS = {
     "front_lidar",
     "imu_data",
     "imu_data/odometry",
+    "imu_data/ins_status",
+    "imu_data/navsat_fix",
     "midrange_camera/ffmpeg",
 }
 
@@ -51,6 +53,7 @@ def next_on_topic(reader, selected_topic, previous_timestamp):
 
 
 def main():
+    results_root = (Path(__file__).resolve().parents[1] / "results").resolve()
     parser = argparse.ArgumentParser(
         description="Merge split Wuhu MCAP bags into one indexed runtime bag")
     parser.add_argument(
@@ -58,15 +61,24 @@ def main():
         default=Path("/home/project/data/haibo/wuhu_livo/ros2bag"))
     parser.add_argument(
         "--output", type=Path,
-        default=Path("/home/project/data/haibo/wuhu_livo/ros2bag_my_livo"))
+        default=results_root / "prepared/wuhu_livo")
     parser.add_argument(
         "--lio-only", action="store_true",
         help="omit the camera topic (smaller, but cannot run LIVO mode)")
     args = parser.parse_args()
+    args.output = args.output.resolve()
+    if not args.output.is_relative_to(results_root):
+        parser.error(f"--output must be inside {results_root}")
+    ros_logs = Path(os.environ.get("ROS_LOG_DIR") or results_root / "roslog").resolve()
+    if not ros_logs.is_relative_to(results_root):
+        parser.error(f"ROS_LOG_DIR must be inside {results_root}")
+    ros_logs.mkdir(parents=True, exist_ok=True)
+    os.environ["ROS_LOG_DIR"] = str(ros_logs)
 
     if args.output.exists():
         raise SystemExit(
             f"output already exists: {args.output}; choose a new path or remove it explicitly")
+    args.output.parent.mkdir(parents=True, exist_ok=True)
 
     metadata_files = sorted(args.bag_root.glob("*/metadata.yaml"))
     source_bags = [path.parent for path in metadata_files
