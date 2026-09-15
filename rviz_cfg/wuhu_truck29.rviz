@@ -61,10 +61,10 @@ Visualization Manager:
         Min Value: -10
         Value: true
       Axis: Z
-      Channel Name: intensity
+      Channel Name: rgb
       Class: rviz_default_plugins/PointCloud2
       Color: 255; 255; 255
-      Color Transformer: Intensity
+      Color Transformer: RGB8
       Decay Time: 0
       Enabled: true
       Invert Rainbow: false
@@ -95,10 +95,10 @@ Visualization Manager:
         Min Value: 45.03461837768555
         Value: true
       Axis: Z
-      Channel Name: intensity
+      Channel Name: rgb
       Class: rviz_default_plugins/PointCloud2
       Color: 255; 255; 255
-      Color Transformer: FlatColor
+      Color Transformer: RGB8
       Decay Time: 0
       Enabled: true
       Invert Rainbow: false
@@ -329,10 +329,10 @@ Visualization Manager:
       Name: Current View
       Near Clip Distance: 0.009999999776482582
       Scale: 1.0650155544281006
-      Target Frame: mine
+      Target Frame: aft_mapped
       Value: TopDownOrtho (rviz_default_plugins)
-      X: 256.2353210449219
-      Y: -459.0658874511719
+      X: 0
+      Y: 0
     Saved: ~
 Window Geometry:
   Displays:

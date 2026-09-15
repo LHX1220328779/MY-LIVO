@@ -41,6 +41,7 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   Ros2ParameterReader parameters(node);
   parameters.param<bool>("rtk/require_status", require_status, true);
   parameters.param<bool>("rtk/save_map", save_map, false);
+  parameters.param<bool>("common/img_en", color_enabled, false);
   bool frontend_position_aiding = false;
   parameters.param<bool>("rtk/frontend_position_aiding", frontend_position_aiding, false);
   if (frontend_position_aiding)
@@ -57,6 +58,7 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
       {"keyframe_interval_sec", &key_interval}, {"keyframe_min_interval_sec", &key_min_interval},
       {"position_factor_interval_sec", &position_factor_interval},
       {"geometry_anchor_interval_sec", &geometry_anchor_interval},
+      {"geometry_min_baseline_m", &geometry_min_baseline},
       {"keyframe_translation_m", &key_translation}, {"keyframe_rotation_deg", &key_rotation},
       {"plane_voxel_m", &plane_voxel}, {"plane_max_thickness_m", &plane_thickness},
       {"plane_model_sigma_m", &plane_noise_floor},
@@ -154,6 +156,12 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
     frame_index.exceptions(std::ios::badbit | std::ios::failbit);
     archive.open(directory / "scans.bin", std::ios::binary);
     archive.write("LIVORTK3", 8);
+    if (color_enabled)
+    {
+      color_archive.exceptions(std::ios::badbit | std::ios::failbit);
+      color_archive.open(directory / "colors.bin", std::ios::binary);
+      color_archive.write("LIVORGB1", 8);
+    }
     frame_index.open(directory / "frames.csv");
     frame_index << std::setprecision(17);
     frame_index << "# scans.bin LIVORTK3: little-endian float32 x,y,z,intensity,offset_ms; NATIVE deskewed virtual LiDAR returns; one scan-end transform\n";
@@ -168,8 +176,9 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   map_publisher = node->create_publisher<sensor_msgs::PointCloud2>("/rtk/map", rclcpp::QoS(1).transient_local());
   current_publisher = node->create_publisher<sensor_msgs::PointCloud2>("/rtk/cloud_current", 1);
   RCLCPP_INFO(node->get_logger(),
-      "LIO RTK geometry fusion: rear-axle lever [%.3f %.3f %.3f], nominal sigma %.3f/%.3f m, results %s",
-      lever.x(), lever.y(), lever.z(), horizontal_sigma, vertical_sigma, directory.c_str());
+      "LIO RTK geometry fusion: rear-axle lever [%.3f %.3f %.3f], nominal sigma %.3f/%.3f m, RGB map=%s, results %s",
+      lever.x(), lever.y(), lever.z(), horizontal_sigma, vertical_sigma,
+      color_enabled ? "camera" : "grayscale display", directory.c_str());
   worker = std::thread([this] {
     try
     {
@@ -660,13 +669,21 @@ void RtkFusion::initializeGravity(double stamp, const V3D &gravity, const M3D &c
 }
 
 void RtkFusion::submit(double stamp, double begin, const StatesGroup &state,
-                       const PointCloudXYZI::Ptr &cloud, const gtsam::Matrix6 &lidar_information)
+                       const PointCloudXYZI::Ptr &cloud, const gtsam::Matrix6 &lidar_information,
+                       const PointCloudXYZRGB::Ptr &colored_world_cloud)
 {
   if (!std::isfinite(stamp) || !std::isfinite(begin) || begin > stamp ||
       stamp - begin > 2 || !state.pos_end.allFinite() || !state.rot_end.allFinite())
     throw std::runtime_error("Invalid LIO pose or scan interval submitted to fusion");
-  Frame frame{stamp, begin, gtsam::Pose3(gtsam::Rot3(state.rot_end), state.pos_end),
-              std::make_shared<PointCloudXYZI>(*cloud)};
+  if (color_enabled && colored_world_cloud == nullptr)
+    throw std::runtime_error("Camera-enabled RTK fusion requires an RGB cloud for every submitted frame");
+  Frame frame;
+  frame.stamp = stamp;
+  frame.begin = begin;
+  frame.raw = gtsam::Pose3(gtsam::Rot3(state.rot_end), state.pos_end);
+  frame.cloud = std::make_shared<PointCloudXYZI>(*cloud);
+  if (color_enabled)
+    frame.color_cloud = std::make_shared<PointCloudXYZRGB>(*colored_world_cloud);
   frame.gravity = state.gravity;
   if (!lidar_information.allFinite()) throw std::runtime_error("Nonfinite native LiDAR information");
   frame.lidar_information = lidar_information;
@@ -1305,19 +1322,20 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
       }
       ++cell_number;
     }
-    // One high-overlap edge and one long-baseline, high-overlap edge.
-    // Keep both matching work and graph degree bounded. A rejected best
-    // candidate no longer permanently hides other covisible observations.
-    for (bool long_baseline : {false, true})
     {
+      // Native LIO already supplies short-baseline motion. Do not reuse the
+      // keyframe insertion distance as a long-baseline selection scale:
+      // it previously admitted 3 m scan pairs and mostly rebuilt local LIO
+      // with a less complete surface model. Add at most one long-baseline
+      // covisible edge; actual close-position revisits remain handled above.
       std::vector<std::pair<double, std::size_t>> ranked;
       for (auto i : geometry_anchors)
       {
         if (!counts[i] || index - i <= static_cast<std::size_t>(local_neighbors)) continue;
         const double baseline = (keyframes[i].optimized.translation() - position).norm();
-        if (baseline < key_translation || std::any_of(new_links.begin(), new_links.end(),
+        if (baseline < geometry_min_baseline || std::any_of(new_links.begin(), new_links.end(),
             [i](const GeometryLink &link) { return link.a == i; })) continue;
-        ranked.emplace_back(counts[i] * (long_baseline ? baseline : 1.), i);
+        ranked.emplace_back(counts[i] * baseline, i);
       }
       std::sort(ranked.begin(), ranked.end(), [](const auto &a, const auto &b) {
         return a.first == b.first ? a.second < b.second : a.first > b.first;
@@ -1407,6 +1425,44 @@ void RtkFusion::appendCloud(const Frame &frame, pcl::PointCloud<pcl::PointXYZI> 
   }
 }
 
+void RtkFusion::appendDisplayCloud(const Frame &frame, PointCloudXYZRGB &output) const
+{
+  if (color_enabled)
+  {
+    if (!frame.color_cloud)
+      throw std::runtime_error("RGB frame data missing from camera-enabled RTK cache");
+    output.reserve(output.size() + frame.color_cloud->size());
+    // color_cloud is already in the native frontend world frame. Applying
+    // C(t)=X_global*X_frontend^-1 preserves the exact camera association while
+    // moving the colored surface with the same global correction as geometry.
+    const auto correction = correctionAt(frame.stamp);
+    for (const PointTypeRGB &point : *frame.color_cloud)
+    {
+      const V3D p = correction.transformFrom(V3D(point.x, point.y, point.z));
+      PointTypeRGB result = point;
+      result.x = p.x(); result.y = p.y(); result.z = p.z();
+      output.push_back(result);
+    }
+    return;
+  }
+
+  // Keep RViz on one stable RGB8 display configuration even in LIO-only mode.
+  // Without a camera, encode intensity as grayscale; saved non-camera maps
+  // remain XYZI and retain their original format.
+  pcl::PointCloud<pcl::PointXYZI> intensity;
+  appendCloud(frame, intensity);
+  output.reserve(output.size() + intensity.size());
+  for (const auto &point : intensity)
+  {
+    PointTypeRGB result;
+    result.x = point.x; result.y = point.y; result.z = point.z;
+    const auto value = static_cast<std::uint8_t>(
+        std::clamp(point.intensity, 0.0f, 255.0f));
+    result.r = value; result.g = value; result.b = value;
+    output.push_back(result);
+  }
+}
+
 void RtkFusion::process(Frame frame)
 {
   const auto start = std::chrono::steady_clock::now();
@@ -1416,6 +1472,7 @@ void RtkFusion::process(Frame frame)
   if (!frames.empty() && frame.stamp <= frames.back().stamp)
     throw std::runtime_error("Fusion frames must have strictly increasing timestamps");
   frame.count = frame.cloud->size();
+  frame.color_count = frame.color_cloud ? frame.color_cloud->size() : 0;
   if (save_map)
   {
     frame.offset = static_cast<std::uint64_t>(archive.tellp());
@@ -1426,6 +1483,18 @@ void RtkFusion::process(Frame frame)
       packed.insert(packed.end(), {point.x, point.y, point.z, point.intensity, point.curvature});
     }
     archive.write(reinterpret_cast<const char *>(packed.data()), packed.size() * sizeof(float));
+    if (color_enabled)
+    {
+      frame.color_offset = static_cast<std::uint64_t>(color_archive.tellp());
+      std::vector<float> colors;
+      colors.reserve(static_cast<std::size_t>(frame.color_count) * 6);
+      for (const PointTypeRGB &point : *frame.color_cloud)
+        colors.insert(colors.end(), {point.x, point.y, point.z,
+            static_cast<float>(point.r), static_cast<float>(point.g),
+            static_cast<float>(point.b)});
+      color_archive.write(reinterpret_cast<const char *>(colors.data()),
+                          colors.size() * sizeof(float));
+    }
     const auto q = frame.raw.rotation().toQuaternion();
     const auto p = frame.raw.translation();
     frame_index << std::setprecision(17) << frame.stamp << ',' << frame.begin << ',' << frame.offset << ','
@@ -1436,6 +1505,7 @@ void RtkFusion::process(Frame frame)
   while (recent_frames.size() > static_cast<std::size_t>(local_map_frames)) recent_frames.pop_front();
   Frame metadata = frame;
   metadata.cloud.reset();
+  metadata.color_cloud.reset();
   frames.push_back(std::move(metadata));
   // One scan of latency lets same-stamp INS/status callbacks arrive before
   // matching. A late RTK seed must not leave permanently frozen wrong matches.
@@ -1516,8 +1586,8 @@ void RtkFusion::publishCurrent(const Frame &frame)
     odom_publisher->publish(message);
     if (current_publisher->get_subscription_count() > 0)
     {
-      pcl::PointCloud<pcl::PointXYZI> cloud;
-      appendCloud(frame, cloud);
+      PointCloudXYZRGB cloud;
+      appendDisplayCloud(frame, cloud);
       sensor_msgs::PointCloud2 current;
       pcl::toROSMsg(cloud, current);
       current.header = message.header;
@@ -1555,9 +1625,9 @@ void RtkFusion::publish(double stamp, bool force)
   path_publisher->publish(path);
   if (map_publisher->get_subscription_count() > 0)
   {
-    pcl::PointCloud<pcl::PointXYZI> cloud;
+    PointCloudXYZRGB cloud;
     for (const Frame &frame : recent_frames)
-      if (frame.stamp <= stamp + 1e-6) appendCloud(frame, cloud);
+      if (frame.stamp <= stamp + 1e-6) appendDisplayCloud(frame, cloud);
     sensor_msgs::PointCloud2 message;
     pcl::toROSMsg(cloud, message);
     message.header = path.header;
@@ -1729,39 +1799,82 @@ void RtkFusion::exportMap()
   {
     archive.flush();
     frame_index.flush();
-    std::ifstream input(directory / "scans.bin", std::ios::binary);
-    input.exceptions(std::ios::failbit | std::ios::badbit);
-    pcl::PointCloud<pcl::PointXYZI> chunk;
     std::size_t chunk_index = 0;
-    for (const Frame &metadata : frames)
+    if (color_enabled)
     {
-      Frame frame = metadata;
-      auto cloud = std::make_shared<PointCloudXYZI>();
-      cloud->resize(frame.count);
-      std::vector<float> packed(static_cast<std::size_t>(frame.count) * 5);
-      input.seekg(frame.offset);
-      input.read(reinterpret_cast<char *>(packed.data()), packed.size() * sizeof(float));
-      for (std::size_t i = 0; i < frame.count; ++i)
+      color_archive.flush();
+      std::ifstream input(directory / "colors.bin", std::ios::binary);
+      input.exceptions(std::ios::failbit | std::ios::badbit);
+      PointCloudXYZRGB chunk;
+      for (const Frame &metadata : frames)
       {
-        PointType &point = cloud->points[i];
-        point.x = packed[5 * i]; point.y = packed[5 * i + 1]; point.z = packed[5 * i + 2];
-        point.intensity = packed[5 * i + 3]; point.curvature = packed[5 * i + 4];
+        if (metadata.color_count == 0) continue;
+        Frame frame = metadata;
+        auto cloud = std::make_shared<PointCloudXYZRGB>();
+        cloud->resize(frame.color_count);
+        std::vector<float> packed(static_cast<std::size_t>(frame.color_count) * 6);
+        input.seekg(frame.color_offset);
+        input.read(reinterpret_cast<char *>(packed.data()), packed.size() * sizeof(float));
+        for (std::size_t i = 0; i < frame.color_count; ++i)
+        {
+          PointTypeRGB &point = cloud->points[i];
+          point.x = packed[6 * i]; point.y = packed[6 * i + 1]; point.z = packed[6 * i + 2];
+          point.r = static_cast<std::uint8_t>(packed[6 * i + 3]);
+          point.g = static_cast<std::uint8_t>(packed[6 * i + 4]);
+          point.b = static_cast<std::uint8_t>(packed[6 * i + 5]);
+        }
+        frame.color_cloud = cloud;
+        appendDisplayCloud(frame, chunk);
+        if (chunk.size() >= static_cast<std::size_t>(export_chunk_points))
+        {
+          const auto file = directory / ("map_" + std::to_string(chunk_index++) + ".pcd");
+          if (pcl::io::savePCDFileBinary(file.string(), chunk) != 0)
+            throw std::runtime_error("Cannot write optimized RGB point cloud " + file.string());
+          chunk.clear();
+        }
       }
-      frame.cloud = cloud;
-      appendCloud(frame, chunk);
-      if (chunk.size() >= static_cast<std::size_t>(export_chunk_points))
+      if (!chunk.empty())
       {
-        const auto file = directory / ("map_" + std::to_string(chunk_index++) + ".pcd");
+        const auto file = directory / ("map_" + std::to_string(chunk_index) + ".pcd");
         if (pcl::io::savePCDFileBinary(file.string(), chunk) != 0)
-          throw std::runtime_error("Cannot write optimized point cloud " + file.string());
-        chunk.clear();
+          throw std::runtime_error("Cannot write optimized RGB point cloud " + file.string());
       }
     }
-    if (!chunk.empty())
+    else
     {
-      const auto file = directory / ("map_" + std::to_string(chunk_index) + ".pcd");
-      if (pcl::io::savePCDFileBinary(file.string(), chunk) != 0)
-        throw std::runtime_error("Cannot write optimized point cloud " + file.string());
+      std::ifstream input(directory / "scans.bin", std::ios::binary);
+      input.exceptions(std::ios::failbit | std::ios::badbit);
+      pcl::PointCloud<pcl::PointXYZI> chunk;
+      for (const Frame &metadata : frames)
+      {
+        Frame frame = metadata;
+        auto cloud = std::make_shared<PointCloudXYZI>();
+        cloud->resize(frame.count);
+        std::vector<float> packed(static_cast<std::size_t>(frame.count) * 5);
+        input.seekg(frame.offset);
+        input.read(reinterpret_cast<char *>(packed.data()), packed.size() * sizeof(float));
+        for (std::size_t i = 0; i < frame.count; ++i)
+        {
+          PointType &point = cloud->points[i];
+          point.x = packed[5 * i]; point.y = packed[5 * i + 1]; point.z = packed[5 * i + 2];
+          point.intensity = packed[5 * i + 3]; point.curvature = packed[5 * i + 4];
+        }
+        frame.cloud = cloud;
+        appendCloud(frame, chunk);
+        if (chunk.size() >= static_cast<std::size_t>(export_chunk_points))
+        {
+          const auto file = directory / ("map_" + std::to_string(chunk_index++) + ".pcd");
+          if (pcl::io::savePCDFileBinary(file.string(), chunk) != 0)
+            throw std::runtime_error("Cannot write optimized point cloud " + file.string());
+          chunk.clear();
+        }
+      }
+      if (!chunk.empty())
+      {
+        const auto file = directory / ("map_" + std::to_string(chunk_index) + ".pcd");
+        if (pcl::io::savePCDFileBinary(file.string(), chunk) != 0)
+          throw std::runtime_error("Cannot write optimized point cloud " + file.string());
+      }
     }
   }
   RCLCPP_INFO(node->get_logger(), "RTK finalized %zu frames, %zu keys, %zu position factors: %s",

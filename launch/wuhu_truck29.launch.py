@@ -1,7 +1,7 @@
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, SetEnvironmentVariable
 from launch.conditions import IfCondition
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from ament_index_python.packages import get_package_share_directory
@@ -26,6 +26,11 @@ def generate_launch_description():
     use_rviz = LaunchConfiguration("use_rviz")
     use_rtk = LaunchConfiguration("use_rtk")
     rear_axle_to_imu = LaunchConfiguration("rear_axle_to_imu")
+    rviz_current_cloud = PythonExpression([
+        "'/rtk/cloud_current' if '", use_rtk,
+        "'.lower() == 'true' else ('/cloud_registered' if '", use_camera,
+        "'.lower() == 'true' else '/cloud_current_frame')",
+    ])
 
     decoder = Node(
         package="image_transport",
@@ -73,15 +78,17 @@ def generate_launch_description():
         name="rviz2",
         arguments=["-d", rviz_config],
         condition=IfCondition(use_rviz),
+        remappings=[("/rtk/cloud_current", rviz_current_cloud)],
         output="screen",
     )
 
     return LaunchDescription([
-        # Match the bag player: preserve an explicitly selected transport.
-        # Unconditionally replacing SHM here made launch and direct runs use
-        # different communication paths in restricted/container environments.
+        # Raw 1920x1080 camera frames are too large for the local UDP path at
+        # 30 Hz and can starve the IMU stream. Keep the high-bandwidth local
+        # traffic on FastDDS shared memory, while preserving an explicit
+        # override for deployments that need another transport.
         SetEnvironmentVariable(name="FASTDDS_BUILTIN_TRANSPORTS",
-                               value=os.environ.get("FASTDDS_BUILTIN_TRANSPORTS") or "UDPv4"),
+                               value=os.environ.get("FASTDDS_BUILTIN_TRANSPORTS") or "SHM"),
         DeclareLaunchArgument("use_camera", default_value="false"),
         DeclareLaunchArgument("use_rviz", default_value="false"),
         DeclareLaunchArgument("use_rtk", default_value="true"),

@@ -63,7 +63,7 @@ public:
   void ins_status_cbk(const diagnostic_msgs::msg::DiagnosticArray::ConstSharedPtr &msg);
   void img_cbk(const sensor_msgs::ImageConstPtr &msg_in);
   void publish_img_rgb(const image_transport::Publisher &pubImage, VIOManagerPtr vio_manager);
-  void publish_frame_world(const rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr &publisher, VIOManagerPtr vio_manager);
+  PointCloudXYZRGB::Ptr publish_frame_world(const rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr &publisher, VIOManagerPtr vio_manager);
   void publish_visual_sub_map(const rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr &publisher);
   void publish_effect_world(const rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr &publisher, const std::vector<PointToPlane> &ptpl_list);
   void publish_odometry(const rclcpp::Publisher<nav_msgs::Odometry>::SharedPtr &publisher);
@@ -266,6 +266,17 @@ public:
   std::unique_ptr<tf2_ros::StaticTransformBroadcaster> alignment_broadcaster_;
   std::unique_ptr<RtkFusion> rtk_fusion_;
   bool rtk_enabled = false;
+  struct PendingRtkLivoFrame
+  {
+    bool valid = false;
+    double stamp = 0.0;
+    double begin = 0.0;
+    StatesGroup state;
+    PointCloudXYZI::Ptr cloud;
+    Eigen::Matrix<double, 6, 6> lidar_information =
+        Eigen::Matrix<double, 6, 6>::Zero();
+  };
+  PendingRtkLivoFrame pending_rtk_livo_frame_;
 
   rclcpp::Publisher<visualization_msgs::Marker>::SharedPtr plane_pub;
   rclcpp::Publisher<visualization_msgs::MarkerArray>::SharedPtr voxel_pub;

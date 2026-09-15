@@ -88,14 +88,16 @@ LIVMapper::LIVMapper(const rclcpp::Node::SharedPtr &node)
   root_dir = projectResultDirectory(root_dir).string() + '/';
   initializeFiles();
   initializeComponents();
-  if (rtk_enabled && slam_mode_ == ONLY_LIO)
+  if (rtk_enabled && (slam_mode_ == ONLY_LIO || slam_mode_ == LIVO))
   {
     if (!imu_standard_rfu || !rear_axle_to_imu_enabled)
       throw std::runtime_error("RTK fusion requires standard_rfu IMU and physical-IMU reference_frame_conversion.enabled");
     rtk_fusion_ = std::make_unique<RtkFusion>(node_, extR, extT, imu_to_rear_axle, root_dir);
+    RCLCPP_INFO(node_->get_logger(), "RTK backend enabled for %s frontend",
+                slam_mode_ == LIVO ? "LIVO" : "LIO");
   }
   else if (rtk_enabled)
-    RCLCPP_INFO(node_->get_logger(), "RTK backend is disabled outside LIO mode");
+    RCLCPP_WARN(node_->get_logger(), "RTK backend requires an IMU-enabled LIO/LIVO frontend");
   path.header.stamp = stampFromSec(node_->now().seconds());
   path.header.frame_id = lio_world_frame;
   imu_reference_path.header.frame_id = "mine";
@@ -611,6 +613,10 @@ void LIVMapper::initializeFiles()
   fout_pre.open(root_dir + "Log/mat_pre.txt", std::ios::out);
   fout_out.open(root_dir + "Log/mat_out.txt", std::ios::out);
   p_imu->fout_imu.open(root_dir + "Log/imu.txt", std::ios::out);
+  // RTK uses the native LiDAR Hessian as an observability diagnostic in both
+  // LIO and LIVO.  Keep collecting it whenever the backend is enabled; the
+  // CSV itself remains a LIO-only diagnostic to avoid changing file output.
+  if (rtk_enabled) voxelmap_manager->collect_geometry_diagnostics_ = true;
   if (!img_en && lidar_en && imu_en)
   {
     voxelmap_manager->collect_geometry_diagnostics_ = true;
@@ -971,7 +977,19 @@ void LIVMapper::handleVIO()
   //   visual_sub_map->push_back(temp_map);
   // }
 
-  publish_frame_world(pubLaserCloudFullRes, vio_manager);
+  PointCloudXYZRGB::Ptr colored_world_cloud =
+      publish_frame_world(pubLaserCloudFullRes, vio_manager);
+  if (rtk_fusion_ && slam_mode_ == LIVO && pending_rtk_livo_frame_.valid)
+  {
+    if (!colored_world_cloud)
+      throw std::runtime_error("LIVO RGB publication did not produce a color cloud for RTK fusion");
+    rtk_fusion_->submit(
+        pending_rtk_livo_frame_.stamp, pending_rtk_livo_frame_.begin,
+        pending_rtk_livo_frame_.state, pending_rtk_livo_frame_.cloud,
+        pending_rtk_livo_frame_.lidar_information, colored_world_cloud);
+    pending_rtk_livo_frame_.valid = false;
+    pending_rtk_livo_frame_.cloud.reset();
+  }
   publish_img_rgb(pubImage, vio_manager);
 
   euler_cur = RotMtoEuler(_state.rot_end);
@@ -1173,7 +1191,28 @@ void LIVMapper::handleLIO()
   {
     RGBpointBodyToWorld(&feats_undistort->points[i], &current_frame_world->points[i]);
   }
-  pcl::toROSMsg(*current_frame_world, current_frame_msg);
+  if (img_en)
+  {
+    pcl::toROSMsg(*current_frame_world, current_frame_msg);
+  }
+  else
+  {
+    // RViz uses one RGB8 transformer for all modes. In LiDAR-only operation
+    // preserve visibility by encoding intensity as grayscale RGB; camera mode
+    // is remapped to the genuinely camera-colored /cloud_registered stream.
+    PointCloudXYZRGB display_cloud;
+    display_cloud.reserve(current_frame_world->size());
+    for (const PointType &point : *current_frame_world)
+    {
+      PointTypeRGB display;
+      display.x = point.x; display.y = point.y; display.z = point.z;
+      const auto value = static_cast<std::uint8_t>(
+          std::clamp(point.intensity, 0.0f, 255.0f));
+      display.r = value; display.g = value; display.b = value;
+      display_cloud.push_back(display);
+    }
+    pcl::toROSMsg(display_cloud, current_frame_msg);
+  }
   current_frame_msg.header.stamp = stampFromSec(LidarMeasures.last_lio_update_time);
   current_frame_msg.header.frame_id = lio_world_frame;
   pubCurrentFrame->publish(current_frame_msg);
@@ -1183,9 +1222,35 @@ void LIVMapper::handleLIO()
   publish_mavros(mavros_pose_publisher);
   publishReferenceTrajectory(LidarMeasures.last_lio_update_time);
   if (rtk_fusion_)
-    rtk_fusion_->submit(LidarMeasures.last_lio_update_time,
-        LidarMeasures.lidar_frame_beg_time, _state, feats_undistort,
-        voxelmap_manager->lidar_information_body_);
+  {
+    // point_time_reference is the absolute time represented by curvature==0.
+    // For ONLY_LIO it is the physical scan start; for LIVO it is the previous
+    // image-rate estimator update after the raw scan has been split/rebased.
+    // feats_undistort is rigidly deskewed to last_lio_update_time in either
+    // case, so this is the exact native interval consumed by the RTK backend.
+    const double fusion_begin = LidarMeasures.measures.back().point_time_reference;
+    if (slam_mode_ == LIVO)
+    {
+      if (pending_rtk_livo_frame_.valid)
+        throw std::runtime_error("Previous LIVO frame reached the next LiDAR update before camera coloring");
+      // Defer only the backend handoff until the immediately following VIO
+      // update colors these SAME world points. Preserve the pre-VIO native
+      // state/cloud/information exactly, so RGB never changes optimization.
+      pending_rtk_livo_frame_.valid = true;
+      pending_rtk_livo_frame_.stamp = LidarMeasures.last_lio_update_time;
+      pending_rtk_livo_frame_.begin = fusion_begin;
+      pending_rtk_livo_frame_.state = _state;
+      pending_rtk_livo_frame_.cloud =
+          std::make_shared<PointCloudXYZI>(*feats_undistort);
+      pending_rtk_livo_frame_.lidar_information =
+          voxelmap_manager->lidar_information_body_;
+    }
+    else
+    {
+      rtk_fusion_->submit(LidarMeasures.last_lio_update_time, fusion_begin,
+          _state, feats_undistort, voxelmap_manager->lidar_information_body_);
+    }
+  }
 
   frame_num++;
   aver_time_consu = aver_time_consu * (frame_num - 1) / frame_num + (t4 - t0) / frame_num;
@@ -2412,11 +2477,11 @@ void LIVMapper::publish_img_rgb(const image_transport::Publisher &pubImage, VIOM
 }
 
 // Provide output format for LiDAR-visual BA
-void LIVMapper::publish_frame_world(const rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr &pubLaserCloudFullRes,
+PointCloudXYZRGB::Ptr LIVMapper::publish_frame_world(const rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr &pubLaserCloudFullRes,
                                     VIOManagerPtr vio_manager)
 {
-  if (pcl_w_wait_pub->empty()) return;
   PointCloudXYZRGB::Ptr laserCloudWorldRGB(new PointCloudXYZRGB());
+  if (pcl_w_wait_pub->empty()) return laserCloudWorldRGB;
   static int pub_num = 1;
   pub_num++;
 
@@ -2570,6 +2635,7 @@ void LIVMapper::publish_frame_world(const rclcpp::Publisher<sensor_msgs::PointCl
 
   if(laserCloudWorldRGB->size() > 0)  PointCloudXYZI().swap(*pcl_wait_pub); 
   if(LidarMeasures.lio_vio_flg == VIO)  PointCloudXYZI().swap(*pcl_w_wait_pub);
+  return laserCloudWorldRGB;
 }
 
 void LIVMapper::publish_visual_sub_map(const rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr &pubSubVisualMap)

@@ -50,8 +50,14 @@ struct RtkFusion
     double stamp, begin;
     gtsam::Pose3 raw;
     PointCloudXYZI::ConstPtr cloud;
+    // Camera-colored points are already in the native frontend world frame.
+    // The RTK backend applies only C(t) to them; geometry continues to use the
+    // immutable native deskewed LiDAR cloud above.
+    PointCloudXYZRGB::ConstPtr color_cloud;
     std::uint64_t offset = 0;
     std::uint32_t count = 0;
+    std::uint64_t color_offset = 0;
+    std::uint32_t color_count = 0;
     double frontend_residual = std::numeric_limits<double>::quiet_NaN();
     double frontend_speed = 0;
     V3D gravity = V3D(0, 0, -G_m_s2);
@@ -128,7 +134,7 @@ struct RtkFusion
   rclcpp::Node::SharedPtr node;
   M3D lidar_rotation;
   V3D lidar_translation, lever;
-  bool require_status = true, save_map = false;
+  bool require_status = true, save_map = false, color_enabled = false;
   double recovery_stable_interval = 0.5;
   // A non-fixed startup keeps the frontend in its original local frame.
   // A single fixed frame transform later anchors it; its voxel map never jumps.
@@ -152,6 +158,7 @@ struct RtkFusion
   double huber_delta = 2.8, key_interval = 1.0, key_min_interval = 0.5;
   double position_factor_interval = 0.5;
   double geometry_anchor_interval = 0.5;
+  double geometry_min_baseline = 20;
   double key_translation = 3, key_rotation = 3;
   double plane_voxel = 2, plane_thickness = 0.05, plane_noise_floor = 0.05;
   double revisit_radius = 8, revisit_age = 15, match_distance = 1.2;
@@ -161,7 +168,7 @@ struct RtkFusion
   int export_chunk_points = 1000000;
   std::vector<int> accepted_modes;
   std::filesystem::path directory;
-  std::ofstream archive, frame_index, diagnostics, optimization_log, history_log, association_log, geometry_history;
+  std::ofstream archive, color_archive, frame_index, diagnostics, optimization_log, history_log, association_log, geometry_history;
   std::vector<gtsam::Pose3> last_logged_poses;
   mutable std::mutex mutex;
   std::condition_variable changed;
@@ -207,7 +214,8 @@ struct RtkFusion
   void initializeGravity(double stamp, const V3D &gravity, const M3D &covariance);
   void submit(double stamp, double begin, const StatesGroup &state,
               const PointCloudXYZI::Ptr &deskewed_cloud,
-              const gtsam::Matrix6 &lidar_information);
+              const gtsam::Matrix6 &lidar_information,
+              const PointCloudXYZRGB::Ptr &colored_world_cloud = nullptr);
   void finish();
   void process(Frame frame);
   void optimizeKeyframe(const Frame &frame);
@@ -223,6 +231,7 @@ struct RtkFusion
   gtsam::Pose3 correctionAt(double stamp) const;
   gtsam::Pose3 poseAt(const Frame &frame) const;
   void appendCloud(const Frame &frame, pcl::PointCloud<pcl::PointXYZI> &cloud) const;
+  void appendDisplayCloud(const Frame &frame, PointCloudXYZRGB &cloud) const;
   void publishCurrent(const Frame &frame);
   void publish(double stamp, bool force = false);
   void exportMap();

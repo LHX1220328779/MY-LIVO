@@ -18,3 +18,7 @@ __pycache__/
 
 # Accidental command output
 /0
+
+# Real-data evidence is retained on disk, not source-controlled.
+/results/
+/results.unwritable-*/

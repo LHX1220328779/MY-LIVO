@@ -7,7 +7,9 @@ BAG_ROOT="/home/project/data/haibo/wuhu_livo/ros2bag"
 START_OFFSET="0"
 PLAY_RATE="1.0"
 PLAY_ALL_TOPICS=0
-LIO_ONLY=1
+# The standard Wuhu run includes the camera. Use --lio-only explicitly for
+# LiDAR/IMU-only playback.
+LIO_ONLY=0
 DRY_RUN=0
 PREPARED_BAG=""
 PREPARED_EXPLICIT=0
@@ -67,33 +69,58 @@ case "$ROS_LOG_DIR/" in
 esac
 mkdir -p "$ROS_LOG_DIR"
 
-# Prefer UDP locally, but preserve an explicitly selected transport (e.g.
-# SHM in a restricted environment); player and mapper must use the same one.
-export FASTDDS_BUILTIN_TRANSPORTS="${FASTDDS_BUILTIN_TRANSPORTS:-UDPv4}"
+# The decoded 1920x1080 camera stream is about 180 MB/s before DDS overhead.
+# Keep local bag playback on shared memory so that camera traffic cannot starve
+# the IMU stream. Preserve an explicit override for non-local deployments.
+export FASTDDS_BUILTIN_TRANSPORTS="${FASTDDS_BUILTIN_TRANSPORTS:-SHM}"
 
-# Reading an explicitly supplied historical bag is allowed. New prepared
-# data has a results-owned default; otherwise play the original split bags.
-if [[ -z "$PREPARED_BAG" ]]; then PREPARED_BAG="$results_root/prepared/wuhu_livo"; fi
-# A reusable LIO-only prepared bag must not silently break camera playback.
-# Check topic availability before selecting it; never rewrite its metadata.
-if [[ -f "$PREPARED_BAG/metadata.yaml" ]] && ((!LIO_ONLY && !PLAY_ALL_TOPICS)); then
-  if ! /usr/bin/python3 - "$PREPARED_BAG/metadata.yaml" <<'PY'
+# Reading an explicitly supplied historical bag is allowed. The normal Wuhu
+# camera run uses one globally ordered runtime bag so segment handoff cannot
+# drop IMU samples while a new rosbag2 player discovers subscribers.
+if [[ -z "$PREPARED_BAG" ]]; then
+  if ((LIO_ONLY)); then
+    PREPARED_BAG="$results_root/prepared/wuhu_livo"
+  else
+    PREPARED_BAG="$results_root/prepared/wuhu_livo_camera"
+  fi
+fi
+
+has_camera_topic() {
+  /usr/bin/python3 - "$1" <<'PYTOPIC'
 import sys
 import yaml
 with open(sys.argv[1]) as stream:
     info = yaml.safe_load(stream)["rosbag2_bagfile_information"]
 names = {entry["topic_metadata"]["name"].lstrip("/") for entry in info["topics_with_message_count"]}
 sys.exit(0 if "midrange_camera/ffmpeg" in names else 1)
-PY
-  then
+PYTOPIC
+}
+
+if ((!LIO_ONLY && !PLAY_ALL_TOPICS)); then
+  if [[ -f "$PREPARED_BAG/metadata.yaml" ]] && ! has_camera_topic "$PREPARED_BAG/metadata.yaml"; then
     if ((PREPARED_EXPLICIT)); then
       echo "Requested prepared bag has no camera topic; use --lio-only or a camera-capable bag." >&2
       exit 2
     fi
-    echo "Default prepared bag is LIO-only; camera playback uses the original source bags." >&2
-    PREPARED_BAG=""
+    PREPARED_BAG="$results_root/prepared/wuhu_livo_camera"
+  fi
+
+  if [[ ! -f "$PREPARED_BAG/metadata.yaml" ]] && ((!PREPARED_EXPLICIT)); then
+    if ((DRY_RUN)); then
+      echo "camera runtime bag missing; would prepare: $PREPARED_BAG"
+    else
+      prepared_tmp="${PREPARED_BAG}.build.$$"
+      cleanup_prepared_tmp() { rm -rf -- "$prepared_tmp"; }
+      trap cleanup_prepared_tmp INT TERM EXIT
+      mkdir -p "$(dirname "$PREPARED_BAG")"
+      /usr/bin/python3 "$repo_dir/scripts/prepare_wuhu_bag.py" \
+        --bag-root "$BAG_ROOT" --output "$prepared_tmp"
+      mv -- "$prepared_tmp" "$PREPARED_BAG"
+      trap - INT TERM EXIT
+    fi
   fi
 fi
+
 if [[ -f "$PREPARED_BAG/metadata.yaml" ]]; then
   if ((LIO_ONLY)); then
     prepared_topic_args=(--topics front_left_lidar back_lidar front_right_lidar front_lidar imu_data imu_data/odometry imu_data/ins_status imu_data/navsat_fix)
