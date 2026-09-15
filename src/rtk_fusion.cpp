@@ -138,7 +138,7 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   // Persist effective parameters, not a copy of a possibly unrelated YAML.
   std::ofstream settings(directory / "parameters.txt");
   settings.exceptions(std::ios::badbit | std::ios::failbit);
-  settings << "model=native_lio_global_correction; scan_geometry=native_deskew_scan_end; surface_residual=profiled_common_support_plane; motion_residual=so3_and_endpoint_position; motion_rotation_loss=component_huber; motion_translation_loss=component_huber; overlap_selection=observed_surface_covisibility; geometry_validation=observable_baseline_consistency; association_lifetime=verified_observation; line_validation=single_scan_surface_context\n";
+  settings << "model=native_lio_global_correction; scan_geometry=native_deskew_scan_end; surface_residual=common_support_mean_squared_point_distance; motion_residual=so3_and_endpoint_position; motion_rotation_loss=component_huber; motion_translation_loss=component_huber; overlap_selection=observed_surface_covisibility; geometry_validation=observable_baseline_consistency; association_lifetime=verified_observation\n";
   for (const auto &name : node->list_parameters({}, 0).names)
   {
     const auto parameter = node->get_parameter(name);
@@ -788,63 +788,6 @@ std::vector<RtkFusion::Plane> RtkFusion::extractPlanes(const Frame &frame) const
       plane.support.push_back(lidar_rotation * V3D(point.x, point.y, point.z) + lidar_translation);
       plane.extendSupport(plane.support.back());
     }
-    if (plane.linear)
-    {
-      // Rank-one samples alone cannot identify a physical edge: a sparse
-      // LiDAR stripe on a broad plane is also rank one. Resolve this using
-      // the SAME scan's measured surrounding surface, not its world height,
-      // orientation, GNSS error or points frozen from another pose.
-      const double radius = 3 * plane_voxel, squared_radius = radius * radius;
-      const V3D center = plane.center;
-      const FusionVoxelKey cell{static_cast<std::int64_t>(std::floor(center.x() / plane_voxel)),
-          static_cast<std::int64_t>(std::floor(center.y() / plane_voxel)),
-          static_cast<std::int64_t>(std::floor(center.z() / plane_voxel))};
-      std::array<V3D, 3> sums{V3D::Zero(), V3D::Zero(), V3D::Zero()};
-      std::array<M3D, 3> scatters{M3D::Zero(), M3D::Zero(), M3D::Zero()};
-      std::array<std::size_t, 3> context_counts{};
-      for (int x = -3; x <= 3; ++x) for (int y = -3; y <= 3; ++y) for (int z = -3; z <= 3; ++z)
-      {
-        const FusionVoxelKey neighbor{cell.x + x, cell.y + y, cell.z + z};
-        const V3D minimum = plane_voxel * V3D(neighbor.x, neighbor.y, neighbor.z);
-        const V3D outside = (minimum - center).cwiseMax(0) +
-            (center - minimum - V3D::Constant(plane_voxel)).cwiseMax(0);
-        if (outside.squaredNorm() > squared_radius) continue;
-        const auto found = cells.find(neighbor);
-        if (found == cells.end()) continue;
-        for (auto index : found->second.indices)
-        {
-          const auto &point = frame.cloud->points[index];
-          const V3D p = lidar_rotation * V3D(point.x, point.y, point.z) + lidar_translation;
-          const V3D delta = p - center;
-          const double distance = delta.squaredNorm(), along = plane.normal.dot(delta);
-          // Other objects beyond the observed endpoints cannot hide the
-          // sheet underlying this strip. All bounds come from actual returns.
-          if (distance > squared_radius || along < plane.support_min.x() - 1e-6 ||
-              along > plane.support_max.x() + 1e-6) continue;
-          for (int scale = 0; scale < 3; ++scale)
-            if (distance <= (scale + 1) * (scale + 1) * plane_voxel * plane_voxel)
-            {
-              sums[scale] += p; scatters[scale].noalias() += p * p.transpose(); ++context_counts[scale];
-            }
-        }
-      }
-      bool sheet = false;
-      for (int scale = 0; scale < 3 && !sheet; ++scale)
-      {
-        Plane context;
-        if (!fitSurface(sums[scale], scatters[scale], context_counts[scale], context) || context.linear) continue;
-        const double offset = context.normal.dot(center - context.center);
-        const double slope = context.normal.dot(plane.normal);
-        // A crossing plane at the midpoint is not evidence against a pole:
-        // it must explain the candidate's WHOLE measured axial interval.
-        sheet = std::max(std::abs(offset + slope * plane.support_min.x()),
-            std::abs(offset + slope * plane.support_max.x())) <= 2 * plane_thickness;
-      }
-      if (sheet) continue;
-      // An unresolved narrow strip is not promoted to a new plane with a
-      // fabricated second direction. Supported neighboring planes remain
-      // available, and genuine slender structures retain their line factor.
-    }
     planes.push_back(std::move(plane));
   }
   return planes;
@@ -911,7 +854,7 @@ std::size_t RtkFusion::addGeometry(std::size_t a, std::size_t b,
   };
   const auto measurement = [&](const Match &m) {
     return ScanPlaneBatchFactor::Constraint{m.a->normal, m.a->center, m.b->center,
-        sigma(m), m.a->linear, m.b->sqrt_covariance, m.a->sqrt_covariance};
+        sigma(m), m.a->linear, m.b->sqrt_covariance};
   };
   const auto cost = [&](const gtsam::Pose3 &pose) {
     double sum = 0;
@@ -928,17 +871,28 @@ std::size_t RtkFusion::addGeometry(std::size_t a, std::size_t b,
   const auto register_matches = [&](gtsam::Pose3 &registered) {
     gtsam::Vector6 scaling;
     scaling << 1. / 30, 1. / 30, 1. / 30, 1, 1, 1;
-    std::vector<ScanPlaneBatchFactor::Constraint> rows;
-    rows.reserve(matches.size());
-    for (const auto &m : matches) rows.push_back(measurement(m));
-    const ScanPlaneBatchFactor registration(0, 1, std::move(rows));
     for (int iteration = 0; iteration < 8; ++iteration)
     {
-      gtsam::Matrix jacobian;
-      const auto residual = registration.evaluateError(gtsam::Pose3(), registered, nullptr, &jacobian);
-      jacobian = (jacobian * scaling.asDiagonal()).eval();
-      const gtsam::Matrix6 information = jacobian.transpose() * jacobian;
-      const gtsam::Vector6 gradient = jacobian.transpose() * residual;
+      gtsam::Matrix6 information = gtsam::Matrix6::Zero();
+      gtsam::Vector6 gradient = gtsam::Vector6::Zero();
+      for (const auto &m : matches)
+      {
+        const double stddev = sigma(m);
+        const auto projector = m.a->projector();
+        const Eigen::Matrix<double, 3, 4> residuals = measurement(m).physicalResidual(registered) / stddev;
+        const double weight = residuals.norm() <= 1.5 ? 1 : 1.5 / residuals.norm();
+        for (int part = 0; part < 4; ++part)
+        {
+          const V3D point = part ? V3D(registered.rotation().rotate(m.b->sqrt_covariance.col(part - 1))) :
+              registered.transformFrom(m.b->center);
+          Eigen::Matrix<double, 3, 6> jacobian;
+          jacobian.leftCols<3>() = -projector * gtsam::skewSymmetric(point);
+          jacobian.rightCols<3>() = part ? M3D::Zero().eval() : projector;
+          jacobian = (jacobian * scaling.asDiagonal() / stddev).eval();
+          information.noalias() += weight * jacobian.transpose() * jacobian;
+          gradient.noalias() += weight * jacobian.transpose() * residuals.col(part);
+        }
+      }
       Eigen::SelfAdjointEigenSolver<gtsam::Matrix6> eig(information);
       if (eig.info() != Eigen::Success) return false;
       gtsam::Vector6 step = gtsam::Vector6::Zero();
@@ -953,7 +907,7 @@ std::size_t RtkFusion::addGeometry(std::size_t a, std::size_t b,
       bool accepted = false;
       for (int trial = 0; trial < 5; ++trial)
       {
-        const auto proposal = registered.retract(step);
+        const auto proposal = gtsam::Pose3::Expmap(step) * registered;
         if (cost(proposal) <= before)
         { registered = proposal; accepted = true; break; }
         step *= .5;
@@ -1650,10 +1604,7 @@ void RtkFusion::exportMap()
   constraints << "a_stamp,b_stamp,ax,ay,az,bx,by,bz,nx,ny,nz,sigma_m,residual_m,native_residual_m,is_line";
   for (int row = 0; row < 3; ++row) for (int col = 0; col < 3; ++col)
     constraints << ",source_body_sqrt_" << row << col;
-  constraints << ",centroid_residual_m";
-  for (int row = 0; row < 3; ++row) for (int col = 0; col < 3; ++col)
-    constraints << ",target_body_sqrt_" << row << col;
-  constraints << '\n';
+  constraints << ",centroid_residual_m\n";
   for (const auto &link : geometry_links)
   {
     if (link.factor_index == std::numeric_limits<std::size_t>::max()) continue;
@@ -1672,7 +1623,7 @@ void RtkFusion::exportMap()
       constraint.normal.cwiseAbs().maxCoeff(&axis);
       if (constraint.linear) ++line_count; else ++counts[axis];
       const V3D delta = relative.transformFrom(constraint.point) - constraint.center;
-      const double signed_residual = constraint.linear ? constraint.project(delta).norm() : constraint.planeNormal(relative).dot(delta);
+      const double signed_residual = constraint.linear ? constraint.project(delta).norm() : constraint.normal.dot(delta);
       const double residual = constraint.physicalResidual(relative).norm();
       const double native_residual = constraint.physicalResidual(native_relative).norm();
       squared += residual * residual;
@@ -1692,10 +1643,7 @@ void RtkFusion::exportMap()
       constraints << ',' << constraint.sigma << ',' << residual << ',' << native_residual << ',' << constraint.linear;
       for (int row = 0; row < 3; ++row) for (int col = 0; col < 3; ++col)
         constraints << ',' << constraint.source_sqrt(row, col);
-      constraints << ',' << signed_residual;
-      for (int row = 0; row < 3; ++row) for (int col = 0; col < 3; ++col)
-        constraints << ',' << constraint.target_sqrt(row, col);
-      constraints << '\n';
+      constraints << ',' << signed_residual << '\n';
     }
     geometry << std::setprecision(17) << keyframes[link.a].stamp << ',' << keyframes[link.b].stamp << ','
         << relative.translation().norm() << ',' << factor->constraints().size();

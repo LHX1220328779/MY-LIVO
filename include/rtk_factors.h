@@ -119,59 +119,6 @@ public:
     double sigma;
     bool linear = false;
     gtsam::Matrix3 source_sqrt = gtsam::Matrix3::Zero();
-    gtsam::Matrix3 target_sqrt = gtsam::Matrix3::Zero();
-    bool sharedPlane() const { return !linear && target_sqrt.squaredNorm() > 0; }
-    Eigen::Matrix<double, 3, 7> moments(const gtsam::Pose3 &relative) const
-    {
-      Eigen::Matrix<double, 3, 7> result = Eigen::Matrix<double, 3, 7>::Zero();
-      result.col(0) = relative.transformFrom(point) - center;
-      result.middleCols<3>(1) = relative.rotation().matrix() * source_sqrt;
-      if (sharedPlane())
-      {
-        result.middleCols<3>(1) *= std::sqrt(2.);
-        result.rightCols<3>() = std::sqrt(2.) * target_sqrt;
-      }
-      return result;
-    }
-    gtsam::Vector3 planeNormal(const gtsam::Pose3 &relative,
-        Eigen::Matrix<double, 3, 6> *derivative = nullptr) const
-    {
-      if (derivative) derivative->setZero();
-      // Zero target extent denotes legacy fixed-normal measurements only.
-      // Production supplies BOTH measured shared-support covariances.
-      if (!sharedPlane()) return normal;
-      const auto e = moments(relative);
-      const gtsam::Matrix3 scatter = e * e.transpose();
-      const Eigen::SelfAdjointEigenSolver<gtsam::Matrix3> eig(scatter);
-      if (eig.info() != Eigen::Success) throw std::runtime_error("Invalid shared-plane scatter");
-      const gtsam::Vector3 n = std::copysign(1., normal.dot(eig.eigenvectors().col(0))) * eig.eigenvectors().col(0);
-      if (derivative)
-      {
-        const auto rotation = relative.rotation().matrix();
-        const gtsam::Matrix3 source_covariance = source_sqrt * source_sqrt.transpose();
-        for (int axis = 0; axis < 6; ++axis)
-        {
-          gtsam::Matrix3 change = gtsam::Matrix3::Zero();
-          gtsam::Vector3 displacement;
-          if (axis < 3)
-          {
-            const gtsam::Matrix3 skew = gtsam::skewSymmetric(gtsam::Vector3::Unit(axis));
-            change = 2 * rotation * (skew * source_covariance - source_covariance * skew) * rotation.transpose();
-            displacement = -rotation * gtsam::skewSymmetric(point).col(axis);
-          }
-          else displacement = rotation.col(axis - 3);
-          change.noalias() += displacement * e.col(0).transpose() + e.col(0) * displacement.transpose();
-          for (int j = 1; j < 3; ++j)
-          {
-            const double gap = eig.eigenvalues()(j) - eig.eigenvalues()(0);
-            if (gap > 1e-10 * std::max(1., eig.eigenvalues()(2)))
-              derivative->col(axis).noalias() -= eig.eigenvectors().col(j) *
-                  (eig.eigenvectors().col(j).dot(change * n) / gap);
-          }
-        }
-      }
-      return n;
-    }
     gtsam::Matrix3 projector() const
     {
       const gtsam::Matrix3 along = normal * normal.transpose();
@@ -182,11 +129,12 @@ public:
       const gtsam::Vector3 along = normal * normal.dot(delta);
       return linear ? gtsam::Vector3(delta - along) : along;
     }
-    Eigen::Matrix<double, 3, 7> physicalResidual(const gtsam::Pose3 &relative) const
+    Eigen::Matrix<double, 3, 4> physicalResidual(const gtsam::Pose3 &relative) const
     {
-      const gtsam::Vector3 direction = planeNormal(relative);
-      const gtsam::Matrix3 projection = linear ? projector() : gtsam::Matrix3(direction * direction.transpose());
-      return projection * moments(relative);
+      Eigen::Matrix<double, 3, 4> result;
+      result.col(0) = project(relative.transformFrom(point) - center);
+      result.rightCols<3>() = projector() * relative.rotation().matrix() * source_sqrt;
+      return result;
     }
   };
 private:
@@ -195,7 +143,7 @@ public:
   ScanPlaneBatchFactor(gtsam::Key a, gtsam::Key b, std::vector<Constraint> constraints)
       : gtsam::NoiseModelFactor2<gtsam::Pose3, gtsam::Pose3>(
             gtsam::noiseModel::Isotropic::Sigma(std::accumulate(constraints.begin(), constraints.end(),
-                std::size_t{0}, [](std::size_t size, const Constraint &c) { return size + (c.linear ? 12 : 7); }), 1), a, b),
+                std::size_t{0}, [](std::size_t size, const Constraint &c) { return size + (c.linear ? 12 : 4); }), 1), a, b),
         constraints_(std::move(constraints)) {}
 
   const std::vector<Constraint> &constraints() const { return constraints_; }
@@ -234,7 +182,6 @@ public:
   {
     const auto relative = a.between(b);
     const auto rotation = relative.rotation().matrix();
-    const auto inverse_adjoint = relative.inverse().AdjointMap();
     const std::size_t rows = dim();
     gtsam::Vector residual(rows);
     if (ha) ha->resize(rows, 6);
@@ -247,35 +194,30 @@ public:
       const gtsam::Matrix3 projection = c.projector() / c.sigma;
       Eigen::Matrix<double, 12, 1> value;
       Eigen::Matrix<double, 12, 6> ja, jb;
-      const int count = c.linear ? 12 : 7;
-      if (!c.linear)
+      const int count = c.linear ? 12 : 4;
+      for (int part = 0; part < 4; ++part)
       {
-        Eigen::Matrix<double, 3, 6> dn;
-        const auto normal = c.planeNormal(relative, ha || hb ? &dn : nullptr);
-        const auto moments = c.moments(relative);
-        const double extent_scale = c.sharedPlane() ? std::sqrt(2.) : 1.;
-        for (int part = 0; part < 7; ++part)
+        const gtsam::Vector3 body = part ? gtsam::Vector3(c.source_sqrt.col(part - 1)) : c.point;
+        const gtsam::Vector3 rotated = part ? gtsam::Vector3(rotation * body) : local;
+        if (!c.linear)
         {
-          value(part) = normal.dot(moments.col(part)) / c.sigma;
-          if (ha || hb)
+          // A plane needs one normal row per moment, not a rank-one 3D
+          // embedding. Keep the exact same energy with one third of the QR work.
+          const Eigen::RowVector3d normal = c.normal.transpose() / c.sigma;
+          value(part) = normal.dot(part ? rotated : gtsam::Vector3(local - c.center));
+          if (ha)
           {
-            Eigen::Matrix<double, 3, 6> dm = Eigen::Matrix<double, 3, 6>::Zero();
-            if (part < 4)
-            {
-              const gtsam::Vector3 body = part ? gtsam::Vector3(extent_scale * c.source_sqrt.col(part - 1)) : c.point;
-              dm.leftCols<3>() = -rotation * gtsam::skewSymmetric(body);
-              if (!part) dm.rightCols<3>() = rotation;
-            }
-            jb.row(part) = (normal.transpose() * dm + moments.col(part).transpose() * dn) / c.sigma;
-            if (ha) ja.row(part) = -jb.row(part) * inverse_adjoint;
+            ja.block<1, 3>(part, 0) = normal * gtsam::skewSymmetric(rotated);
+            ja.block<1, 3>(part, 3) = part ? Eigen::RowVector3d::Zero().eval() : Eigen::RowVector3d(-normal);
+          }
+          if (hb)
+          {
+            jb.block<1, 3>(part, 0) = -normal * rotation * gtsam::skewSymmetric(body);
+            jb.block<1, 3>(part, 3) = part ? Eigen::RowVector3d::Zero().eval() : Eigen::RowVector3d(normal * rotation);
           }
         }
-      }
-      else
-        for (int part = 0; part < 4; ++part)
+        else
         {
-          const gtsam::Vector3 body = part ? gtsam::Vector3(c.source_sqrt.col(part - 1)) : c.point;
-          const gtsam::Vector3 rotated = part ? gtsam::Vector3(rotation * body) : local;
           value.segment<3>(3 * part) = projection * (part ? rotated : gtsam::Vector3(local - c.center));
           if (ha)
           {
@@ -288,11 +230,12 @@ public:
             jb.block<3, 3>(3 * part, 3) = part ? gtsam::Matrix3::Zero().eval() : gtsam::Matrix3(projection * rotation);
           }
         }
-      // For planes, energy = 4 * minimum eigenvalue of the equal-patch
-      // pooled scatter. This profiles out the COMMON physical plane normal,
-      // not the observed points. Parallel separated planes retain the same
-      // centroid displacement scale; neither scan supplies an exact normal.
-      // No per-point information multiplication or synthetic pose directions.
+      }
+      // ||P(T mean - target)||^2 + ||P R sqrt(Cov)||_F^2 is EXACTLY
+      // the average squared distance of the shared source returns. It keeps
+      // their physical extent: rotating a plane/line about its centroid can
+      // no longer have zero geometric cost. No fitted joint plane, fabricated
+      // normal prior, extra point-count weight or full-rank pose prior.
       constexpr double huber = 1.5;
       const double length = value.head(count).norm();
       double scale = 1, radial = 0;
