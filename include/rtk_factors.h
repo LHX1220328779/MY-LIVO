@@ -105,48 +105,6 @@ public:
   }
 };
 
-// Receiver position = physical rear axle + a small ENU-correlated error +
-// white measurement noise. The bias is NOT a free correction of the map.
-class RtkPositionBiasFactor final
-    : public gtsam::NoiseModelFactor2<gtsam::Pose3, gtsam::Vector3>
-{
-  gtsam::Vector3 measured_, lever_;
-public:
-  RtkPositionBiasFactor(gtsam::Key pose, gtsam::Key bias,
-      const gtsam::Vector3 &measured, const gtsam::Vector3 &lever,
-      const gtsam::SharedNoiseModel &noise)
-      : gtsam::NoiseModelFactor2<gtsam::Pose3, gtsam::Vector3>(noise, pose, bias),
-        measured_(measured), lever_(lever) {}
-  gtsam::Vector evaluateError(const gtsam::Pose3 &pose, const gtsam::Vector3 &bias,
-      gtsam::OptionalMatrixType hp = nullptr, gtsam::OptionalMatrixType hb = nullptr) const override
-  {
-    if (hb) *hb = gtsam::Matrix3::Identity();
-    return pose.transformFrom(lever_, hp) + bias - measured_;
-  }
-};
-
-// Exact discrete stationary Gauss-Markov process, including irregular keys
-// and RTK outages. Finite stationary variance prevents an unbounded walk.
-class RtkBiasEvolutionFactor final
-    : public gtsam::NoiseModelFactor2<gtsam::Vector3, gtsam::Vector3>
-{
-  double retention_;
-public:
-  RtkBiasEvolutionFactor(gtsam::Key a, gtsam::Key b, double dt, double correlation_time,
-      const gtsam::Vector3 &stationary_sigmas)
-      : gtsam::NoiseModelFactor2<gtsam::Vector3, gtsam::Vector3>(
-            gtsam::noiseModel::Diagonal::Sigmas(stationary_sigmas *
-                std::sqrt(-std::expm1(-2 * dt / correlation_time))), a, b),
-        retention_(std::exp(-dt / correlation_time)) {}
-  gtsam::Vector evaluateError(const gtsam::Vector3 &a, const gtsam::Vector3 &b,
-      gtsam::OptionalMatrixType ha = nullptr, gtsam::OptionalMatrixType hb = nullptr) const override
-  {
-    if (ha) *ha = -retention_ * gtsam::Matrix3::Identity();
-    if (hb) *hb = gtsam::Matrix3::Identity();
-    return b - retention_ * a;
-  }
-};
-
 // One sparse graph factor per scan pair. A surface contributes its actual
 // mean squared point-to-plane/line distance, not only its centroid distance.
 // Sufficient statistics retain orientation evidence without allocating a

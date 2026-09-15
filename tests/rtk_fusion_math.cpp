@@ -85,28 +85,6 @@ void auditSavedMotion(const std::filesystem::path &run, const std::filesystem::p
     values.insert(gtsam::Symbol('x', i), refined.back());
   }
   gtsam::NonlinearFactorGraph graph;
-  const bool correlated_rtk = std::filesystem::exists(run / "rtk_bias.csv");
-  V3D bias_sigmas = V3D::Zero();
-  double bias_time = 0;
-  if (correlated_rtk)
-  {
-    const auto biases = table(run / "rtk_bias.csv", ',');
-    if (biases.size() != keys.size()) throw std::runtime_error("Incomplete recorded RTK bias states");
-    for (std::size_t i = 0; i < keys.size(); ++i)
-    {
-      if (biases[i][0] != keys[i][0]) throw std::runtime_error("RTK bias timestamp mismatch");
-      values.insert(gtsam::Symbol('b', i), V3D(biases[i][2], biases[i][3], biases[i][4]));
-    }
-    std::ifstream stream(run / "rtk_bias.csv");
-    for (std::string line; std::getline(stream, line);)
-    {
-      std::istringstream fields(line);
-      std::string marker, name; fields >> marker >> name;
-      if (marker == "#" && name == "stationary_sigmas") fields >> bias_sigmas.x() >> bias_sigmas.y() >> bias_sigmas.z();
-      if (marker == "#" && name == "correlation_time_sec") fields >> bias_time;
-    }
-    if (bias_sigmas.minCoeff() <= 0 || bias_time <= 0) throw std::runtime_error("Missing recorded RTK bias model");
-  }
   Pose3 reference_seed = pose(seed);
   gtsam::Vector6 prior_sigma; prior_sigma << .01, .01, .05, 10, 10, 10;
   graph.emplace_shared<gtsam::PriorFactor<Pose3>>(gtsam::Symbol('x', 0),
@@ -160,17 +138,7 @@ void auditSavedMotion(const std::filesystem::path &run, const std::filesystem::p
       const auto noise = gtsam::noiseModel::Robust::Create(
           gtsam::noiseModel::mEstimator::Huber::Create(2.8 * std::sqrt(row[14])),
           gtsam::noiseModel::Gaussian::Covariance(cov));
-      if (correlated_rtk)
-        graph.emplace_shared<RtkPositionBiasFactor>(gtsam::Symbol('x', i), gtsam::Symbol('b', i),
-            V3D(row[3], row[4], row[5]), lever, noise);
-      else graph.emplace_shared<gtsam::GPSFactorArm>(gtsam::Symbol('x', i), V3D(row[3], row[4], row[5]), lever, noise);
-    }
-    if (correlated_rtk)
-    {
-      if (!i) graph.emplace_shared<gtsam::PriorFactor<V3D>>(gtsam::Symbol('b', 0), V3D::Zero(),
-          gtsam::noiseModel::Diagonal::Sigmas(bias_sigmas));
-      else graph.emplace_shared<RtkBiasEvolutionFactor>(gtsam::Symbol('b', i - 1), gtsam::Symbol('b', i),
-          row[0] - keys[i - 1][0], bias_time, bias_sigmas);
+      graph.emplace_shared<gtsam::GPSFactorArm>(gtsam::Symbol('x', i), V3D(row[3], row[4], row[5]), lever, noise);
     }
     if (!i) continue;
     const double dt = row[0] - keys[i - 1][0];
@@ -207,18 +175,20 @@ void auditSavedMotion(const std::filesystem::path &run, const std::filesystem::p
       gtsam::Symbol('x', p.first.second), std::move(p.second));
   double groups[4] = {};
   for (const auto &f : graph)
-    groups[(dynamic_cast<gtsam::GPSFactorArm *>(f.get()) || dynamic_cast<RtkPositionBiasFactor *>(f.get())) ? 0 : dynamic_cast<NativeMotionFactor *>(f.get()) ? 1 :
+    groups[dynamic_cast<gtsam::GPSFactorArm *>(f.get()) ? 0 : dynamic_cast<NativeMotionFactor *>(f.get()) ? 1 :
            dynamic_cast<ScanPlaneBatchFactor *>(f.get()) ? 2 : 3] += f->error(values);
-  std::cout << std::setprecision(17) << "Reconstructed fixed-graph costs RTK/motion/geometry/other="
+  std::cout << std::setprecision(17) << "Reconstructed fixed-graph costs RTK/motion/geometry/gauge="
       << groups[0] << ',' << groups[1] << ',' << groups[2] << ',' << groups[3] << '\n';
   std::ifstream optimization(run / "optimization.csv");
   std::vector<std::string> last;
+  std::map<double, double> online_costs;
   for (std::string line; std::getline(optimization, line);)
   {
     std::istringstream fields(line);
     std::vector<std::string> row;
     for (std::string field; std::getline(fields, field, ',');) row.push_back(field);
     if (row.size() == 10 && row[1] == "final") last = std::move(row);
+    else if (row.size() == 10 && row[1] == "online") online_costs[std::stod(row[0])] = std::stod(row[4]);
   }
   if (last.empty()) throw std::runtime_error("Saved final objective is required for causal audit");
   for (int i = 0; i < 4; ++i)
@@ -229,6 +199,56 @@ void auditSavedMotion(const std::filesystem::path &run, const std::filesystem::p
   }
   std::cout << "All four cost groups reproduce optimization.csv within rounding tolerance.\n";
   if (velocity_geometry == "--verify-objective") return;
+  if (velocity_geometry == "--online-convergence")
+  {
+    // A verified-observation graph has immutable factors, created no earlier
+    // than their last key. Its exact prefix is therefore the online objective
+    // at that key, without future observations or any changed correspondence.
+    std::ifstream settings(run / "parameters.txt");
+    std::string model; std::getline(settings, model);
+    if (model.find("association_lifetime=verified_observation") == std::string::npos)
+      throw std::runtime_error("Historical rematching prevents exact online-prefix reconstruction");
+    std::map<std::size_t, double> online;
+    for (const auto &row : table(run / "diagnostics.csv", ','))
+    {
+      if (row.size() < 20 || !std::isfinite(row[18])) continue;
+      const auto found = indices.lower_bound(row[16] - 1e-6);
+      if (found != indices.end() && std::abs(found->first - row[16]) < 1e-5)
+        online[found->second] = std::max(online[found->second], row[18]);
+    }
+    std::vector<std::pair<double, std::size_t>> ranked;
+    for (const auto &item : online) ranked.emplace_back(item.second, item.first);
+    std::sort(ranked.rbegin(), ranked.rend());
+    std::ofstream report(output / "online_prefix_convergence.csv");
+    report << std::setprecision(17) << "last_stamp,keys,online_rtk_m,prefix_optimum_rtk_m,iterations,online_cost,seed_cost,prefix_cost,scaled_gradient_inf\n";
+    for (std::size_t sample = 0; sample < std::min<std::size_t>(5, ranked.size()); ++sample)
+    {
+      const std::size_t last_key = ranked[sample].second;
+      gtsam::NonlinearFactorGraph prefix;
+      for (const auto &f : graph)
+        if (std::all_of(f->keys().begin(), f->keys().end(), [last_key](gtsam::Key k) {
+              return gtsam::Symbol(k).index() <= last_key; })) prefix.push_back(f);
+      gtsam::Values initial;
+      for (std::size_t i = 0; i <= last_key; ++i) initial.insert(gtsam::Symbol('x', i), refined[i]);
+      gtsam::LevenbergMarquardtParams params;
+      params.maxIterations = 100; params.relativeErrorTol = 1e-9; params.absoluteErrorTol = 1e-9;
+      params.linearSolverType = gtsam::NonlinearOptimizerParams::MULTIFRONTAL_QR;
+      gtsam::LevenbergMarquardtOptimizer optimizer(prefix, initial, params);
+      const auto solution = optimizer.optimize();
+      const auto linear = prefix.linearize(solution);
+      const auto gradient = linear->gradientAtZero(), diagonal = linear->hessianDiagonal();
+      double norm = 0;
+      for (const auto &item : gradient) norm = std::max(norm,
+          (item.second.array().abs() / diagonal.at(item.first).array().max(1e-20).sqrt()).maxCoeff());
+      const V3D reference(keys[last_key][3], keys[last_key][4], keys[last_key][5]);
+      report << keys[last_key][0] << ',' << last_key + 1 << ',' << ranked[sample].first << ','
+          << (solution.at<Pose3>(gtsam::Symbol('x', last_key)).transformFrom(lever) - reference).norm() << ','
+          << optimizer.iterations() << ',' << online_costs.at(keys[last_key][0]) << ','
+          << prefix.error(initial) << ',' << prefix.error(solution) << ',' << norm << '\n';
+    }
+    std::cout << "Saved fixed-measurement prefix solutions; no future factors and no production poses changed.\n";
+    return;
+  }
   if (velocity_geometry == "--geometry-baseline")
   {
     std::ofstream report(output / "geometry_baseline.csv");
@@ -291,8 +311,6 @@ void auditSavedMotion(const std::filesystem::path &run, const std::filesystem::p
         c << r[8], r[9], r[10], r[9], r[11], r[12], r[10], r[12], r[13];
         covariance += c;
       }
-      if (correlated_rtk) covariance += (bias_sigmas.cwiseProduct(bias_sigmas) *
-          (-2 * std::expm1(-(keys[b][0] - keys[a][0]) / bias_time))).asDiagonal();
       const double position_variance = reference.normalized().dot(covariance * reference.normalized());
       const auto change = original.between(relative);
       report << keys[a][0] << ',' << keys[b][0] << ',' << factor->constraints().size() << ',' << cost(original) << ',' << cost(relative) << ','
@@ -424,10 +442,7 @@ void auditSavedMotion(const std::filesystem::path &run, const std::filesystem::p
       gtsam::Values initial;
       const Pose3 first(reference_seed.rotation(), reference_seed.translation() - reference_seed.rotation().rotate(lever));
       for (std::size_t i = 0; i < count; ++i)
-      {
         initial.insert(gtsam::Symbol('x', i), seed_kind ? first * raw[0].between(raw[i]) : refined[i]);
-        if (correlated_rtk) initial.insert(gtsam::Symbol('b', i), values.at<V3D>(gtsam::Symbol('b', i)));
-      }
       gtsam::LevenbergMarquardtParams params;
       params.maxIterations = 100; params.relativeErrorTol = 1e-9;
       params.linearSolverType = gtsam::NonlinearOptimizerParams::MULTIFRONTAL_QR;
@@ -605,12 +620,8 @@ void qualityAndRecovery()
   RtkFusion::Observation local;
   require(fusion.frontendReferenceAt(1005.3, state, local) ? 0 : 1, 0, "frontend uses shared quality gate");
   require((local.position - state.pos_end - lever).norm(), 1e-10, "ENU position transformed into unchanged frontend map");
-  require(fusion.estimate.size() == 2 * fusion.keyframes.size() ? 0 : 1, 0,
-          "global graph contains pose and 3D RTK error only, no duplicated IMU states");
-  for (const auto &factor : fusion.solver.getFactorsUnsafe())
-    if (const auto position = std::dynamic_pointer_cast<RtkPositionBiasFactor>(factor))
-      require(fusion.keyframes[gtsam::Symbol(position->keys()[0]).index()].has_position ? 0 : 1, 0,
-          "an unqualified RTK key has no pose-to-bias coupling");
+  require(fusion.estimate.size() == fusion.keyframes.size() ? 0 : 1, 0,
+          "global graph contains only pose states, no duplicate IMU velocity or bias states");
   const auto one = fusion.motionSigmas(1.0);
   const auto half = fusion.motionSigmas(0.5);
   gtsam::Vector6 drift;
@@ -707,14 +718,11 @@ void qualityAndRecovery()
   gtsam::NonlinearFactorGraph conditional;
   conditional.emplace_shared<NativeMotionFactor>(previous, next,
       fusion.keyframes.back().raw.between(failed.raw), fusion.motionSigmas(.5), std::sqrt(.5));
-  const gtsam::Symbol next_bias('b', fusion.keyframes.size());
-  conditional.emplace_shared<RtkPositionBiasFactor>(next, next_bias, failed.reference, lever,
+  conditional.emplace_shared<gtsam::GPSFactorArm>(next, failed.reference, lever,
       gtsam::noiseModel::Robust::Create(gtsam::noiseModel::mEstimator::Huber::Create(2.8),
           gtsam::noiseModel::Diagonal::Sigmas(V3D(.03, .03, .05))));
   gtsam::Values guess; guess.insert(next, failed.optimized);
-  guess.insert(next_bias, V3D::Zero().eval());
   auto full = fusion.estimate; full.insert(next, failed.optimized);
-  full.insert(next_bias, V3D::Zero().eval());
   const double before_initialization = conditional.error(full);
   fusion.keyframes.push_back(failed);
   fusion.initializePose(conditional, guess);
@@ -966,33 +974,6 @@ int main(int argc, char **argv)
   }
   const Pose3 a(Rot3::RzRyRx(0.12, -0.08, 1.2), Point3(-65, -280, 45));
   const Pose3 b(Rot3::RzRyRx(0.13, -0.07, 1.21), Point3(-64, -278, 44.9));
-  {
-    const V3D bias(.02, -.03, .04), arm(.904, -4.679, -1.699), sigmas(.03, .03, .05);
-    const RtkPositionBiasFactor factor(0, 1, a.transformFrom(arm) + bias, arm,
-        gtsam::noiseModel::Diagonal::Sigmas(sigmas));
-    gtsam::Matrix hp, hb;
-    require(factor.evaluateError(a, bias, &hp, &hb).norm(), 1e-12,
-        "RTK error sign is measurement = physical rear axle + correlated bias");
-    const std::function<gtsam::Vector(const Pose3 &, const V3D &)> residual =
-        [&](const Pose3 &p, const V3D &v) { return factor.evaluateError(p, v); };
-    require((hp - numericalDerivative21<gtsam::Vector, Pose3, V3D>(residual, a, bias, 1e-6)).norm(), 1e-7,
-        "biased RTK factor retains the physical lever-arm pose Jacobian");
-    require((hb - numericalDerivative22<gtsam::Vector, Pose3, V3D>(residual, a, bias, 1e-6)).norm(), 1e-7,
-        "correlated error Jacobian is ENU additive, not body-frame rotation");
-    const M3D stationary = sigmas.cwiseProduct(sigmas).asDiagonal();
-    for (double dt : {.03, .5, 30., 300.})
-    {
-      const RtkBiasEvolutionFactor process(0, 1, dt, 30, sigmas);
-      const double rho = std::exp(-dt / 30);
-      require(process.evaluateError(bias, (rho * bias).eval(), &hp, &hb).norm(), 1e-12,
-          "RTK bias mean reverts through both short keys and outages");
-      const auto noise = std::dynamic_pointer_cast<gtsam::noiseModel::Gaussian>(process.noiseModel());
-      require((rho * rho * stationary + noise->covariance() - stationary).norm(), 1e-12,
-          "RTK process variance is stationary and independent of node interval");
-      require((hp + rho * M3D::Identity()).norm() + (hb - M3D::Identity()).norm(), 1e-12,
-          "RTK bias process linear Jacobians");
-    }
-  }
   Vector6 motion_sigmas, motion_error;
   motion_sigmas << .0005, .0005, .0007, .03, .03, .02;
   {

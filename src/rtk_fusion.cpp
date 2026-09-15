@@ -3,6 +3,7 @@
 
 #include <Eigen/Eigenvalues>
 #include <gtsam/inference/Symbol.h>
+#include <gtsam/navigation/GPSFactor.h>
 #include <gtsam/nonlinear/ISAM2UpdateParams.h>
 #include <gtsam/nonlinear/LevenbergMarquardtOptimizer.h>
 #include <gtsam/slam/PriorFactor.h>
@@ -24,7 +25,6 @@ gtsam::ISAM2Params fusionSolverParameters()
   gtsam::Vector6 threshold;
   threshold << 0.0001, 0.0001, 0.0001, 0.002, 0.002, 0.002;
   thresholds['x'] = threshold;
-  thresholds['b'] = gtsam::Vector3::Constant(.002);
   params.relinearizeThreshold = thresholds;
   params.optimizationParams = gtsam::ISAM2DoglegParams();
   params.factorization = gtsam::ISAM2Params::QR;
@@ -50,9 +50,6 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   const std::pair<const char *, double *> doubles[] = {
       {"status_max_age_sec", &status_age}, {"interpolation_max_gap_sec", &interpolation_gap},
       {"horizontal_sigma_m", &horizontal_sigma}, {"vertical_sigma_m", &vertical_sigma},
-      {"bias_stationary_sigma_xy_m", &bias_horizontal_sigma},
-      {"bias_stationary_sigma_z_m", &bias_vertical_sigma},
-      {"bias_correlation_time_sec", &bias_correlation_time},
       {"maximum_horizontal_sigma_m", &max_horizontal_sigma},
       {"maximum_vertical_sigma_m", &max_vertical_sigma},
       {"covariance_scale", &covariance_scale}, {"huber_delta", &huber_delta},
@@ -125,7 +122,7 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
     throw std::runtime_error("Fusion run directory already exists");
   diagnostics.exceptions(std::ios::badbit | std::ios::failbit);
   diagnostics.open(directory / "diagnostics.csv");
-  diagnostics << "stamp,keyframes,position_factors,position_pending_attempts,planes,factors,rtk_residual_m,processing_ms,frontend_rtk_residual_m,frontend_speed_mps,reference_failure,global_aligned,prepare_ms,association_ms,solve_ms,refresh_ms,published_stamp,publish_lag_sec,latest_key_rtk_residual_m,unoptimized_tail_rtk_residual_m\n";
+  diagnostics << "stamp,keyframes,position_factors,position_pending_attempts,planes,factors,rtk_residual_m,processing_ms,frontend_rtk_residual_m,frontend_speed_mps,reference_failure,global_aligned,prepare_ms,association_ms,solve_ms,refresh_ms,published_stamp,publish_lag_sec,latest_key_rtk_residual_m,unoptimized_tail_rtk_residual_m,refinement_steps,refinement_max_translation_m,refinement_max_rotation_deg\n";
   optimization_log.exceptions(std::ios::badbit | std::ios::failbit);
   history_log.exceptions(std::ios::badbit | std::ios::failbit);
   optimization_log.open(directory / "optimization.csv");
@@ -141,7 +138,7 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   // Persist effective parameters, not a copy of a possibly unrelated YAML.
   std::ofstream settings(directory / "parameters.txt");
   settings.exceptions(std::ios::badbit | std::ios::failbit);
-  settings << "model=native_lio_global_correction; scan_geometry=native_deskew_scan_end; surface_residual=common_support_mean_squared_point_distance; motion_residual=so3_and_endpoint_position; motion_rotation_loss=component_huber; motion_translation_loss=component_huber; overlap_selection=observed_surface_covisibility; geometry_validation=observable_baseline_consistency; association_lifetime=verified_observation; rtk_error=white_plus_stationary_gauss_markov\n";
+  settings << "model=native_lio_global_correction; scan_geometry=native_deskew_scan_end; surface_residual=common_support_mean_squared_point_distance; motion_residual=so3_and_endpoint_position; motion_rotation_loss=component_huber; motion_translation_loss=component_huber; overlap_selection=observed_surface_covisibility; geometry_validation=observable_baseline_consistency; association_lifetime=verified_observation\n";
   for (const auto &name : node->list_parameters({}, 0).names)
   {
     const auto parameter = node->get_parameter(name);
@@ -286,7 +283,7 @@ void RtkFusion::initializePose(const gtsam::NonlinearFactorGraph &graph, gtsam::
   values.insert(key, current.optimized);
   for (const auto &factor : local)
     for (gtsam::Key other : factor->keys())
-      if (!values.exists(other)) values.insert(other, initial.exists(other) ? initial.at(other) : estimate.at(other));
+      if (!values.exists(other)) values.insert(other, estimate.at<gtsam::Pose3>(other));
   double cost = local.error(values);
   // Choose an initial guess by the SAME motion/RTK objective. A failed native
   // increment must not seed associations metres outside their capture range.
@@ -294,8 +291,7 @@ void RtkFusion::initializePose(const gtsam::NonlinearFactorGraph &graph, gtsam::
   // altered RTK weight is introduced; all history remains variable in iSAM2.
   const auto native = current.optimized;
   values.update(key, gtsam::Pose3(native.rotation(),
-      current.reference - values.at<gtsam::Vector3>(gtsam::Symbol('b', keyframes.size() - 1)) -
-          native.rotation().rotate(lever)));
+      current.reference - native.rotation().rotate(lever)));
   if (local.error(values) < cost) cost = local.error(values);
   else values.update(key, native);
   // Only one six-dimensional block is solved here. Other poses are held at
@@ -391,7 +387,7 @@ void RtkFusion::logOptimization(const char *phase, int iteration, double before,
     const double p95 = magnitudes[low] + (rank - low) *
         (magnitudes[std::min(low + 1, magnitudes.size() - 1)] - magnitudes[low]);
     // Unsaturated metre residuals of EXACTLY the same local representatives
-    // and normals throughout optimization of the same physical observation.
+    // and normals, even when their original graph factor has been replaced.
     // A common world rigid move changes neither the residual nor relative
     // motion. These model probes complement, not replace actual PCD checks.
     geometry_history << std::setprecision(17) << keyframes.back().stamp << ',' << phase << ','
@@ -405,7 +401,7 @@ void RtkFusion::logOptimization(const char *phase, int iteration, double before,
   for (const auto &factor : graph)
   {
     if (!factor) continue;
-    const int group = dynamic_cast<const RtkPositionBiasFactor *>(factor.get()) ? 0 :
+    const int group = dynamic_cast<const gtsam::GPSFactorArm *>(factor.get()) ? 0 :
         dynamic_cast<const NativeMotionFactor *>(factor.get()) ? 1 :
         dynamic_cast<const ScanPlaneBatchFactor *>(factor.get()) ? 2 : 3;
     costs[group] += factor->error(estimate);
@@ -1047,11 +1043,8 @@ std::size_t RtkFusion::addGeometry(std::size_t a, std::size_t b,
           gtsam::skewSymmetric(lever);
       derivative.tail<3>() = baseline.normalized().transpose() * registered.rotation().matrix();
       derivative = (derivative * units.asDiagonal()).eval();
-      const V3D stationary_sigmas(bias_horizontal_sigma, bias_horizontal_sigma, bias_vertical_sigma);
-      const M3D correlated_difference = (stationary_sigmas.cwiseProduct(stationary_sigmas) *
-          (-2 * std::expm1(-(current.stamp - anchor.stamp) / bias_correlation_time))).asDiagonal();
       double variance = reference.normalized().dot(
-          (anchor.reference_covariance + current.reference_covariance + correlated_difference) * reference.normalized());
+          (anchor.reference_covariance + current.reference_covariance) * reference.normalized());
       for (int i = 0; i < 6; ++i)
       {
         const double response = derivative.dot(spectrum.eigenvectors().col(i));
@@ -1137,13 +1130,11 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
       graph.at(0) = std::make_shared<gtsam::PriorFactor<gtsam::Pose3>>(
           gtsam::Symbol('x', 0), alignment * prior->prior(), prior->noiseModel());
       for (auto &pose : last_logged_poses) pose = alignment * pose;
-      // Biases are defined in ENU from creation; before alignment no RTK
-      // factors couple them to poses. Preserve their zero-mean process.
-      gtsam::Values values = estimate;
+      gtsam::Values values;
       for (std::size_t i = 0; i < keyframes.size(); ++i)
       {
         keyframes[i].optimized = alignment * keyframes[i].optimized;
-        values.update(gtsam::Symbol('x', i), keyframes[i].optimized);
+        values.insert(gtsam::Symbol('x', i), keyframes[i].optimized);
       }
       solver = gtsam::ISAM2(fusionSolverParameters());
       const auto rebuilt = solver.update(graph, values);
@@ -1231,24 +1222,6 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
         gtsam::Symbol('x', index - 1), key, keyframes[index - 1].raw.between(frame.raw),
         motionSigmas(frame.stamp - keyframes[index - 1].stamp),
         motion_huber_rate * std::sqrt(frame.stamp - keyframes[index - 1].stamp));
-  // One small 3D process state per key, even through an outage. Late RTK
-  // callbacks then attach to an existing state without rewiring history.
-  // A non-fixed key has NO pose-to-bias factor, so this process cannot aid LIO.
-  const gtsam::Symbol bias_key('b', index);
-  const V3D stationary_sigmas(bias_horizontal_sigma, bias_horizontal_sigma, bias_vertical_sigma);
-  if (index == 0)
-  {
-    initial.insert(bias_key, V3D::Zero().eval());
-    graph.emplace_shared<gtsam::PriorFactor<V3D>>(bias_key, V3D::Zero(),
-        gtsam::noiseModel::Diagonal::Sigmas(stationary_sigmas));
-  }
-  else
-  {
-    const double dt = frame.stamp - keyframes[index - 1].stamp;
-    const gtsam::Symbol previous('b', index - 1);
-    initial.insert(bias_key, (std::exp(-dt / bias_correlation_time) * estimate.at<V3D>(previous)).eval());
-    graph.emplace_shared<RtkBiasEvolutionFactor>(previous, bias_key, dt, bias_correlation_time, stationary_sigmas);
-  }
   // Late quality/position callbacks can fill an earlier keyframe. Never add
   // the same sample/factor twice and never extrapolate beyond the INS bracket.
   const std::size_t first_pending = index > 100 ? index - 100 : 0;
@@ -1270,7 +1243,7 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
     const auto noise = gtsam::noiseModel::Robust::Create(
         gtsam::noiseModel::mEstimator::Huber::Create(huber_delta * std::sqrt(weight)),
         gtsam::noiseModel::Gaussian::Covariance(reference.covariance));
-    graph.emplace_shared<RtkPositionBiasFactor>(gtsam::Symbol('x', i), gtsam::Symbol('b', i),
+    graph.emplace_shared<gtsam::GPSFactorArm>(gtsam::Symbol('x', i),
         reference.position, lever, noise);
     keyframes[i].reference = reference.position;
     keyframes[i].reference_covariance = reference.covariance;
@@ -1367,17 +1340,24 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
   solver.update();
   updatePoses();
   timing(key_timings[2]);
-  // Finish the current fixed graph before publishing it. Do not wait for
-  // future measurements to provide iterations for an already available fix.
-  // Bounded incremental work; no repeated whole-graph batch LM online.
+  // Refine the current fixed graph before publication, including history.
+  // A stable newest pose does NOT imply that earlier poses have converged.
+  // Keep bounded incremental work; no whole-graph batch LM on every scan.
+  std::vector<gtsam::Pose3> previous(keyframes.size());
   for (int iteration = 0; iteration < 6; ++iteration)
   {
-    const auto previous = keyframes.back().optimized;
+    for (std::size_t i = 0; i < keyframes.size(); ++i) previous[i] = keyframes[i].optimized;
     solver.update();
     updatePoses();
-    const auto change = previous.between(keyframes.back().optimized);
-    if (change.translation().norm() < .002 &&
-        gtsam::Rot3::Logmap(change.rotation()).norm() < .0001) break;
+    refinement_translation = refinement_rotation = 0;
+    for (std::size_t i = 0; i < keyframes.size(); ++i)
+    {
+      const auto change = previous[i].between(keyframes[i].optimized);
+      refinement_translation = std::max(refinement_translation, change.translation().norm());
+      refinement_rotation = std::max(refinement_rotation, gtsam::Rot3::Logmap(change.rotation()).norm());
+    }
+    refinement_steps = iteration + 1;
+    if (refinement_translation < .002 && refinement_rotation < .0001) break;
   }
   timing(key_timings[3]);
   logOptimization("online", 0, std::numeric_limits<double>::quiet_NaN(), solver.getFactorsUnsafe().error(estimate));
@@ -1431,6 +1411,8 @@ void RtkFusion::process(Frame frame)
 {
   const auto start = std::chrono::steady_clock::now();
   key_timings.fill(0);
+  refinement_steps = 0;
+  refinement_translation = refinement_rotation = 0;
   if (!frames.empty() && frame.stamp <= frames.back().stamp)
     throw std::runtime_error("Fusion frames must have strictly increasing timestamps");
   frame.count = frame.cloud->size();
@@ -1500,6 +1482,7 @@ void RtkFusion::process(Frame frame)
       << reference_failure << ',' << graph_in_enu;
   for (double duration : key_timings) diagnostics << ',' << duration;
   diagnostics << ',' << published.stamp << ',' << frame.stamp - published.stamp << ',' << residual << ',' << tail_residual;
+  diagnostics << ',' << refinement_steps << ',' << refinement_translation << ',' << refinement_rotation * 180 / M_PI;
   diagnostics << '\n';
   if (keyframe && (accepted_positions == 0 || (std::isfinite(residual) && residual > 0.10)))
     RCLCPP_WARN_THROTTLE(node->get_logger(), *node->get_clock(), 5000,
@@ -1599,21 +1582,6 @@ void RtkFusion::exportMap()
     optimization_log << ' ' << covariance(row, column);
   optimization_log << '\n';
   optimization_log.flush();
-  std::ofstream biases(directory / "rtk_bias.csv");
-  biases.exceptions(std::ios::failbit | std::ios::badbit);
-  biases << std::setprecision(17) << "# stationary_sigmas " << bias_horizontal_sigma << ' '
-         << bias_horizontal_sigma << ' ' << bias_vertical_sigma << "\n# correlation_time_sec "
-         << bias_correlation_time << "\nstamp,has_position,bx_m,by_m,bz_m,innovation_x_m,innovation_y_m,innovation_z_m\n";
-  for (std::size_t i = 0; i < keyframes.size(); ++i)
-  {
-    const auto &key = keyframes[i];
-    const V3D bias = estimate.at<V3D>(gtsam::Symbol('b', i));
-    const V3D innovation = key.has_position ? V3D(key.optimized.transformFrom(lever) + bias - key.reference) :
-        V3D::Constant(std::numeric_limits<double>::quiet_NaN());
-    biases << key.stamp << ',' << key.has_position;
-    for (const V3D &v : {bias, innovation}) for (int axis = 0; axis < 3; ++axis) biases << ',' << v(axis);
-    biases << '\n';
-  }
   std::ofstream motion(directory / "motion_residuals.csv");
   motion.exceptions(std::ios::failbit | std::ios::badbit);
   motion << "a_stamp,b_stamp,rx_deg,ry_deg,rz_deg,tx_m,ty_m,tz_m,robust_cost\n";
