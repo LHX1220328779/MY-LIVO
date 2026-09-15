@@ -705,6 +705,16 @@ void qualityAndRecovery()
       "supported slender patch is a candidate requiring independent cross-scan validation");
   require(linear.front().projector().col(2).norm(), 1e-6,
       "a vertical line candidate contains no invented axial information");
+  auto stripes = std::make_shared<PointCloudXYZI>();
+  for (int stripe = 0; stripe < 5; ++stripe) for (int sample = 0; sample < 40; ++sample)
+  {
+    PointType point;
+    point.x = .2 + .1 * sample; point.y = .3 + 2 * stripe; point.z = .5;
+    stripes->push_back(point);
+  }
+  support.cloud = stripes;
+  require(fusion.extractPlanes(support).size(), 0,
+      "separate LiDAR stripes on one measured broad plane are not physical line landmarks");
 
   // Exercise production initialization with a 25 m failed native increment.
   // The same factors select the lower-cost seed; no position clamp/new prior.
