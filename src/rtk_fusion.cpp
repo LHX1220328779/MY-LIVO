@@ -138,7 +138,7 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   // Persist effective parameters, not a copy of a possibly unrelated YAML.
   std::ofstream settings(directory / "parameters.txt");
   settings.exceptions(std::ios::badbit | std::ios::failbit);
-  settings << "model=native_lio_global_correction; scan_geometry=native_deskew_scan_end; surface_residual=common_support_mean_squared_point_distance; motion_residual=so3_and_endpoint_position; motion_rotation_loss=component_huber; motion_translation_loss=component_huber; overlap_selection=observed_surface_covisibility; geometry_validation=observable_baseline_consistency\n";
+  settings << "model=native_lio_global_correction; scan_geometry=native_deskew_scan_end; surface_residual=common_support_mean_squared_point_distance; motion_residual=so3_and_endpoint_position; motion_rotation_loss=component_huber; motion_translation_loss=component_huber; overlap_selection=observed_surface_covisibility; geometry_validation=observable_baseline_consistency; association_lifetime=verified_observation\n";
   for (const auto &name : node->list_parameters({}, 0).names)
   {
     const auto parameter = node->get_parameter(name);
@@ -466,40 +466,29 @@ void RtkFusion::logOptimization(const char *phase, int iteration, double before,
 
 void RtkFusion::finalizeOptimization()
 {
-  // iSAM2 updates have a real-time budget; they are not a convergence proof.
-  // Alternate fixed-association LM with reassociation. Costs are
-  // compared ONLY within an unchanged factor graph, never across match sets.
-  for (int outer = 0; outer <= 6; ++outer)
-  {
-    auto graph = solver.getFactorsUnsafe();
-    const double before = graph.error(estimate);
-    gtsam::LevenbergMarquardtParams parameters;
-    parameters.maxIterations = 30;
-    parameters.relativeErrorTol = 1e-7;
-    parameters.absoluteErrorTol = 1e-8;
-    parameters.linearSolverType = gtsam::NonlinearOptimizerParams::MULTIFRONTAL_QR;
-    gtsam::LevenbergMarquardtOptimizer optimizer(graph, estimate, parameters);
-    estimate = optimizer.optimize();
-    const double after = graph.error(estimate);
-    if (!std::isfinite(after) || after > before + 1e-7 * std::max(1.0, before))
-      throw std::runtime_error("Final optimizer did not preserve/decrease the fixed-graph objective");
-    // Reset the incremental linearization at the refined state. Factor slots
-    // can contain holes after rematching; remap every live geometry link.
-    solver = gtsam::ISAM2(fusionSolverParameters());
-    const auto rebuilt = solver.update(graph, estimate);
-    for (auto &link : geometry_links)
-      if (link.factor_index != std::numeric_limits<std::size_t>::max())
-        link.factor_index = rebuilt.newFactorsIndices.at(link.factor_index);
-    updatePoses();
-    logOptimization("final_fixed_graph", optimizer.iterations(), before, after);
-    // The final correspondence replacement MUST receive a fixed-graph solve.
-    // Previously the last rematch could change the objective, run just two
-    // incremental steps and export that unconverged state as the final map.
-    if (outer == 6) break;
-    if (refreshGeometry() == 0) break;
-    if (outer == 5)
-      RCLCPP_WARN(node->get_logger(), "Final associations still changing at iteration limit; geometric convergence UNVERIFIED");
-  }
+  // Measurements do not change merely because their poses are optimized.
+  // Re-cropping/reselecting patches after each 0.1 degree update changed the
+  // objective and produced a two-cycle without any new sensor observations.
+  // Keep verified correspondences and robust physical residuals; ALL poses
+  // remain free. New scans supply new measurements through optimizeKeyframe.
+  auto graph = solver.getFactorsUnsafe();
+  const double before = graph.error(estimate);
+  gtsam::LevenbergMarquardtParams parameters;
+  parameters.maxIterations = 30;
+  parameters.relativeErrorTol = 1e-7;
+  parameters.absoluteErrorTol = 1e-8;
+  parameters.linearSolverType = gtsam::NonlinearOptimizerParams::MULTIFRONTAL_QR;
+  gtsam::LevenbergMarquardtOptimizer optimizer(graph, estimate, parameters);
+  estimate = optimizer.optimize();
+  const double after = graph.error(estimate);
+  if (!std::isfinite(after) || after > before + 1e-7 * std::max(1.0, before))
+    throw std::runtime_error("Final optimizer did not preserve/decrease the fixed-graph objective");
+  solver = gtsam::ISAM2(fusionSolverParameters());
+  const auto rebuilt = solver.update(graph, estimate);
+  for (auto &link : geometry_links)
+    link.factor_index = rebuilt.newFactorsIndices.at(link.factor_index);
+  updatePoses();
+  logOptimization("final_fixed_graph", optimizer.iterations(), before, after);
   logOptimization("final", 0, solver.getFactorsUnsafe().error(estimate), solver.getFactorsUnsafe().error(estimate));
   optimization_log.flush();
   history_log.flush();
@@ -805,7 +794,7 @@ std::vector<RtkFusion::Plane> RtkFusion::extractPlanes(const Frame &frame) const
 }
 
 std::size_t RtkFusion::addGeometry(std::size_t a, std::size_t b,
-    gtsam::NonlinearFactorGraph &graph, GeometryKind kind, bool remember)
+    gtsam::NonlinearFactorGraph &graph, GeometryKind kind)
 {
   const auto &anchor = keyframes[a];
   const auto &current = keyframes[b];
@@ -1069,7 +1058,7 @@ std::size_t RtkFusion::addGeometry(std::size_t a, std::size_t b,
     }
   }
   record(true);
-  if (remember) new_links.push_back({a, b, graph.size(), relative, kind});
+  new_links.push_back({a, b, graph.size(), kind});
   graph.push_back(factor);
   return count;
 }
@@ -1351,7 +1340,6 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
   solver.update();
   updatePoses();
   timing(key_timings[2]);
-  refreshGeometry();
   // Finish the current fixed graph before publishing it. Do not wait for
   // future measurements to provide iterations for an already available fix.
   // Bounded incremental work; no repeated whole-graph batch LM online.
@@ -1389,39 +1377,6 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
     }
   }
 }
-
-std::size_t RtkFusion::refreshGeometry()
-{
-  if (frames.empty()) return 0;
-  gtsam::NonlinearFactorGraph replacements;
-  gtsam::FactorIndices removals;
-  std::vector<std::pair<std::size_t, std::size_t>> pending;
-  constexpr std::size_t absent = std::numeric_limits<std::size_t>::max();
-  for (std::size_t i = 0; i < geometry_links.size(); ++i)
-  {
-    auto &link = geometry_links[i];
-    const auto relative = keyframes[link.a].optimized.between(keyframes[link.b].optimized);
-    const auto change = link.matched_relative.between(relative);
-    if (change.translation().norm() < 0.10 &&
-        gtsam::Rot3::Logmap(change.rotation()).norm() < 0.001745329252) continue;
-    // Correspondences are not immutable measurements. Remove associations
-    // invalidated by optimization, including late GNSS and revisit updates.
-    if (link.factor_index != absent) removals.push_back(link.factor_index);
-    link.factor_index = absent;
-    link.matched_relative = relative;
-    const auto slot = replacements.size();
-    if (addGeometry(link.a, link.b, replacements, link.kind, false))
-      pending.emplace_back(i, slot);
-  }
-  if (replacements.empty() && removals.empty()) return 0;
-  const auto update = solver.update(replacements, gtsam::Values(), removals);
-  for (const auto &entry : pending)
-    geometry_links[entry.first].factor_index = update.newFactorsIndices.at(entry.second);
-  solver.update();
-  updatePoses();
-  return removals.size() + replacements.size();
-}
-
 
 gtsam::Pose3 RtkFusion::poseAt(const Frame &frame) const
 {

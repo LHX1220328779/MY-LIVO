@@ -716,7 +716,7 @@ void qualityAndRecovery()
   fusion.max_pair_factors = 24;
   index_surfaces(anchor); index_surfaces(current);
   gtsam::NonlinearFactorGraph graph;
-  require(fusion.addGeometry(0, 1, graph, RtkFusion::GeometryKind::Local, false) == 24 ? 0 : 1, 0,
+  require(fusion.addGeometry(0, 1, graph, RtkFusion::GeometryKind::Local) == 24 ? 0 : 1, 0,
           "surface association keeps a bounded geometry budget");
   const auto factor = std::dynamic_pointer_cast<ScanPlaneBatchFactor>(graph.at(0));
   std::array<int, 3> counts{};
@@ -745,7 +745,7 @@ void qualityAndRecovery()
   }
   graph.resize(0);
   index_surfaces(anchor); index_surfaces(current);
-  require(fusion.addGeometry(0, 1, graph, RtkFusion::GeometryKind::Local, false), 0,
+  require(fusion.addGeometry(0, 1, graph, RtkFusion::GeometryKind::Local), 0,
           "nearby disjoint surface footprints cannot create extrapolated constraints");
   for (std::size_t i = 0; i < current.planes.size(); ++i)
   {
@@ -753,7 +753,7 @@ void qualityAndRecovery()
         relative.rotation().unrotate(V3D((i % 2 ? -1. : 1.) * V3D::UnitZ())));
   }
   index_surfaces(current);
-  require(fusion.addGeometry(0, 1, graph, RtkFusion::GeometryKind::Local, false) == 24 ? 0 : 1, 0,
+  require(fusion.addGeometry(0, 1, graph, RtkFusion::GeometryKind::Local) == 24 ? 0 : 1, 0,
           "mutually supported planes retain real translation error");
   // Most patches share a correctable 30 cm displacement. Four parallel but
   // different surfaces cannot be made consistent by that same rigid pose.
@@ -763,7 +763,7 @@ void qualityAndRecovery()
         V3D(0, 0, i % 6 == 0 ? .9 : .3))), relative.rotation().unrotate(V3D::UnitZ())));
   index_surfaces(current);
   graph.resize(0);
-  require(fusion.addGeometry(0, 1, graph, RtkFusion::GeometryKind::Local, false) == 20 ? 0 : 1, 0,
+  require(fusion.addGeometry(0, 1, graph, RtkFusion::GeometryKind::Local) == 20 ? 0 : 1, 0,
           "common registration separates parallel wrong surfaces from coherent 30 cm drift");
   const auto verified = std::dynamic_pointer_cast<ScanPlaneBatchFactor>(graph.at(0));
   for (const auto &row : verified->constraints())

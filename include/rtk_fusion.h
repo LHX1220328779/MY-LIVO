@@ -116,7 +116,6 @@ struct RtkFusion
   struct GeometryLink
   {
     std::size_t a, b, factor_index;
-    gtsam::Pose3 matched_relative;
     GeometryKind kind;
   };
   struct GeometryProbe
@@ -213,8 +212,7 @@ struct RtkFusion
   bool fitSurface(const V3D &sum, const M3D &scatter, std::size_t count, Plane &plane) const;
   std::vector<Plane> extractPlanes(const Frame &frame) const;
   std::size_t addGeometry(std::size_t a, std::size_t b,
-      gtsam::NonlinearFactorGraph &graph, GeometryKind kind, bool remember = true);
-  std::size_t refreshGeometry();
+      gtsam::NonlinearFactorGraph &graph, GeometryKind kind);
   void updatePoses();
   void initializePose(const gtsam::NonlinearFactorGraph &graph, gtsam::Values &initial);
   gtsam::Vector6 motionSigmas(double duration) const;
