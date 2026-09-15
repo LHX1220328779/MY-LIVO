@@ -56,8 +56,7 @@ void auditSavedMotion(const std::filesystem::path &run, const std::filesystem::p
       for (std::string value; values >> value;) row.push_back(std::stod(value));
       rows.push_back(std::move(row));
     }
-    if (rows.empty() && path.filename() != "geometry_constraints.csv")
-      throw std::runtime_error("Empty audit input " + path.string());
+    if (rows.empty()) throw std::runtime_error("Empty audit input " + path.string());
     return rows;
   };
   const auto pose = [](const std::vector<double> &r) {

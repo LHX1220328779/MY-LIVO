@@ -138,7 +138,7 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   // Persist effective parameters, not a copy of a possibly unrelated YAML.
   std::ofstream settings(directory / "parameters.txt");
   settings.exceptions(std::ios::badbit | std::ios::failbit);
-  settings << "model=native_lio_global_correction; scan_geometry=native_deskew_scan_end; surface_residual=common_support_mean_squared_point_distance; motion_residual=so3_and_endpoint_position; motion_rotation_loss=component_huber; motion_translation_loss=component_huber; overlap_selection=observed_surface_covisibility; geometry_validation=observable_baseline_consistency; association_lifetime=verified_observation; finalization=common_rotation_without_geometry_counterfactual\n";
+  settings << "model=native_lio_global_correction; scan_geometry=native_deskew_scan_end; surface_residual=common_support_mean_squared_point_distance; motion_residual=so3_and_endpoint_position; motion_rotation_loss=component_huber; motion_translation_loss=component_huber; overlap_selection=observed_surface_covisibility; geometry_validation=observable_baseline_consistency; association_lifetime=verified_observation\n";
   for (const auto &name : node->list_parameters({}, 0).names)
   {
     const auto parameter = node->get_parameter(name);
@@ -466,100 +466,29 @@ void RtkFusion::logOptimization(const char *phase, int iteration, double before,
 
 void RtkFusion::finalizeOptimization()
 {
-  // Controlled full-map counterfactual, NOT an online attitude model:
-  // preserve EVERY native relative rotation, but allow ONE shared global
-  // rotation in addition to three world translations per knot. This separates
-  // uncertain initial world alignment from time-varying angular distortion.
-  // The original finite gravity/heading datum and all noise are unchanged.
-  // Second controlled ablation: omit ONLY the backend geometry observations
-  // at finalization. Native LIO geometry/deskew and RTK/motion stay unchanged.
-  gtsam::FactorIndices removed;
-  for (auto &link : geometry_links)
-    if (link.factor_index != std::numeric_limits<std::size_t>::max())
-    {
-      removed.push_back(link.factor_index);
-      link.factor_index = std::numeric_limits<std::size_t>::max();
-    }
-  solver.update(gtsam::NonlinearFactorGraph(), gtsam::Values(), removed);
-  const auto &graph = solver.getFactorsUnsafe();
-  for (std::size_t i = 0; i < keyframes.size(); ++i)
-  {
-    const auto key = gtsam::Symbol('x', i);
-    const auto rotation = (frontend_to_enu * keyframes[i].raw).rotation();
-    estimate.update(key, gtsam::Pose3(rotation, estimate.at<gtsam::Pose3>(key).translation()));
-  }
+  // Measurements do not change merely because their poses are optimized.
+  // Re-cropping/reselecting patches after each 0.1 degree update changed the
+  // objective and produced a two-cycle without any new sensor observations.
+  // Keep verified correspondences and robust physical residuals; ALL poses
+  // remain free. New scans supply new measurements through optimizeKeyframe.
+  auto graph = solver.getFactorsUnsafe();
   const double before = graph.error(estimate);
-  double cost = before;
-  const gtsam::Key rotation_key = gtsam::Symbol('r', 0);
-  std::ofstream trace(directory / "translation_refinement.csv");
-  trace.exceptions(std::ios::badbit | std::ios::failbit);
-  trace << "iteration,cost,reduced_scaled_gradient_inf,translation_step_max_m,common_rotation_step_deg\n";
-  int iteration = 0;
-  for (; iteration < 100; ++iteration)
-  {
-    const auto full = graph.linearize(estimate);
-    gtsam::GaussianFactorGraph reduced;
-    reduced.reserve(full->size());
-    for (const auto &factor : *full)
-    {
-      if (!factor) continue;
-      const auto jacobian = std::dynamic_pointer_cast<gtsam::JacobianFactor>(factor);
-      if (!jacobian) throw std::runtime_error("Translation solve requires a Jacobian factor");
-      std::vector<std::pair<gtsam::Key, gtsam::Matrix>> terms;
-      gtsam::Matrix common = gtsam::Matrix::Zero(jacobian->rows(), 3);
-      for (auto key : jacobian->keys())
-      {
-        const auto &pose = estimate.at<gtsam::Pose3>(key);
-        const auto block = jacobian->getA(jacobian->find(key));
-        // A common LEFT world rotation gives right-local dtheta=R^T*dphi
-        // for every pose. Sum, do not create one rotation variable per key.
-        common.noalias() += block.leftCols(3) * pose.rotation().matrix().transpose();
-        // Pose3 right-tangent translation = R^T * world translation.
-        terms.emplace_back(key, block.rightCols(3) *
-            pose.rotation().matrix().transpose());
-      }
-      terms.emplace_back(rotation_key, std::move(common));
-      reduced.emplace_shared<gtsam::JacobianFactor>(terms, jacobian->getb(), jacobian->get_model());
-    }
-    const auto gradient = reduced.gradientAtZero(), diagonal = reduced.hessianDiagonal();
-    double norm = 0;
-    for (const auto &entry : gradient)
-      norm = std::max(norm, (entry.second.array().abs() /
-          diagonal.at(entry.first).array().max(1e-20).sqrt()).maxCoeff());
-    const auto step = reduced.optimize(gtsam::EliminateQR);
-    double maximum = 0;
-    for (const auto &entry : step)
-    {
-      if (!entry.second.allFinite()) throw std::runtime_error("Nonfinite translation step");
-      if (entry.first != rotation_key) maximum = std::max(maximum, entry.second.norm());
-    }
-    const V3D angular = step.at(rotation_key);
-    trace << std::setprecision(17) << iteration << ',' << cost << ',' << norm << ',' << maximum
-          << ',' << angular.norm() * 180 / M_PI << '\n';
-    if (norm < 1e-5 || (maximum < 1e-7 && angular.norm() < 1e-9)) break;
-    bool accepted = false;
-    for (double scale = 1; scale >= 1. / 65536; scale *= .5)
-    {
-      auto proposal = estimate;
-      const auto rotation = gtsam::Rot3::Expmap(scale * angular);
-      for (const auto &entry : step)
-      {
-        if (entry.first == rotation_key) continue;
-        const auto &pose = estimate.at<gtsam::Pose3>(entry.first);
-        proposal.update(entry.first, gtsam::Pose3(rotation * pose.rotation(),
-            V3D(pose.translation() + scale * entry.second)));
-      }
-      const double next = graph.error(proposal);
-      if (std::isfinite(next) && next < cost)
-      { estimate = std::move(proposal); cost = next; accepted = true; break; }
-    }
-    if (!accepted) break;
-  }
-  // Do not re-run the unconstrained iSAM estimate after the reduced solve.
-  // Its factor storage remains unchanged and supplies export/diagnostics.
-  for (std::size_t i = 0; i < keyframes.size(); ++i)
-    keyframes[i].optimized = estimate.at<gtsam::Pose3>(gtsam::Symbol('x', i));
-  logOptimization("final_common_rotation", iteration, before, cost);
+  gtsam::LevenbergMarquardtParams parameters;
+  parameters.maxIterations = 30;
+  parameters.relativeErrorTol = 1e-7;
+  parameters.absoluteErrorTol = 1e-8;
+  parameters.linearSolverType = gtsam::NonlinearOptimizerParams::MULTIFRONTAL_QR;
+  gtsam::LevenbergMarquardtOptimizer optimizer(graph, estimate, parameters);
+  estimate = optimizer.optimize();
+  const double after = graph.error(estimate);
+  if (!std::isfinite(after) || after > before + 1e-7 * std::max(1.0, before))
+    throw std::runtime_error("Final optimizer did not preserve/decrease the fixed-graph objective");
+  solver = gtsam::ISAM2(fusionSolverParameters());
+  const auto rebuilt = solver.update(graph, estimate);
+  for (auto &link : geometry_links)
+    link.factor_index = rebuilt.newFactorsIndices.at(link.factor_index);
+  updatePoses();
+  logOptimization("final_fixed_graph", optimizer.iterations(), before, after);
   logOptimization("final", 0, solver.getFactorsUnsafe().error(estimate), solver.getFactorsUnsafe().error(estimate));
   optimization_log.flush();
   history_log.flush();
