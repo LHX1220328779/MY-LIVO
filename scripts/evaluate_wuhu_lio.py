@@ -222,6 +222,26 @@ def compare_trajectory(path, reference, args):
           f"{'PASS' if assessed_m > 0 and within10 >= .80 and maximum <= .20 else 'FAIL/UNASSESSED'}; "
           "requires >=80% distance within 10cm and all accepted samples within 20cm. "
           "Unassessed intervals are never counted as passing.")
+    if args.rear_axle_to_imu:
+        # RViz compares physical IMU paths, whereas GPSFactorArm observes the
+        # rear axle. Moving each estimate to the rear axle can hide a large
+        # IMU discrepancy compensated by its own erroneous attitude.
+        # Match publishReferenceTrajectory(): convert each original INS
+        # sample first, then interpolate its IMU position at the same time.
+        imu_samples = positions - Rotation.from_quat(quaternions).apply(args.imu_to_rear_axle)
+        imu_reference = imu_samples[left] * (1 - ratio[:, None]) + imu_samples[right] * ratio[:, None]
+        imu_error = trajectory[:, 1:4] - imu_reference
+        accepted = valid & quality_valid
+        print("Above budget is REAR AXLE, not the RViz IMU trajectory. "
+              "INS-derived IMU reference includes attitude/lever uncertainty; NOT independent position truth.")
+        for axis, error in [("XY", np.linalg.norm(imu_error[:, :2], axis=1)),
+                            ("Z", np.abs(imu_error[:, 2])),
+                            ("3D", np.linalg.norm(imu_error, axis=1))]:
+            print(metric_summary(f"accepted INS-derived IMU consistency {axis}", error[accepted]))
+        imu_distance, imu_within10, imu_within20 = route_budget(imu_error, imu_reference, eligible)
+        print(f"IMU-reference route consistency: assessed={imu_distance:.3f}m, "
+              f"<=10cm={imu_within10:.2%}, >20cm={1-imu_within20:.2%}; "
+              "rear-axle agreement alone is not blue-path or map acceptance.")
     closest = np.where(query - times[left] < times[right] - query, left, right)
     rotation_errors = (Rotation.from_quat(quaternions[closest]).inv() *
                        Rotation.from_quat(trajectory[:, 4:8])).magnitude()
@@ -276,6 +296,11 @@ def inspect_startup(run, reference, lever, output):
     tilt = np.degrees(np.arccos(np.clip(correction.apply(np.tile([0, 0, 1.], (len(native), 1)))[:, 2], -1, 1)))
     raw_route = route_error_components(gps, arc, raw_error)
     fused_route = route_error_components(gps, arc, fused_error)
+    imu_samples = reference[1] - Rotation.from_quat(reference[2]).apply(lever)
+    imu_reference = np.column_stack([np.interp(native[:, 0], reference[0], imu_samples[:, i]) for i in range(3)])
+    raw_imu_error, fused_imu_error = native[:, 1:4] - imu_reference, position - imu_reference
+    raw_imu_route = route_error_components(imu_reference, arc, raw_imu_error)
+    fused_imu_route = route_error_components(imu_reference, arc, fused_imu_error)
     side_valid = valid & np.isfinite(raw_route[:, 1]) & np.isfinite(fused_route[:, 1])
     opposite = raw_route[:, 1] * fused_route[:, 1] < 0
     # Also report the literal synchronized RTK--native XY segment. Alpha=0
@@ -289,11 +314,13 @@ def inspect_startup(run, reference, lever, output):
     output.mkdir(parents=True, exist_ok=True)
     data = np.column_stack((native[:, 0], arc, raw_error, fused_error,
                             position - native[:, 1:4], rotation.apply(lever) - raw_rotation.apply(lever), tilt,
-                            raw_route, fused_route, alpha, segment_distance))
+                            raw_route, fused_route, alpha, segment_distance,
+                            raw_imu_error, fused_imu_error, raw_imu_route, fused_imu_route))
     np.savetxt(output / "startup.csv", data[valid], delimiter=",", comments="", fmt="%.17g",
-               header="stamp,arc_m,lio_error_x,lio_error_y,lio_error_z,fused_error_x,fused_error_y,fused_error_z,imu_shift_x,imu_shift_y,imu_shift_z,lever_shift_x,lever_shift_y,lever_shift_z,correction_tilt_deg,lio_along_m,lio_cross_m,fused_along_m,fused_cross_m,rtk_to_lio_segment_alpha,segment_distance_xy_m")
+               header="stamp,arc_m,lio_error_x,lio_error_y,lio_error_z,fused_error_x,fused_error_y,fused_error_z,imu_shift_x,imu_shift_y,imu_shift_z,lever_shift_x,lever_shift_y,lever_shift_z,correction_tilt_deg,lio_along_m,lio_cross_m,fused_along_m,fused_cross_m,rtk_to_lio_segment_alpha,segment_distance_xy_m,lio_imu_error_x,lio_imu_error_y,lio_imu_error_z,fused_imu_error_x,fused_imu_error_y,fused_imu_error_z,lio_imu_along_m,lio_imu_cross_m,fused_imu_along_m,fused_imu_cross_m")
     lines = [f"run={run.resolve()}; first {arc[valid][-1]:.3f} reference-polyline metres; NO ALIGNMENT",
-             "LIO/RTK consistency does not determine which has better absolute accuracy or map finesse."]
+             "LIO/RTK consistency does not determine which has better absolute accuracy or map finesse.",
+             "The following errors and segment checks use the REAR AXLE; RViz paths use the IMU."]
     for label, error in [("native", raw_error), ("fused", fused_error)]:
         lines.append(f"{label} 3D error median/P95/max={np.percentile(np.linalg.norm(error[valid], axis=1), [50,95,100]).tolist()} m")
     for distance in (10, 20, 30):
@@ -307,6 +334,15 @@ def inspect_startup(run, reference, lever, output):
     lines.append(f"correction tilt min/median/max={np.percentile(tilt[valid], [0,50,100]).tolist()} deg")
     first = np.flatnonzero(valid)[0]
     lines.append(f"first fused rear error={fused_error[first].tolist()} m; IMU shift={data[first,8:11].tolist()} m; rotated lever shift={data[first,11:14].tolist()} m")
+    lines.append("RViz IMU-reference check: INS attitude/lever uncertainty included, NOT independent truth.")
+    for label, error in [("native IMU", raw_imu_error), ("fused IMU", fused_imu_error)]:
+        lines.append(f"{label} 3D difference median/P95/max={np.percentile(np.linalg.norm(error[valid], axis=1), [50,95,100]).tolist()} m")
+    for distance in (10, 20, 30):
+        selected = valid & (arc <= distance) & np.isfinite(raw_imu_route[:, 1]) & np.isfinite(fused_imu_route[:, 1])
+        if not selected.any(): continue
+        opposite_imu = raw_imu_route[:, 1] * fused_imu_route[:, 1] < 0
+        lines.append(f"first {distance} m IMU opposite route sides={np.count_nonzero(selected & opposite_imu)}/{selected.sum()} samples; "
+                     f"native/fused IMU signed cross-track median={np.median(raw_imu_route[selected,1]):.6f}/{np.median(fused_imu_route[selected,1]):.6f} m")
     (output / "startup_summary.txt").write_text("\n".join(lines) + "\n")
 
     import matplotlib
@@ -314,8 +350,8 @@ def inspect_startup(run, reference, lever, output):
     import matplotlib.pyplot as plt
     fig, panels = plt.subplots(2, 3, figsize=(16, 9))
     panels = panels.ravel()
-    for label, trajectory in [("RTK", gps), ("native LIO", raw_rear), ("fused", fused_rear)]:
-        q = trajectory[valid] - gps[first]
+    for label, trajectory in [("INS-derived IMU", imu_reference), ("native LIO IMU", native[:, 1:4]), ("fused IMU", position)]:
+        q = trajectory[valid] - imu_reference[first]
         panels[0].plot(q[:, 0], q[:, 1], label=label)
     panels[0].set_aspect("equal"); panels[0].set_xlabel("East offset (m)"); panels[0].set_ylabel("North offset (m)")
     for label, error in [("native", raw_error), ("fused", fused_error)]:
@@ -329,14 +365,14 @@ def inspect_startup(run, reference, lever, output):
         rows = history[np.abs(history["key_stamp"] - native[first, 0]) < 1e-5]
         panels[3].plot(rows["update_stamp"] - native[first, 0], rows["rtk_residual_m"], label="same first key")
     panels[3].set_xlabel("Later optimization time (s)"); panels[3].set_ylabel("Historical first-key RTK difference (m)")
-    for label, components in [("native", raw_route), ("fused", fused_route)]:
+    for label, components in [("native IMU", raw_imu_route), ("fused IMU", fused_imu_route)]:
         panels[4].plot(arc[valid], components[valid, 1], label=label)
         panels[5].plot(arc[valid], components[valid, 0], label=label)
     for panel, component in [(panels[4], "left-of-route"), (panels[5], "along-route")]:
         panel.axhline(0, color="gray", linestyle=":")
-        panel.set_xlabel("First route distance (m)"); panel.set_ylabel(f"Signed {component} error (m)")
+        panel.set_xlabel("First route distance (m)"); panel.set_ylabel(f"IMU signed {component} difference (m)")
     for panel in panels: panel.grid(alpha=.2); panel.legend()
-    fig.suptitle("Startup audit: unchanged timestamps and reference point; no trajectory clipping")
+    fig.suptitle("Startup: physical IMU paths / separate rear-axle residuals; no alignment or clipping")
     fig.tight_layout(); fig.savefig(output / "startup.png", dpi=160); plt.close(fig)
     print("\n".join(lines))
 

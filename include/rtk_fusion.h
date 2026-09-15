@@ -128,7 +128,7 @@ struct RtkFusion
   rclcpp::Node::SharedPtr node;
   M3D lidar_rotation;
   V3D lidar_translation, lever;
-  bool require_status = true, save_map = false, geometry_enabled = true;
+  bool require_status = true, save_map = false;
   double recovery_stable_interval = 0.5;
   // A non-fixed startup keeps the frontend in its original local frame.
   // A single fixed frame transform later anchors it; its voxel map never jumps.
