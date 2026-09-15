@@ -138,7 +138,7 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   // Persist effective parameters, not a copy of a possibly unrelated YAML.
   std::ofstream settings(directory / "parameters.txt");
   settings.exceptions(std::ios::badbit | std::ios::failbit);
-  settings << "model=native_lio_global_correction; scan_geometry=native_deskew_scan_end; surface_residual=common_support_mean_squared_point_distance; motion_residual=so3_and_endpoint_position; motion_rotation_loss=component_huber; motion_translation_loss=component_huber; overlap_selection=observed_surface_covisibility; geometry_validation=observable_baseline_consistency; association_lifetime=verified_observation; finalization=fixed_native_attitude_without_geometry_counterfactual\n";
+  settings << "model=native_lio_global_correction; scan_geometry=native_deskew_scan_end; surface_residual=common_support_mean_squared_point_distance; motion_residual=so3_and_endpoint_position; motion_rotation_loss=component_huber; motion_translation_loss=component_huber; overlap_selection=observed_surface_covisibility; geometry_validation=observable_baseline_consistency; association_lifetime=verified_observation; finalization=common_rotation_without_geometry_counterfactual\n";
   for (const auto &name : node->list_parameters({}, 0).names)
   {
     const auto parameter = node->get_parameter(name);
@@ -467,10 +467,10 @@ void RtkFusion::logOptimization(const char *phase, int iteration, double before,
 void RtkFusion::finalizeOptimization()
 {
   // Controlled full-map counterfactual, NOT an online attitude model:
-  // retain the exact verified observations, noise, robust losses and native
-  // deskew. Fix every orientation to native LIO in the same initial ENU
-  // frame, and solve ONLY three world-translation variables per knot.
-  // Eliminating rotation columns is exact, not a huge artificial prior.
+  // preserve EVERY native relative rotation, but allow ONE shared global
+  // rotation in addition to three world translations per knot. This separates
+  // uncertain initial world alignment from time-varying angular distortion.
+  // The original finite gravity/heading datum and all noise are unchanged.
   // Second controlled ablation: omit ONLY the backend geometry observations
   // at finalization. Native LIO geometry/deskew and RTK/motion stay unchanged.
   gtsam::FactorIndices removed;
@@ -490,9 +490,10 @@ void RtkFusion::finalizeOptimization()
   }
   const double before = graph.error(estimate);
   double cost = before;
+  const gtsam::Key rotation_key = gtsam::Symbol('r', 0);
   std::ofstream trace(directory / "translation_refinement.csv");
   trace.exceptions(std::ios::badbit | std::ios::failbit);
-  trace << "iteration,cost,translation_scaled_gradient_inf,translation_step_max_m\n";
+  trace << "iteration,cost,reduced_scaled_gradient_inf,translation_step_max_m,common_rotation_step_deg\n";
   int iteration = 0;
   for (; iteration < 100; ++iteration)
   {
@@ -505,13 +506,19 @@ void RtkFusion::finalizeOptimization()
       const auto jacobian = std::dynamic_pointer_cast<gtsam::JacobianFactor>(factor);
       if (!jacobian) throw std::runtime_error("Translation solve requires a Jacobian factor");
       std::vector<std::pair<gtsam::Key, gtsam::Matrix>> terms;
+      gtsam::Matrix common = gtsam::Matrix::Zero(jacobian->rows(), 3);
       for (auto key : jacobian->keys())
       {
         const auto &pose = estimate.at<gtsam::Pose3>(key);
+        const auto block = jacobian->getA(jacobian->find(key));
+        // A common LEFT world rotation gives right-local dtheta=R^T*dphi
+        // for every pose. Sum, do not create one rotation variable per key.
+        common.noalias() += block.leftCols(3) * pose.rotation().matrix().transpose();
         // Pose3 right-tangent translation = R^T * world translation.
-        terms.emplace_back(key, jacobian->getA(jacobian->find(key)).rightCols(3) *
+        terms.emplace_back(key, block.rightCols(3) *
             pose.rotation().matrix().transpose());
       }
+      terms.emplace_back(rotation_key, std::move(common));
       reduced.emplace_shared<gtsam::JacobianFactor>(terms, jacobian->getb(), jacobian->get_model());
     }
     const auto gradient = reduced.gradientAtZero(), diagonal = reduced.hessianDiagonal();
@@ -524,18 +531,22 @@ void RtkFusion::finalizeOptimization()
     for (const auto &entry : step)
     {
       if (!entry.second.allFinite()) throw std::runtime_error("Nonfinite translation step");
-      maximum = std::max(maximum, entry.second.norm());
+      if (entry.first != rotation_key) maximum = std::max(maximum, entry.second.norm());
     }
-    trace << std::setprecision(17) << iteration << ',' << cost << ',' << norm << ',' << maximum << '\n';
-    if (norm < 1e-5 || maximum < 1e-7) break;
+    const V3D angular = step.at(rotation_key);
+    trace << std::setprecision(17) << iteration << ',' << cost << ',' << norm << ',' << maximum
+          << ',' << angular.norm() * 180 / M_PI << '\n';
+    if (norm < 1e-5 || (maximum < 1e-7 && angular.norm() < 1e-9)) break;
     bool accepted = false;
     for (double scale = 1; scale >= 1. / 65536; scale *= .5)
     {
       auto proposal = estimate;
+      const auto rotation = gtsam::Rot3::Expmap(scale * angular);
       for (const auto &entry : step)
       {
+        if (entry.first == rotation_key) continue;
         const auto &pose = estimate.at<gtsam::Pose3>(entry.first);
-        proposal.update(entry.first, gtsam::Pose3(pose.rotation(),
+        proposal.update(entry.first, gtsam::Pose3(rotation * pose.rotation(),
             V3D(pose.translation() + scale * entry.second)));
       }
       const double next = graph.error(proposal);
@@ -548,7 +559,7 @@ void RtkFusion::finalizeOptimization()
   // Its factor storage remains unchanged and supplies export/diagnostics.
   for (std::size_t i = 0; i < keyframes.size(); ++i)
     keyframes[i].optimized = estimate.at<gtsam::Pose3>(gtsam::Symbol('x', i));
-  logOptimization("final_fixed_native_attitude", iteration, before, cost);
+  logOptimization("final_common_rotation", iteration, before, cost);
   logOptimization("final", 0, solver.getFactorsUnsafe().error(estimate), solver.getFactorsUnsafe().error(estimate));
   optimization_log.flush();
   history_log.flush();
