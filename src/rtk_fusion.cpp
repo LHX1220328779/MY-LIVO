@@ -41,6 +41,7 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   Ros2ParameterReader parameters(node);
   parameters.param<bool>("rtk/require_status", require_status, true);
   parameters.param<bool>("rtk/save_map", save_map, false);
+  parameters.param<bool>("rtk/geometry_enabled", geometry_enabled, true);
   bool frontend_position_aiding = false;
   parameters.param<bool>("rtk/frontend_position_aiding", frontend_position_aiding, false);
   if (frontend_position_aiding)
@@ -1175,8 +1176,8 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
   }
   else
     current.optimized = keyframes.back().optimized * keyframes.back().raw.between(frame.raw);
-  const bool geometry_anchor = geometry_anchors.empty() || frame.stamp -
-      keyframes[geometry_anchors.back()].stamp >= geometry_anchor_interval - 1e-6;
+  const bool geometry_anchor = geometry_enabled && (geometry_anchors.empty() || frame.stamp -
+      keyframes[geometry_anchors.back()].stamp >= geometry_anchor_interval - 1e-6);
   // Native deskew stays immutable in the physical sensor frame. Global
   // pose updates cannot silently change surfaces or repeat IMU integration.
   if (geometry_anchor)
