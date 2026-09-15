@@ -138,7 +138,7 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   // Persist effective parameters, not a copy of a possibly unrelated YAML.
   std::ofstream settings(directory / "parameters.txt");
   settings.exceptions(std::ios::badbit | std::ios::failbit);
-  settings << "model=native_lio_global_correction; scan_geometry=native_deskew_scan_end; surface_residual=common_support_mean_squared_point_distance; motion_residual=so3_and_endpoint_position; motion_rotation_loss=component_huber; motion_translation_loss=component_huber; overlap_selection=observed_surface_covisibility; geometry_validation=observable_baseline_consistency; association_lifetime=verified_observation\n";
+  settings << "model=native_lio_global_correction; scan_geometry=native_deskew_scan_end; surface_residual=common_support_mean_squared_point_distance; motion_residual=so3_and_endpoint_position; motion_rotation_loss=component_huber; motion_translation_loss=component_huber; overlap_selection=observed_surface_covisibility; geometry_validation=observable_baseline_consistency; association_lifetime=verified_observation; finalization=fixed_native_attitude_counterfactual\n";
   for (const auto &name : node->list_parameters({}, 0).names)
   {
     const auto parameter = node->get_parameter(name);
@@ -466,29 +466,79 @@ void RtkFusion::logOptimization(const char *phase, int iteration, double before,
 
 void RtkFusion::finalizeOptimization()
 {
-  // Measurements do not change merely because their poses are optimized.
-  // Re-cropping/reselecting patches after each 0.1 degree update changed the
-  // objective and produced a two-cycle without any new sensor observations.
-  // Keep verified correspondences and robust physical residuals; ALL poses
-  // remain free. New scans supply new measurements through optimizeKeyframe.
-  auto graph = solver.getFactorsUnsafe();
+  // Controlled full-map counterfactual, NOT an online attitude model:
+  // retain the exact verified observations, noise, robust losses and native
+  // deskew. Fix every orientation to native LIO in the same initial ENU
+  // frame, and solve ONLY three world-translation variables per knot.
+  // Eliminating rotation columns is exact, not a huge artificial prior.
+  const auto &graph = solver.getFactorsUnsafe();
+  for (std::size_t i = 0; i < keyframes.size(); ++i)
+  {
+    const auto key = gtsam::Symbol('x', i);
+    const auto rotation = (frontend_to_enu * keyframes[i].raw).rotation();
+    estimate.update(key, gtsam::Pose3(rotation, estimate.at<gtsam::Pose3>(key).translation()));
+  }
   const double before = graph.error(estimate);
-  gtsam::LevenbergMarquardtParams parameters;
-  parameters.maxIterations = 30;
-  parameters.relativeErrorTol = 1e-7;
-  parameters.absoluteErrorTol = 1e-8;
-  parameters.linearSolverType = gtsam::NonlinearOptimizerParams::MULTIFRONTAL_QR;
-  gtsam::LevenbergMarquardtOptimizer optimizer(graph, estimate, parameters);
-  estimate = optimizer.optimize();
-  const double after = graph.error(estimate);
-  if (!std::isfinite(after) || after > before + 1e-7 * std::max(1.0, before))
-    throw std::runtime_error("Final optimizer did not preserve/decrease the fixed-graph objective");
-  solver = gtsam::ISAM2(fusionSolverParameters());
-  const auto rebuilt = solver.update(graph, estimate);
-  for (auto &link : geometry_links)
-    link.factor_index = rebuilt.newFactorsIndices.at(link.factor_index);
-  updatePoses();
-  logOptimization("final_fixed_graph", optimizer.iterations(), before, after);
+  double cost = before;
+  std::ofstream trace(directory / "translation_refinement.csv");
+  trace.exceptions(std::ios::badbit | std::ios::failbit);
+  trace << "iteration,cost,translation_scaled_gradient_inf,translation_step_max_m\n";
+  int iteration = 0;
+  for (; iteration < 100; ++iteration)
+  {
+    const auto full = graph.linearize(estimate);
+    gtsam::GaussianFactorGraph reduced;
+    reduced.reserve(full->size());
+    for (const auto &factor : *full)
+    {
+      if (!factor) continue;
+      const auto jacobian = std::dynamic_pointer_cast<gtsam::JacobianFactor>(factor);
+      if (!jacobian) throw std::runtime_error("Translation solve requires a Jacobian factor");
+      std::vector<std::pair<gtsam::Key, gtsam::Matrix>> terms;
+      for (auto key : jacobian->keys())
+      {
+        const auto &pose = estimate.at<gtsam::Pose3>(key);
+        // Pose3 right-tangent translation = R^T * world translation.
+        terms.emplace_back(key, jacobian->getA(jacobian->find(key)).rightCols(3) *
+            pose.rotation().matrix().transpose());
+      }
+      reduced.emplace_shared<gtsam::JacobianFactor>(terms, jacobian->getb(), jacobian->get_model());
+    }
+    const auto gradient = reduced.gradientAtZero(), diagonal = reduced.hessianDiagonal();
+    double norm = 0;
+    for (const auto &entry : gradient)
+      norm = std::max(norm, (entry.second.array().abs() /
+          diagonal.at(entry.first).array().max(1e-20).sqrt()).maxCoeff());
+    const auto step = reduced.optimize(gtsam::EliminateQR);
+    double maximum = 0;
+    for (const auto &entry : step)
+    {
+      if (!entry.second.allFinite()) throw std::runtime_error("Nonfinite translation step");
+      maximum = std::max(maximum, entry.second.norm());
+    }
+    trace << std::setprecision(17) << iteration << ',' << cost << ',' << norm << ',' << maximum << '\n';
+    if (norm < 1e-5 || maximum < 1e-7) break;
+    bool accepted = false;
+    for (double scale = 1; scale >= 1. / 65536; scale *= .5)
+    {
+      auto proposal = estimate;
+      for (const auto &entry : step)
+      {
+        const auto &pose = estimate.at<gtsam::Pose3>(entry.first);
+        proposal.update(entry.first, gtsam::Pose3(pose.rotation(),
+            V3D(pose.translation() + scale * entry.second)));
+      }
+      const double next = graph.error(proposal);
+      if (std::isfinite(next) && next < cost)
+      { estimate = std::move(proposal); cost = next; accepted = true; break; }
+    }
+    if (!accepted) break;
+  }
+  // Do not re-run the unconstrained iSAM estimate after the reduced solve.
+  // Its factor storage remains unchanged and supplies export/diagnostics.
+  for (std::size_t i = 0; i < keyframes.size(); ++i)
+    keyframes[i].optimized = estimate.at<gtsam::Pose3>(gtsam::Symbol('x', i));
+  logOptimization("final_fixed_native_attitude", iteration, before, cost);
   logOptimization("final", 0, solver.getFactorsUnsafe().error(estimate), solver.getFactorsUnsafe().error(estimate));
   optimization_log.flush();
   history_log.flush();
