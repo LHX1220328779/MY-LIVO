@@ -781,21 +781,28 @@ std::vector<RtkFusion::Plane> RtkFusion::extractPlanes(const Frame &frame) const
   {
     auto &candidate = candidates[i * candidates.size() / count];
     auto &plane = candidate.first;
+    plane.support.reserve(candidate.second->indices.size());
+    for (auto index : candidate.second->indices)
+    {
+      const auto &point = frame.cloud->points[index];
+      plane.support.push_back(lidar_rotation * V3D(point.x, point.y, point.z) + lidar_translation);
+      plane.extendSupport(plane.support.back());
+    }
     if (plane.linear)
     {
       // Rank-one samples alone cannot identify a physical edge: a sparse
       // LiDAR stripe on a broad plane is also rank one. Resolve this using
       // the SAME scan's measured surrounding surface, not its world height,
       // orientation, GNSS error or points frozen from another pose.
-      const double radius = 1.5 * plane_voxel, squared_radius = radius * radius;
+      const double radius = 3 * plane_voxel, squared_radius = radius * radius;
       const V3D center = plane.center;
       const FusionVoxelKey cell{static_cast<std::int64_t>(std::floor(center.x() / plane_voxel)),
           static_cast<std::int64_t>(std::floor(center.y() / plane_voxel)),
           static_cast<std::int64_t>(std::floor(center.z() / plane_voxel))};
-      V3D sum = V3D::Zero();
-      M3D scatter = M3D::Zero();
-      std::size_t context_count = 0;
-      for (int x = -2; x <= 2; ++x) for (int y = -2; y <= 2; ++y) for (int z = -2; z <= 2; ++z)
+      std::array<V3D, 3> sums{V3D::Zero(), V3D::Zero(), V3D::Zero()};
+      std::array<M3D, 3> scatters{M3D::Zero(), M3D::Zero(), M3D::Zero()};
+      std::array<std::size_t, 3> context_counts{};
+      for (int x = -3; x <= 3; ++x) for (int y = -3; y <= 3; ++y) for (int z = -3; z <= 3; ++z)
       {
         const FusionVoxelKey neighbor{cell.x + x, cell.y + y, cell.z + z};
         const V3D minimum = plane_voxel * V3D(neighbor.x, neighbor.y, neighbor.z);
@@ -808,24 +815,35 @@ std::vector<RtkFusion::Plane> RtkFusion::extractPlanes(const Frame &frame) const
         {
           const auto &point = frame.cloud->points[index];
           const V3D p = lidar_rotation * V3D(point.x, point.y, point.z) + lidar_translation;
-          if ((p - center).squaredNorm() > squared_radius) continue;
-          sum += p; scatter.noalias() += p * p.transpose(); ++context_count;
+          const V3D delta = p - center;
+          const double distance = delta.squaredNorm(), along = plane.normal.dot(delta);
+          // Other objects beyond the observed endpoints cannot hide the
+          // sheet underlying this strip. All bounds come from actual returns.
+          if (distance > squared_radius || along < plane.support_min.x() - 1e-6 ||
+              along > plane.support_max.x() + 1e-6) continue;
+          for (int scale = 0; scale < 3; ++scale)
+            if (distance <= (scale + 1) * (scale + 1) * plane_voxel * plane_voxel)
+            {
+              sums[scale] += p; scatters[scale].noalias() += p * p.transpose(); ++context_counts[scale];
+            }
         }
       }
-      Plane context;
-      if (fitSurface(sum, scatter, context_count, context) && !context.linear &&
-          std::abs(context.normal.dot(center - context.center)) <= 2 * plane_thickness)
-        continue;
+      bool sheet = false;
+      for (int scale = 0; scale < 3 && !sheet; ++scale)
+      {
+        Plane context;
+        if (!fitSurface(sums[scale], scatters[scale], context_counts[scale], context) || context.linear) continue;
+        const double offset = context.normal.dot(center - context.center);
+        const double slope = context.normal.dot(plane.normal);
+        // A crossing plane at the midpoint is not evidence against a pole:
+        // it must explain the candidate's WHOLE measured axial interval.
+        sheet = std::max(std::abs(offset + slope * plane.support_min.x()),
+            std::abs(offset + slope * plane.support_max.x())) <= 2 * plane_thickness;
+      }
+      if (sheet) continue;
       // An unresolved narrow strip is not promoted to a new plane with a
       // fabricated second direction. Supported neighboring planes remain
       // available, and genuine slender structures retain their line factor.
-    }
-    plane.support.reserve(candidate.second->indices.size());
-    for (auto index : candidate.second->indices)
-    {
-      const auto &point = frame.cloud->points[index];
-      plane.support.push_back(lidar_rotation * V3D(point.x, point.y, point.z) + lidar_translation);
-      plane.extendSupport(plane.support.back());
     }
     planes.push_back(std::move(plane));
   }
