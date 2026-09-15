@@ -138,7 +138,7 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   // Persist effective parameters, not a copy of a possibly unrelated YAML.
   std::ofstream settings(directory / "parameters.txt");
   settings.exceptions(std::ios::badbit | std::ios::failbit);
-  settings << "model=native_lio_global_correction; scan_geometry=native_deskew_scan_end; surface_residual=common_support_mean_squared_point_distance; motion_residual=so3_and_endpoint_position; motion_rotation_loss=component_huber; motion_translation_loss=component_huber; overlap_selection=observed_surface_covisibility; geometry_validation=observable_baseline_consistency; association_lifetime=verified_observation; finalization=fixed_native_attitude_counterfactual\n";
+  settings << "model=native_lio_global_correction; scan_geometry=native_deskew_scan_end; surface_residual=common_support_mean_squared_point_distance; motion_residual=so3_and_endpoint_position; motion_rotation_loss=component_huber; motion_translation_loss=component_huber; overlap_selection=observed_surface_covisibility; geometry_validation=observable_baseline_consistency; association_lifetime=verified_observation; finalization=fixed_native_attitude_without_geometry_counterfactual\n";
   for (const auto &name : node->list_parameters({}, 0).names)
   {
     const auto parameter = node->get_parameter(name);
@@ -471,6 +471,16 @@ void RtkFusion::finalizeOptimization()
   // deskew. Fix every orientation to native LIO in the same initial ENU
   // frame, and solve ONLY three world-translation variables per knot.
   // Eliminating rotation columns is exact, not a huge artificial prior.
+  // Second controlled ablation: omit ONLY the backend geometry observations
+  // at finalization. Native LIO geometry/deskew and RTK/motion stay unchanged.
+  gtsam::FactorIndices removed;
+  for (auto &link : geometry_links)
+    if (link.factor_index != std::numeric_limits<std::size_t>::max())
+    {
+      removed.push_back(link.factor_index);
+      link.factor_index = std::numeric_limits<std::size_t>::max();
+    }
+  solver.update(gtsam::NonlinearFactorGraph(), gtsam::Values(), removed);
   const auto &graph = solver.getFactorsUnsafe();
   for (std::size_t i = 0; i < keyframes.size(); ++i)
   {
