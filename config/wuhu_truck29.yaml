@@ -81,10 +81,16 @@ laser_mapping:
       status_max_age_sec: 0.10
       recovery_stable_interval_sec: 0.5
       interpolation_max_gap_sec: 0.05
-      # TOTAL fallback sigmas for unknown/all-zero message covariance only.
-      # They are not added to a valid receiver covariance.
+      # White-noise fallback for unknown/all-zero message covariance only;
+      # not added to a valid receiver covariance. A separate, finite-variance
+      # Gauss-Markov state represents correlated error, not extra white noise.
       horizontal_sigma_m: 0.03
       vertical_sigma_m: 0.05
+      # Engineering starting model, NOT claimed receiver calibration. Actual
+      # unbiased RTK error is unobservable without independent ground truth.
+      bias_stationary_sigma_xy_m: 0.03
+      bias_stationary_sigma_z_m: 0.05
+      bias_correlation_time_sec: 30.0
       # Effective reported covariance = covariance_scale * report + model.
       # Model terms require calibration; do not silently invent lever/time
       # uncertainty or count a covariance component twice.

@@ -147,6 +147,7 @@ struct RtkFusion
   double motion_huber_rate = 1;
   double time_offset = 0, status_age = 0.1, interpolation_gap = 0.05;
   double horizontal_sigma = 0.03, vertical_sigma = 0.05, covariance_scale = 1;
+  double bias_horizontal_sigma = 0.03, bias_vertical_sigma = 0.05, bias_correlation_time = 30;
   double reported_model_sigma_xy = 0, reported_model_sigma_z = 0;
   double max_horizontal_sigma = 0.15, max_vertical_sigma = 0.25;
   double huber_delta = 2.8, key_interval = 1.0, key_min_interval = 0.5;
@@ -173,7 +174,7 @@ struct RtkFusion
   std::vector<std::size_t> geometry_anchors;
   std::array<double, 4> key_timings{};
   std::vector<GeometryLink> geometry_links, new_links;
-  // Fixed correspondences survive graph rematching. Preserve eight early
+  // Fixed physical observations. Preserve eight early
   // regions and sixteen recent regions; bounded diagnostic work per update.
   std::vector<GeometryProbe> geometry_probes;
   std::size_t next_probe_slot = 8, last_probe_key = 0;
