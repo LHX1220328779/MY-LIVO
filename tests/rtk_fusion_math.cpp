@@ -169,6 +169,9 @@ void auditSavedMotion(const std::filesystem::path &run, const std::filesystem::p
     if (r.size() >= 24)
       for (int row = 0; row < 3; ++row) for (int col = 0; col < 3; ++col)
         surface.source_sqrt(row, col) = r[15 + 3 * row + col];
+    if (r.size() >= 34)
+      for (int row = 0; row < 3; ++row) for (int col = 0; col < 3; ++col)
+        surface.target_sqrt(row, col) = r[25 + 3 * row + col];
     patches[{a,b}].push_back(std::move(surface));
   }
   for (auto &p : patches) graph.emplace_shared<ScanPlaneBatchFactor>(gtsam::Symbol('x', p.first.first),
@@ -764,6 +767,8 @@ void qualityAndRecovery()
       plane.support.push_back(center + .15 * (u * plane.tangent + v * normal.cross(plane.tangent)));
       plane.extendSupport(plane.support.back());
     }
+    plane.sqrt_covariance.col(0) = std::sqrt(.045) * plane.tangent;
+    plane.sqrt_covariance.col(1) = std::sqrt(.045) * normal.cross(plane.tangent);
     return plane;
   };
   for (int axis = 0; axis < 3; ++axis)
@@ -825,7 +830,10 @@ void qualityAndRecovery()
         V3D(0, 0, i % 6 == 0 ? .9 : .3))), relative.rotation().unrotate(V3D::UnitZ())));
   index_surfaces(current);
   graph.resize(0);
-  require(fusion.addGeometry(0, 1, graph, RtkFusion::GeometryKind::Local) == 20 ? 0 : 1, 0,
+  const auto consistent_surfaces = fusion.addGeometry(0, 1, graph, RtkFusion::GeometryKind::Local);
+  fusion.association_log.flush();
+  std::cout << "Common-support retained surface count: " << consistent_surfaces << std::endl;
+  require(consistent_surfaces == 20 ? 0 : 1, 0,
           "common registration separates parallel wrong surfaces from coherent 30 cm drift");
   const auto verified = std::dynamic_pointer_cast<ScanPlaneBatchFactor>(graph.at(0));
   for (const auto &row : verified->constraints())
@@ -1038,6 +1046,30 @@ int main(int argc, char **argv)
             "native robust correction-rate energy invariant to uneven interval splitting");
   }
   const gtsam::Vector3 normal = gtsam::Vector3(0.2, -0.3, 0.8).normalized();
+  {
+    const M3D target_extent = gtsam::Vector3(.4, .7, .02).asDiagonal();
+    const M3D source_extent = Rot3::RzRyRx(.03, -.01, .1).matrix() * target_extent;
+    const ScanPlaneBatchFactor::Constraint observed{V3D::UnitZ(), V3D(10, 3, 1), V3D(9.9, 3.1, 1.05),
+        .07, false, source_extent, target_extent};
+    const ScanPlaneBatchFactor shared(0, 1, {observed});
+    gtsam::Matrix ja, jb;
+    shared.evaluateError(a, b, &ja, &jb);
+    const std::function<gtsam::Vector(const Pose3 &, const Pose3 &)> residual =
+        [&](const Pose3 &x, const Pose3 &y) { return shared.evaluateError(x, y); };
+    require((ja - numericalDerivative21<gtsam::Vector, Pose3, Pose3>(residual, a, b, 1e-6)).norm(), 1e-5,
+        "shared-plane anchor Jacobian includes the estimated normal derivative");
+    require((jb - numericalDerivative22<gtsam::Vector, Pose3, Pose3>(residual, a, b, 1e-6)).norm(), 1e-5,
+        "shared-plane source Jacobian includes the estimated normal derivative");
+    const ScanPlaneBatchFactor::Constraint swapped{V3D::UnitZ(), observed.point, observed.center,
+        .07, false, target_extent, source_extent};
+    require(std::abs(observed.physicalResidual(a.between(b)).squaredNorm() -
+        swapped.physicalResidual(b.between(a)).squaredNorm()), 1e-10,
+        "common physical plane energy is invariant to exchanging the two scans");
+    const ScanPlaneBatchFactor::Constraint parallel{V3D::UnitZ(), V3D::Zero(), V3D(0, 0, .03),
+        .07, false, V3D(1, 1, 0).asDiagonal(), V3D(1, 1, 0).asDiagonal()};
+    require(std::abs(parallel.physicalResidual(Pose3()).norm() - .03), 1e-12,
+        "profiling the common plane preserves physical parallel-plane separation scale");
+  }
   gtsam::Matrix ha, hb;
   const Pose3 world(Rot3::RzRyRx(-0.3, 0.1, 0.5), Point3(1000, -800, 250));
   const ScanPlaneBatchFactor batch(0, 1, {

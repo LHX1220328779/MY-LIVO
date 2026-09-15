@@ -138,7 +138,7 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   // Persist effective parameters, not a copy of a possibly unrelated YAML.
   std::ofstream settings(directory / "parameters.txt");
   settings.exceptions(std::ios::badbit | std::ios::failbit);
-  settings << "model=native_lio_global_correction; scan_geometry=native_deskew_scan_end; surface_residual=common_support_mean_squared_point_distance; motion_residual=so3_and_endpoint_position; motion_rotation_loss=component_huber; motion_translation_loss=component_huber; overlap_selection=observed_surface_covisibility; geometry_validation=observable_baseline_consistency; association_lifetime=verified_observation; line_validation=single_scan_surface_context\n";
+  settings << "model=native_lio_global_correction; scan_geometry=native_deskew_scan_end; surface_residual=profiled_common_support_plane; motion_residual=so3_and_endpoint_position; motion_rotation_loss=component_huber; motion_translation_loss=component_huber; overlap_selection=observed_surface_covisibility; geometry_validation=observable_baseline_consistency; association_lifetime=verified_observation; line_validation=single_scan_surface_context\n";
   for (const auto &name : node->list_parameters({}, 0).names)
   {
     const auto parameter = node->get_parameter(name);
@@ -893,7 +893,7 @@ std::size_t RtkFusion::addGeometry(std::size_t a, std::size_t b,
   };
   const auto measurement = [&](const Match &m) {
     return ScanPlaneBatchFactor::Constraint{m.a->normal, m.a->center, m.b->center,
-        sigma(m), m.a->linear, m.b->sqrt_covariance};
+        sigma(m), m.a->linear, m.b->sqrt_covariance, m.a->sqrt_covariance};
   };
   const auto cost = [&](const gtsam::Pose3 &pose) {
     double sum = 0;
@@ -910,28 +910,17 @@ std::size_t RtkFusion::addGeometry(std::size_t a, std::size_t b,
   const auto register_matches = [&](gtsam::Pose3 &registered) {
     gtsam::Vector6 scaling;
     scaling << 1. / 30, 1. / 30, 1. / 30, 1, 1, 1;
+    std::vector<ScanPlaneBatchFactor::Constraint> rows;
+    rows.reserve(matches.size());
+    for (const auto &m : matches) rows.push_back(measurement(m));
+    const ScanPlaneBatchFactor registration(0, 1, std::move(rows));
     for (int iteration = 0; iteration < 8; ++iteration)
     {
-      gtsam::Matrix6 information = gtsam::Matrix6::Zero();
-      gtsam::Vector6 gradient = gtsam::Vector6::Zero();
-      for (const auto &m : matches)
-      {
-        const double stddev = sigma(m);
-        const auto projector = m.a->projector();
-        const Eigen::Matrix<double, 3, 4> residuals = measurement(m).physicalResidual(registered) / stddev;
-        const double weight = residuals.norm() <= 1.5 ? 1 : 1.5 / residuals.norm();
-        for (int part = 0; part < 4; ++part)
-        {
-          const V3D point = part ? V3D(registered.rotation().rotate(m.b->sqrt_covariance.col(part - 1))) :
-              registered.transformFrom(m.b->center);
-          Eigen::Matrix<double, 3, 6> jacobian;
-          jacobian.leftCols<3>() = -projector * gtsam::skewSymmetric(point);
-          jacobian.rightCols<3>() = part ? M3D::Zero().eval() : projector;
-          jacobian = (jacobian * scaling.asDiagonal() / stddev).eval();
-          information.noalias() += weight * jacobian.transpose() * jacobian;
-          gradient.noalias() += weight * jacobian.transpose() * residuals.col(part);
-        }
-      }
+      gtsam::Matrix jacobian;
+      const auto residual = registration.evaluateError(gtsam::Pose3(), registered, nullptr, &jacobian);
+      jacobian = (jacobian * scaling.asDiagonal()).eval();
+      const gtsam::Matrix6 information = jacobian.transpose() * jacobian;
+      const gtsam::Vector6 gradient = jacobian.transpose() * residual;
       Eigen::SelfAdjointEigenSolver<gtsam::Matrix6> eig(information);
       if (eig.info() != Eigen::Success) return false;
       gtsam::Vector6 step = gtsam::Vector6::Zero();
@@ -946,7 +935,7 @@ std::size_t RtkFusion::addGeometry(std::size_t a, std::size_t b,
       bool accepted = false;
       for (int trial = 0; trial < 5; ++trial)
       {
-        const auto proposal = gtsam::Pose3::Expmap(step) * registered;
+        const auto proposal = registered.retract(step);
         if (cost(proposal) <= before)
         { registered = proposal; accepted = true; break; }
         step *= .5;
@@ -1643,7 +1632,10 @@ void RtkFusion::exportMap()
   constraints << "a_stamp,b_stamp,ax,ay,az,bx,by,bz,nx,ny,nz,sigma_m,residual_m,native_residual_m,is_line";
   for (int row = 0; row < 3; ++row) for (int col = 0; col < 3; ++col)
     constraints << ",source_body_sqrt_" << row << col;
-  constraints << ",centroid_residual_m\n";
+  constraints << ",centroid_residual_m";
+  for (int row = 0; row < 3; ++row) for (int col = 0; col < 3; ++col)
+    constraints << ",target_body_sqrt_" << row << col;
+  constraints << '\n';
   for (const auto &link : geometry_links)
   {
     if (link.factor_index == std::numeric_limits<std::size_t>::max()) continue;
@@ -1662,7 +1654,7 @@ void RtkFusion::exportMap()
       constraint.normal.cwiseAbs().maxCoeff(&axis);
       if (constraint.linear) ++line_count; else ++counts[axis];
       const V3D delta = relative.transformFrom(constraint.point) - constraint.center;
-      const double signed_residual = constraint.linear ? constraint.project(delta).norm() : constraint.normal.dot(delta);
+      const double signed_residual = constraint.linear ? constraint.project(delta).norm() : constraint.planeNormal(relative).dot(delta);
       const double residual = constraint.physicalResidual(relative).norm();
       const double native_residual = constraint.physicalResidual(native_relative).norm();
       squared += residual * residual;
@@ -1682,7 +1674,10 @@ void RtkFusion::exportMap()
       constraints << ',' << constraint.sigma << ',' << residual << ',' << native_residual << ',' << constraint.linear;
       for (int row = 0; row < 3; ++row) for (int col = 0; col < 3; ++col)
         constraints << ',' << constraint.source_sqrt(row, col);
-      constraints << ',' << signed_residual << '\n';
+      constraints << ',' << signed_residual;
+      for (int row = 0; row < 3; ++row) for (int col = 0; col < 3; ++col)
+        constraints << ',' << constraint.target_sqrt(row, col);
+      constraints << '\n';
     }
     geometry << std::setprecision(17) << keyframes[link.a].stamp << ',' << keyframes[link.b].stamp << ','
         << relative.translation().norm() << ',' << factor->constraints().size();
