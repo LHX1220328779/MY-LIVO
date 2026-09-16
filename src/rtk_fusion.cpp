@@ -140,7 +140,7 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   // Persist effective parameters, not a copy of a possibly unrelated YAML.
   std::ofstream settings(directory / "parameters.txt");
   settings.exceptions(std::ios::badbit | std::ios::failbit);
-  settings << "model=native_lio_global_correction; scan_geometry=native_deskew_scan_end; surface_residual=common_support_mean_squared_point_distance; motion_residual=so3_and_endpoint_position; motion_rotation_loss=component_huber; motion_translation_loss=component_huber; overlap_selection=observed_surface_covisibility; geometry_validation=observable_baseline_consistency; association_lifetime=verified_observation\n";
+  settings << "model=native_lio_global_correction; scan_geometry=native_deskew_scan_end; surface_residual=common_support_mean_squared_point_distance; motion_residual=so3_and_endpoint_position; motion_rotation_loss=component_huber; motion_translation_loss=component_huber; motion_translation_reliability=fixed_measured_baseline_length; overlap_selection=observed_surface_covisibility; geometry_validation=observable_baseline_consistency; association_lifetime=verified_observation\n";
   for (const auto &name : node->list_parameters({}, 0).names)
   {
     const auto parameter = node->get_parameter(name);
@@ -1234,11 +1234,6 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
     graph.emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(
         key, keyframes.back().optimized, gtsam::noiseModel::Gaussian::Covariance(covariance));
   }
-  else
-    graph.emplace_shared<NativeMotionFactor>(
-        gtsam::Symbol('x', index - 1), key, keyframes[index - 1].raw.between(frame.raw),
-        motionSigmas(frame.stamp - keyframes[index - 1].stamp),
-        motion_huber_rate * std::sqrt(frame.stamp - keyframes[index - 1].stamp));
   // Late quality/position callbacks can fill an earlier keyframe. Never add
   // the same sample/factor twice and never extrapolate beyond the INS bracket.
   const std::size_t first_pending = index > 100 ? index - 100 : 0;
@@ -1268,6 +1263,39 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
     keyframes[i].has_position = true;
     keyframes[i].position_information_weight = weight;
     ++accepted_positions;
+  }
+  if (index)
+  {
+    const auto &previous = keyframes[index - 1];
+    const auto &current = keyframes[index];
+    const double duration = frame.stamp - previous.stamp;
+    const auto measured = previous.raw.between(frame.raw);
+    const auto sigmas = motionSigmas(duration);
+    double translation_weight = 1;
+    if (previous.has_position && current.has_position)
+    {
+      // Compare two measured BASELINE LENGTHS. This is independent of the
+      // unknown world yaw and of the optimized poses, unlike gating against
+      // their evolving residual. Do not use INS attitude as a measurement.
+      const V3D native = measured.transformFrom(lever) - lever;
+      const V3D reference = current.reference - previous.reference;
+      if (native.norm() > 1e-6 && reference.norm() > 1e-6)
+      {
+        Eigen::Matrix<double, 1, 6> jacobian;
+        jacobian.head<3>() = -native.normalized().transpose() * measured.rotation().matrix() *
+            gtsam::skewSymmetric(lever);
+        jacobian.tail<3>() = native.normalized().transpose() * measured.rotation().matrix();
+        const double variance = reference.normalized().dot(
+            (previous.reference_covariance + current.reference_covariance) * reference.normalized()) +
+            jacobian.cwiseAbs2().dot(sigmas.cwiseAbs2());
+        const double disagreement = native.norm() - reference.norm();
+        // Three nominal standard deviations define a conservative scale;
+        // smooth bounded influence, not a hard route/time/position cutoff.
+        translation_weight = 1 / (1 + disagreement * disagreement / (9 * variance));
+      }
+    }
+    graph.emplace_shared<NativeMotionFactor>(gtsam::Symbol('x', index - 1), key,
+        measured, sigmas, motion_huber_rate * std::sqrt(duration), translation_weight);
   }
   initializePose(graph, initial);
   timing(key_timings[0]);
@@ -1653,7 +1681,7 @@ void RtkFusion::exportMap()
   optimization_log.flush();
   std::ofstream motion(directory / "motion_residuals.csv");
   motion.exceptions(std::ios::failbit | std::ios::badbit);
-  motion << "a_stamp,b_stamp,rx_deg,ry_deg,rz_deg,tx_m,ty_m,tz_m,robust_cost\n";
+  motion << "a_stamp,b_stamp,rx_deg,ry_deg,rz_deg,tx_m,ty_m,tz_m,robust_cost,translation_weight\n";
   for (const auto &item : solver.getFactorsUnsafe())
   {
     const auto factor = std::dynamic_pointer_cast<NativeMotionFactor>(item);
@@ -1663,7 +1691,7 @@ void RtkFusion::exportMap()
     error.head<3>() *= 180 / M_PI;
     motion << std::setprecision(17) << keyframes[a].stamp << ',' << keyframes[b].stamp;
     for (double value : error) motion << ',' << value;
-    motion << ',' << factor->error(estimate) << '\n';
+    motion << ',' << factor->error(estimate) << ',' << factor->translationWeight() << '\n';
   }
   std::ofstream geometry(directory / "geometry.csv");
   geometry.exceptions(std::ios::failbit | std::ios::badbit);

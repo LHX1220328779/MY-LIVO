@@ -53,12 +53,19 @@ class NativeMotionFactor final
   gtsam::Pose3 measured_;
   gtsam::Vector6 sigmas_;
   double scale_;
+  double translation_weight_;
 public:
   NativeMotionFactor(gtsam::Key a, gtsam::Key b, const gtsam::Pose3 &measured,
-      const gtsam::Vector6 &sigmas, double scale)
+      const gtsam::Vector6 &sigmas, double scale, double translation_weight = 1)
       : gtsam::NoiseModelFactor2<gtsam::Pose3, gtsam::Pose3>(
             gtsam::noiseModel::Isotropic::Sigma(6, 1), a, b),
-        measured_(measured), sigmas_(sigmas), scale_(scale) {}
+        measured_(measured), sigmas_(sigmas), scale_(scale), translation_weight_(translation_weight)
+  {
+    if (!std::isfinite(translation_weight_) || translation_weight_ <= 0 || translation_weight_ > 1)
+      throw std::runtime_error("Invalid native displacement reliability");
+  }
+
+  double translationWeight() const { return translation_weight_; }
 
   gtsam::Vector6 physicalError(const gtsam::Pose3 &a, const gtsam::Pose3 &b) const
   {
@@ -98,6 +105,15 @@ public:
           std::sqrt(2 * scale_ * magnitude - scale_ * scale_);
       residual(i) = std::copysign(loss, value);
       derivative(i) = (quadratic ? 1.0 : scale_ / loss) / sigmas_(i);
+      // A measurement-only baseline disagreement can discredit translation
+      // without discarding the independently useful native angular increment.
+      // This weight is immutable: it cannot create a second minimum by
+      // changing with the pose residual during optimization.
+      if (i >= 3)
+      {
+        residual(i) *= std::sqrt(translation_weight_);
+        derivative(i) *= std::sqrt(translation_weight_);
+      }
     }
     if (ha) *ha = derivative.asDiagonal() * local * ja;
     if (hb) *hb = derivative.asDiagonal() * local * jb;
