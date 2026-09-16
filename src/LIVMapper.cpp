@@ -1191,28 +1191,9 @@ void LIVMapper::handleLIO()
   {
     RGBpointBodyToWorld(&feats_undistort->points[i], &current_frame_world->points[i]);
   }
-  if (img_en)
-  {
-    pcl::toROSMsg(*current_frame_world, current_frame_msg);
-  }
-  else
-  {
-    // RViz uses one RGB8 transformer for all modes. In LiDAR-only operation
-    // preserve visibility by encoding intensity as grayscale RGB; camera mode
-    // is remapped to the genuinely camera-colored /cloud_registered stream.
-    PointCloudXYZRGB display_cloud;
-    display_cloud.reserve(current_frame_world->size());
-    for (const PointType &point : *current_frame_world)
-    {
-      PointTypeRGB display;
-      display.x = point.x; display.y = point.y; display.z = point.z;
-      const auto value = static_cast<std::uint8_t>(
-          std::clamp(point.intensity, 0.0f, 255.0f));
-      display.r = value; display.g = value; display.b = value;
-      display_cloud.push_back(display);
-    }
-    pcl::toROSMsg(display_cloud, current_frame_msg);
-  }
+  // Keep physical reflectivity, including for native LIO without RTK. Camera
+  // mode displays /cloud_registered instead, which retains actual RGB.
+  pcl::toROSMsg(*current_frame_world, current_frame_msg);
   current_frame_msg.header.stamp = stampFromSec(LidarMeasures.last_lio_update_time);
   current_frame_msg.header.frame_id = lio_world_frame;
   pubCurrentFrame->publish(current_frame_msg);

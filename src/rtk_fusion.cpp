@@ -58,6 +58,7 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
       {"keyframe_interval_sec", &key_interval}, {"keyframe_min_interval_sec", &key_min_interval},
       {"position_factor_interval_sec", &position_factor_interval},
       {"geometry_anchor_interval_sec", &geometry_anchor_interval},
+      {"geometry_min_baseline_m", &geometry_min_baseline},
       {"keyframe_translation_m", &key_translation}, {"keyframe_rotation_deg", &key_rotation},
       {"plane_voxel_m", &plane_voxel}, {"plane_max_thickness_m", &plane_thickness},
       {"plane_model_sigma_m", &plane_noise_floor},
@@ -177,7 +178,7 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   RCLCPP_INFO(node->get_logger(),
       "LIO RTK geometry fusion: rear-axle lever [%.3f %.3f %.3f], nominal sigma %.3f/%.3f m, RGB map=%s, results %s",
       lever.x(), lever.y(), lever.z(), horizontal_sigma, vertical_sigma,
-      color_enabled ? "camera" : "grayscale display", directory.c_str());
+      color_enabled ? "camera" : "intensity display", directory.c_str());
   worker = std::thread([this] {
     try
     {
@@ -1321,19 +1322,20 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
       }
       ++cell_number;
     }
-    // One high-overlap edge and one long-baseline, high-overlap edge.
-    // Keep both matching work and graph degree bounded. A rejected best
-    // candidate no longer permanently hides other covisible observations.
-    for (bool long_baseline : {false, true})
     {
+      // Native LIO already supplies short-baseline motion. Do not reuse the
+      // keyframe insertion distance as a long-baseline selection scale:
+      // it previously admitted 3 m scan pairs and mostly rebuilt local LIO
+      // with a less complete surface model. Add at most one long-baseline
+      // covisible edge; actual close-position revisits remain handled above.
       std::vector<std::pair<double, std::size_t>> ranked;
       for (auto i : geometry_anchors)
       {
         if (!counts[i] || index - i <= static_cast<std::size_t>(local_neighbors)) continue;
         const double baseline = (keyframes[i].optimized.translation() - position).norm();
-        if (baseline < key_translation || std::any_of(new_links.begin(), new_links.end(),
+        if (baseline < geometry_min_baseline || std::any_of(new_links.begin(), new_links.end(),
             [i](const GeometryLink &link) { return link.a == i; })) continue;
-        ranked.emplace_back(counts[i] * (long_baseline ? baseline : 1.), i);
+        ranked.emplace_back(counts[i] * baseline, i);
       }
       std::sort(ranked.begin(), ranked.end(), [](const auto &a, const auto &b) {
         return a.first == b.first ? a.second < b.second : a.first > b.first;
@@ -1425,38 +1427,18 @@ void RtkFusion::appendCloud(const Frame &frame, pcl::PointCloud<pcl::PointXYZI> 
 
 void RtkFusion::appendDisplayCloud(const Frame &frame, PointCloudXYZRGB &output) const
 {
-  if (color_enabled)
+  if (!frame.color_cloud)
+    throw std::runtime_error("RGB frame data missing from camera-enabled RTK cache");
+  output.reserve(output.size() + frame.color_cloud->size());
+  // color_cloud is already in the native frontend world frame. Applying
+  // C(t)=X_global*X_frontend^-1 preserves the exact camera association while
+  // moving the colored surface with the same global correction as geometry.
+  const auto correction = correctionAt(frame.stamp);
+  for (const PointTypeRGB &point : *frame.color_cloud)
   {
-    if (!frame.color_cloud)
-      throw std::runtime_error("RGB frame data missing from camera-enabled RTK cache");
-    output.reserve(output.size() + frame.color_cloud->size());
-    // color_cloud is already in the native frontend world frame. Applying
-    // C(t)=X_global*X_frontend^-1 preserves the exact camera association while
-    // moving the colored surface with the same global correction as geometry.
-    const auto correction = correctionAt(frame.stamp);
-    for (const PointTypeRGB &point : *frame.color_cloud)
-    {
-      const V3D p = correction.transformFrom(V3D(point.x, point.y, point.z));
-      PointTypeRGB result = point;
-      result.x = p.x(); result.y = p.y(); result.z = p.z();
-      output.push_back(result);
-    }
-    return;
-  }
-
-  // Keep RViz on one stable RGB8 display configuration even in LIO-only mode.
-  // Without a camera, encode intensity as grayscale; saved non-camera maps
-  // remain XYZI and retain their original format.
-  pcl::PointCloud<pcl::PointXYZI> intensity;
-  appendCloud(frame, intensity);
-  output.reserve(output.size() + intensity.size());
-  for (const auto &point : intensity)
-  {
-    PointTypeRGB result;
-    result.x = point.x; result.y = point.y; result.z = point.z;
-    const auto value = static_cast<std::uint8_t>(
-        std::clamp(point.intensity, 0.0f, 255.0f));
-    result.r = value; result.g = value; result.b = value;
+    const V3D p = correction.transformFrom(V3D(point.x, point.y, point.z));
+    PointTypeRGB result = point;
+    result.x = p.x(); result.y = p.y(); result.z = p.z();
     output.push_back(result);
   }
 }
@@ -1584,10 +1566,19 @@ void RtkFusion::publishCurrent(const Frame &frame)
     odom_publisher->publish(message);
     if (current_publisher->get_subscription_count() > 0)
     {
-      PointCloudXYZRGB cloud;
-      appendDisplayCloud(frame, cloud);
       sensor_msgs::PointCloud2 current;
-      pcl::toROSMsg(cloud, current);
+      if (color_enabled)
+      {
+        PointCloudXYZRGB cloud;
+        appendDisplayCloud(frame, cloud);
+        pcl::toROSMsg(cloud, current);
+      }
+      else
+      {
+        pcl::PointCloud<pcl::PointXYZI> cloud;
+        appendCloud(frame, cloud);
+        pcl::toROSMsg(cloud, current);
+      }
       current.header = message.header;
       current_publisher->publish(current);
     }
@@ -1623,11 +1614,21 @@ void RtkFusion::publish(double stamp, bool force)
   path_publisher->publish(path);
   if (map_publisher->get_subscription_count() > 0)
   {
-    PointCloudXYZRGB cloud;
-    for (const Frame &frame : recent_frames)
-      if (frame.stamp <= stamp + 1e-6) appendDisplayCloud(frame, cloud);
     sensor_msgs::PointCloud2 message;
-    pcl::toROSMsg(cloud, message);
+    if (color_enabled)
+    {
+      PointCloudXYZRGB cloud;
+      for (const Frame &frame : recent_frames)
+        if (frame.stamp <= stamp + 1e-6) appendDisplayCloud(frame, cloud);
+      pcl::toROSMsg(cloud, message);
+    }
+    else
+    {
+      pcl::PointCloud<pcl::PointXYZI> cloud;
+      for (const Frame &frame : recent_frames)
+        if (frame.stamp <= stamp + 1e-6) appendCloud(frame, cloud);
+      pcl::toROSMsg(cloud, message);
+    }
     message.header = path.header;
     map_publisher->publish(message);
   }

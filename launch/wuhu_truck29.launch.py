@@ -1,5 +1,5 @@
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, SetEnvironmentVariable
+from launch.actions import DeclareLaunchArgument, SetEnvironmentVariable, OpaqueFunction
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
@@ -7,6 +7,32 @@ from launch_ros.parameter_descriptions import ParameterValue
 from ament_index_python.packages import get_package_share_directory
 
 import os
+import yaml
+
+
+def launch_rviz(context, config, current_cloud):
+    # Only the camera display needs a derived config. Keep the installed
+    # default usable for standalone RViz/LIO, and runtime files under results.
+    if LaunchConfiguration("use_camera").perform(context).lower() == "true":
+        with open(config, encoding="utf-8") as stream:
+            settings = yaml.safe_load(stream)
+        for display in settings["Visualization Manager"]["Displays"]:
+            if display.get("Class") == "rviz_default_plugins/PointCloud2":
+                display["Color Transformer"] = "RGB8"
+                display["Channel Name"] = "rgb"
+        output = os.path.realpath(LaunchConfiguration("output_directory").perform(context))
+        results = os.path.realpath("/home/project/MY-LIVO/results")
+        if os.path.commonpath([output, results]) != results:
+            raise ValueError("RViz runtime configuration must stay under results/")
+        os.makedirs(output, exist_ok=True)
+        config = os.path.join(output, "camera_display.rviz")
+        with open(config, "w", encoding="utf-8") as stream:
+            yaml.safe_dump(settings, stream, sort_keys=False)
+    return [Node(
+        package="rviz2", executable="rviz2", name="rviz2",
+        arguments=["-d", config],
+        remappings=[("/rtk/cloud_current", current_cloud)], output="screen",
+    )]
 
 
 def generate_launch_description():
@@ -72,14 +98,10 @@ def generate_launch_description():
         ],
     )
 
-    rviz = Node(
-        package="rviz2",
-        executable="rviz2",
-        name="rviz2",
-        arguments=["-d", rviz_config],
+    rviz = OpaqueFunction(
+        function=launch_rviz,
+        args=[rviz_config, rviz_current_cloud],
         condition=IfCondition(use_rviz),
-        remappings=[("/rtk/cloud_current", rviz_current_cloud)],
-        output="screen",
     )
 
     return LaunchDescription([
