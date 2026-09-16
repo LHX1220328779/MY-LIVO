@@ -36,6 +36,8 @@ struct RtkFusion
   {
     double stamp;
     V3D position;
+    // Display diagnostic only; includes INS attitude/lever uncertainty.
+    V3D imu_position = V3D::Constant(std::numeric_limits<double>::quiet_NaN());
     M3D covariance;
     bool position_valid = true;
     Eigen::Quaterniond orientation = Eigen::Quaterniond::Identity();
@@ -62,6 +64,7 @@ struct RtkFusion
     double frontend_speed = 0;
     V3D gravity = V3D(0, 0, -G_m_s2);
     gtsam::Matrix6 lidar_information = gtsam::Matrix6::Zero();
+    V3D reference_imu = V3D::Constant(std::numeric_limits<double>::quiet_NaN());
   };
   struct Plane
   {
@@ -168,7 +171,7 @@ struct RtkFusion
   int export_chunk_points = 1000000;
   std::vector<int> accepted_modes;
   std::filesystem::path directory;
-  std::ofstream archive, color_archive, frame_index, diagnostics, optimization_log, history_log, association_log, geometry_history;
+  std::ofstream archive, color_archive, frame_index, diagnostics, optimization_log, history_log, association_log, geometry_history, path_log;
   std::vector<gtsam::Pose3> last_logged_poses;
   mutable std::mutex mutex;
   std::condition_variable changed;

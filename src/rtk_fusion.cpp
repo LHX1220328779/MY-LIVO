@@ -124,7 +124,10 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
     throw std::runtime_error("Fusion run directory already exists");
   diagnostics.exceptions(std::ios::badbit | std::ios::failbit);
   diagnostics.open(directory / "diagnostics.csv");
-  diagnostics << "stamp,keyframes,position_factors,position_pending_attempts,planes,factors,rtk_residual_m,processing_ms,frontend_rtk_residual_m,frontend_speed_mps,reference_failure,global_aligned,prepare_ms,association_ms,solve_ms,refresh_ms,published_stamp,publish_lag_sec,latest_key_rtk_residual_m,unoptimized_tail_rtk_residual_m,refinement_steps,refinement_max_translation_m,refinement_max_rotation_deg\n";
+  diagnostics << "stamp,keyframes,position_factors,position_pending_attempts,planes,factors,rtk_residual_m,processing_ms,frontend_rtk_residual_m,frontend_speed_mps,reference_failure,global_aligned,prepare_ms,association_ms,solve_ms,refresh_ms,published_stamp,publish_lag_sec,latest_key_rtk_residual_m,unoptimized_tail_rtk_residual_m,refinement_steps,refinement_max_translation_m,refinement_max_rotation_deg,published_imu_reference_difference_m\n";
+  path_log.exceptions(std::ios::badbit | std::ios::failbit);
+  path_log.open(directory / "online_path.csv");
+  path_log << "stamp,assessed_frames,latest_imu_difference_m,max_imu_difference_m,worst_stamp,mean_imu_difference_m,over_10cm_frames,over_20cm_frames\n";
   optimization_log.exceptions(std::ios::badbit | std::ios::failbit);
   history_log.exceptions(std::ios::badbit | std::ios::failbit);
   optimization_log.open(directory / "optimization.csv");
@@ -140,7 +143,7 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   // Persist effective parameters, not a copy of a possibly unrelated YAML.
   std::ofstream settings(directory / "parameters.txt");
   settings.exceptions(std::ios::badbit | std::ios::failbit);
-  settings << "model=native_lio_global_correction; scan_geometry=native_deskew_scan_end; surface_residual=common_support_mean_squared_point_distance; motion_residual=so3_and_endpoint_position; motion_rotation_loss=native_directional_curvature; motion_translation_loss=component_huber; motion_translation_reliability=fixed_measured_baseline_length; overlap_selection=observed_surface_covisibility; geometry_validation=observable_baseline_consistency; association_lifetime=verified_observation\n";
+  settings << "model=native_lio_global_correction; scan_geometry=native_deskew_scan_end; surface_residual=common_support_mean_squared_point_distance; line_direction=profiled_dual_distribution; motion_residual=so3_and_endpoint_position; motion_rotation_loss=component_huber; motion_translation_loss=component_huber; motion_translation_reliability=fixed_measured_baseline_length; overlap_selection=observed_surface_covisibility; geometry_validation=observable_baseline_consistency; association_lifetime=verified_observation\n";
   for (const auto &name : node->list_parameters({}, 0).names)
   {
     const auto parameter = node->get_parameter(name);
@@ -533,6 +536,8 @@ void RtkFusion::observe(const nav_msgs::Odometry &message)
   sample.orientation_valid = sample.orientation.coeffs().allFinite() &&
       std::abs(sample.orientation.norm() - 1.0) < 0.01;
   if (sample.orientation_valid) sample.orientation.normalize();
+  if (sample.orientation_valid && sample.position_valid)
+    sample.imu_position = sample.position - sample.orientation * lever;
   for (int row = 0; row < 3; ++row)
     for (int column = 0; column < 3; ++column)
       sample.covariance(row, column) = message.pose.covariance[6 * row + column];
@@ -643,6 +648,8 @@ bool RtkFusion::referenceAt(double stamp, Observation &result, int *failure_reas
   const double ratio = interval < 1e-6 ? 0.0 : (stamp - before->stamp) / interval;
   result.stamp = stamp;
   result.position = (1.0 - ratio) * before->position + ratio * after->position;
+  // Match RViz: relocate each original INS sample before interpolation.
+  result.imu_position = (1.0 - ratio) * before->imu_position + ratio * after->imu_position;
   // Consecutive INS outputs are correlated; interpolation does not earn the
   // variance reduction of two independent observations.
   result.covariance = (1.0 - ratio) * before->covariance + ratio * after->covariance;
@@ -871,7 +878,8 @@ std::size_t RtkFusion::addGeometry(std::size_t a, std::size_t b,
   };
   const auto measurement = [&](const Match &m) {
     return ScanPlaneBatchFactor::Constraint{m.a->normal, m.a->center, m.b->center,
-        sigma(m), m.a->linear, m.b->sqrt_covariance};
+        sigma(m), m.a->linear, m.b->sqrt_covariance,
+        m.a->linear ? m.a->sqrt_covariance : M3D::Zero().eval()};
   };
   const auto cost = [&](const gtsam::Pose3 &pose) {
     double sum = 0;
@@ -894,9 +902,22 @@ std::size_t RtkFusion::addGeometry(std::size_t a, std::size_t b,
       gtsam::Vector6 gradient = gtsam::Vector6::Zero();
       for (const auto &m : matches)
       {
+        const auto constraint = measurement(m);
+        if (constraint.sharedLine())
+        {
+          gtsam::Matrix jacobian;
+          const ScanPlaneBatchFactor factor(0, 1, {constraint});
+          const auto residual = factor.evaluateError(gtsam::Pose3(), registered, nullptr, &jacobian);
+          // Registration uses a LEFT increment; graph Jacobians use RIGHT
+          // body increments. Preserve the existing registration convention.
+          jacobian = (jacobian * registered.inverse().AdjointMap() * scaling.asDiagonal()).eval();
+          information.noalias() += jacobian.transpose() * jacobian;
+          gradient.noalias() += jacobian.transpose() * residual;
+          continue;
+        }
         const double stddev = sigma(m);
         const auto projector = m.a->projector();
-        const Eigen::Matrix<double, 3, 4> residuals = measurement(m).physicalResidual(registered) / stddev;
+        const gtsam::Matrix residuals = constraint.physicalResidual(registered) / stddev;
         const double weight = residuals.norm() <= 1.5 ? 1 : 1.5 / residuals.norm();
         for (int part = 0; part < 4; ++part)
         {
@@ -1295,8 +1316,7 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
       }
     }
     graph.emplace_shared<NativeMotionFactor>(gtsam::Symbol('x', index - 1), key,
-        measured, sigmas, motion_huber_rate * std::sqrt(duration), translation_weight,
-        current.angular_observability);
+        measured, sigmas, motion_huber_rate * std::sqrt(duration), translation_weight);
   }
   initializePose(graph, initial);
   timing(key_timings[0]);
@@ -1480,6 +1500,11 @@ void RtkFusion::process(Frame frame)
   refinement_translation = refinement_rotation = 0;
   if (!frames.empty() && frame.stamp <= frames.back().stamp)
     throw std::runtime_error("Fusion frames must have strictly increasing timestamps");
+  Observation display_reference;
+  if (referenceAt(frame.stamp, display_reference)) frame.reference_imu = display_reference.imu_position;
+  if (!frames.empty() && !frames.back().reference_imu.allFinite() &&
+      referenceAt(frames.back().stamp, display_reference))
+    frames.back().reference_imu = display_reference.imu_position;
   frame.count = frame.cloud->size();
   frame.color_count = frame.color_cloud ? frame.color_cloud->size() : 0;
   if (save_map)
@@ -1562,6 +1587,9 @@ void RtkFusion::process(Frame frame)
   for (double duration : key_timings) diagnostics << ',' << duration;
   diagnostics << ',' << published.stamp << ',' << frame.stamp - published.stamp << ',' << residual << ',' << tail_residual;
   diagnostics << ',' << refinement_steps << ',' << refinement_translation << ',' << refinement_rotation * 180 / M_PI;
+  diagnostics << ',' << (graph_in_enu && published_reference.imu_position.allFinite() ?
+      (poseAt(published).translation() - published_reference.imu_position).norm() :
+      std::numeric_limits<double>::quiet_NaN());
   diagnostics << '\n';
   if (keyframe && (accepted_positions == 0 || (std::isfinite(residual) && residual > 0.10)))
     RCLCPP_WARN_THROTTLE(node->get_logger(), *node->get_clock(), 5000,
@@ -1626,12 +1654,22 @@ void RtkFusion::publish(double stamp, bool force)
   path.header.frame_id = graph_in_enu ? "mine" : "lio_local";
   path.header.stamp = stampFromSec(stamp);
   path.poses.reserve(frames.size());
+  std::size_t assessed = 0, over10 = 0, over20 = 0;
+  double sum = 0, maximum = -1, worst_stamp = -1;
+  double latest = std::numeric_limits<double>::quiet_NaN();
   for (const Frame &frame : frames)
   {
     if (frame.stamp > stamp + 1e-6) break;
     const auto pose = poseAt(frame);
     const auto p = pose.translation();
     const auto q = pose.rotation().toQuaternion();
+    latest = std::numeric_limits<double>::quiet_NaN();
+    if (graph_in_enu && frame.reference_imu.allFinite())
+    {
+      latest = (p - frame.reference_imu).norm();
+      ++assessed; sum += latest; over10 += latest > .10; over20 += latest > .20;
+      if (latest > maximum) { maximum = latest; worst_stamp = frame.stamp; }
+    }
     geometry_msgs::PoseStamped message;
     message.header.frame_id = path.header.frame_id;
     message.header.stamp = stampFromSec(frame.stamp);
@@ -1641,6 +1679,10 @@ void RtkFusion::publish(double stamp, bool force)
     path.poses.push_back(message);
   }
   path_publisher->publish(path);
+  path_log << std::setprecision(17) << stamp << ',' << assessed << ',' << latest << ','
+      << (assessed ? maximum : std::numeric_limits<double>::quiet_NaN()) << ',' << worst_stamp << ','
+      << (assessed ? sum / assessed : std::numeric_limits<double>::quiet_NaN()) << ',' << over10 << ',' << over20 << '\n';
+  path_log.flush();
   if (map_publisher->get_subscription_count() > 0)
   {
     sensor_msgs::PointCloud2 message;
@@ -1702,7 +1744,10 @@ void RtkFusion::exportMap()
   constraints << "a_stamp,b_stamp,ax,ay,az,bx,by,bz,nx,ny,nz,sigma_m,residual_m,native_residual_m,is_line";
   for (int row = 0; row < 3; ++row) for (int col = 0; col < 3; ++col)
     constraints << ",source_body_sqrt_" << row << col;
-  constraints << ",centroid_residual_m\n";
+  constraints << ",centroid_residual_m";
+  for (int row = 0; row < 3; ++row) for (int col = 0; col < 3; ++col)
+    constraints << ",target_body_sqrt_" << row << col;
+  constraints << '\n';
   for (const auto &link : geometry_links)
   {
     if (link.factor_index == std::numeric_limits<std::size_t>::max()) continue;
@@ -1741,7 +1786,10 @@ void RtkFusion::exportMap()
       constraints << ',' << constraint.sigma << ',' << residual << ',' << native_residual << ',' << constraint.linear;
       for (int row = 0; row < 3; ++row) for (int col = 0; col < 3; ++col)
         constraints << ',' << constraint.source_sqrt(row, col);
-      constraints << ',' << signed_residual << '\n';
+      constraints << ',' << signed_residual;
+      for (int row = 0; row < 3; ++row) for (int col = 0; col < 3; ++col)
+        constraints << ',' << constraint.target_sqrt(row, col);
+      constraints << '\n';
     }
     geometry << std::setprecision(17) << keyframes[link.a].stamp << ',' << keyframes[link.b].stamp << ','
         << relative.translation().norm() << ',' << factor->constraints().size();
