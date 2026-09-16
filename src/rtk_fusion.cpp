@@ -58,7 +58,6 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
       {"keyframe_interval_sec", &key_interval}, {"keyframe_min_interval_sec", &key_min_interval},
       {"position_factor_interval_sec", &position_factor_interval},
       {"geometry_anchor_interval_sec", &geometry_anchor_interval},
-      {"geometry_min_baseline_m", &geometry_min_baseline},
       {"keyframe_translation_m", &key_translation}, {"keyframe_rotation_deg", &key_rotation},
       {"plane_voxel_m", &plane_voxel}, {"plane_max_thickness_m", &plane_thickness},
       {"plane_model_sigma_m", &plane_noise_floor},
@@ -1322,20 +1321,19 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
       }
       ++cell_number;
     }
+    // One high-overlap edge and one long-baseline, high-overlap edge.
+    // Keep both matching work and graph degree bounded. A rejected best
+    // candidate no longer permanently hides other covisible observations.
+    for (bool long_baseline : {false, true})
     {
-      // Native LIO already supplies short-baseline motion. Do not reuse the
-      // keyframe insertion distance as a long-baseline selection scale:
-      // it previously admitted 3 m scan pairs and mostly rebuilt local LIO
-      // with a less complete surface model. Add at most one long-baseline
-      // covisible edge; actual close-position revisits remain handled above.
       std::vector<std::pair<double, std::size_t>> ranked;
       for (auto i : geometry_anchors)
       {
         if (!counts[i] || index - i <= static_cast<std::size_t>(local_neighbors)) continue;
         const double baseline = (keyframes[i].optimized.translation() - position).norm();
-        if (baseline < geometry_min_baseline || std::any_of(new_links.begin(), new_links.end(),
+        if (baseline < key_translation || std::any_of(new_links.begin(), new_links.end(),
             [i](const GeometryLink &link) { return link.a == i; })) continue;
-        ranked.emplace_back(counts[i] * baseline, i);
+        ranked.emplace_back(counts[i] * (long_baseline ? baseline : 1.), i);
       }
       std::sort(ranked.begin(), ranked.end(), [](const auto &a, const auto &b) {
         return a.first == b.first ? a.second < b.second : a.first > b.first;
