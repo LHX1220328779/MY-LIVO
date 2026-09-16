@@ -140,7 +140,7 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   // Persist effective parameters, not a copy of a possibly unrelated YAML.
   std::ofstream settings(directory / "parameters.txt");
   settings.exceptions(std::ios::badbit | std::ios::failbit);
-  settings << "model=native_lio_global_correction; scan_geometry=native_deskew_scan_end; surface_residual=common_support_mean_squared_point_distance; motion_residual=so3_and_endpoint_position; motion_rotation_loss=component_huber; motion_translation_loss=component_huber; motion_translation_reliability=fixed_measured_baseline_length; overlap_selection=observed_surface_covisibility; geometry_validation=observable_baseline_consistency; association_lifetime=verified_observation\n";
+  settings << "model=native_lio_global_correction; scan_geometry=native_deskew_scan_end; surface_residual=common_support_mean_squared_point_distance; motion_residual=so3_and_endpoint_position; motion_rotation_loss=native_directional_curvature; motion_translation_loss=component_huber; motion_translation_reliability=fixed_measured_baseline_length; overlap_selection=observed_surface_covisibility; geometry_validation=observable_baseline_consistency; association_lifetime=verified_observation\n";
   for (const auto &name : node->list_parameters({}, 0).names)
   {
     const auto parameter = node->get_parameter(name);
@@ -1295,7 +1295,8 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
       }
     }
     graph.emplace_shared<NativeMotionFactor>(gtsam::Symbol('x', index - 1), key,
-        measured, sigmas, motion_huber_rate * std::sqrt(duration), translation_weight);
+        measured, sigmas, motion_huber_rate * std::sqrt(duration), translation_weight,
+        current.angular_observability);
   }
   initializePose(graph, initial);
   timing(key_timings[0]);

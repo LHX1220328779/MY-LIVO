@@ -66,6 +66,9 @@ void auditSavedMotion(const std::filesystem::path &run, const std::filesystem::p
   const auto refined_rows = table(run / "trajectory_optimized.txt", ' ');
   const auto keys = table(run / "keyframes.csv", ',');
   const auto motion_rows = table(run / "motion_residuals.csv", ',');
+  std::ifstream settings(run / "parameters.txt");
+  std::string model; std::getline(settings, model);
+  const bool directional_motion = model.find("motion_rotation_loss=native_directional_curvature") != std::string::npos;
   const auto seed = seed_file == "-" ? std::vector<double>{0, 0, 0, 0, 0, 0, 0, 1} : table(seed_file, ' ').front();
   const V3D lever(.904, -4.679, -1.699);
   std::map<double, std::size_t> indices;
@@ -146,9 +149,12 @@ void auditSavedMotion(const std::filesystem::path &run, const std::filesystem::p
     gtsam::Vector6 sigmas;
     sigmas << .02 * M_PI / 180, .02 * M_PI / 180, .03 * M_PI / 180, .03, .03, .02;
     sigmas *= std::sqrt(dt / .5);
+    gtsam::Matrix3 angular = gtsam::Matrix3::Zero();
+    if (directional_motion)
+      for (int r = 0; r < 3; ++r) for (int c = 0; c < 3; ++c) angular(r, c) = row.at(15 + 3 * r + c);
     const auto factor = std::make_shared<NativeMotionFactor>(gtsam::Symbol('x', i - 1), gtsam::Symbol('x', i),
         raw[i - 1].between(raw[i]), sigmas, std::sqrt(dt),
-        motion_rows.at(i - 1).size() > 9 ? motion_rows.at(i - 1)[9] : 1.);
+        motion_rows.at(i - 1).size() > 9 ? motion_rows.at(i - 1)[9] : 1., angular);
     gtsam::Matrix a, b;
     const auto r = factor->evaluateError(refined[i - 1], refined[i], &a, &b);
     const double displacement_error = factor->physicalError(refined[i - 1], refined[i]).tail<3>().norm();

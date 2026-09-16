@@ -54,15 +54,25 @@ class NativeMotionFactor final
   gtsam::Vector6 sigmas_;
   double scale_;
   double translation_weight_;
+  gtsam::Matrix3 angular_basis_ = gtsam::Matrix3::Identity();
+  gtsam::Vector3 angular_strength_ = gtsam::Vector3::Zero();
 public:
   NativeMotionFactor(gtsam::Key a, gtsam::Key b, const gtsam::Pose3 &measured,
-      const gtsam::Vector6 &sigmas, double scale, double translation_weight = 1)
+      const gtsam::Vector6 &sigmas, double scale, double translation_weight = 1,
+      const gtsam::Matrix3 &angular_observability = gtsam::Matrix3::Zero())
       : gtsam::NoiseModelFactor2<gtsam::Pose3, gtsam::Pose3>(
             gtsam::noiseModel::Isotropic::Sigma(6, 1), a, b),
         measured_(measured), sigmas_(sigmas), scale_(scale), translation_weight_(translation_weight)
   {
     if (!std::isfinite(translation_weight_) || translation_weight_ <= 0 || translation_weight_ > 1)
       throw std::runtime_error("Invalid native displacement reliability");
+    if (angular_observability.squaredNorm() == 0) return;
+    const Eigen::SelfAdjointEigenSolver<gtsam::Matrix3> spectrum(angular_observability);
+    if (spectrum.info() != Eigen::Success || !spectrum.eigenvalues().allFinite() ||
+        spectrum.eigenvalues()(0) < -1e-9 || spectrum.eigenvalues()(2) > 1 + 1e-9)
+      throw std::runtime_error("Invalid native angular direction strengths");
+    angular_basis_ = spectrum.eigenvectors().transpose();
+    angular_strength_ = spectrum.eigenvalues().cwiseMax(0).cwiseMin(1);
   }
 
   double translationWeight() const { return translation_weight_; }
@@ -93,18 +103,28 @@ public:
     local.setZero();
     local.topLeftCorner<3, 3>() = rotation_derivative;
     local.bottomRightCorner<3, 3>() = difference.rotation().matrix();
+    gtsam::Matrix6 whitening = sigmas_.cwiseInverse().asDiagonal();
+    for (int i = 0; i < 3; ++i)
+      whitening.block<1, 3>(i, 0) = angular_basis_.row(i) /
+          std::sqrt(angular_basis_.row(i).cwiseAbs2().dot(sigmas_.head<3>().cwiseAbs2()));
+    const gtsam::Vector6 whitened = whitening * error;
     gtsam::Vector6 residual, derivative;
     for (int i = 0; i < 6; ++i)
     {
-      const double value = error(i) / sigmas_(i), magnitude = std::abs(value);
+      const double value = whitened(i), magnitude = std::abs(value);
       // Convex Huber in each physical component. A redescending Cauchy
       // motion prior creates a second minimum at a failed native increment,
       // even when a much better globally anchored solution exists.
       const bool quadratic = magnitude <= scale_;
-      const double loss = quadratic ? magnitude :
+      const double huber_loss = quadratic ? magnitude :
           std::sqrt(2 * scale_ * magnitude - scale_ * scale_);
+      // Retain native angular curvature in LiDAR-observed directions. This
+      // transfers relative directional strength, NOT inverse fixed-map H as
+      // an independent covariance. Weak directions keep the robust fallback.
+      const double strength = i < 3 ? angular_strength_(i) : 0;
+      const double loss = std::sqrt((1 - strength) * huber_loss * huber_loss + strength * value * value);
       residual(i) = std::copysign(loss, value);
-      derivative(i) = (quadratic ? 1.0 : scale_ / loss) / sigmas_(i);
+      derivative(i) = quadratic ? 1 : ((1 - strength) * scale_ + strength * magnitude) / loss;
       // A measurement-only baseline disagreement can discredit translation
       // without discarding the independently useful native angular increment.
       // This weight is immutable: it cannot create a second minimum by
@@ -115,8 +135,8 @@ public:
         derivative(i) *= std::sqrt(translation_weight_);
       }
     }
-    if (ha) *ha = derivative.asDiagonal() * local * ja;
-    if (hb) *hb = derivative.asDiagonal() * local * jb;
+    if (ha) *ha = derivative.asDiagonal() * whitening * local * ja;
+    if (hb) *hb = derivative.asDiagonal() * whitening * local * jb;
     return residual;
   }
 };
