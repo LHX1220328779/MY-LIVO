@@ -62,6 +62,8 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
       {"plane_voxel_m", &plane_voxel}, {"plane_max_thickness_m", &plane_thickness},
       {"plane_model_sigma_m", &plane_noise_floor},
       {"motion_huber_rate_per_sqrt_sec", &motion_huber_rate},
+      {"startup_motion_huber_rate_per_sqrt_sec", &startup_motion_huber_rate},
+      {"startup_native_motion_distance_m", &startup_native_motion_distance},
       {"revisit_radius_m", &revisit_radius}, {"revisit_min_age_sec", &revisit_age},
       {"match_max_distance_m", &match_distance}, {"publish_interval_sec", &publish_interval}};
   for (const auto &parameter : doubles)
@@ -142,7 +144,7 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   // Persist effective parameters, not a copy of a possibly unrelated YAML.
   std::ofstream settings(directory / "parameters.txt");
   settings.exceptions(std::ios::badbit | std::ios::failbit);
-  settings << "model=native_lio_global_correction; scan_geometry=native_deskew_continuous_global_correction; surface_residual=common_support_mean_squared_point_distance; motion_residual=so3_and_endpoint_position; motion_rotation_loss=component_huber; motion_translation_loss=component_huber; overlap_selection=observed_surface_covisibility; geometry_validation=observable_baseline_consistency; association_lifetime=verified_observation\n";
+  settings << "model=native_lio_global_correction; scan_geometry=native_deskew_continuous_global_correction; surface_residual=common_support_mean_squared_point_distance; motion_residual=so3_and_endpoint_position; motion_rotation_loss=component_huber; motion_translation_loss=component_huber; startup_motion=first_reference_arc_and_measured_baseline_consistency; overlap_selection=observed_surface_covisibility; geometry_validation=observable_baseline_consistency; association_lifetime=verified_observation\n";
   for (const auto &name : node->list_parameters({}, 0).names)
   {
     const auto parameter = node->get_parameter(name);
@@ -194,15 +196,16 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
                                 [this] { return stopping || !queue.empty(); }))
           {
             lock.unlock();
-            // A stopped/paused input must not leave RViz at the previous
-            // throttled snapshot, or leave its last scan only extrapolated.
-            // Do this once per tail, without repeatedly reoptimizing history.
+            // Wall-clock stalls must never alter the factor graph. Inserting
+            // a tail keyframe here bypasses the data-time keyframe interval,
+            // making graph topology depend on CPU scheduling. During an idle
+            // period publish only the newest already-solved state; finish()
+            // still forces the true final tail into the graph before export.
             if (!recent_frames.empty() && recent_frames.back().stamp > flushed_stamp)
             {
               const auto &tail = recent_frames.back();
-              if (keyframes.empty() || tail.stamp > keyframes.back().stamp + 1e-6)
-                optimizeKeyframe(tail);
-              publish(tail.stamp, true);
+              if (!keyframes.empty())
+                publish(std::min(tail.stamp, keyframes.back().stamp), true);
               flushed_stamp = tail.stamp;
             }
             continue;
@@ -1240,11 +1243,6 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
     graph.emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(
         key, keyframes.back().optimized, gtsam::noiseModel::Gaussian::Covariance(covariance));
   }
-  else
-    graph.emplace_shared<NativeMotionFactor>(
-        gtsam::Symbol('x', index - 1), key, keyframes[index - 1].raw.between(frame.raw),
-        motionSigmas(frame.stamp - keyframes[index - 1].stamp),
-        motion_huber_rate * std::sqrt(frame.stamp - keyframes[index - 1].stamp));
   // Late quality/position callbacks can fill an earlier keyframe. Never add
   // the same sample/factor twice and never extrapolate beyond the INS bracket.
   const std::size_t first_pending = index > 100 ? index - 100 : 0;
@@ -1274,6 +1272,54 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
     keyframes[i].has_position = true;
     keyframes[i].position_information_weight = weight;
     ++accepted_positions;
+  }
+  if (index)
+  {
+    const auto &previous = keyframes[index - 1];
+    const auto &current = keyframes[index];
+    const double duration = current.stamp - previous.stamp;
+    const auto measured = previous.raw.between(current.raw);
+    const auto sigmas = motionSigmas(duration);
+
+    // The user-verified startup section has dense geometry and accurate native
+    // LIO. Preserve that local shape more strongly, but only while TWO
+    // independent measured rear-axle baselines remain statistically
+    // consistent. The gate uses reference arc length, not time or world
+    // coordinates, and never re-enables later on the route.
+    double reference_arc = 0;
+    bool complete_reference_prefix = true;
+    for (std::size_t i = 1; i <= index; ++i)
+    {
+      if (!keyframes[i - 1].has_position || !keyframes[i].has_position)
+      { complete_reference_prefix = false; break; }
+      reference_arc += (keyframes[i].reference - keyframes[i - 1].reference).norm();
+    }
+    bool baseline_consistent = false;
+    if (previous.has_position && current.has_position)
+    {
+      const V3D native = measured.transformFrom(lever) - lever;
+      const V3D reference = current.reference - previous.reference;
+      if (native.norm() < .2 && reference.norm() < .2)
+        baseline_consistent = true;
+      else if (native.norm() > .2 && reference.norm() > .2)
+      {
+        Eigen::Matrix<double, 1, 6> jacobian;
+        jacobian.head<3>() = -native.normalized().transpose() * measured.rotation().matrix() *
+            gtsam::skewSymmetric(lever);
+        jacobian.tail<3>() = native.normalized().transpose() * measured.rotation().matrix();
+        const double variance = reference.normalized().dot(
+            (previous.reference_covariance + current.reference_covariance) * reference.normalized()) +
+            jacobian.cwiseAbs2().dot(sigmas.cwiseAbs2());
+        const double disagreement = native.norm() - reference.norm();
+        baseline_consistent = variance > 0 &&
+            disagreement * disagreement <= 9 * variance;
+      }
+    }
+    const bool protect_startup = complete_reference_prefix &&
+        reference_arc <= startup_native_motion_distance && baseline_consistent;
+    const double robust_rate = protect_startup ? startup_motion_huber_rate : motion_huber_rate;
+    graph.emplace_shared<NativeMotionFactor>(gtsam::Symbol('x', index - 1), key,
+        measured, sigmas, robust_rate * std::sqrt(duration));
   }
   initializePose(graph, initial);
   timing(key_timings[0]);
@@ -1687,7 +1733,7 @@ void RtkFusion::exportMap()
   optimization_log.flush();
   std::ofstream motion(directory / "motion_residuals.csv");
   motion.exceptions(std::ios::failbit | std::ios::badbit);
-  motion << "a_stamp,b_stamp,rx_deg,ry_deg,rz_deg,tx_m,ty_m,tz_m,robust_cost\n";
+  motion << "a_stamp,b_stamp,rx_deg,ry_deg,rz_deg,tx_m,ty_m,tz_m,robust_cost,huber_scale\n";
   for (const auto &item : solver.getFactorsUnsafe())
   {
     const auto factor = std::dynamic_pointer_cast<NativeMotionFactor>(item);
@@ -1697,7 +1743,7 @@ void RtkFusion::exportMap()
     error.head<3>() *= 180 / M_PI;
     motion << std::setprecision(17) << keyframes[a].stamp << ',' << keyframes[b].stamp;
     for (double value : error) motion << ',' << value;
-    motion << ',' << factor->error(estimate) << '\n';
+    motion << ',' << factor->error(estimate) << ',' << factor->robustScale() << '\n';
   }
   std::ofstream geometry(directory / "geometry.csv");
   geometry.exceptions(std::ios::failbit | std::ios::badbit);

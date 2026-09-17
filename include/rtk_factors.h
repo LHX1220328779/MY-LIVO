@@ -60,6 +60,8 @@ public:
             gtsam::noiseModel::Isotropic::Sigma(6, 1), a, b),
         measured_(measured), sigmas_(sigmas), scale_(scale) {}
 
+  double robustScale() const { return scale_; }
+
   gtsam::Vector6 physicalError(const gtsam::Pose3 &a, const gtsam::Pose3 &b) const
   {
     const auto error = measured_.inverse() * a.between(b);

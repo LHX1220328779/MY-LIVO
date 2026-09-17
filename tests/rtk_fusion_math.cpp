@@ -65,6 +65,17 @@ void auditSavedMotion(const std::filesystem::path &run, const std::filesystem::p
   const auto raw_rows = table(run / "trajectory_lio.txt", ' ');
   const auto refined_rows = table(run / "trajectory_optimized.txt", ' ');
   const auto keys = table(run / "keyframes.csv", ',');
+  bool recorded_motion_scales = false;
+  {
+    std::ifstream settings(run / "parameters.txt");
+    std::string model;
+    std::getline(settings, model);
+    recorded_motion_scales = model.find("startup_motion=first_reference_arc_and_measured_baseline_consistency") != std::string::npos;
+  }
+  const auto motion_rows = recorded_motion_scales ? table(run / "motion_residuals.csv", ',') :
+      std::vector<std::vector<double>>{};
+  if (recorded_motion_scales && motion_rows.size() + 1 != keys.size())
+    throw std::runtime_error("Recorded motion scales do not match keyframe edges");
   const auto seed = seed_file == "-" ? std::vector<double>{0, 0, 0, 0, 0, 0, 0, 1} : table(seed_file, ' ').front();
   const V3D lever(.904, -4.679, -1.699);
   std::map<double, std::size_t> indices;
@@ -145,8 +156,9 @@ void auditSavedMotion(const std::filesystem::path &run, const std::filesystem::p
     gtsam::Vector6 sigmas;
     sigmas << .02 * M_PI / 180, .02 * M_PI / 180, .03 * M_PI / 180, .03, .03, .02;
     sigmas *= std::sqrt(dt / .5);
+    const double robust_scale = recorded_motion_scales ? motion_rows.at(i - 1).at(9) : std::sqrt(dt);
     const auto factor = std::make_shared<NativeMotionFactor>(gtsam::Symbol('x', i - 1), gtsam::Symbol('x', i),
-        raw[i - 1].between(raw[i]), sigmas, std::sqrt(dt));
+        raw[i - 1].between(raw[i]), sigmas, robust_scale);
     gtsam::Matrix a, b;
     const auto r = factor->evaluateError(refined[i - 1], refined[i], &a, &b);
     const double displacement_error = factor->physicalError(refined[i - 1], refined[i]).tail<3>().norm();
