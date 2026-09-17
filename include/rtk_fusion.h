@@ -161,7 +161,6 @@ struct RtkFusion
   double huber_delta = 2.8, key_interval = 1.0, key_min_interval = 0.5;
   double position_factor_interval = 0.5;
   double geometry_anchor_interval = 0.5;
-  double geometry_min_baseline = 20;
   double key_translation = 3, key_rotation = 3;
   double plane_voxel = 2, plane_thickness = 0.05, plane_noise_floor = 0.05;
   double revisit_radius = 8, revisit_age = 15, match_distance = 1.2;

@@ -120,9 +120,6 @@ laser_mapping:
       # Long-baseline edges connect only spaced LiDAR anchors. Local scan
       # motion comes from native LIO increments, including during RTK loss.
       geometry_anchor_interval_sec: 0.49
-      # Distinct from keyframe insertion (3 m): local motion is owned by LIO.
-      # One covisible long-baseline edge per anchor; true revisits are separate.
-      geometry_min_baseline_m: 20.0
       # Fit 2 m planar patches for reliable far-range overlap; nonplanar
       # parents fall back to 1 m children. Export retains all original points.
       plane_voxel_m: 2.0

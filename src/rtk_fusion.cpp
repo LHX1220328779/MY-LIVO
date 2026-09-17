@@ -58,7 +58,6 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
       {"keyframe_interval_sec", &key_interval}, {"keyframe_min_interval_sec", &key_min_interval},
       {"position_factor_interval_sec", &position_factor_interval},
       {"geometry_anchor_interval_sec", &geometry_anchor_interval},
-      {"geometry_min_baseline_m", &geometry_min_baseline},
       {"keyframe_translation_m", &key_translation}, {"keyframe_rotation_deg", &key_rotation},
       {"plane_voxel_m", &plane_voxel}, {"plane_max_thickness_m", &plane_thickness},
       {"plane_model_sigma_m", &plane_noise_floor},
@@ -143,7 +142,7 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   // Persist effective parameters, not a copy of a possibly unrelated YAML.
   std::ofstream settings(directory / "parameters.txt");
   settings.exceptions(std::ios::badbit | std::ios::failbit);
-  settings << "model=native_lio_global_correction; scan_geometry=native_deskew_scan_end; surface_residual=common_support_mean_squared_point_distance; line_direction=profiled_dual_distribution; motion_residual=so3_and_endpoint_position; motion_rotation_loss=component_huber; motion_translation_loss=component_huber; motion_translation_reliability=fixed_measured_baseline_length; overlap_selection=observed_surface_covisibility; geometry_validation=observable_baseline_consistency; association_lifetime=verified_observation\n";
+  settings << "model=native_lio_global_correction; scan_geometry=native_deskew_continuous_global_correction; surface_residual=common_support_mean_squared_point_distance; motion_residual=so3_and_endpoint_position; motion_rotation_loss=baseline_gated_native_directional_curvature; motion_translation_loss=component_huber; overlap_selection=observed_surface_covisibility; geometry_validation=observable_baseline_consistency; association_lifetime=verified_observation\n";
   for (const auto &name : node->list_parameters({}, 0).names)
   {
     const auto parameter = node->get_parameter(name);
@@ -878,8 +877,7 @@ std::size_t RtkFusion::addGeometry(std::size_t a, std::size_t b,
   };
   const auto measurement = [&](const Match &m) {
     return ScanPlaneBatchFactor::Constraint{m.a->normal, m.a->center, m.b->center,
-        sigma(m), m.a->linear, m.b->sqrt_covariance,
-        m.a->linear ? m.a->sqrt_covariance : M3D::Zero().eval()};
+        sigma(m), m.a->linear, m.b->sqrt_covariance};
   };
   const auto cost = [&](const gtsam::Pose3 &pose) {
     double sum = 0;
@@ -902,22 +900,9 @@ std::size_t RtkFusion::addGeometry(std::size_t a, std::size_t b,
       gtsam::Vector6 gradient = gtsam::Vector6::Zero();
       for (const auto &m : matches)
       {
-        const auto constraint = measurement(m);
-        if (constraint.sharedLine())
-        {
-          gtsam::Matrix jacobian;
-          const ScanPlaneBatchFactor factor(0, 1, {constraint});
-          const auto residual = factor.evaluateError(gtsam::Pose3(), registered, nullptr, &jacobian);
-          // Registration uses a LEFT increment; graph Jacobians use RIGHT
-          // body increments. Preserve the existing registration convention.
-          jacobian = (jacobian * registered.inverse().AdjointMap() * scaling.asDiagonal()).eval();
-          information.noalias() += jacobian.transpose() * jacobian;
-          gradient.noalias() += jacobian.transpose() * residual;
-          continue;
-        }
         const double stddev = sigma(m);
         const auto projector = m.a->projector();
-        const gtsam::Matrix residuals = constraint.physicalResidual(registered) / stddev;
+        const Eigen::Matrix<double, 3, 4> residuals = measurement(m).physicalResidual(registered) / stddev;
         const double weight = residuals.norm() <= 1.5 ? 1 : 1.5 / residuals.norm();
         for (int part = 0; part < 4; ++part)
         {
@@ -1292,15 +1277,16 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
     const double duration = frame.stamp - previous.stamp;
     const auto measured = previous.raw.between(frame.raw);
     const auto sigmas = motionSigmas(duration);
-    double translation_weight = 1;
+    double angular_reliability = 0;
     if (previous.has_position && current.has_position)
     {
-      // Compare two measured BASELINE LENGTHS. This is independent of the
-      // unknown world yaw and of the optimized poses, unlike gating against
-      // their evolving residual. Do not use INS attitude as a measurement.
+      // The native angular increment is trusted more only when TWO independent
+      // measured baseline lengths agree. This gate is world-yaw invariant and
+      // never imports INS attitude. A bad native displacement therefore also
+      // prevents its coupled attitude from being made artificially rigid.
       const V3D native = measured.transformFrom(lever) - lever;
       const V3D reference = current.reference - previous.reference;
-      if (native.norm() > 1e-6 && reference.norm() > 1e-6)
+      if (native.norm() > .2 && reference.norm() > .2)
       {
         Eigen::Matrix<double, 1, 6> jacobian;
         jacobian.head<3>() = -native.normalized().transpose() * measured.rotation().matrix() *
@@ -1310,13 +1296,18 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
             (previous.reference_covariance + current.reference_covariance) * reference.normalized()) +
             jacobian.cwiseAbs2().dot(sigmas.cwiseAbs2());
         const double disagreement = native.norm() - reference.norm();
-        // Three nominal standard deviations define a conservative scale;
-        // smooth bounded influence, not a hard route/time/position cutoff.
-        translation_weight = 1 / (1 + disagreement * disagreement / (9 * variance));
+        // Three nominal standard deviations define a smooth reliability scale.
+        // At the accurate startup this is near one; the measured 0.4--0.7 m
+        // baseline mismatch in the thick-ground section drives it near zero.
+        angular_reliability = 1 / (1 + disagreement * disagreement /
+            std::max(1e-12, 9 * variance));
       }
     }
+    const gtsam::Matrix3 angular_observability =
+        .5 * (previous.angular_observability + current.angular_observability);
     graph.emplace_shared<NativeMotionFactor>(gtsam::Symbol('x', index - 1), key,
-        measured, sigmas, motion_huber_rate * std::sqrt(duration), translation_weight);
+        measured, sigmas, motion_huber_rate * std::sqrt(duration),
+        angular_observability, angular_reliability);
   }
   initializePose(graph, initial);
   timing(key_timings[0]);
@@ -1371,20 +1362,19 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
       }
       ++cell_number;
     }
+    // Restore the last stable geometry policy: one best-overlap edge and one
+    // long-baseline overlap edge. The later 20 m-only policy removed useful
+    // observable constraints and was rejected by full-run map/trajectory data.
+    for (bool long_baseline : {false, true})
     {
-      // Native LIO already supplies short-baseline motion. Do not reuse the
-      // keyframe insertion distance as a long-baseline selection scale:
-      // it previously admitted 3 m scan pairs and mostly rebuilt local LIO
-      // with a less complete surface model. Add at most one long-baseline
-      // covisible edge; actual close-position revisits remain handled above.
       std::vector<std::pair<double, std::size_t>> ranked;
       for (auto i : geometry_anchors)
       {
         if (!counts[i] || index - i <= static_cast<std::size_t>(local_neighbors)) continue;
         const double baseline = (keyframes[i].optimized.translation() - position).norm();
-        if (baseline < geometry_min_baseline || std::any_of(new_links.begin(), new_links.end(),
+        if (baseline < key_translation || std::any_of(new_links.begin(), new_links.end(),
             [i](const GeometryLink &link) { return link.a == i; })) continue;
-        ranked.emplace_back(counts[i] * baseline, i);
+        ranked.emplace_back(counts[i] * (long_baseline ? baseline : 1.), i);
       }
       std::sort(ranked.begin(), ranked.end(), [](const auto &a, const auto &b) {
         return a.first == b.first ? a.second < b.second : a.first > b.first;
@@ -1460,14 +1450,21 @@ gtsam::Pose3 RtkFusion::poseAt(const Frame &frame) const
 void RtkFusion::appendCloud(const Frame &frame, pcl::PointCloud<pcl::PointXYZI> &output) const
 {
   output.reserve(output.size() + frame.cloud->size());
-  const auto pose = poseAt(frame);
-  const M3D rotation = pose.rotation().matrix() * lidar_rotation;
-  const V3D translation = pose.transformFrom(lidar_translation);
-  // Each native deskewed scan receives exactly ONE rigid transform. All
-  // chunks/publications use the same correction knots and frame-end pose.
+  const M3D native_rotation = frame.raw.rotation().matrix() * lidar_rotation;
+  const V3D native_translation = frame.raw.transformFrom(lidar_translation);
+  // FAST-LIVO has already deskewed every return rigidly to frame.stamp. Thus
+  // frame.raw*T_BL*p_undistorted is the same native-world surface that the raw
+  // return occupied at its own acquisition time. Apply only the LOW-FREQUENCY
+  // global correction at that point time; do not run a second IMU deskewer.
   for (const PointType &point : *frame.cloud)
   {
-    const V3D p = rotation * V3D(point.x, point.y, point.z) + translation;
+    double point_stamp = frame.begin + point.curvature / 1000.0;
+    if (!std::isfinite(point_stamp) || point_stamp < frame.begin - 1e-3 ||
+        point_stamp > frame.stamp + 1e-3)
+      throw std::runtime_error("Archived LiDAR point timestamp is outside its submitted frame interval");
+    point_stamp = std::max(frame.begin, std::min(frame.stamp, point_stamp));
+    const V3D native = native_rotation * V3D(point.x, point.y, point.z) + native_translation;
+    const V3D p = correctionAt(point_stamp).transformFrom(native);
     pcl::PointXYZI result;
     result.x = p.x(); result.y = p.y(); result.z = p.z(); result.intensity = point.intensity;
     output.push_back(result);
@@ -1724,7 +1721,7 @@ void RtkFusion::exportMap()
   optimization_log.flush();
   std::ofstream motion(directory / "motion_residuals.csv");
   motion.exceptions(std::ios::failbit | std::ios::badbit);
-  motion << "a_stamp,b_stamp,rx_deg,ry_deg,rz_deg,tx_m,ty_m,tz_m,robust_cost,translation_weight\n";
+  motion << "a_stamp,b_stamp,rx_deg,ry_deg,rz_deg,tx_m,ty_m,tz_m,robust_cost,angular_reliability\n";
   for (const auto &item : solver.getFactorsUnsafe())
   {
     const auto factor = std::dynamic_pointer_cast<NativeMotionFactor>(item);
@@ -1734,7 +1731,7 @@ void RtkFusion::exportMap()
     error.head<3>() *= 180 / M_PI;
     motion << std::setprecision(17) << keyframes[a].stamp << ',' << keyframes[b].stamp;
     for (double value : error) motion << ',' << value;
-    motion << ',' << factor->error(estimate) << ',' << factor->translationWeight() << '\n';
+    motion << ',' << factor->error(estimate) << ',' << factor->angularReliability() << '\n';
   }
   std::ofstream geometry(directory / "geometry.csv");
   geometry.exceptions(std::ios::failbit | std::ios::badbit);
@@ -1744,10 +1741,7 @@ void RtkFusion::exportMap()
   constraints << "a_stamp,b_stamp,ax,ay,az,bx,by,bz,nx,ny,nz,sigma_m,residual_m,native_residual_m,is_line";
   for (int row = 0; row < 3; ++row) for (int col = 0; col < 3; ++col)
     constraints << ",source_body_sqrt_" << row << col;
-  constraints << ",centroid_residual_m";
-  for (int row = 0; row < 3; ++row) for (int col = 0; col < 3; ++col)
-    constraints << ",target_body_sqrt_" << row << col;
-  constraints << '\n';
+  constraints << ",centroid_residual_m\n";
   for (const auto &link : geometry_links)
   {
     if (link.factor_index == std::numeric_limits<std::size_t>::max()) continue;
@@ -1786,10 +1780,7 @@ void RtkFusion::exportMap()
       constraints << ',' << constraint.sigma << ',' << residual << ',' << native_residual << ',' << constraint.linear;
       for (int row = 0; row < 3; ++row) for (int col = 0; col < 3; ++col)
         constraints << ',' << constraint.source_sqrt(row, col);
-      constraints << ',' << signed_residual;
-      for (int row = 0; row < 3; ++row) for (int col = 0; col < 3; ++col)
-        constraints << ',' << constraint.target_sqrt(row, col);
-      constraints << '\n';
+      constraints << ',' << signed_residual << '\n';
     }
     geometry << std::setprecision(17) << keyframes[link.a].stamp << ',' << keyframes[link.b].stamp << ','
         << relative.translation().norm() << ',' << factor->constraints().size();

@@ -65,7 +65,6 @@ void auditSavedMotion(const std::filesystem::path &run, const std::filesystem::p
   const auto raw_rows = table(run / "trajectory_lio.txt", ' ');
   const auto refined_rows = table(run / "trajectory_optimized.txt", ' ');
   const auto keys = table(run / "keyframes.csv", ',');
-  const auto motion_rows = table(run / "motion_residuals.csv", ',');
   const auto seed = seed_file == "-" ? std::vector<double>{0, 0, 0, 0, 0, 0, 0, 1} : table(seed_file, ' ').front();
   const V3D lever(.904, -4.679, -1.699);
   std::map<double, std::size_t> indices;
@@ -147,8 +146,7 @@ void auditSavedMotion(const std::filesystem::path &run, const std::filesystem::p
     sigmas << .02 * M_PI / 180, .02 * M_PI / 180, .03 * M_PI / 180, .03, .03, .02;
     sigmas *= std::sqrt(dt / .5);
     const auto factor = std::make_shared<NativeMotionFactor>(gtsam::Symbol('x', i - 1), gtsam::Symbol('x', i),
-        raw[i - 1].between(raw[i]), sigmas, std::sqrt(dt),
-        motion_rows.at(i - 1).size() > 9 ? motion_rows.at(i - 1)[9] : 1.);
+        raw[i - 1].between(raw[i]), sigmas, std::sqrt(dt));
     gtsam::Matrix a, b;
     const auto r = factor->evaluateError(refined[i - 1], refined[i], &a, &b);
     const double displacement_error = factor->physicalError(refined[i - 1], refined[i]).tail<3>().norm();
@@ -171,9 +169,6 @@ void auditSavedMotion(const std::filesystem::path &run, const std::filesystem::p
     if (r.size() >= 24)
       for (int row = 0; row < 3; ++row) for (int col = 0; col < 3; ++col)
         surface.source_sqrt(row, col) = r[15 + 3 * row + col];
-    if (r.size() >= 34)
-      for (int row = 0; row < 3; ++row) for (int col = 0; col < 3; ++col)
-        surface.target_sqrt(row, col) = r[25 + 3 * row + col];
     patches[{a,b}].push_back(std::move(surface));
   }
   for (auto &p : patches) graph.emplace_shared<ScanPlaneBatchFactor>(gtsam::Symbol('x', p.first.first),
@@ -950,32 +945,6 @@ void pointCovarianceFrames()
 
 int main(int argc, char **argv)
 {
-  if (argc == 2 && std::string(argv[1]) == "--check-line-factor")
-  {
-    using namespace gtsam;
-    const Pose3 a(Rot3::RzRyRx(.2, -.1, .4), Point3(3, -4, 2));
-    const Pose3 b(Rot3::RzRyRx(.15, -.15, .5), Point3(3.4, -3.8, 2.2));
-    for (double distance : {.01, .5})
-    {
-      ScanPlaneBatchFactor::Constraint c{gtsam::Vector3::UnitZ(), gtsam::Vector3(1, 2, 3), gtsam::Vector3(1.1, 2 + distance, 3), .08, true};
-      c.source_sqrt = gtsam::Vector3(.01, .02, .7).asDiagonal();
-      c.target_sqrt = Rot3::Ry(.04).matrix() * gtsam::Vector3(.02, .01, 1.1).asDiagonal();
-      const ScanPlaneBatchFactor factor(0, 1, {c});
-      gtsam::Matrix ja, jb;
-      const auto error = factor.evaluateError(a, b, &ja, &jb);
-      const std::function<gtsam::Vector(const Pose3 &, const Pose3 &)> residual =
-          [&](const Pose3 &x, const Pose3 &y) { return factor.evaluateError(x, y); };
-      require((ja - numericalDerivative21<gtsam::Vector, Pose3, Pose3>(residual, a, b, 1e-6)).norm(),
-          1e-5, "shared-line anchor derivative includes changing fitted direction");
-      require((jb - numericalDerivative22<gtsam::Vector, Pose3, Pose3>(residual, a, b, 1e-6)).norm(),
-          1e-5, "shared-line source derivative includes changing fitted direction");
-      std::swap(c.point, c.center); std::swap(c.source_sqrt, c.target_sqrt);
-      const ScanPlaneBatchFactor reversed(1, 0, {c});
-      require(std::abs(error.squaredNorm() - reversed.evaluateError(b, a).squaredNorm()), 1e-10,
-          "shared-line energy is independent of which scan is the target");
-    }
-    return 0;
-  }
   if ((argc == 5 || argc == 6) && std::string(argv[1]) == "--audit-saved-motion")
   {
     auditSavedMotion(argv[2], argv[3], argv[4], argc == 6 ? argv[5] : "");
@@ -1047,6 +1016,21 @@ int main(int argc, char **argv)
       require(std::abs(actual(i) * actual(i) - (magnitude <= 3 ? value * value : 6 * magnitude - 9)), 1e-8,
           "yaw conflict does not downweight unrelated native-motion components");
     }
+  }
+  {
+    const M3D angular = Rot3::Rz(.35).matrix() * gtsam::Vector3(.9, .4, .05).asDiagonal() *
+        Rot3::Rz(.35).matrix().transpose();
+    motion_error << .004, -.003, .002, .02, -.01, .04;
+    const NativeMotionFactor factor(0, 1, a.between(b) * Pose3::Expmap(motion_error),
+        motion_sigmas, 1.2, angular, .85);
+    gtsam::Matrix ha, hb;
+    factor.evaluateError(a, b, &ha, &hb);
+    const std::function<gtsam::Vector(const Pose3 &, const Pose3 &)> residual =
+        [&](const Pose3 &x, const Pose3 &y) { return factor.evaluateError(x, y); };
+    require((ha - numericalDerivative21<gtsam::Vector, Pose3, Pose3>(residual, a, b, 1e-7)).norm(), 8e-4,
+        "baseline-gated native angular curvature anchor Jacobian");
+    require((hb - numericalDerivative22<gtsam::Vector, Pose3, Pose3>(residual, a, b, 1e-7)).norm(), 8e-4,
+        "baseline-gated native angular curvature current Jacobian");
   }
   for (double drift_rate : {.01, .10, 5.0})
   {
