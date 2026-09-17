@@ -119,7 +119,7 @@ laser_mapping:
       # prefix stays locally close to native LIO. After 30 m the normal robust
       # motion model is restored; no later route segment can re-enter this mode.
       startup_native_motion_distance_m: 30.0
-      startup_motion_huber_rate_per_sqrt_sec: 2.8
+      startup_motion_huber_rate_per_sqrt_sec: 1.0
       # Nominal independent-position interval. A node interval dt receives
       # weight min(1,dt/interval), including short tails; no dropped valid
       # tail and no multiplication of information when increasing node rate.
