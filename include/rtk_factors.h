@@ -53,31 +53,12 @@ class NativeMotionFactor final
   gtsam::Pose3 measured_;
   gtsam::Vector6 sigmas_;
   double scale_;
-  gtsam::Matrix3 angular_basis_ = gtsam::Matrix3::Identity();
-  gtsam::Vector3 angular_strength_ = gtsam::Vector3::Zero();
-  double angular_reliability_ = 0;
 public:
   NativeMotionFactor(gtsam::Key a, gtsam::Key b, const gtsam::Pose3 &measured,
-      const gtsam::Vector6 &sigmas, double scale,
-      const gtsam::Matrix3 &angular_observability = gtsam::Matrix3::Zero(),
-      double angular_reliability = 0)
+      const gtsam::Vector6 &sigmas, double scale)
       : gtsam::NoiseModelFactor2<gtsam::Pose3, gtsam::Pose3>(
             gtsam::noiseModel::Isotropic::Sigma(6, 1), a, b),
-        measured_(measured), sigmas_(sigmas), scale_(scale), angular_reliability_(angular_reliability)
-  {
-    if (!std::isfinite(angular_reliability_) || angular_reliability_ < 0 || angular_reliability_ > 1)
-      throw std::runtime_error("Invalid native angular reliability");
-    if (angular_observability.squaredNorm() == 0 || angular_reliability_ == 0) return;
-    const Eigen::SelfAdjointEigenSolver<gtsam::Matrix3> spectrum(
-        .5 * (angular_observability + angular_observability.transpose()));
-    if (spectrum.info() != Eigen::Success || !spectrum.eigenvalues().allFinite() ||
-        spectrum.eigenvalues()(0) < -1e-9 || spectrum.eigenvalues()(2) > 1 + 1e-9)
-      throw std::runtime_error("Invalid native angular direction strengths");
-    angular_basis_ = spectrum.eigenvectors().transpose();
-    angular_strength_ = angular_reliability_ * spectrum.eigenvalues().cwiseMax(0).cwiseMin(1);
-  }
-
-  double angularReliability() const { return angular_reliability_; }
+        measured_(measured), sigmas_(sigmas), scale_(scale) {}
 
   gtsam::Vector6 physicalError(const gtsam::Pose3 &a, const gtsam::Pose3 &b) const
   {
@@ -105,34 +86,21 @@ public:
     local.setZero();
     local.topLeftCorner<3, 3>() = rotation_derivative;
     local.bottomRightCorner<3, 3>() = difference.rotation().matrix();
-    gtsam::Matrix6 whitening = sigmas_.cwiseInverse().asDiagonal();
-    for (int i = 0; i < 3; ++i)
-      whitening.block<1, 3>(i, 0) = angular_basis_.row(i) /
-          std::sqrt(angular_basis_.row(i).cwiseAbs2().dot(sigmas_.head<3>().cwiseAbs2()));
-    const gtsam::Vector6 whitened = whitening * error;
     gtsam::Vector6 residual, derivative;
     for (int i = 0; i < 6; ++i)
     {
-      const double value = whitened(i), magnitude = std::abs(value);
+      const double value = error(i) / sigmas_(i), magnitude = std::abs(value);
       // Convex Huber in each physical component. A redescending Cauchy
       // motion prior creates a second minimum at a failed native increment,
       // even when a much better globally anchored solution exists.
       const bool quadratic = magnitude <= scale_;
-      const double huber_loss = quadratic ? magnitude :
+      const double loss = quadratic ? magnitude :
           std::sqrt(2 * scale_ * magnitude - scale_ * scale_);
-      // When independent measured baseline lengths agree, preserve curvature
-      // only in LiDAR-observed angular directions. As baseline disagreement
-      // grows, this smoothly falls back to the original component-wise Huber.
-      // No INS attitude is introduced and no fixed-map Hessian is inverted.
-      const double strength = i < 3 ? angular_strength_(i) : 0;
-      const double loss = std::sqrt((1 - strength) * huber_loss * huber_loss +
-                                    strength * value * value);
       residual(i) = std::copysign(loss, value);
-      derivative(i) = quadratic ? 1.0 :
-          ((1 - strength) * scale_ + strength * magnitude) / loss;
+      derivative(i) = (quadratic ? 1.0 : scale_ / loss) / sigmas_(i);
     }
-    if (ha) *ha = derivative.asDiagonal() * whitening * local * ja;
-    if (hb) *hb = derivative.asDiagonal() * whitening * local * jb;
+    if (ha) *ha = derivative.asDiagonal() * local * ja;
+    if (hb) *hb = derivative.asDiagonal() * local * jb;
     return residual;
   }
 };

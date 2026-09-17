@@ -1017,21 +1017,6 @@ int main(int argc, char **argv)
           "yaw conflict does not downweight unrelated native-motion components");
     }
   }
-  {
-    const M3D angular = Rot3::Rz(.35).matrix() * gtsam::Vector3(.9, .4, .05).asDiagonal() *
-        Rot3::Rz(.35).matrix().transpose();
-    motion_error << .004, -.003, .002, .02, -.01, .04;
-    const NativeMotionFactor factor(0, 1, a.between(b) * Pose3::Expmap(motion_error),
-        motion_sigmas, 1.2, angular, .85);
-    gtsam::Matrix ha, hb;
-    factor.evaluateError(a, b, &ha, &hb);
-    const std::function<gtsam::Vector(const Pose3 &, const Pose3 &)> residual =
-        [&](const Pose3 &x, const Pose3 &y) { return factor.evaluateError(x, y); };
-    require((ha - numericalDerivative21<gtsam::Vector, Pose3, Pose3>(residual, a, b, 1e-7)).norm(), 8e-4,
-        "baseline-gated native angular curvature anchor Jacobian");
-    require((hb - numericalDerivative22<gtsam::Vector, Pose3, Pose3>(residual, a, b, 1e-7)).norm(), 8e-4,
-        "baseline-gated native angular curvature current Jacobian");
-  }
   for (double drift_rate : {.01, .10, 5.0})
   {
     const auto cost = [&](double dt) {
