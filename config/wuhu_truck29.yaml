@@ -113,10 +113,6 @@ laser_mapping:
       # does not change its cost at the same drift rate, including short tails.
       # No redescending motion loss (failed native increments form false minima).
       motion_huber_rate_per_sqrt_sec: 1.0
-      # Approximate 4DoF global correction: shared map tilt may move as one
-      # rigid gauge, but correction roll/pitch cannot vary scan by scan.
-      # 0.001 deg per 0.5 s is numerical softness, not a sensor covariance.
-      correction_tilt_sigma_deg_sqrt_sec: 0.00141421356237
       # Nominal independent-position interval. A node interval dt receives
       # weight min(1,dt/interval), including short tails; no dropped valid
       # tail and no multiplication of information when increasing node rate.
@@ -136,7 +132,10 @@ laser_mapping:
       # Each surface belongs to one native deskewed scan-end pose, exactly
       # matching export. A multi-scan patch cannot stay rigid when C(t) changes.
       max_planes_per_frame: 800
-      max_factors_per_pair: 120
+      # Bound each scan pair to 12 direction-balanced surface patches, so
+      # correlated nearby ground patches cannot all count as independent
+      # global evidence. Original physical noise/Huber thresholds stay intact.
+      max_factors_per_pair: 12
       local_neighbors: 3
       # Overlap edges use actual surface covisibility; these two limits below
       # concern vehicle-position revisits only, not long-range surface overlap.
