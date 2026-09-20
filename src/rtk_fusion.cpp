@@ -1064,6 +1064,10 @@ std::size_t RtkFusion::addGeometry(std::size_t a, std::size_t b,
     const auto &m = matches[directions[axis][(2 * i + 1) * directions[axis].size() /
         (2 * quotas[axis])]];
     auto constraint = measurement(m);
+    // Adjacent scans reuse surfaces and are correlated with native LIO.
+    // Share a single geometry information budget across these neighbours;
+    // do not claim N independent measurements of the same local map.
+    if (kind == GeometryKind::Local) constraint.sigma *= std::sqrt(local_neighbors);
     constraints.push_back(std::move(constraint));
   }
   auto factor = std::make_shared<ScanPlaneBatchFactor>(gtsam::Symbol('x', a), gtsam::Symbol('x', b),
@@ -1307,6 +1311,13 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
   }
   initializePose(graph, initial);
   timing(key_timings[0]);
+  // A robust native increment is a motion regularizer, not a guarantee of
+  // local map consistency. Retain measured common-support geometry between
+  // nearby scans, with a bounded shared information budget and its real
+  // nullspace, so the global correction field stays locally consistent.
+  if (geometry_anchor)
+    for (std::size_t n = 0; n < std::min<std::size_t>(local_neighbors, geometry_anchors.size()); ++n)
+      addGeometry(geometry_anchors[geometry_anchors.size() - 1 - n], index, graph, GeometryKind::Local);
   if (geometry_anchor)
   {
     const V3D position = keyframes.back().optimized.translation();

@@ -121,7 +121,7 @@ struct RtkFusion
     unsigned reference_covariance_source = 0;
     M3D angular_observability = M3D::Zero();
   };
-  enum class GeometryKind { Overlap, Revisit };
+  enum class GeometryKind { Local, Overlap, Revisit };
   struct GeometryLink
   {
     std::size_t a, b, factor_index;
