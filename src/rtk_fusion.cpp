@@ -142,7 +142,7 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   // Persist effective parameters, not a copy of a possibly unrelated YAML.
   std::ofstream settings(directory / "parameters.txt");
   settings.exceptions(std::ios::badbit | std::ios::failbit);
-  settings << "model=native_lio_global_correction; scan_geometry=native_deskew_scan_end_rigid; surface_residual=common_support_mean_squared_point_distance; motion_residual=so3_and_endpoint_position; motion_rotation_loss=component_huber; motion_translation_loss=component_huber; local_geometry=bounded_shared_support; overlap_selection=observed_surface_covisibility; geometry_validation=observable_baseline_consistency; association_lifetime=verified_observation\n";
+  settings << "model=native_lio_global_correction; map_projection=native_deskew_world_point_with_point_time_correction; surface_factor_model=scan_end_rigid; surface_residual=common_support_mean_squared_point_distance; motion_residual=so3_and_endpoint_position; motion_rotation_loss=component_huber; motion_translation_loss=component_huber; local_geometry=bounded_shared_support; overlap_selection=observed_surface_covisibility; geometry_validation=observable_baseline_consistency; association_lifetime=verified_observation\n";
   for (const auto &name : node->list_parameters({}, 0).names)
   {
     const auto parameter = node->get_parameter(name);
@@ -1454,15 +1454,25 @@ gtsam::Pose3 RtkFusion::poseAt(const Frame &frame) const
 void RtkFusion::appendCloud(const Frame &frame, pcl::PointCloud<pcl::PointXYZI> &output) const
 {
   output.reserve(output.size() + frame.cloud->size());
-  const auto pose = poseAt(frame);
-  const M3D rotation = pose.rotation().matrix() * lidar_rotation;
-  const V3D translation = pose.transformFrom(lidar_translation);
-  // The factor and map must transform the SAME native deskewed surface.
-  // Point-time correction would deform it after fitting a scan-end factor.
-  // Preserve native intra-scan shape; no second, unconstrained deskewer.
+  const M3D native_rotation = frame.raw.rotation().matrix() * lidar_rotation;
+  const V3D native_translation = frame.raw.transformFrom(lidar_translation);
+  // FAST-LIVO has already deskewed each return to the scan-end body frame.
+  // Transforming that point by the native scan-end pose recovers the static
+  // native-world observation made at its acquisition time. Apply only the
+  // interpolated LOW-FREQUENCY global correction at that point time. This is
+  // not a second IMU deskew: native point geometry and the original timestamp
+  // remain immutable. A scan-end-only correction is invalid after native LIO
+  // velocity degenerates, because it preserves the resulting metre-scale
+  // intra-scan world error in the final map.
   for (const PointType &point : *frame.cloud)
   {
-    const V3D p = rotation * V3D(point.x, point.y, point.z) + translation;
+    double point_stamp = frame.begin + point.curvature / 1000.0;
+    if (!std::isfinite(point_stamp) || point_stamp < frame.begin - 1e-3 ||
+        point_stamp > frame.stamp + 1e-3)
+      throw std::runtime_error("Archived LiDAR point timestamp is outside its submitted frame interval");
+    point_stamp = std::max(frame.begin, std::min(frame.stamp, point_stamp));
+    const V3D native = native_rotation * V3D(point.x, point.y, point.z) + native_translation;
+    const V3D p = correctionAt(point_stamp).transformFrom(native);
     pcl::PointXYZI result;
     result.x = p.x(); result.y = p.y(); result.z = p.z(); result.intensity = point.intensity;
     output.push_back(result);

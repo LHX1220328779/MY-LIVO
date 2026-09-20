@@ -106,7 +106,7 @@ laser_mapping:
       # not the inverse of a fixed-map Hessian. Sigmas scale with sqrt(dt).
       # At 0.5 s: rotation [0.02,0.02,0.03] deg, translation [3,3,2] cm.
       # No raw IMU factors or duplicate neighboring scan constraints.
-      motion_rotation_sigma_deg_sqrt_sec: [0.028284271247, 0.028284271247, 0.12727922061357856]
+      motion_rotation_sigma_deg_sqrt_sec: [0.028284271247, 0.028284271247, 0.042426406871]
       motion_translation_sigma_m_sqrt_sec: [0.042426406871, 0.042426406871, 0.028284271247]
       # Component-wise convex Huber on native correction RATE. Both sigma
       # and whitened threshold scale with sqrt(dt): splitting a time interval
