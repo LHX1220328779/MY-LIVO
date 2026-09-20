@@ -1,5 +1,13 @@
 # MY-LIVO RTK 融合实验延续状态
 
+> **2026-09-20 更新（run91–99 完成，分支 `fusion/56c6896-ins-attitude`）**：当前基线 **run99**（`results/wuhu_rtk_99_extrinsic_v2`，全部 50 个 map_*.pcd 已落盘）。
+> 指标：后轴 100% ≤10 cm（max 8.1 cm，中位 1.9）、物理 IMU 轨迹 99.99% ≤10 cm、姿态 vs INS 俯仰/横滚 P95 0.2°、偏航 P95 0.47°；前端全程健康（末段速度 5.5/5.5 m/s）；全程多时代地面厚度 P50 21.0→9.9 cm（后段 17.2→6.6 cm）。
+> 根因与改动全文：docs/mcp-frontend-root-cause-and-fusion-fixes.md。已证伪勿重试：陀螺零偏初值 σ（run92）、绝对 σ 的前端姿态伪观测（run94）、后端偏航 σ 2°（run98）。
+> 灯柱重影剩余主因是雷达间残余水平/时延标定（同帧 5–12 cm）与物理杆径 17 cm 的两侧可见弧；轨迹侧姿态/位置已与 INS/RTK 一致。
+> 评估注意：`scripts/evaluate_wuhu_round.sh` 自动读取 `parameters.txt` 的 `rtk.time_offset_sec`（现为 +0.025）；手动调用 `evaluate_wuhu_lio.py` 必须传 `--time-offset-sec 0.025`。
+>
+> 以下为历史状态（run83–89 时代）：
+
 > **2026-09-19 更新（run84-89 完成）**：当前基线 **db90565**（run89=局部近邻边+yaw运动σ×3，最优存档）。
 > 最优指标：灯柱 0v10 中位 15.27cm（原生 16.0）、位置 100%≤10cm max 9.50cm、地面 5-20m 41.58mm（原生 44.69）、IMU 异侧 52/77。
 > 已证伪勿重试：yaw multistart（84）、时代池化加边（85）、sigma 0.035（86，尾部恶化）。
