@@ -1032,10 +1032,29 @@ std::size_t RtkFusion::addGeometry(std::size_t a, std::size_t b,
     if (matches[i].a->linear) axis = 3;
     directions[axis].push_back(i);
   }
+  // Allocate the per-pair budget in proportion to the matched direction mix
+  // instead of an equal round-robin. An edge dominated by street-parallel
+  // walls and pole-like linears keeps its yaw evidence instead of donating
+  // slots to a small ground stratum; every present class still retains at
+  // least one stratum while its share allows. Repeated greedy largest-
+  // deficit allocation is deterministic and bounded by the budget.
   std::array<std::size_t, 4> quotas{};
+  const double direction_total = static_cast<double>(matches.size());
   for (std::size_t selected = 0; selected < count;)
-    for (int axis = 0; axis < 4 && selected < count; ++axis)
-      if (quotas[axis] < directions[axis].size()) { ++quotas[axis]; ++selected; }
+  {
+    int best = -1;
+    double best_deficit = 0;
+    for (int axis = 0; axis < 4; ++axis)
+    {
+      if (quotas[axis] >= directions[axis].size()) continue;
+      const double deficit =
+          static_cast<double>(directions[axis].size()) / direction_total * count - quotas[axis];
+      if (deficit > best_deficit) { best_deficit = deficit; best = axis; }
+    }
+    if (best < 0) break;
+    ++quotas[best];
+    ++selected;
+  }
   std::vector<ScanPlaneBatchFactor::Constraint> constraints;
   constraints.reserve(count);
   for (int axis = 0; axis < 4; ++axis) for (std::size_t i = 0; i < quotas[axis]; ++i)

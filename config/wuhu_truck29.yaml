@@ -132,10 +132,10 @@ laser_mapping:
       # Each surface belongs to one native deskewed scan-end pose, exactly
       # matching export. A multi-scan patch cannot stay rigid when C(t) changes.
       max_planes_per_frame: 800
-      # Bound each scan pair to 12 direction-balanced surface patches, so
+      # Bound each scan pair to 20 proportionally direction-balanced surface patches, so
       # correlated nearby ground patches cannot all count as independent
       # global evidence. Original physical noise/Huber thresholds stay intact.
-      max_factors_per_pair: 12
+      max_factors_per_pair: 20
       local_neighbors: 3
       # Overlap edges use actual surface covisibility; these two limits below
       # concern vehicle-position revisits only, not long-range surface overlap.
