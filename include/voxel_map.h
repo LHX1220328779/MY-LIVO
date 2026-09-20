@@ -215,6 +215,28 @@ public:
   // This is NOT an independent LIO Between covariance or an IMU posterior.
   bool collect_geometry_diagnostics_ = false;
   Eigen::Matrix<double, 6, 6> lidar_information_body_ = Eigen::Matrix<double, 6, 6>::Zero();
+  // Optional absolute body-attitude pseudo-measurement for the iterated update
+  // (qualified INS attitude in this LIO world frame). Scan-to-map residuals
+  // only observe attitude relative to the self-built map, so a distance-
+  // proportional registration bias integrates into unbounded pitch/roll drift
+  // and, through gravity leakage, into a diverging along-track velocity. The
+  // measurement is convex-Huber bounded and is NOT included in the pure
+  // LiDAR information diagnostics above.
+  bool attitude_aiding_ = false;
+  M3D attitude_measurement_ = M3D::Identity();
+  // attitude_information_: absolute floor 1/sigma^2 (INS accuracy) that
+  // dominates when LiDAR is weak. attitude_pull_fraction_: fraction of the
+  // current LiDAR angular information, so that in rich scenes the attitude
+  // still relaxes toward the absolute reference with a bounded time constant
+  // (f=0.05 -> ~20 scans) instead of being locked to the self-built map.
+  double attitude_information_ = 0.0, attitude_pull_fraction_ = 0.0, attitude_huber_rad_ = 0.0;
+  // Per-body-axis mask (x=right/pitch, y=forward/roll, z=up/yaw). Gravity
+  // leakage into velocity only involves roll/pitch; short-term yaw is left to
+  // LiDAR so that a 0.1-0.2 deg INS heading wobble is not imprinted on the
+  // local map (0.2 deg at 30 m is already 10 cm of map smear).
+  V3D attitude_axis_mask_ = V3D(1.0, 1.0, 1.0);
+  V3D attitude_residual_ = V3D::Zero();
+  double attitude_weight_used_ = 0.0, lidar_angular_information_ = 0.0;
   double lidar_residual_rms_ = std::numeric_limits<double>::quiet_NaN();
   std::vector<M3D> cross_mat_list_;
   std::vector<M3D> body_cov_list_;

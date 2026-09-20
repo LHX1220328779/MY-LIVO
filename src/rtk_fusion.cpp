@@ -25,6 +25,8 @@ gtsam::ISAM2Params fusionSolverParameters()
   gtsam::Vector6 threshold;
   threshold << 0.0001, 0.0001, 0.0001, 0.002, 0.002, 0.002;
   thresholds['x'] = threshold;
+  // Installation misalignment (Rot3): relinearize on the same angular scale.
+  thresholds['m'] = gtsam::Vector3::Constant(0.0001);
   params.relinearizeThreshold = thresholds;
   params.optimizationParams = gtsam::ISAM2DoglegParams();
   params.factorization = gtsam::ISAM2Params::QR;
@@ -47,6 +49,8 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   if (frontend_position_aiding)
     throw std::runtime_error("Global correction requires unassisted native LIO; frontend_position_aiding must be false");
   parameters.param<double>("rtk/time_offset_sec", time_offset, 0.0);
+  parameters.param<double>("rtk/attitude_time_offset_sec", attitude_time_offset, time_offset);
+  if (!std::isfinite(attitude_time_offset)) throw std::runtime_error("rtk/attitude_time_offset_sec must be finite");
   parameters.param("rtk/accepted_position_modes", accepted_modes, std::vector<int>{4});
   const std::pair<const char *, double *> doubles[] = {
       {"status_max_age_sec", &status_age}, {"interpolation_max_gap_sec", &interpolation_gap},
@@ -111,6 +115,32 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
     motion_rotation_sigma(axis) = rotation_sigmas[axis] * M_PI / 180;
     motion_translation_sigma(axis) = translation_sigmas[axis];
   }
+  parameters.param<bool>("rtk/attitude_enabled", attitude_enabled, attitude_enabled);
+  parameters.param<double>("rtk/attitude_huber_delta", attitude_huber, attitude_huber);
+  parameters.param<double>("rtk/attitude_min_speed_mps", attitude_min_speed, attitude_min_speed);
+  parameters.param<double>("rtk/attitude_motion_age_sec", attitude_motion_age, attitude_motion_age);
+  if (!std::isfinite(attitude_min_speed) || attitude_min_speed < 0 ||
+      !std::isfinite(attitude_motion_age) || attitude_motion_age < 0)
+    throw std::runtime_error("rtk/attitude_min_speed_mps and attitude_motion_age_sec must be finite and nonnegative");
+  std::vector<double> attitude_sigmas, misalignment_sigmas;
+  parameters.param("rtk/attitude_sigma_deg", attitude_sigmas,
+      std::vector<double>{attitude_sigma.x() * 180 / M_PI, attitude_sigma.y() * 180 / M_PI,
+                          attitude_sigma.z() * 180 / M_PI});
+  parameters.param("rtk/attitude_misalignment_prior_deg", misalignment_sigmas,
+      std::vector<double>{misalignment_prior_sigma.x() * 180 / M_PI,
+                          misalignment_prior_sigma.y() * 180 / M_PI,
+                          misalignment_prior_sigma.z() * 180 / M_PI});
+  for (const auto &values : {attitude_sigmas, misalignment_sigmas})
+    if (values.size() != 3 || std::any_of(values.begin(), values.end(),
+        [](double value) { return !std::isfinite(value) || value <= 0; }))
+      throw std::runtime_error("INS attitude sigmas require three finite positive body-axis components");
+  if (!std::isfinite(attitude_huber) || attitude_huber <= 0)
+    throw std::runtime_error("rtk/attitude_huber_delta must be finite and positive");
+  for (int axis = 0; axis < 3; ++axis)
+  {
+    attitude_sigma(axis) = attitude_sigmas[axis] * M_PI / 180;
+    misalignment_prior_sigma(axis) = misalignment_sigmas[axis] * M_PI / 180;
+  }
   std::string configured_directory;
   parameters.param<string>("rtk/output_directory", configured_directory, "");
   const auto base = projectResultDirectory(configured_directory.empty()
@@ -130,7 +160,7 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   optimization_log.exceptions(std::ios::badbit | std::ios::failbit);
   history_log.exceptions(std::ios::badbit | std::ios::failbit);
   optimization_log.open(directory / "optimization.csv");
-  optimization_log << "stamp,phase,iteration,cost_before,cost_after,rtk_cost,local_motion_cost,geometry_cost,other_cost,scaled_gradient_inf\n";
+  optimization_log << "stamp,phase,iteration,cost_before,cost_after,rtk_cost,local_motion_cost,geometry_cost,other_cost,scaled_gradient_inf,attitude_cost\n";
   history_log.open(directory / "history.csv");
   history_log << "update_stamp,key_stamp,age_sec,translation_change_m,rotation_change_deg,rtk_residual_m\n";
   association_log.exceptions(std::ios::badbit | std::ios::failbit);
@@ -142,7 +172,7 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   // Persist effective parameters, not a copy of a possibly unrelated YAML.
   std::ofstream settings(directory / "parameters.txt");
   settings.exceptions(std::ios::badbit | std::ios::failbit);
-  settings << "model=native_lio_global_correction; map_projection=native_deskew_world_point_with_point_time_correction; surface_factor_model=scan_end_rigid; surface_residual=common_support_mean_squared_point_distance; motion_residual=so3_and_endpoint_position; motion_rotation_loss=component_huber; motion_translation_loss=component_huber; local_geometry=bounded_shared_support; overlap_selection=observed_surface_covisibility; geometry_validation=observable_baseline_consistency; association_lifetime=verified_observation\n";
+  settings << "model=native_lio_global_correction; attitude_observation=ins_body_attitude_with_installation_misalignment; map_projection=native_deskew_world_point_with_point_time_correction; surface_factor_model=scan_end_rigid; surface_residual=common_support_mean_squared_point_distance; motion_residual=so3_and_endpoint_position; motion_rotation_loss=component_huber; motion_translation_loss=component_huber; local_geometry=bounded_shared_support; overlap_selection=observed_surface_covisibility; geometry_validation=observable_baseline_consistency; association_lifetime=verified_observation\n";
   for (const auto &name : node->list_parameters({}, 0).names)
   {
     const auto parameter = node->get_parameter(name);
@@ -295,7 +325,13 @@ void RtkFusion::initializePose(const gtsam::NonlinearFactorGraph &graph, gtsam::
   values.insert(key, current.optimized);
   for (const auto &factor : local)
     for (gtsam::Key other : factor->keys())
-      if (!values.exists(other)) values.insert(other, estimate.at<gtsam::Pose3>(other));
+    {
+      if (values.exists(other)) continue;
+      // Non-pose variables (installation misalignment) condition the local
+      // solve at their current or freshly initialized value.
+      if (initial.exists(other)) values.insert(other, initial.at(other));
+      else values.insert(other, estimate.at(other));
+    }
   double cost = local.error(values);
   // Choose an initial guess by the SAME motion/RTK objective. A failed native
   // increment must not seed associations metres outside their capture range.
@@ -409,13 +445,14 @@ void RtkFusion::logOptimization(const char *phase, int iteration, double before,
     probe.previous_a = a.optimized;
     probe.previous_b = b.optimized;
   }
-  double costs[4] = {};
+  double costs[5] = {};
   for (const auto &factor : graph)
   {
     if (!factor) continue;
     const int group = dynamic_cast<const gtsam::GPSFactorArm *>(factor.get()) ? 0 :
         dynamic_cast<const NativeMotionFactor *>(factor.get()) ? 1 :
-        dynamic_cast<const ScanPlaneBatchFactor *>(factor.get()) ? 2 : 3;
+        dynamic_cast<const ScanPlaneBatchFactor *>(factor.get()) ? 2 :
+        dynamic_cast<const InsAttitudeFactor *>(factor.get()) ? 4 : 3;
     costs[group] += factor->error(estimate);
   }
   double gradient_norm = std::numeric_limits<double>::quiet_NaN();
@@ -433,8 +470,8 @@ void RtkFusion::logOptimization(const char *phase, int iteration, double before,
   }
   optimization_log << std::setprecision(17) << keyframes.back().stamp << ',' << phase << ',' << iteration
       << ',' << before << ',' << after;
-  for (double cost : costs) optimization_log << ',' << cost;
-  optimization_log << ',' << gradient_norm << '\n';
+  for (int group = 0; group < 4; ++group) optimization_log << ',' << costs[group];
+  optimization_log << ',' << gradient_norm << ',' << costs[4] << '\n';
   // Fixed early anchors plus worst historical changes/residuals. Do not emit
   // an O(N^2) full-history log during long mine surveys.
   std::set<std::size_t> monitored{0, keyframes.size() - 1};
@@ -654,9 +691,25 @@ bool RtkFusion::referenceAt(double stamp, Observation &result, int *failure_reas
   // variance reduction of two independent observations.
   result.covariance = (1.0 - ratio) * before->covariance + ratio * after->covariance;
   result.covariance_source = before->covariance_source | after->covariance_source;
-  result.orientation_valid = before->orientation_valid && after->orientation_valid;
+  // Orientation may use its own latency: the sample stamped h is the attitude at
+  // h - attitude_time_offset, i.e. the observation with stamp s + attitude_time_offset - time_offset.
+  const double orientation_stamp = stamp + attitude_time_offset - time_offset;
+  auto o_after = after;
+  auto o_before = before;
+  if (std::abs(orientation_stamp - stamp) > 1e-9)
+  {
+    o_after = std::lower_bound(observations.begin(), observations.end(), orientation_stamp,
+        [](const Observation &sample, double time) { return sample.stamp < time; });
+    if (o_after == observations.end()) { result.orientation_valid = false; if (failure_reason) *failure_reason = 0; return true; }
+    o_before = (std::abs(o_after->stamp - orientation_stamp) < 1e-6 || o_after == observations.begin()) ? o_after : std::prev(o_after);
+    if (o_before->stamp > orientation_stamp + 1e-6 || o_after->stamp - o_before->stamp > interpolation_gap)
+    { result.orientation_valid = false; if (failure_reason) *failure_reason = 0; return true; }
+  }
+  const double o_interval = o_after->stamp - o_before->stamp;
+  const double o_ratio = o_interval < 1e-6 ? 0.0 : (orientation_stamp - o_before->stamp) / o_interval;
+  result.orientation_valid = o_before->orientation_valid && o_after->orientation_valid;
   if (result.orientation_valid)
-    result.orientation = before->orientation.slerp(ratio, after->orientation);
+    result.orientation = o_before->orientation.slerp(o_ratio, o_after->orientation);
   if (failure_reason) *failure_reason = 0;
   return true;
 }
@@ -1298,6 +1351,44 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
     keyframes[i].position_information_weight = weight;
     ++accepted_positions;
   }
+  // Bounded absolute attitude from the qualified INS solution. Same quality
+  // gate, timing and temporal weight as the rear-axle position; one factor per
+  // keyframe. The installation misalignment is a single shared variable with
+  // a weak prior, so a constant mounting offset never bends the trajectory.
+  if (attitude_enabled)
+    for (std::size_t i = first_pending; i <= index; ++i)
+    {
+      if (keyframes[i].has_attitude || !graph_in_enu) continue;
+      // Native speed over the preceding keyframe interval gates the INS
+      // heading: stationary/slow heading is gyro-held, not GNSS-aligned.
+      if (i == 0) continue;
+      const double interval = keyframes[i].stamp - keyframes[i - 1].stamp;
+      const double speed = interval > 0 ?
+          (keyframes[i].raw.translation() - keyframes[i - 1].raw.translation()).norm() / interval : 0;
+      if (speed >= 0.5 && motion_start_stamp < 0) motion_start_stamp = keyframes[i].stamp;
+      if (speed < attitude_min_speed || motion_start_stamp < 0 ||
+          keyframes[i].stamp - motion_start_stamp < attitude_motion_age) continue;
+      Observation reference;
+      if (!referenceAt(keyframes[i].stamp, reference) || !reference.orientation_valid) continue;
+      const gtsam::Key misalignment_key = gtsam::Symbol('m', 0);
+      if (!misalignment_initialized)
+      {
+        initial.insert(misalignment_key, gtsam::Rot3());
+        graph.emplace_shared<gtsam::PriorFactor<gtsam::Rot3>>(misalignment_key, gtsam::Rot3(),
+            gtsam::noiseModel::Diagonal::Sigmas(misalignment_prior_sigma));
+        misalignment_initialized = true;
+      }
+      const double weight = i == 0 ? 1 : std::min(1.,
+          (keyframes[i].stamp - keyframes[i - 1].stamp) / position_factor_interval);
+      const auto noise = gtsam::noiseModel::Robust::Create(
+          gtsam::noiseModel::mEstimator::Huber::Create(attitude_huber * std::sqrt(weight)),
+          gtsam::noiseModel::Diagonal::Sigmas(attitude_sigma / std::sqrt(weight)));
+      keyframes[i].reference_rotation = gtsam::Rot3(reference.orientation);
+      graph.emplace_shared<InsAttitudeFactor>(gtsam::Symbol('x', i), misalignment_key,
+          keyframes[i].reference_rotation, noise);
+      keyframes[i].has_attitude = true;
+      ++accepted_attitudes;
+    }
   if (index)
   {
     const auto &previous = keyframes[index - 1];
@@ -1741,6 +1832,27 @@ void RtkFusion::exportMap()
     for (double value : error) motion << ',' << value;
     motion << ',' << factor->error(estimate) << ',' << factor->robustScale() << '\n';
   }
+  {
+    std::ofstream attitude(directory / "attitude_residuals.csv");
+    attitude.exceptions(std::ios::failbit | std::ios::badbit);
+    const gtsam::Rot3 misalignment = misalignment_initialized ?
+        estimate.at<gtsam::Rot3>(gtsam::Symbol('m', 0)) : gtsam::Rot3();
+    const V3D mis = gtsam::Rot3::Logmap(misalignment) * 180 / M_PI;
+    attitude << "# installation_misalignment_deg(body x,y,z) " << mis.transpose() << '\n';
+    attitude << "stamp,rx_deg,ry_deg,rz_deg,robust_cost\n";
+    for (const auto &item : solver.getFactorsUnsafe())
+    {
+      const auto factor = std::dynamic_pointer_cast<InsAttitudeFactor>(item);
+      if (!factor) continue;
+      const auto index = gtsam::Symbol(factor->keys()[0]).index();
+      const V3D error = factor->physicalError(keyframes[index].optimized, misalignment) * 180 / M_PI;
+      attitude << std::setprecision(17) << keyframes[index].stamp << ',' << error.x() << ',' << error.y()
+               << ',' << error.z() << ',' << factor->error(estimate) << '\n';
+    }
+    RCLCPP_INFO(node->get_logger(),
+        "INS attitude factors: %zu; estimated installation misalignment [%.4f %.4f %.4f] deg",
+        accepted_attitudes, mis.x(), mis.y(), mis.z());
+  }
   std::ofstream geometry(directory / "geometry.csv");
   geometry.exceptions(std::ios::failbit | std::ios::badbit);
   geometry << "a_stamp,b_stamp,baseline_m,matches,normal_x,normal_y,normal_z,offset_rms_m,offset_max_m,offset_p95_m,normalized_rms,native_offset_rms_m,line_matches\n";
@@ -1805,7 +1917,7 @@ void RtkFusion::exportMap()
   keys << "stamp,has_position,reference_failure,reference_x,reference_y,reference_z,rtk_residual_m,covariance_source,cov_xx,cov_xy,cov_xz,cov_yy,cov_yz,cov_zz,information_weight";
   for (int row = 0; row < 3; ++row) for (int column = 0; column < 3; ++column)
     keys << ",native_angular_observability_" << row << column;
-  keys << '\n';
+  keys << ",has_attitude\n";
   double maximum_key_residual = 0;
   for (const auto &key : keyframes)
   {
@@ -1822,7 +1934,7 @@ void RtkFusion::exportMap()
     keys << ',' << key.position_information_weight;
     for (int row = 0; row < 3; ++row) for (int column = 0; column < 3; ++column)
       keys << ',' << key.angular_observability(row, column);
-    keys << '\n';
+    keys << ',' << key.has_attitude << '\n';
   }
   const auto rejected = std::count_if(keyframes.begin(), keyframes.end(),
       [](const Keyframe &key) { return !key.has_position; });

@@ -120,6 +120,10 @@ struct RtkFusion
     M3D reference_covariance = M3D::Zero();
     unsigned reference_covariance_source = 0;
     M3D angular_observability = M3D::Zero();
+    // INS absolute attitude observation (LIO body frame after the estimated
+    // installation misalignment). Added once per keyframe, like positions.
+    bool has_attitude = false;
+    gtsam::Rot3 reference_rotation;
   };
   enum class GeometryKind { Local, Overlap, Revisit };
   struct GeometryLink
@@ -155,6 +159,9 @@ struct RtkFusion
   V3D motion_translation_sigma = V3D(0.03, 0.03, 0.02) / std::sqrt(0.5);
   double motion_huber_rate = 1;
   double time_offset = 0, status_age = 0.1, interpolation_gap = 0.05;
+  // INS attitude can carry a different latency than the INS position output.
+  // Scan time s uses the INS orientation sample stamped s + attitude_time_offset.
+  double attitude_time_offset = 0;
   double horizontal_sigma = 0.03, vertical_sigma = 0.05, covariance_scale = 1;
   double reported_model_sigma_xy = 0, reported_model_sigma_z = 0;
   double max_horizontal_sigma = 0.15, max_vertical_sigma = 0.25;
@@ -165,6 +172,19 @@ struct RtkFusion
   double plane_voxel = 2, plane_thickness = 0.05, plane_noise_floor = 0.05;
   double revisit_radius = 8, revisit_age = 15, match_distance = 1.2;
   double publish_interval = 1, last_publish = -1;
+  // INS attitude factors: bounded absolute roll/pitch/yaw evidence. Sigmas are
+  // per body axis (x=right, y=forward, z=up) in radians after configuration.
+  bool attitude_enabled = true, misalignment_initialized = false;
+  V3D attitude_sigma = V3D(0.15, 0.15, 0.3) * (M_PI / 180.0);
+  V3D misalignment_prior_sigma = V3D(0.3, 0.3, 0.5) * (M_PI / 180.0);
+  double attitude_huber = 2.8;
+  // A single-antenna INS holds heading on the gyro while stationary and only
+  // re-aligns it once the vehicle moves. Attitude factors are therefore added
+  // only when the native speed exceeds attitude_min_speed and the vehicle has
+  // been moving for attitude_motion_age seconds (sign-plate epochs before the
+  // first turn disagreed by ~0.1 deg / 7 cm with stationary INS heading).
+  double attitude_min_speed = 1.0, attitude_motion_age = 5.0, motion_start_stamp = -1;
+  std::size_t accepted_attitudes = 0;
   int minimum_satellites = 12, max_planes = 800, max_pair_factors = 120;
   int local_neighbors = 3, local_map_frames = 30, queue_capacity = 8;
   int export_chunk_points = 1000000;

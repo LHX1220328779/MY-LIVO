@@ -266,6 +266,12 @@ public:
   std::unique_ptr<tf2_ros::StaticTransformBroadcaster> alignment_broadcaster_;
   std::unique_ptr<RtkFusion> rtk_fusion_;
   bool rtk_enabled = false;
+  // Qualified INS attitude as a bounded absolute attitude measurement in the
+  // LIO update (positions/velocities stay unaided).
+  bool frontend_attitude_aiding = false;
+  double frontend_attitude_sigma_deg = 0.3, frontend_attitude_huber_deg = 1.0;
+  double frontend_attitude_pull_fraction = 0.05;
+  std::vector<double> frontend_attitude_axis_mask{1.0, 1.0, 0.0};
   struct PendingRtkLivoFrame
   {
     bool valid = false;

@@ -114,6 +114,19 @@ void LIVMapper::readParameters()
   nh.param<string>("common/imu_topic", imu_topic, "/livox/imu");
   nh.param<string>("common/ins_odom_topic", ins_odom_topic, "/imu_data/odometry");
   nh.param<bool>("rtk/enabled", rtk_enabled, false);
+  nh.param<bool>("rtk/frontend_attitude_aiding", frontend_attitude_aiding, false);
+  nh.param<double>("rtk/frontend_attitude_sigma_deg", frontend_attitude_sigma_deg, 0.3);
+  nh.param<double>("rtk/frontend_attitude_huber_deg", frontend_attitude_huber_deg, 1.0);
+  nh.param<double>("rtk/frontend_attitude_pull_fraction", frontend_attitude_pull_fraction, 0.05);
+  nh.param("rtk/frontend_attitude_axis_mask", frontend_attitude_axis_mask, std::vector<double>{1.0, 1.0, 0.0});
+  if (frontend_attitude_axis_mask.size() != 3 || std::any_of(frontend_attitude_axis_mask.begin(),
+      frontend_attitude_axis_mask.end(), [](double v) { return !(v == 0.0 || v == 1.0); }))
+    throw std::runtime_error("rtk.frontend_attitude_axis_mask must be three 0/1 values (body x,y,z)");
+  if (!std::isfinite(frontend_attitude_sigma_deg) || frontend_attitude_sigma_deg <= 0.0 ||
+      !std::isfinite(frontend_attitude_huber_deg) || frontend_attitude_huber_deg <= 0.0 ||
+      !std::isfinite(frontend_attitude_pull_fraction) || frontend_attitude_pull_fraction < 0.0 ||
+      frontend_attitude_pull_fraction >= 1.0)
+    throw std::runtime_error("rtk.frontend_attitude_sigma_deg/huber_deg must be positive and pull_fraction in [0,1)");
   nh.param<bool>("common/ros_driver_bug_fix", ros_driver_fix_en, false);
   nh.param<bool>("common/img_en", img_en, true);
   nh.param<bool>("common/lidar_en", lidar_en, true);
@@ -1091,6 +1104,29 @@ void LIVMapper::handleLIO()
 
   double t1 = omp_get_wtime();
 
+  // Qualified INS attitude (same mode-4 gate, freshness and timing contract as
+  // the backend position factors) as a bounded absolute attitude measurement.
+  // It never touches position/velocity; without it, scan-to-map registration
+  // on this multi-LiDAR rig drifted native pitch ~0.01 deg per metre.
+  voxelmap_manager->attitude_aiding_ = false;
+  if (rtk_fusion_ && frontend_attitude_aiding)
+  {
+    RtkFusion::Observation reference;
+    gtsam::Pose3 alignment;
+    if (rtk_fusion_->referenceAt(LidarMeasures.last_lio_update_time, reference) &&
+        reference.orientation_valid && rtk_fusion_->frontendAlignment(alignment))
+    {
+      voxelmap_manager->attitude_measurement_ =
+          alignment.rotation().matrix().transpose() * reference.orientation.toRotationMatrix();
+      const double sigma = frontend_attitude_sigma_deg * M_PI / 180.0;
+      voxelmap_manager->attitude_information_ = 1.0 / (sigma * sigma);
+      voxelmap_manager->attitude_huber_rad_ = frontend_attitude_huber_deg * M_PI / 180.0;
+      voxelmap_manager->attitude_pull_fraction_ = frontend_attitude_pull_fraction;
+      voxelmap_manager->attitude_axis_mask_ = V3D(frontend_attitude_axis_mask[0],
+          frontend_attitude_axis_mask[1], frontend_attitude_axis_mask[2]);
+      voxelmap_manager->attitude_aiding_ = true;
+    }
+  }
   voxelmap_manager->StateEstimation(state_propagat);
   _state = voxelmap_manager->state_;
   _pv_list = voxelmap_manager->pv_list_;

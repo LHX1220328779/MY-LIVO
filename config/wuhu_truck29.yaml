@@ -11,7 +11,14 @@ laser_mapping:
     multi_lidar:
       enabled: true
       # calibration_file: "/home/project/data/haibo/huaining/03/sensor-imu_calibration/perception_truck03.json"
-      calibration_file: "/home/project/data/haibo/wuhu_livo/sensor-imu_calibration/perception_truck29.json"
+      # Manual calibration refined from this recording (scripts/refine_multi_lidar_extrinsics.py):
+      # stationary ground overlap showed front_left roll off by -1.31 deg vs front/front_right
+      # (16 cm ground mismatch at 12-27 m), front_right +0.37 deg, back +0.23/-0.13 deg;
+      # only the ground-observable roll/pitch/height terms were corrected. Original file untouched.
+      # v2 adds a driven-window 6-DoF refinement (scripts/refine_multi_lidar_yaw.py):
+      # side LiDARs +6.5/+7 cm forward, back LiDAR -10 cm height, <0.15 deg rotations.
+      calibration_file: "/home/project/MY-LIVO/config/perception_truck29_refined_v2.json"
+      # calibration_file: "/home/project/data/haibo/wuhu_livo/sensor-imu_calibration/perception_truck29.json"
       # topics and transform_keys are paired by index. Keep only the desired
       # pairs to run with any subset of the available LiDAR sources.
       topics: ["/front_right_lidar", "/back_lidar", "/front_left_lidar", "/front_lidar"]
@@ -62,7 +69,13 @@ laser_mapping:
 
     time_offset:
       imu_time_offset: 0.0
-      lidar_time_offset: 0.0
+      # LiDAR headers are ~0.125 s late relative to the IMU/INS clock on this
+      # recording: the native LIO attitude (anchored to the scans) lags the
+      # gyro-consistent INS attitude by 0.125 s during turns (regression of
+      # the attitude difference on body rate, runs 90/93). Shift scan times
+      # earlier so deskew and propagation use the IMU samples that were
+      # actually acquired with the returns.
+      lidar_time_offset: -0.125
       img_time_offset: 0.0
       exposure_time_init: 0.0
 
@@ -74,7 +87,32 @@ laser_mapping:
       # Effective timestamp correspondence verified on this Wuhu recording:
       # scan t queries the original INS sample at t-0.1 s. Dataset-specific,
       # NOT a universal CGI-610 hardware clock calibration.
-      time_offset_sec: -0.1
+      # Position association preserved after the -0.125 s LiDAR shift:
+      # the previous -0.1 s (scan label t <-> INS header t-0.1) becomes +0.025.
+      time_offset_sec: 0.025
+      # INS attitude is time-consistent with the raw gyro (lag -0.01 s), so the
+      # orientation sample is taken at the scan time itself.
+      attitude_time_offset_sec: 0.0
+      # Qualified INS attitude as a bounded absolute attitude measurement in
+      # the LIO iterated update (positions/velocities remain unaided). Native
+      # pitch drifted ~0.01 deg/m relative to gravity because scan-to-map
+      # registration only observes attitude relative to the self-built map;
+      # the induced gravity leakage diverged the along-track velocity on the
+      # final degenerate straight. Body-axis sigma in degrees; convex Huber.
+      frontend_attitude_aiding: true
+      # sigma is the absolute floor (INS accuracy) that dominates when LiDAR
+      # is weak. In rich scenes scan-to-map rows carry ~1e9 rad^-2 of
+      # (map-relative) angular information, so the absolute reference also
+      # receives a fixed fraction of that information: f=0.05 relaxes the
+      # attitude toward the INS with a ~20-scan time constant and bounds the
+      # ~0.003 deg/scan registration bias to ~0.06 deg steady state.
+      frontend_attitude_sigma_deg: 0.3
+      frontend_attitude_pull_fraction: 0.05
+      frontend_attitude_huber_deg: 1.0
+      # Body axes x(pitch), y(roll), z(yaw). Only roll/pitch leak gravity into
+      # velocity; yaw stays LiDAR/gyro-consistent locally (the INS heading
+      # wobbles 0.1-0.2 deg, i.e. 5-10 cm at 30 m if imprinted every scan).
+      frontend_attitude_axis_mask: [1.0, 1.0, 0.0]
       require_status: true
       accepted_position_modes: [4]
       minimum_satellites: 12
@@ -142,6 +180,29 @@ laser_mapping:
       revisit_radius_m: 8.0
       revisit_min_age_sec: 15.0
       match_max_distance_m: 1.2
+      # Absolute body attitude from the qualified INS solution (same mode-4
+      # gate and -0.1 s timing as positions). Native LIO attitude is only
+      # relative to its own map: on this bag a 0.05 deg/s gyro-bias error
+      # drifted pitch by ~3.8 deg in 75 s, which rear-axle positions can only
+      # observe through the ~5 m lever arm. Sigmas per body axis x/y/z
+      # (pitch/roll/yaw) in degrees; convex Huber; one shared installation
+      # misalignment with a weak prior absorbs the constant mounting offset.
+      attitude_enabled: true
+      # Yaw sigma 1.0 deg per keyframe: the native/LiDAR chain (0.03 deg per
+      # 0.5 s step) then dominates yaw up to ~30 s while the INS still bounds
+      # the long-term heading drift. With 0.3 deg the INS heading wobble was
+      # imprinted at ~8 s scales (sign plate epochs disagreed by ~10 cm).
+      # Yaw 0.5 deg per keyframe: balanced against the native chain at ~8 s
+      # (INS heading wobble is not imprinted at short scales) while still
+      # bounding the late-segment LiDAR/gyro yaw drift (2 deg let it reach 0.75 deg).
+      attitude_sigma_deg: [0.15, 0.15, 0.5]
+      # Single-antenna INS heading is gyro-held while stationary and re-aligns
+      # after motion starts: no attitude factors below 1 m/s or within the
+      # first 5 s of motion.
+      attitude_min_speed_mps: 1.0
+      attitude_motion_age_sec: 5.0
+      attitude_huber_delta: 2.8
+      attitude_misalignment_prior_deg: [0.3, 0.3, 0.5]
       local_map_frames: 30
       queue_capacity: 8
       publish_interval_sec: 1.0
@@ -187,7 +248,13 @@ laser_mapping:
       # across the run; do not allow bias to absorb degree-per-second map errors.
       gyr_bias_rw_sigma: 0.00001
       acc_bias_rw_sigma: 0.001
-      initial_gyr_bias_sigma: 0.0005
+      # Stationary-mean gyro bias is accurate to ~1e-4 rad/s (0.1 deg/s sample
+      # std over 200 samples). The previous 0.0005 let the first LiDAR updates
+      # during engine start-up shaking pull bias_g(x) from the correct 1.9e-3
+      # to 1.2e-3 rad/s; that 0.05 deg/s error drifted native pitch 3.8 deg in
+      # 75 s, forced acc bias to 0.32 m/s^2, and diverged velocity to 19 m/s on
+      # the final degenerate straight.
+      initial_gyr_bias_sigma: 0.0001
       # 100 Hz source: allow one missing sample, but never interpolate across
       # a long hole while deskewing a scan.
       maximum_time_gap: 0.011

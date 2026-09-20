@@ -257,6 +257,46 @@ public:
   }
 };
 
+// Absolute body attitude from the GNSS-aided INS solution. The native LIO
+// observes attitude only relative to its own map, so a gyroscope-bias error
+// integrates into an unbounded pitch/roll/yaw drift that the rear-axle
+// position factors can only see through the ~5 m lever arm. The INS attitude
+// is a bounded, independent low-frequency observation; a single installation
+// misalignment M (INS body -> LIO body) absorbs the constant mounting offset,
+// and a convex Huber loss bounds the influence of individual INS glitches.
+// Residual: Log((R_ins * M)^T * R_i) in the LIO body frame.
+class InsAttitudeFactor final
+    : public gtsam::NoiseModelFactor2<gtsam::Pose3, gtsam::Rot3>
+{
+  gtsam::Rot3 measured_;
+public:
+  InsAttitudeFactor(gtsam::Key pose, gtsam::Key misalignment, const gtsam::Rot3 &measured,
+      const gtsam::SharedNoiseModel &model)
+      : gtsam::NoiseModelFactor2<gtsam::Pose3, gtsam::Rot3>(model, pose, misalignment),
+        measured_(measured) {}
+
+  const gtsam::Rot3 &measured() const { return measured_; }
+
+  gtsam::Vector3 physicalError(const gtsam::Pose3 &pose, const gtsam::Rot3 &misalignment) const
+  {
+    return gtsam::Rot3::Logmap(measured_.compose(misalignment).between(pose.rotation()));
+  }
+
+  gtsam::Vector evaluateError(const gtsam::Pose3 &pose, const gtsam::Rot3 &misalignment,
+      gtsam::OptionalMatrixType h_pose = nullptr, gtsam::OptionalMatrixType h_mis = nullptr) const override
+  {
+    gtsam::Matrix3 d_pred_mis, d_diff_pred, d_diff_rot, d_log;
+    gtsam::Matrix36 d_rot_pose;
+    const gtsam::Rot3 predicted = measured_.compose(misalignment, nullptr, d_pred_mis);
+    const gtsam::Rot3 rotation = pose.rotation(d_rot_pose);
+    const gtsam::Rot3 difference = predicted.between(rotation, d_diff_pred, d_diff_rot);
+    const gtsam::Vector3 error = gtsam::Rot3::Logmap(difference, d_log);
+    if (h_pose) *h_pose = d_log * d_diff_rot * d_rot_pose;
+    if (h_mis) *h_mis = d_log * d_diff_pred * d_pred_mis;
+    return error;
+  }
+};
+
 inline gtsam::Pose3 interpolateTransform(const gtsam::Pose3 &a,
                                   const gtsam::Pose3 &b, double ratio)
 {

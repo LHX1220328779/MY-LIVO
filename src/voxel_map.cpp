@@ -504,6 +504,24 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
       lidar_residual_rms_ = effct_feat_num_ ? meas_vec.norm() / std::sqrt(effct_feat_num_) :
           std::numeric_limits<double>::quiet_NaN();
     }
+    if (attitude_aiding_ && attitude_information_ > 0.0)
+    {
+      // Right-perturbation residual z = Log(R_meas^T R); d z / d(delta theta)
+      // = J_r^{-1}(z) ~ I for the small residuals that survive the Huber gate.
+      // Same measurement-update path as the plane rows: it enters H^T R^-1 H
+      // and H^T R^-1 z and therefore the posterior covariance consistently.
+      const V3D z = Log(M3D(attitude_measurement_.transpose() * state_.rot_end)).cwiseProduct(attitude_axis_mask_);
+      lidar_angular_information_ = H_T_H.block<3, 3>(0, 0).trace() / 3.0;
+      double weight = attitude_information_;
+      if (attitude_pull_fraction_ > 0.0 && attitude_pull_fraction_ < 1.0)
+        weight = std::max(weight, attitude_pull_fraction_ / (1.0 - attitude_pull_fraction_) * lidar_angular_information_);
+      attitude_weight_used_ = weight;
+      const double magnitude = z.norm();
+      if (attitude_huber_rad_ > 0.0 && magnitude > attitude_huber_rad_) weight *= attitude_huber_rad_ / magnitude;
+      H_T_H.block<3, 3>(0, 0) += weight * M3D(attitude_axis_mask_.asDiagonal());
+      HTz.head<3>() -= weight * z;
+      attitude_residual_ = z;
+    }
     // EigenSolver<Matrix<double, 6, 6>> es(H_T_H.block<6,6>(0,0));
     MD(DIM_STATE, DIM_STATE) &&K_1 = (H_T_H.block<DIM_STATE, DIM_STATE>(0, 0) + state_.cov.block<DIM_STATE, DIM_STATE>(0, 0).inverse()).inverse();
     G = K_1 * H_T_H;
