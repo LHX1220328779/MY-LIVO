@@ -121,7 +121,7 @@ struct RtkFusion
     unsigned reference_covariance_source = 0;
     M3D angular_observability = M3D::Zero();
   };
-  enum class GeometryKind { Local, Overlap, Revisit };
+  enum class GeometryKind { Overlap, Revisit };
   struct GeometryLink
   {
     std::size_t a, b, factor_index;
@@ -154,6 +154,7 @@ struct RtkFusion
   V3D motion_rotation_sigma = V3D(0.02, 0.02, 0.03) * (M_PI / 180.0) / std::sqrt(0.5);
   V3D motion_translation_sigma = V3D(0.03, 0.03, 0.02) / std::sqrt(0.5);
   double motion_huber_rate = 1;
+  double correction_tilt_sigma_deg_sqrt_sec = 0.00141421356237;
   double time_offset = 0, status_age = 0.1, interpolation_gap = 0.05;
   double horizontal_sigma = 0.03, vertical_sigma = 0.05, covariance_scale = 1;
   double reported_model_sigma_xy = 0, reported_model_sigma_z = 0;

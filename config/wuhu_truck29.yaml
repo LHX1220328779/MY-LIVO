@@ -113,12 +113,16 @@ laser_mapping:
       # does not change its cost at the same drift rate, including short tails.
       # No redescending motion loss (failed native increments form false minima).
       motion_huber_rate_per_sqrt_sec: 1.0
+      # Approximate 4DoF global correction: shared map tilt may move as one
+      # rigid gauge, but correction roll/pitch cannot vary scan by scan.
+      # 0.001 deg per 0.5 s is numerical softness, not a sensor covariance.
+      correction_tilt_sigma_deg_sqrt_sec: 0.00141421356237
       # Nominal independent-position interval. A node interval dt receives
       # weight min(1,dt/interval), including short tails; no dropped valid
       # tail and no multiplication of information when increasing node rate.
       position_factor_interval_sec: 0.49
-      # The same scan-end surface model supplies bounded local and distant
-      # overlap edges. Native increments retain information in weak directions.
+      # Sparse verified overlap/revisit surfaces supplement native motion;
+      # adjacent scans are already consumed by the native LIO map.
       geometry_anchor_interval_sec: 0.49
       # Fit 2 m planar patches for reliable far-range overlap; nonplanar
       # parents fall back to 1 m children. Export retains all original points.

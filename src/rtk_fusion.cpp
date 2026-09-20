@@ -16,6 +16,51 @@
 namespace
 {
 
+// A common roll/pitch change rotates the entire map rigidly. Changes of
+// roll/pitch between correction knots instead split overlapping native scans.
+// This relative factor is invariant to delayed left-hand ENU alignment.
+class CorrectionTiltFactor final
+    : public gtsam::NoiseModelFactor2<gtsam::Pose3, gtsam::Pose3>
+{
+  gtsam::Rot3 raw_a_, raw_b_;
+  Eigen::Matrix<double, 2, 3> horizontal_;
+public:
+  CorrectionTiltFactor(gtsam::Key a, gtsam::Key b,
+      const gtsam::Rot3 &raw_a, const gtsam::Rot3 &raw_b,
+      const gtsam::Vector3 &gravity, double sigma)
+      : gtsam::NoiseModelFactor2<gtsam::Pose3, gtsam::Pose3>(
+            gtsam::noiseModel::Isotropic::Sigma(2, sigma), a, b),
+        raw_a_(raw_a), raw_b_(raw_b)
+  {
+    const gtsam::Vector3 vertical = gravity.normalized();
+    const gtsam::Vector3 x = vertical.unitOrthogonal();
+    horizontal_.row(0) = x.transpose();
+    horizontal_.row(1) = vertical.cross(x).transpose();
+  }
+
+  gtsam::Vector evaluateError(const gtsam::Pose3 &a, const gtsam::Pose3 &b,
+      gtsam::OptionalMatrixType ha = nullptr,
+      gtsam::OptionalMatrixType hb = nullptr) const override
+  {
+    const gtsam::Rot3 relative = a.rotation().between(b.rotation());
+    const gtsam::Rot3 correction_change = raw_a_ * relative * raw_b_.inverse();
+    gtsam::Matrix3 derivative;
+    const gtsam::Vector3 angle = gtsam::Rot3::Logmap(correction_change, derivative);
+    const Eigen::Matrix<double, 2, 3> common = horizontal_ * derivative * raw_b_.matrix();
+    if (ha)
+    {
+      ha->setZero(2, 6);
+      ha->leftCols<3>() = -common * relative.matrix().transpose();
+    }
+    if (hb)
+    {
+      hb->setZero(2, 6);
+      hb->leftCols<3>() = common;
+    }
+    return horizontal_ * angle;
+  }
+};
+
 gtsam::ISAM2Params fusionSolverParameters()
 {
   gtsam::ISAM2Params params;
@@ -62,6 +107,7 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
       {"plane_voxel_m", &plane_voxel}, {"plane_max_thickness_m", &plane_thickness},
       {"plane_model_sigma_m", &plane_noise_floor},
       {"motion_huber_rate_per_sqrt_sec", &motion_huber_rate},
+      {"correction_tilt_sigma_deg_sqrt_sec", &correction_tilt_sigma_deg_sqrt_sec},
       {"revisit_radius_m", &revisit_radius}, {"revisit_min_age_sec", &revisit_age},
       {"match_max_distance_m", &match_distance}, {"publish_interval_sec", &publish_interval}};
   for (const auto &parameter : doubles)
@@ -414,7 +460,8 @@ void RtkFusion::logOptimization(const char *phase, int iteration, double before,
   {
     if (!factor) continue;
     const int group = dynamic_cast<const gtsam::GPSFactorArm *>(factor.get()) ? 0 :
-        dynamic_cast<const NativeMotionFactor *>(factor.get()) ? 1 :
+        (dynamic_cast<const NativeMotionFactor *>(factor.get()) ||
+         dynamic_cast<const CorrectionTiltFactor *>(factor.get())) ? 1 :
         dynamic_cast<const ScanPlaneBatchFactor *>(factor.get()) ? 2 : 3;
     costs[group] += factor->error(estimate);
   }
@@ -1042,10 +1089,6 @@ std::size_t RtkFusion::addGeometry(std::size_t a, std::size_t b,
   {
     const auto &m = matches[directions[axis][i * directions[axis].size() / quotas[axis]]];
     auto constraint = measurement(m);
-    // Adjacent scans reuse surfaces and are correlated with native LIO.
-    // Share a single geometry information budget across these neighbours;
-    // do not claim N independent measurements of the same local map.
-    if (kind == GeometryKind::Local) constraint.sigma *= std::sqrt(local_neighbors);
     constraints.push_back(std::move(constraint));
   }
   auto factor = std::make_shared<ScanPlaneBatchFactor>(gtsam::Symbol('x', a), gtsam::Symbol('x', b),
@@ -1286,16 +1329,18 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
 
     graph.emplace_shared<NativeMotionFactor>(gtsam::Symbol('x', index - 1), key,
         measured, sigmas, motion_huber_rate * std::sqrt(duration));
+    // Keep the native short-time roll/pitch structure. The common global
+    // tilt remains free, while yaw and translation can correct long drift.
+    // This is a two-dimensional process restriction, not an INS attitude
+    // measurement or an inverse-Hessian covariance estimate.
+    const double tilt_sigma = correction_tilt_sigma_deg_sqrt_sec * M_PI / 180 * std::sqrt(duration);
+    graph.emplace_shared<CorrectionTiltFactor>(gtsam::Symbol('x', index - 1), key,
+        previous.raw.rotation(), current.raw.rotation(), local_gravity, tilt_sigma);
   }
   initializePose(graph, initial);
   timing(key_timings[0]);
-  // A robust native increment is a motion regularizer, not a guarantee of
-  // local map consistency. Retain measured common-support geometry between
-  // nearby scans, with a bounded information budget and its real nullspace.
   if (geometry_anchor)
   {
-    for (std::size_t n = 0; n < std::min<std::size_t>(local_neighbors, geometry_anchors.size()); ++n)
-      addGeometry(geometry_anchors[geometry_anchors.size() - 1 - n], index, graph, GeometryKind::Local);
     const V3D position = keyframes.back().optimized.translation();
     const FusionVoxelKey cell{static_cast<std::int64_t>(std::floor(position.x() / revisit_radius)),
         static_cast<std::int64_t>(std::floor(position.y() / revisit_radius)),
