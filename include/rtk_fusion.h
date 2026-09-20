@@ -153,13 +153,13 @@ struct RtkFusion
   // marginal covariance. No second IMU factor duplicates native LIO.
   V3D motion_rotation_sigma = V3D(0.02, 0.02, 0.03) * (M_PI / 180.0) / std::sqrt(0.5);
   V3D motion_translation_sigma = V3D(0.03, 0.03, 0.02) / std::sqrt(0.5);
-  double motion_huber_rate = 1, startup_motion_huber_rate = 2.8;
+  double motion_huber_rate = 1;
   double time_offset = 0, status_age = 0.1, interpolation_gap = 0.05;
   double horizontal_sigma = 0.03, vertical_sigma = 0.05, covariance_scale = 1;
   double reported_model_sigma_xy = 0, reported_model_sigma_z = 0;
   double max_horizontal_sigma = 0.15, max_vertical_sigma = 0.25;
   double huber_delta = 2.8, key_interval = 1.0, key_min_interval = 0.5;
-  double position_factor_interval = 0.5, startup_native_motion_distance = 30;
+  double position_factor_interval = 0.5;
   double geometry_anchor_interval = 0.5;
   double key_translation = 3, key_rotation = 3;
   double plane_voxel = 2, plane_thickness = 0.05, plane_noise_floor = 0.05;

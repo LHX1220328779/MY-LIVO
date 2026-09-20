@@ -62,8 +62,6 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
       {"plane_voxel_m", &plane_voxel}, {"plane_max_thickness_m", &plane_thickness},
       {"plane_model_sigma_m", &plane_noise_floor},
       {"motion_huber_rate_per_sqrt_sec", &motion_huber_rate},
-      {"startup_motion_huber_rate_per_sqrt_sec", &startup_motion_huber_rate},
-      {"startup_native_motion_distance_m", &startup_native_motion_distance},
       {"revisit_radius_m", &revisit_radius}, {"revisit_min_age_sec", &revisit_age},
       {"match_max_distance_m", &match_distance}, {"publish_interval_sec", &publish_interval}};
   for (const auto &parameter : doubles)
@@ -144,7 +142,7 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   // Persist effective parameters, not a copy of a possibly unrelated YAML.
   std::ofstream settings(directory / "parameters.txt");
   settings.exceptions(std::ios::badbit | std::ios::failbit);
-  settings << "model=native_lio_global_correction; scan_geometry=native_deskew_continuous_global_correction; surface_residual=common_support_mean_squared_point_distance; motion_residual=so3_and_endpoint_position; motion_rotation_loss=component_huber; motion_translation_loss=component_huber; startup_motion=first_reference_arc_and_measured_baseline_consistency; overlap_selection=observed_surface_covisibility; geometry_validation=observable_baseline_consistency; association_lifetime=verified_observation\n";
+  settings << "model=native_lio_global_correction; scan_geometry=native_deskew_scan_end_rigid; surface_residual=common_support_mean_squared_point_distance; motion_residual=so3_and_endpoint_position; motion_rotation_loss=component_huber; motion_translation_loss=component_huber; local_geometry=bounded_shared_support; overlap_selection=observed_surface_covisibility; geometry_validation=observable_baseline_consistency; association_lifetime=verified_observation\n";
   for (const auto &name : node->list_parameters({}, 0).names)
   {
     const auto parameter = node->get_parameter(name);
@@ -1043,7 +1041,12 @@ std::size_t RtkFusion::addGeometry(std::size_t a, std::size_t b,
   for (int axis = 0; axis < 4; ++axis) for (std::size_t i = 0; i < quotas[axis]; ++i)
   {
     const auto &m = matches[directions[axis][i * directions[axis].size() / quotas[axis]]];
-    constraints.push_back(measurement(m));
+    auto constraint = measurement(m);
+    // Adjacent scans reuse surfaces and are correlated with native LIO.
+    // Share a single geometry information budget across these neighbours;
+    // do not claim N independent measurements of the same local map.
+    if (kind == GeometryKind::Local) constraint.sigma *= std::sqrt(local_neighbors);
+    constraints.push_back(std::move(constraint));
   }
   auto factor = std::make_shared<ScanPlaneBatchFactor>(gtsam::Symbol('x', a), gtsam::Symbol('x', b),
                                                       std::move(constraints));
@@ -1281,53 +1284,18 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
     const auto measured = previous.raw.between(current.raw);
     const auto sigmas = motionSigmas(duration);
 
-    // The user-verified startup section has dense geometry and accurate native
-    // LIO. Preserve that local shape more strongly, but only while TWO
-    // independent measured rear-axle baselines remain statistically
-    // consistent. The gate uses reference arc length, not time or world
-    // coordinates, and never re-enables later on the route.
-    double reference_arc = 0;
-    bool complete_reference_prefix = true;
-    for (std::size_t i = 1; i <= index; ++i)
-    {
-      if (!keyframes[i - 1].has_position || !keyframes[i].has_position)
-      { complete_reference_prefix = false; break; }
-      reference_arc += (keyframes[i].reference - keyframes[i - 1].reference).norm();
-    }
-    bool baseline_consistent = false;
-    if (previous.has_position && current.has_position)
-    {
-      const V3D native = measured.transformFrom(lever) - lever;
-      const V3D reference = current.reference - previous.reference;
-      if (native.norm() < .2 && reference.norm() < .2)
-        baseline_consistent = true;
-      else if (native.norm() > .2 && reference.norm() > .2)
-      {
-        Eigen::Matrix<double, 1, 6> jacobian;
-        jacobian.head<3>() = -native.normalized().transpose() * measured.rotation().matrix() *
-            gtsam::skewSymmetric(lever);
-        jacobian.tail<3>() = native.normalized().transpose() * measured.rotation().matrix();
-        const double variance = reference.normalized().dot(
-            (previous.reference_covariance + current.reference_covariance) * reference.normalized()) +
-            jacobian.cwiseAbs2().dot(sigmas.cwiseAbs2());
-        const double disagreement = native.norm() - reference.norm();
-        baseline_consistent = variance > 0 &&
-            disagreement * disagreement <= 9 * variance;
-      }
-    }
-    const bool protect_startup = complete_reference_prefix &&
-        reference_arc <= startup_native_motion_distance && baseline_consistent;
-    const double robust_rate = protect_startup ? startup_motion_huber_rate : motion_huber_rate;
     graph.emplace_shared<NativeMotionFactor>(gtsam::Symbol('x', index - 1), key,
-        measured, sigmas, robust_rate * std::sqrt(duration));
+        measured, sigmas, motion_huber_rate * std::sqrt(duration));
   }
   initializePose(graph, initial);
   timing(key_timings[0]);
-  // Native relative motion supplies the local constraint. Do not duplicate
-  // it with simplified neighboring scan geometry. Retain only spaced,
-  // independently associated long-baseline/revisit links.
+  // A robust native increment is a motion regularizer, not a guarantee of
+  // local map consistency. Retain measured common-support geometry between
+  // nearby scans, with a bounded information budget and its real nullspace.
   if (geometry_anchor)
   {
+    for (std::size_t n = 0; n < std::min<std::size_t>(local_neighbors, geometry_anchors.size()); ++n)
+      addGeometry(geometry_anchors[geometry_anchors.size() - 1 - n], index, graph, GeometryKind::Local);
     const V3D position = keyframes.back().optimized.translation();
     const FusionVoxelKey cell{static_cast<std::int64_t>(std::floor(position.x() / revisit_radius)),
         static_cast<std::int64_t>(std::floor(position.y() / revisit_radius)),
@@ -1462,21 +1430,15 @@ gtsam::Pose3 RtkFusion::poseAt(const Frame &frame) const
 void RtkFusion::appendCloud(const Frame &frame, pcl::PointCloud<pcl::PointXYZI> &output) const
 {
   output.reserve(output.size() + frame.cloud->size());
-  const M3D native_rotation = frame.raw.rotation().matrix() * lidar_rotation;
-  const V3D native_translation = frame.raw.transformFrom(lidar_translation);
-  // FAST-LIVO has already deskewed every return rigidly to frame.stamp. Thus
-  // frame.raw*T_BL*p_undistorted is the same native-world surface that the raw
-  // return occupied at its own acquisition time. Apply only the LOW-FREQUENCY
-  // global correction at that point time; do not run a second IMU deskewer.
+  const auto pose = poseAt(frame);
+  const M3D rotation = pose.rotation().matrix() * lidar_rotation;
+  const V3D translation = pose.transformFrom(lidar_translation);
+  // The factor and map must transform the SAME native deskewed surface.
+  // Point-time correction would deform it after fitting a scan-end factor.
+  // Preserve native intra-scan shape; no second, unconstrained deskewer.
   for (const PointType &point : *frame.cloud)
   {
-    double point_stamp = frame.begin + point.curvature / 1000.0;
-    if (!std::isfinite(point_stamp) || point_stamp < frame.begin - 1e-3 ||
-        point_stamp > frame.stamp + 1e-3)
-      throw std::runtime_error("Archived LiDAR point timestamp is outside its submitted frame interval");
-    point_stamp = std::max(frame.begin, std::min(frame.stamp, point_stamp));
-    const V3D native = native_rotation * V3D(point.x, point.y, point.z) + native_translation;
-    const V3D p = correctionAt(point_stamp).transformFrom(native);
+    const V3D p = rotation * V3D(point.x, point.y, point.z) + translation;
     pcl::PointXYZI result;
     result.x = p.x(); result.y = p.y(); result.z = p.z(); result.intensity = point.intensity;
     output.push_back(result);
