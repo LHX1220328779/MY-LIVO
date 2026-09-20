@@ -441,6 +441,40 @@ def read_pcd(path, with_header=False):
     return (cloud, header) if with_header else cloud
 
 
+def actual_pcd_frames(directory, index, archive):
+    """Stream unchanged saved returns, paired by archive order, one chunk at a time."""
+    files = sorted(directory.glob("map_*.pcd"), key=lambda path: int(path.stem.split("_")[-1]))
+    if not files or [int(p.stem.split("_")[-1]) for p in files] != list(range(len(files))):
+        raise ValueError("Actual map PCD chunks must start at zero and be contiguous")
+    file_number, row, cloud = 0, 0, read_pcd(files[0])
+    expected_start = 0
+    for record in index:
+        count = int(record["count"])
+        offset = int(record["offset_bytes"]) - 8
+        if count < 0 or offset != expected_start * 20 or expected_start + count > len(archive):
+            raise ValueError("Frame archive offsets/counts are not contiguous source returns")
+        parts, remaining = [], count
+        while remaining:
+            if row == len(cloud):
+                file_number += 1
+                if file_number == len(files):
+                    raise ValueError("Saved PCDs end before the indexed source returns")
+                cloud, row = read_pcd(files[file_number]), 0
+            take = min(remaining, len(cloud) - row)
+            if take:
+                parts.append(cloud[row:row + take])
+                row += take
+                remaining -= take
+        saved = (parts[0] if len(parts) == 1 else np.concatenate(parts)) if parts else np.empty((0, 4), dtype="<f4")
+        source = archive[expected_start:expected_start + count]
+        if not np.array_equal(saved[:, 3], source[:, 3], equal_nan=True):
+            raise ValueError(f"Actual PCD/source-return intensity order differs at {record['stamp']:.9f}")
+        yield saved
+        expected_start += count
+    if expected_start != len(archive) or row != len(cloud) or file_number + 1 != len(files):
+        raise ValueError("Actual PCD/archive contains returns outside the frame index")
+
+
 def pcd_sections(directory, selection=None, reference=None, lever=(.904, -4.679, -1.699), output=None):
     """Inspect actual saved PCDs, without reprojecting or registering them.
 
@@ -1015,6 +1049,52 @@ def compare_pole_chunks(directory, ground_triangle, height, chunks, output, manu
         writer.writerow(("z_m", "count_a", "count_b", "surface_x_a", "surface_y_a",
                          "surface_x_b", "surface_y_b", "same_height_xy_separation_m"))
         writer.writerows(rows)
+    # Visibility evidence for the upper fixture. A different highest return
+    # need not be the same physical feature (occlusion, scan pattern, crop).
+    # Keep these observations separate from the validated shaft XY score.
+    height_rows, upper_cells = [], []
+    for chunk, region in zip(chunks, regions):
+        if not len(region):
+            summary.append(f"map_{chunk}: upper visibility UNASSESSED, empty crop")
+            upper_cells.append({})
+            continue
+        z = region[:, 2]
+        quantiles = np.percentile(z, [50, 95, 99, 100])
+        upper = region[z >= shaft_z[1]]
+        summary.append(f"map_{chunk}: visible crop Z median/P95/P99/max={quantiles.tolist()} m; "
+                       f"returns above shaft band={len(upper)}; these are visibility, NOT physical top-height estimates")
+        z_bins = np.floor(z / .25).astype(np.int64)
+        for band in np.unique(z_bins):
+            support = region[z_bins == band]
+            height_rows.append((chunk, band * .25, (band + 1) * .25, len(support),
+                                *np.median(support, axis=0),
+                                *np.ptp(np.percentile(support[:, :2], [10, 90], axis=0), axis=0)))
+        cells = {}
+        if len(upper):
+            xy_bins = np.floor(upper[:, :2] / .15).astype(np.int64)
+            for cell in np.unique(xy_bins, axis=0):
+                patch = upper[np.all(xy_bins == cell, axis=1)]
+                if len(patch) >= 3:
+                    cells[tuple(cell)] = (len(patch), *np.percentile(patch[:, 2], [10, 50, 90]))
+        upper_cells.append(cells)
+    with (output / "pole_height_support.csv").open("w") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(("chunk", "z_begin_m", "z_end_m", "returns", "median_x_m", "median_y_m",
+                         "median_z_m", "x_q80_span_m", "y_q80_span_m"))
+        writer.writerows(height_rows)
+    shared = sorted(set(upper_cells[0]) & set(upper_cells[1]))
+    with (output / "pole_upper_common_xy.csv").open("w") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(("cell_x_m", "cell_y_m", "count_a", "z_q10_a", "z_q50_a", "z_q90_a",
+                         "count_b", "z_q10_b", "z_q50_b", "z_q90_b", "observed_z_q50_b_minus_a_m"))
+        for cell in shared:
+            a, b = upper_cells[0][cell], upper_cells[1][cell]
+            writer.writerow((cell[0] * .15, cell[1] * .15, *a, *b, b[2] - a[2]))
+    summary.append(f"Upper-fixture visibility: {len(shared)} common world-XY 0.15 m cells with >=3 returns per chunk; "
+                   "shared XY alone does not establish the same physical top feature.")
+    summary.append("Physical pole-top height error: UNASSESSED. No independently identified common top/cap surface; "
+                   "neither max-Z difference nor visibility quantiles are a top-error or acceptance metric. "
+                   "Inspect pole_height_support.csv, pole_upper_common_xy.csv and the unchanged crop plot.")
     summary.append("Observed surface differences include sampling, occlusion and physical radius; no whole-lamp line-fit accuracy claim.")
     summary.append("Pole comparison: MEASURED, not an automatic acceptance." if supported else
                    "Pole comparison: UNASSESSED. The selected region does not support a valid pole-pair residual.")
@@ -1196,34 +1276,67 @@ def compare_map(directory, frame_stride, point_stride, reference, lever):
             raise ValueError("Unsupported point archive")
     continuous = np.loadtxt(directory / "trajectory_imu.txt", ndmin=2) if version == b"LIVORTK2" else None
     points = np.memmap(directory / "scans.bin", dtype="<f4", mode="r", offset=8).reshape(-1, 5)
+    keys = np.atleast_1d(np.genfromtxt(directory / "keyframes.csv", delimiter=",", names=True))
+    is_key = np.isin(np.round(raw[:, 0], 6), np.round(keys["stamp"], 6))
+    candidates = np.flatnonzero(~is_key)[::10]
+    candidate_set = set(candidates)
+    raw_r = Rotation.from_quat(raw[:, 4:8])
+    cache, scan_points = {}, {}
+
+    def native_points(i, record, scan):
+        local = scan[:, :3].astype(np.float64) @ rotation.T + translation
+        if continuous is not None:
+            query = np.minimum(record["stamp"], record["begin"] + np.floor(scan[:, 4].astype(np.float64) + .5) * .001)
+            r, t = interpolate_poses(raw, query)
+            world = r.apply(local) + t
+        else:
+            world = raw_r[i].apply(local) + raw[i, 1:4]
+        return local, world
+
+    def retain_surface_summary(i, local, world, actual):
+        # One native grouping and identical return IDs in the two maps. In
+        # particular, the optimized normals/centres come from saved points,
+        # not from rigidly transforming an already-deskewed scan a second time.
+        distance = np.linalg.norm(local, axis=1)
+        keep = np.isfinite(local).all(axis=1) & np.isfinite(actual).all(axis=1) & (distance > 5) & (distance < 70)
+        local, world, actual = local[keep], world[keep], actual[keep]
+        scan_points[i] = world[::point_stride], actual[::point_stride]
+        _, inv, counts = np.unique(np.floor(local).astype(np.int64), axis=0, return_inverse=True, return_counts=True)
+        summaries = []
+        for cloud in (world, actual):
+            centers = np.zeros((len(counts), 3)); np.add.at(centers, inv, cloud)
+            centers /= counts[:, None]
+            centered = cloud - centers[inv]
+            cov = np.zeros((len(counts), 3, 3))
+            for axis in range(3):
+                for other in range(3):
+                    np.add.at(cov[:, axis, other], inv, centered[:, axis] * centered[:, other])
+            cov /= counts[:, None, None]
+            eig, vectors = np.linalg.eigh(cov)
+            summaries.append((centers, vectors[:, :, 0], eig))
+        eig = summaries[0][2]
+        planar = (counts >= 6) & (eig[:, 1] > .003) & (eig[:, 0] < .0025) & (eig[:, 0] < .12 * eig[:, 1])
+        cache[i] = tuple((centers[planar], normals[planar]) for centers, normals, _ in summaries)
+
     before, after, stamps, ranges = [], [], [], []
-    for i in range(0, len(index), frame_stride):
+    for i, saved in enumerate(actual_pcd_frames(directory, index, points)):
         record = index[i]
         start = (int(record["offset_bytes"]) - 8) // 20
+        if i in candidate_set:
+            scan = points[start:start + int(record["count"])]
+            local, world = native_points(i, record, scan)
+            retain_surface_summary(i, local, world, np.asarray(saved[:, :3], dtype=float))
+        if i % frame_stride:
+            continue
         scan = points[start:start + int(record["count"]):point_stride]
-        local = scan[:, :3].astype(np.float64) @ rotation.T + translation
+        local, world = native_points(i, record, scan)
+        refined = np.asarray(saved[::point_stride, :3], dtype=float)
         distance = np.linalg.norm(local, axis=1)
-        valid = np.isfinite(local).all(axis=1) & (distance >= 5) & (distance <= 70)
-        scan, local, distance = scan[valid], local[valid], distance[valid]
-        world = Rotation.from_quat(raw[i, 4:8]).apply(local) + raw[i, 1:4]
-        # Mapper evaluates correction on its millisecond grid.
-        query = np.minimum(record["stamp"], record["begin"] + np.floor(scan[:, 4].astype(np.float64) + 0.5) * 0.001)
-        if version == b"LIVORTK3":
-            # Native-deskew archive: mapper applies one final rigid scan-end
-            # pose, never a point-time correction to already-deskewed returns.
-            refined = Rotation.from_quat(optimized[i, 4:8]).apply(local) + optimized[i, 1:4]
-        elif continuous is None:
-            r, t = correction_samples(raw, optimized, query)
-            refined = r.apply(world) + t
-        else:
-            r, t = interpolate_poses(continuous, query)
-            refined = r.apply(local) + t
-            r0, t0 = interpolate_poses(raw, query)
-            world = r0.apply(local) + t0
-        before.append(world)
-        after.append(refined)
-        stamps.append(np.full(len(world), record["stamp"]))
-        ranges.append(distance)
+        valid = np.isfinite(world).all(axis=1) & np.isfinite(refined).all(axis=1) & (distance >= 5) & (distance <= 70)
+        before.append(world[valid])
+        after.append(refined[valid])
+        stamps.append(np.full(np.count_nonzero(valid), record["stamp"]))
+        ranges.append(distance[valid])
     before, after = np.concatenate(before), np.concatenate(after)
     stamps, ranges = np.concatenate(stamps), np.concatenate(ranges)
     cell = np.floor(before).astype(np.int64)
@@ -1248,6 +1361,7 @@ def compare_map(directory, frame_stride, point_stride, reference, lever):
     print(f"\nMap SAME-point temporal surface comparison: sampled={len(before)}, "
           f"planar cells={len(measurements)}, frame/point strides={frame_stride}/{point_stride}")
     print("Cells selected in native LIO map; this is a regression diagnostic, NOT independent geometry truth.")
+    print("Optimized samples are ACTUAL saved map_*.pcd rows; all frame counts and source intensity order verified, no map reconstruction.")
     if continuous is not None:
         print("LIVORTK2 stores raw returns: native comparison uses endpoint pose interpolation, NOT exact native IMU deskew.")
     for low, high in [(5, 20), (20, 40), (40, 70)]:
@@ -1269,48 +1383,13 @@ def compare_map(directory, frame_stride, point_stride, reference, lever):
     # non-keyframes and form correspondences once from rough INS poses, then
     # score exactly those same physical surface candidates for both outputs.
     # INS is only a search seed (0.8 m); it is not geometry ground truth.
-    keys = np.atleast_1d(np.genfromtxt(directory / "keyframes.csv", delimiter=",", names=True))
-    is_key = np.isin(np.round(raw[:, 0], 6), np.round(keys["stamp"], 6))
     times, positions, quaternions, _ = reference
     qi = np.clip(np.searchsorted(times, raw[:, 0]), 0, len(times) - 1)
     seed_r = Rotation.from_quat(quaternions[qi])
     seed_p = positions[qi] - seed_r.apply(lever)
-    raw_r, opt_r = Rotation.from_quat(raw[:, 4:8]), Rotation.from_quat(optimized[:, 4:8])
-    cache, scan_points = {}, {}
-
-    def planes(i):
-        if i in cache:
-            return cache[i]
-        record = index[i]
-        start = (int(record["offset_bytes"]) - 8) // 20
-        scan = points[start:start + int(record["count"])]
-        local = scan[:, :3].astype(float) @ rotation.T + translation
-        if continuous is not None:
-            query = np.minimum(record["stamp"], record["begin"] + np.floor(scan[:, 4].astype(np.float64) + 0.5) * 0.001)
-            rp, tp = interpolate_poses(continuous, query)
-            local = opt_r[i].inv().apply(rp.apply(local) + tp - optimized[i, 1:4])
-        distance = np.linalg.norm(local, axis=1)
-        local = local[np.isfinite(local).all(axis=1) & (distance > 5) & (distance < 70)]
-        scan_points[i] = local[::point_stride]
-        _, inv, counts = np.unique(np.floor(local).astype(np.int64), axis=0, return_inverse=True, return_counts=True)
-        centers = np.zeros((len(counts), 3)); np.add.at(centers, inv, local)
-        centers /= counts[:, None]
-        cov = np.zeros((len(counts), 3, 3))
-        for axis in range(3):
-            for other in range(3):
-                np.add.at(cov[:, axis, other], inv, local[:, axis] * local[:, other])
-        cov /= counts[:, None, None]
-        cov -= centers[:, :, None] * centers[:, None, :]
-        eig, vectors = np.linalg.eigh(cov)
-        keep = (counts >= 6) & (eig[:, 1] > 0.003) & (eig[:, 0] < 0.0025) & (eig[:, 0] < 0.12 * eig[:, 1])
-        result = centers[keep], vectors[keep, :, 0]
-        cache[i] = result
-        return result
-
     offsets = []
     occupancy = {width: [[], []] for width in (0.02, 0.05, 0.10)}
     pair_count = 0
-    candidates = np.flatnonzero(~is_key)[::10]
     for b in candidates:
         previous = candidates[(raw[b, 0] - raw[candidates, 0] >= 5)]
         if not len(previous):
@@ -1320,7 +1399,10 @@ def compare_map(directory, frame_stride, point_stride, reference, lever):
         if abs(distance[nearest] - 30) > 10:
             continue
         a = previous[nearest]
-        ca, na = planes(a); cb, nb = planes(b)
+        ca_world, na_world = cache[a][0]; cb_world, nb_world = cache[b][0]
+        ca = raw_r[a].inv().apply(ca_world - raw[a, 1:4])
+        cb = raw_r[b].inv().apply(cb_world - raw[b, 1:4])
+        na = raw_r[a].inv().apply(na_world); nb = raw_r[b].inv().apply(nb_world)
         if len(ca) < 10 or len(cb) < 10:
             continue
         seeded = seed_r[a].inv().apply(seed_r[b].apply(cb) + seed_p[b] - seed_p[a])
@@ -1331,22 +1413,31 @@ def compare_map(directory, frame_stride, point_stride, reference, lever):
             continue
         aa, nn, bb = ca[match[good]], na[match[good]], cb[good]
         errors = []
-        pa, pb = scan_points[a], scan_points[b]
-        pa = pa[cKDTree(aa).query(pa, k=1)[0] < 0.7]
-        pb = pb[cKDTree(bb).query(pb, k=1)[0] < 0.7]
-        count = min(len(pa), len(pb))
+        # Search supports only once in the native coordinates; apply these
+        # same source-return masks to the actual saved-map counterpart.
+        pa = raw_r[a].inv().apply(scan_points[a][0] - raw[a, 1:4])
+        pb = raw_r[b].inv().apply(scan_points[b][0] - raw[b, 1:4])
+        ids_a = np.flatnonzero(cKDTree(aa).query(pa, k=1)[0] < .7)
+        ids_b = np.flatnonzero(cKDTree(bb).query(pb, k=1)[0] < .7)
+        count = min(len(ids_a), len(ids_b))
         if count:
-            pa = pa[np.linspace(0, len(pa) - 1, count, dtype=int)]
-            pb = pb[np.linspace(0, len(pb) - 1, count, dtype=int)]
-        for pipeline, (rotations, translations) in enumerate([(raw_r, raw[:, 1:4]), (opt_r, optimized[:, 1:4])]):
-            relative = rotations[a].inv().apply(rotations[b].apply(bb) + translations[b] - translations[a])
-            errors.append(abs(np.einsum("ij,ij->i", nn, relative - aa)))
+            ids_a = ids_a[np.linspace(0, len(ids_a) - 1, count, dtype=int)]
+            ids_b = ids_b[np.linspace(0, len(ids_b) - 1, count, dtype=int)]
+        for pipeline in (0, 1):
+            centers_a, normals_a = cache[a][pipeline]
+            centers_b, _ = cache[b][pipeline]
+            errors.append(abs(np.einsum("ij,ij->i", normals_a[match[good]],
+                                       centers_b[good] - centers_a[match[good]])))
             if count >= 100:
-                other = rotations[a].inv().apply(rotations[b].apply(pb) + translations[b] - translations[a])
+                # Same native orientation/origin for both outputs: voxel
+                # occupancy must not gain a separate rotation per pipeline.
+                origin = centers_a[match[good]].mean(axis=0)
+                own = raw_r[a].inv().apply(scan_points[a][pipeline][ids_a] - origin)
+                other = raw_r[a].inv().apply(scan_points[b][pipeline][ids_b] - origin)
                 for width, measurements in occupancy.items():
                     phase_scores = []
                     for phase in (0.0, 0.5):
-                        cells_a = np.unique(np.floor(pa / width + phase).astype(np.int64), axis=0)
+                        cells_a = np.unique(np.floor(own / width + phase).astype(np.int64), axis=0)
                         cells_b = np.unique(np.floor(other / width + phase).astype(np.int64), axis=0)
                         union = len(np.unique(np.concatenate((cells_a, cells_b)), axis=0))
                         phase_scores.append((len(cells_a) + len(cells_b) - union) / union)
@@ -1357,7 +1448,7 @@ def compare_map(directory, frame_stride, point_stride, reference, lever):
     offsets = np.concatenate(offsets) if offsets else np.empty((0, 4))
     print(f"\nNon-keyframe cross-scan surfaces: pairs={pair_count}, matches={len(offsets)}, "
           "time separation >=5s, vehicle baseline 20..40m, fixed INS-seeded correspondences")
-    print("Surface offsets, not truth accuracy; centroid/end-pose approximation excludes within-scan deformation.")
+    print("Surface offsets, not truth accuracy; identical source memberships, normals and centres refit from ACTUAL saved points, including within-scan deformation.")
     for low, high in [(5, 20), (20, 40), (40, 70)]:
         for label, mask in [("ground-like", offsets[:, 3] > 0.9), ("wall-like", offsets[:, 3] < 0.2)]:
             values = offsets[mask & (offsets[:, 2] >= low) & (offsets[:, 2] < high)]
