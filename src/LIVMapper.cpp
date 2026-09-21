@@ -230,6 +230,46 @@ void LIVMapper::readParameters()
                               std::min(y1, y2), std::max(y1, y2)});
       }
     }
+
+    // Static-start extrinsic self-check: ground overlap with the reference
+    // LiDAR observes roll/pitch/height of every other LiDAR; small deviations
+    // are corrected in place, larger ones are only reported.
+    auto &precheck = extrinsic_precheck_config_;
+    nh.param<bool>("multi_lidar/precheck/enabled", precheck.enabled, false);
+    nh.param<bool>("multi_lidar/precheck/apply", precheck.apply, true);
+    nh.param<int>("multi_lidar/precheck/min_frames", precheck.min_frames, 5);
+    nh.param<int>("multi_lidar/precheck/max_frames", precheck.max_frames, 12);
+    nh.param<double>("multi_lidar/precheck/max_rotation_deg",
+                     precheck.max_rotation_deg, 1.0);
+    nh.param<double>("multi_lidar/precheck/max_height_m",
+                     precheck.max_height_m, 0.15);
+    nh.param<double>("multi_lidar/precheck/min_apply_rotation_deg",
+                     precheck.min_apply_rotation_deg, 0.2);
+    nh.param<double>("multi_lidar/precheck/min_apply_height_m",
+                     precheck.min_apply_height_m, 0.04);
+    nh.param<double>("multi_lidar/precheck/static_gyro_deg_s",
+                     precheck.static_gyro_deg_s, 0.5);
+    nh.param<double>("multi_lidar/precheck/static_acc_std_mps2",
+                     precheck.static_acc_std_mps2, 0.4);
+    nh.param<double>("multi_lidar/precheck/cell_size_m",
+                     precheck.cell_size_m, 1.5);
+    nh.param<bool>("multi_lidar/precheck/allow_extrapolated_ground",
+                   precheck.allow_extrapolated_ground, false);
+    nh.param<string>("multi_lidar/precheck/reference_topic",
+                     extrinsic_precheck_reference_topic_, "/front_lidar");
+    vector<double> precheck_body_box;
+    nh.param<vector<double>>("multi_lidar/precheck/body_box",
+                             precheck_body_box,
+                             vector<double>{-2.8, 2.8, -4.5, 9.5});
+    if (precheck_body_box.size() != 4)
+      throw std::runtime_error(
+          "multi_lidar.precheck.body_box must contain x_min,x_max,y_min,y_max.");
+    for (int i = 0; i < 4; ++i) precheck.body_box_m[i] = precheck_body_box[i];
+    if (precheck.min_frames < 1 || precheck.max_frames < precheck.min_frames ||
+        precheck.max_rotation_deg <= 0.0 || precheck.max_height_m <= 0.0 ||
+        precheck.cell_size_m <= 0.0)
+      throw std::runtime_error(
+          "multi_lidar.precheck frame counts, gates and cell size must be positive.");
   }
 
   nh.param<bool>("vio/normal_en", normal_en, true);
@@ -325,6 +365,9 @@ void LIVMapper::readParameters()
                           vector<double>{0.0, 0.0, 0.0, 0.0, 0.0});
   nh.param<int>("camera/width", camera_width, 1920);
   nh.param<int>("camera/height", camera_height, 1080);
+  nh.param<int>("camera/frame_divider", camera_frame_divider, 1);
+  if (camera_frame_divider < 1)
+    throw std::runtime_error("camera.frame_divider must be >= 1.");
   if (multi_lidar_enabled) loadMultiLidarCalibration();
   string imu_message_format;
   nh.param<string>("mine/imu_message_format", imu_message_format, "packed_mine_pose");
@@ -503,18 +546,100 @@ void LIVMapper::loadMultiLidarCalibration()
       camera_from_rear_translation.y(),
       camera_from_rear_translation.z()};
 
+  // Optional sensor sections of the unified calibration file (schema >= 6).
+  // Camera intrinsics and the per-truck time offsets are calibration data,
+  // so they travel with the extrinsics; when present they override the
+  // algorithm yaml and the source is logged.
+  const auto read_numbers = [](const Json::Value &values, std::size_t count,
+                               const string &name) {
+    if (!values.isArray() || values.size() != count)
+      throw std::runtime_error(name + " must contain " + std::to_string(count) + " numbers.");
+    vector<double> out;
+    for (const auto &value : values)
+    {
+      if (!value.isNumeric() || !std::isfinite(value.asDouble()))
+        throw std::runtime_error(name + " contains a non-numeric value.");
+      out.push_back(value.asDouble());
+    }
+    return out;
+  };
+  if (calibration.isMember("camera") && calibration["camera"].isObject())
+  {
+    const Json::Value &camera = calibration["camera"];
+    if (camera.isMember("intrinsics"))
+      camera_intrinsics = read_numbers(camera["intrinsics"], 4, "camera.intrinsics");
+    if (camera.isMember("distortion"))
+      camera_distortion = read_numbers(camera["distortion"], 5, "camera.distortion");
+    if (camera.isMember("width")) camera_width = camera["width"].asInt();
+    if (camera.isMember("height")) camera_height = camera["height"].asInt();
+    RCLCPP_INFO(node_->get_logger(),
+                "Camera model from calibration file: %dx%d fx %.2f fy %.2f cx %.2f cy %.2f "
+                "distortion [%.4f %.4f %.4f %.4f %.4f]",
+                camera_width, camera_height, camera_intrinsics[0], camera_intrinsics[1],
+                camera_intrinsics[2], camera_intrinsics[3], camera_distortion[0],
+                camera_distortion[1], camera_distortion[2], camera_distortion[3],
+                camera_distortion[4]);
+  }
+  if (calibration.isMember("time_offsets") && calibration["time_offsets"].isObject())
+  {
+    const Json::Value &offsets = calibration["time_offsets"];
+    if (offsets.isMember("lidar") && offsets["lidar"].isNumeric())
+      lidar_time_offset = offsets["lidar"].asDouble();
+    if (offsets.isMember("camera") && offsets["camera"].isNumeric())
+      img_time_offset = offsets["camera"].asDouble();
+    RCLCPP_INFO(node_->get_logger(),
+                "Time offsets from calibration file: lidar %+.4f s, camera %+.4f s",
+                lidar_time_offset, img_time_offset);
+  }
+
   string source_description;
+  vector<string> precheck_topics;
+  vector<Eigen::Matrix4d> precheck_transforms;
+  std::size_t precheck_reference = lidar_sources.size();
   for (std::size_t index = 0; index < lidar_sources.size(); ++index)
   {
     if (index != 0) source_description += ", ";
     source_description += lidar_sources[index]->topic + "->" +
                           lidar_sources[index]->transform_key;
+    Eigen::Matrix4d rear_from_lidar = Eigen::Matrix4d::Identity();
+    rear_from_lidar.block<3, 3>(0, 0) = lidar_sources[index]->rear_from_lidar_rotation;
+    rear_from_lidar.block<3, 1>(0, 3) = lidar_sources[index]->rear_from_lidar_translation;
+    precheck_topics.push_back(lidar_sources[index]->topic);
+    precheck_transforms.push_back(rear_from_lidar);
+    if (lidar_sources[index]->topic == extrinsic_precheck_reference_topic_)
+      precheck_reference = index;
   }
   RCLCPP_INFO(
       node_->get_logger(),
       "Loaded %zu LiDAR source(s) from %s: %s",
       lidar_sources.size(), multi_lidar_calibration_file.c_str(),
       source_description.c_str());
+
+  if (extrinsic_precheck_config_.enabled && lidar_sources.size() >= 2)
+  {
+    if (precheck_reference >= lidar_sources.size())
+    {
+      precheck_reference = lidar_sources.size() - 1;
+      RCLCPP_WARN(node_->get_logger(),
+                  "Extrinsic precheck reference topic %s is not configured; using %s",
+                  extrinsic_precheck_reference_topic_.c_str(),
+                  lidar_sources[precheck_reference]->topic.c_str());
+    }
+    extrinsic_precheck_.configure(extrinsic_precheck_config_, precheck_topics,
+                                  precheck_transforms, precheck_reference);
+    RCLCPP_INFO(node_->get_logger(),
+                "Extrinsic precheck armed: reference %s, %d-%d static frames, gates "
+                "%.2f deg / %.3f m, %s",
+                lidar_sources[precheck_reference]->topic.c_str(),
+                extrinsic_precheck_config_.min_frames, extrinsic_precheck_config_.max_frames,
+                extrinsic_precheck_config_.max_rotation_deg,
+                extrinsic_precheck_config_.max_height_m,
+                extrinsic_precheck_config_.apply ? "corrections inside the gates are applied"
+                                                 : "check only");
+  }
+  else
+    extrinsic_precheck_.configure(livo::ExtrinsicPrecheckConfig{}, precheck_topics,
+                                  precheck_transforms, 0);
 }
 
 void LIVMapper::initializeComponents() 
@@ -1646,6 +1771,7 @@ void LIVMapper::multi_lidar_pcl_cbk(
     }
 
     source.pending_frames.push_back({header_time, points});
+    if (extrinsic_precheck_.enabled()) feedExtrinsicPrecheck(source_index);
     if (source.pending_frames.size() > multi_lidar_queue_size)
     {
       const double dropped_time = source.pending_frames.front().header_time;
@@ -1774,6 +1900,136 @@ void LIVMapper::synchronizeMultiLidarFrames()
           multi_lidar_frame_count, lidar_sources.size(), merged->size(),
           start_span * 1000.0, point_span_seconds * 1000.0);
     }
+  }
+}
+
+void LIVMapper::feedExtrinsicPrecheck(std::size_t source_index)
+{
+  // Called with mtx_buffer held, right after the newest frame of this source
+  // was queued. Stillness is judged on the newest 0.2 s of raw IMU samples.
+  const std::size_t window = std::min<std::size_t>(imu_buffer.size(), 20);
+  if (window < 10) return; // no IMU yet: cannot judge motion, keep waiting
+  std::vector<Eigen::Vector3d> gyro, acc;
+  gyro.reserve(window);
+  acc.reserve(window);
+  for (std::size_t i = imu_buffer.size() - window; i < imu_buffer.size(); ++i)
+  {
+    const auto &sample = *imu_buffer[i];
+    gyro.emplace_back(sample.angular_velocity.x, sample.angular_velocity.y,
+                      sample.angular_velocity.z);
+    acc.emplace_back(sample.linear_acceleration.x, sample.linear_acceleration.y,
+                     sample.linear_acceleration.z);
+  }
+  if (extrinsic_precheck_.isStatic(gyro, acc))
+  {
+    const PointCloudXYZI &frame = *lidar_sources[source_index]->pending_frames.back().points;
+    std::vector<Eigen::Vector3f> points;
+    points.reserve(frame.size());
+    for (const auto &point : frame.points) points.emplace_back(point.x, point.y, point.z);
+    extrinsic_precheck_.addFrame(source_index, points);
+    if (extrinsic_precheck_.saturated()) finishExtrinsicPrecheck("static window complete");
+  }
+  else if (extrinsic_precheck_.sufficient())
+    finishExtrinsicPrecheck("vehicle started moving");
+  else
+    finishExtrinsicPrecheck("vehicle moving before enough static frames were collected");
+}
+
+void LIVMapper::finishExtrinsicPrecheck(const string &reason)
+{
+  const auto results = extrinsic_precheck_.solve();
+  bool any_applied = false, any_solved = false, any_gated = false;
+  for (std::size_t s = 0; s < results.size(); ++s)
+  {
+    const auto &r = results[s];
+    if (r.reference)
+    {
+      RCLCPP_INFO(node_->get_logger(), "Extrinsic precheck (%s): %s is the %s",
+                  reason.c_str(), r.topic.c_str(), r.note.c_str());
+      continue;
+    }
+    if (!r.solved)
+    {
+      RCLCPP_WARN(node_->get_logger(), "Extrinsic precheck: %s not checked: %s",
+                  r.topic.c_str(), r.note.c_str());
+      continue;
+    }
+    any_solved = true;
+    any_gated |= !r.within_gates;
+    const char *verdict = r.applied ? "applied"
+                          : (!r.within_gates ? r.note.c_str()
+                             : (!r.significant ? r.note.c_str() : "within gates, not applied (check only)"));
+    if (r.applied || r.within_gates)
+      RCLCPP_INFO(node_->get_logger(),
+                  "Extrinsic precheck: %s ground residual median %.2f -> %.2f cm (n=%d), "
+                  "correction rot_x %+.3f deg rot_y %+.3f deg dz %+.2f cm -> %s",
+                  r.topic.c_str(), 100.0 * r.median_before_m, 100.0 * r.median_after_m,
+                  r.matches_after, r.rot_x_deg, r.rot_y_deg, 100.0 * r.dz_m, verdict);
+    else
+      RCLCPP_WARN(node_->get_logger(),
+                  "Extrinsic precheck: %s ground residual median %.2f -> %.2f cm (n=%d), "
+                  "correction rot_x %+.3f deg rot_y %+.3f deg dz %+.2f cm -> %s",
+                  r.topic.c_str(), 100.0 * r.median_before_m, 100.0 * r.median_after_m,
+                  r.matches_after, r.rot_x_deg, r.rot_y_deg, 100.0 * r.dz_m, verdict);
+    if (!r.applied) continue;
+    any_applied = true;
+
+    LidarSource &source = *lidar_sources[s];
+    const V3D old_origin = source.rear_from_lidar_translation;
+    source.rear_from_lidar_rotation = r.rear_from_lidar_after.block<3, 3>(0, 0);
+    source.rear_from_lidar_translation = r.rear_from_lidar_after.block<3, 1>(0, 3);
+    const M3D correction_rotation = r.correction.block<3, 3>(0, 0);
+    const V3D correction_translation = r.correction.block<3, 1>(0, 3);
+    const V3D new_origin = source.rear_from_lidar_translation;
+    // Returns already expressed in the rear frame with the old extrinsic carry
+    // their beam origin in the normal fields, which identifies the source.
+    const auto correct_cloud = [&](PointCloudXYZI &cloud) {
+      for (PointType &point : cloud.points)
+      {
+        if (std::abs(point.normal_x - static_cast<float>(old_origin.x())) > 1e-4f ||
+            std::abs(point.normal_y - static_cast<float>(old_origin.y())) > 1e-4f ||
+            std::abs(point.normal_z - static_cast<float>(old_origin.z())) > 1e-4f)
+          continue;
+        const V3D corrected =
+            correction_rotation * V3D(point.x, point.y, point.z) + correction_translation;
+        point.x = static_cast<float>(corrected.x());
+        point.y = static_cast<float>(corrected.y());
+        point.z = static_cast<float>(corrected.z());
+        point.normal_x = static_cast<float>(new_origin.x());
+        point.normal_y = static_cast<float>(new_origin.y());
+        point.normal_z = static_cast<float>(new_origin.z());
+      }
+    };
+    for (auto &pending : source.pending_frames) correct_cloud(*pending.points);
+    // Merged frames still queued are replaced by corrected copies. The front
+    // element is left alone: the estimator thread may already hold it.
+    for (std::size_t i = 1; i < lid_raw_data_buffer.size(); ++i)
+    {
+      auto copy = std::make_shared<PointCloudXYZI>(*lid_raw_data_buffer[i]);
+      correct_cloud(*copy);
+      lid_raw_data_buffer[i] = copy;
+    }
+  }
+  string status = "skipped";
+  if (any_applied) status = "applied";
+  else if (any_solved && !extrinsic_precheck_.config().apply) status = "check_only";
+  else if (any_solved && any_gated) status = "gated";
+  else if (any_solved) status = "confirmed";
+  if (any_applied && !p_imu->imu_need_init)
+    RCLCPP_WARN(node_->get_logger(),
+                "Extrinsic precheck applied after mapping had started; earlier frames keep the "
+                "previous extrinsics");
+  try
+  {
+    std::filesystem::create_directories(root_dir + "Log");
+    std::ofstream report(root_dir + "Log/extrinsic_precheck.json");
+    report << extrinsic_precheck_.reportJson(status, last_timestamp_lidar);
+    RCLCPP_INFO(node_->get_logger(), "Extrinsic precheck %s; report %sLog/extrinsic_precheck.json",
+                status.c_str(), root_dir.c_str());
+  }
+  catch (const std::exception &error)
+  {
+    RCLCPP_WARN(node_->get_logger(), "Extrinsic precheck report not written: %s", error.what());
   }
 }
 
@@ -2139,6 +2395,14 @@ void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg_in)
   {
     static int frame_counter = 0;
     if (++frame_counter % 4 != 0) return;
+  }
+  // Generic divider for high-rate cameras (30 Hz -> 10 Hz with 3). In LIVO
+  // mode every LIO/VIO update is cut at an image time, so the image rate also
+  // sets the LiDAR sub-scan length and the estimator update rate.
+  if (camera_frame_divider > 1)
+  {
+    static int divider_counter = 0;
+    if (++divider_counter % camera_frame_divider != 0) return;
   }
   // double msg_header_time =  msg->header.stamp.toSec();
   double msg_header_time = stampToSec(msg->header.stamp) + img_time_offset;

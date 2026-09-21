@@ -31,6 +31,25 @@ laser_mapping:
       # transform_keys: ["transform_matrix_lidar_6"]
       synchronization_tolerance_sec: 0.001
       queue_size: 5
+      # Static-start extrinsic self-check (src/extrinsic_precheck.cpp). While the truck is
+      # still (gyro < static_gyro_deg_s) the first merged frames are collected per LiDAR; each
+      # non-reference LiDAR's ground is registered to the reference LiDAR's ground and the
+      # roll/pitch/z part of its rear-axle extrinsic is corrected when the correction is larger
+      # than the method's own tolerance (min_apply_*) and smaller than the gates (max_*).
+      # Larger errors are only reported (WARN) - recalibrate offline (tools/calib/livo_calib.py).
+      # Every run writes Log/extrinsic_precheck.json; the calibration file itself is never edited.
+      precheck:
+        enabled: true
+        apply: true
+        reference_topic: "/front_lidar"
+        min_frames: 5
+        max_frames: 12
+        static_gyro_deg_s: 0.5
+        cell_size_m: 1.5
+        max_rotation_deg: 1.0
+        max_height_m: 0.15
+        min_apply_rotation_deg: 0.2
+        min_apply_height_m: 0.04
       body_filter:
         # Each consecutive x1,y1,x2,y2 group defines one rectangle in that
         # physical LiDAR coordinate frame; endpoint order is unrestricted.
@@ -45,9 +64,15 @@ laser_mapping:
     camera:
       width: 1920
       height: 1080
+      # Overridden by the "camera" section of the calibration file when present
+      # (tools/calib/livo_calib.py writes it); these values are the fallback.
       intrinsics: [1642.570556640625, 1855.53173828125,
                    971.0083025529602, 534.2602337509306]
       distortion: [0.0, 0.0, 0.0, 0.0, 0.0]
+      # Process every N-th image (1 = all). 30 Hz 1080p VIO is not real-time on the
+      # current machine (~10% behind after 2 min); 2-3 keeps LIVO real-time with a
+      # small loss in native accuracy (run 104: 10 Hz still passes the route budget).
+      frame_divider: 1
 
     mine:
       # rosbag2 publishes this prepared MCAP with RELIABLE QoS. Matching it
@@ -76,7 +101,12 @@ laser_mapping:
       # earlier so deskew and propagation use the IMU samples that were
       # actually acquired with the returns.
       lidar_time_offset: -0.125
-      img_time_offset: 0.0
+      # Camera headers are ~0.115 s late relative to the IMU clock on this recording
+      # (optical-flow yaw rate vs gyro, corr 0.92, four 30 s segments within 7 ms;
+      # tools/calib/livo_calib.py camera-time). Without it the VIO update drags the
+      # native attitude (run 100 vs 101: native max 12.8 -> 4.3 m, yaw 3.9 -> 0.7 deg).
+      # Overridden by time_offsets.camera of the calibration file when present.
+      img_time_offset: -0.115
       exposure_time_init: 0.0
 
     rtk:

@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LIVO Studio · MY-LIVO 建图工作台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="logo">L</div>
+      <div><div class="brand-title">LIVO Studio</div><div class="brand-sub">MY-LIVO 建图工作台</div></div>
+    </div>
+    <nav id="nav">
+      <a href="#overview" data-page="overview"><span class="ico">◎</span>总览</a>
+      <a href="#data" data-page="data"><span class="ico">▤</span>数据准备</a>
+      <a href="#calib" data-page="calib"><span class="ico">⌖</span>标定管理</a>
+      <a href="#mapping" data-page="mapping"><span class="ico">▶</span>一键建图</a>
+      <a href="#results" data-page="results"><span class="ico">≣</span>结果与精度</a>
+    </nav>
+    <div class="sidebar-foot">
+      <div id="sys-mini" class="sys-mini">连接中…</div>
+    </div>
+  </aside>
+  <main class="content">
+    <section id="page-overview" class="page"></section>
+    <section id="page-data" class="page"></section>
+    <section id="page-calib" class="page"></section>
+    <section id="page-mapping" class="page"></section>
+    <section id="page-results" class="page"></section>
+  </main>
+</div>
+<div id="modal-root"></div>
+<div id="toast-root"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,11 @@
+calibration=/home/project/MY-LIVO/config/carlibration/wuhu/truck29/v001_import/calibration.json
+bag=results/prepared/wuhu_livo
+reference=front_lidar
+stationary frames 2..22 (aggregated) for side LiDARs; moving frames 300..340 (per frame) for back LiDAR
+front_right_lidar: stationary aggregated points 12362
+back_lidar: stationary aggregated points 2487
+front_left_lidar: stationary aggregated points 18449
+front_lidar: stationary aggregated points 44072
+front_right_lidar: yaw/xy solved=False; matches 3762->3761; |res| median 6.06->4.15 cm; ground 6.11->4.12 cm (n=3686); vertical 4.45->5.29 cm (n=35); correction rot deg (x,y,z)=(-0.111,+0.368,+0.000) trans cm=(+0.0,+0.0,+1.1); iters 18
+front_left_lidar: yaw/xy solved=False; matches 4629->4809; |res| median 15.79->4.76 cm; ground 16.15->4.73 cm (n=4664); vertical 5.26->5.16 cm (n=62); correction rot deg (x,y,z)=(+0.115,-1.312,+0.000) trans cm=(+0.0,+0.0,-1.0); iters 25
+back_lidar: (moving, per-frame vs refined sides) yaw/xy solved=False; matches 36824->37010; |res| median 8.41->8.06 cm; ground 8.02->7.74 cm (n=31660); vertical n=3947; correction rot deg (x,y,z)=(+0.227,-0.134,+0.000) trans cm=(+0.0,+0.0,+1.6); iters 18

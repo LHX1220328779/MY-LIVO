@@ -1987,6 +1987,9 @@ void RtkFusion::exportMap()
     archive.flush();
     frame_index.flush();
     std::size_t chunk_index = 0;
+    // The colored cloud only contains returns inside the camera frustum, so it
+    // is written as a separate product (rgb_map_*.pcd); the complete geometry
+    // map (map_*.pcd) is always exported and stays evaluable.
     if (color_enabled)
     {
       color_archive.flush();
@@ -2014,7 +2017,7 @@ void RtkFusion::exportMap()
         appendDisplayCloud(frame, chunk);
         if (chunk.size() >= static_cast<std::size_t>(export_chunk_points))
         {
-          const auto file = directory / ("map_" + std::to_string(chunk_index++) + ".pcd");
+          const auto file = directory / ("rgb_map_" + std::to_string(chunk_index++) + ".pcd");
           if (pcl::io::savePCDFileBinary(file.string(), chunk) != 0)
             throw std::runtime_error("Cannot write optimized RGB point cloud " + file.string());
           chunk.clear();
@@ -2022,12 +2025,12 @@ void RtkFusion::exportMap()
       }
       if (!chunk.empty())
       {
-        const auto file = directory / ("map_" + std::to_string(chunk_index) + ".pcd");
+        const auto file = directory / ("rgb_map_" + std::to_string(chunk_index) + ".pcd");
         if (pcl::io::savePCDFileBinary(file.string(), chunk) != 0)
           throw std::runtime_error("Cannot write optimized RGB point cloud " + file.string());
       }
+      chunk_index = 0;
     }
-    else
     {
       std::ifstream input(directory / "scans.bin", std::ios::binary);
       input.exceptions(std::ios::failbit | std::ios::badbit);

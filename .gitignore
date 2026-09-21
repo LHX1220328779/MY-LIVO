@@ -22,3 +22,6 @@ __pycache__/
 # Real-data evidence is retained on disk, not source-controlled.
 /results/
 /results.unwritable-*/
+
+# LIVO Studio local UI state
+config/carlibration/studio_state.json

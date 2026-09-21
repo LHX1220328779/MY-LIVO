@@ -24,6 +24,7 @@ which is included as part of this source code package.
 #include <csignal>
 #include <memory>
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
+#include "extrinsic_precheck.h"
 
 struct RtkFusion;
 
@@ -56,6 +57,8 @@ public:
       const sensor_msgs::PointCloud2::ConstSharedPtr &msg,
       std::size_t source_index);
   void synchronizeMultiLidarFrames();
+  void feedExtrinsicPrecheck(std::size_t source_index);
+  void finishExtrinsicPrecheck(const string &reason);
   void loadMultiLidarCalibration();
   void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg_in);
   void imu_cbk(const sensor_msgs::Imu::ConstSharedPtr &msg_in);
@@ -199,6 +202,13 @@ public:
   double lidar_max_point_offset = 0.2;
   std::size_t multi_lidar_queue_size = 5;
   std::size_t multi_lidar_frame_count = 0;
+
+  // Static-start extrinsic self-check (see extrinsic_precheck.h).
+  livo::ExtrinsicPrecheck extrinsic_precheck_;
+  livo::ExtrinsicPrecheckConfig extrinsic_precheck_config_;
+  string extrinsic_precheck_reference_topic_ = "/front_lidar";
+  // Process every n-th camera frame (30 Hz camera, divider 3 -> 10 Hz VIO).
+  int camera_frame_divider = 1;
 
   deque<sensor_msgs::Imu::ConstSharedPtr> imu_buffer;
   deque<cv::Mat> img_buffer;

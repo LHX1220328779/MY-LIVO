@@ -429,15 +429,22 @@ def read_pcd(path, with_header=False):
                 break
         else: raise ValueError(f"Missing PCD header: {path}")
     count = len(header.get("FIELDS", []))
-    if (header.get("FIELDS", [])[:4] != ["x", "y", "z", "intensity"] or
-            header.get("TYPE") != ["F"] * count or header.get("SIZE") != ["4"] * count or
+    fields = header.get("FIELDS", [])
+    # Native/LIO exports are XYZI; camera-enabled (LIVO) exports are XYZRGB with a packed
+    # 32-bit rgb field. Both have a 16-byte stride; only x,y,z are geometry.
+    rgb_cloud = fields[:4] == ["x", "y", "z", "rgb"]
+    expected_type = ["F", "F", "F", "U"] + ["F"] * (count - 4) if rgb_cloud else ["F"] * count
+    if ((fields[:4] != ["x", "y", "z", "intensity"] and not rgb_cloud) or
+            header.get("TYPE") != expected_type or header.get("SIZE") != ["4"] * count or
             header.get("COUNT") != ["1"] * count or header.get("DATA") != ["binary"]):
-        raise ValueError(f"Expected binary float XYZI PCD: {path}")
+        raise ValueError(f"Expected binary float XYZI or XYZRGB PCD: {path}")
     points = int(header["POINTS"][0])
     if path.stat().st_size != offset + points * count * 4:
         raise ValueError(f"PCD payload size disagrees with declared fields/point stride: {path}")
     cloud = np.memmap(path, mode="r", dtype="<f4", offset=offset,
                       shape=(points, count))[:, :4] if points else np.empty((0, 4), dtype="<f4")
+    if rgb_cloud and points:
+        cloud = np.array(cloud); cloud[:, 3] = 0.0   # packed rgb is not an intensity
     return (cloud, header) if with_header else cloud
 
 
