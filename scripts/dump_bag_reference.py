@@ -6,7 +6,16 @@ Usage (inside the calibration container):
   /usr/bin/python3 scripts/dump_bag_reference.py --bag results/prepared/wuhu_livo --output results/prepared/reference_csv
 """
 import argparse, csv, pathlib
-import rosbag2_py
+import sys
+from pathlib import Path as _LivoPath
+
+for _cand in (_LivoPath(__file__).resolve().parents[1] / "tools", _LivoPath("/home/project/MY-LIVO/tools")):
+    if (_cand / "livo" / "rosenv.py").exists():
+        sys.path.insert(0, str(_cand))
+        break
+from livo import rosenv as _rosenv  # noqa: E402
+_rosenv.ensure()
+from livo.dataset import Dataset  # noqa: E402
 from rclpy.serialization import deserialize_message
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu
@@ -24,10 +33,8 @@ def main():
     a = ap.parse_args()
     out = pathlib.Path(a.output)
     out.mkdir(parents=True, exist_ok=True)
-    reader = rosbag2_py.SequentialReader()
-    reader.open(rosbag2_py.StorageOptions(uri=a.bag, storage_id="mcap"), rosbag2_py.ConverterOptions("", ""))
+    dataset = Dataset.open(a.bag)
     topics = ["imu_data", "imu_data/odometry", "imu_data/ins_status"]
-    reader.set_filter(rosbag2_py.StorageFilter(topics=topics + ["/" + t for t in topics]))
     f_odom = open(out / "ins_odometry.csv", "w", newline="")
     f_stat = open(out / "ins_status.csv", "w", newline="")
     f_imu = open(out / "imu_raw.csv", "w", newline="")
@@ -36,9 +43,7 @@ def main():
     w_stat.writerow(["stamp", "ins_pos_mode", "gps_num_sats", "extra"])
     w_imu.writerow(["stamp", "gx", "gy", "gz", "ax", "ay", "az"])
     n = [0, 0, 0]
-    while reader.has_next():
-        topic, data, _ = reader.read_next()
-        topic = topic.lstrip("/")
+    for topic, data, _ in dataset.iter_messages(topics):
         if topic == "imu_data/odometry":
             m = deserialize_message(data, Odometry)
             p, q = m.pose.pose.position, m.pose.pose.orientation

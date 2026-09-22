@@ -18,7 +18,16 @@ Usage (container):
       --report results/calibration_refinement/report.txt
 """
 import argparse, json, pathlib, numpy as np
-import rosbag2_py
+import sys
+from pathlib import Path as _LivoPath
+
+for _cand in (_LivoPath(__file__).resolve().parents[1] / "tools", _LivoPath("/home/project/MY-LIVO/tools")):
+    if (_cand / "livo" / "rosenv.py").exists():
+        sys.path.insert(0, str(_cand))
+        break
+from livo import rosenv as _rosenv  # noqa: E402
+_rosenv.ensure()
+from livo.dataset import Dataset  # noqa: E402
 from rclpy.serialization import deserialize_message
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2
@@ -31,13 +40,13 @@ REFERENCE = "front_lidar"
 
 
 def read_frames(bag, first, count):
-    reader = rosbag2_py.SequentialReader()
-    reader.open(rosbag2_py.StorageOptions(uri=bag, storage_id="mcap"), rosbag2_py.ConverterOptions("", ""))
+    """Frames [first, first+count) of every LiDAR topic, read directly from the raw recording."""
+    dataset = Dataset.open(bag)
     topics = list(KEYS)
-    reader.set_filter(rosbag2_py.StorageFilter(topics=topics + ["/" + t for t in topics]))
     clouds = {t: [] for t in topics}; counts = {t: 0 for t in topics}
-    while reader.has_next():
-        topic, data, _ = reader.read_next(); topic = topic.lstrip("/")
+    for topic, data, _ in dataset.iter_messages(topics):
+        topic = topic.split("/")[-1] if topic.split("/")[-1] in counts else topic
+        if topic not in counts: continue
         counts[topic] += 1
         if counts[topic] <= first: continue
         if counts[topic] > first + count:

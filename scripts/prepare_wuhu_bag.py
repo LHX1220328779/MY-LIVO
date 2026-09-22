@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Build one indexed, time-ordered MY-LIVO bag from split source MCAPs."""
+"""Build one indexed, time-ordered MY-LIVO bag from split source MCAPs.
+
+DEPRECATED for the normal workflow: playback (tools/livo/player.py), calibration
+(tools/calib/livo_calib.py) and evaluation read the raw recording directly through
+tools/livo/dataset.py. Keep this only to export a single merged archive bag on request.
+"""
 
 import os
 import sys

@@ -1,20 +1,25 @@
 #!/usr/bin/env bash
-# One complete, reproducible Wuhu round inside the calibration container (LIO or LIVO):
-#   launch mapper -> ordered 1x playback -> drain tail -> SIGINT the mapping node
-#   (it optimizes, exports trajectories + every map_*.pcd) -> stop launcher -> evaluate.
-# Everything (logs, PCDs, evaluation, effective config) is written under results/<round>/ only.
+# One complete, reproducible mapping round inside the calibration container (LIO or LIVO):
+#   launch mapper -> time-ordered real-time playback straight from the raw MCAP recording ->
+#   drain tail -> SIGINT the mapping node (it optimizes, exports trajectories + every map_*.pcd)
+#   -> stop launcher -> evaluate.
+# Everything (logs, PCDs, evaluation, effective config, round.json manifest) is written under
+# results/<round>/ only. No prepared/merged bag is required: --dataset accepts the raw recording
+# root (Perception_*/Camera_* folders) or any single ROS 2 bag folder.
 #
 # Usage (inside container):
-#   bash scripts/run_wuhu_round.sh <round_name> [--mode lio|livo] [--no-rtk] [--no-save-map] [--rviz]
-#        [--rate R] [--start-offset S] [--set laser_mapping.key.subkey=value ...] [--no-eval]
-#        [--bag <prepared bag dir>] [--calibration <calibration.json>]
+#   bash scripts/run_wuhu_round.sh <round_name> [--mode lio|livo] [--dataset DIR] [--calibration FILE]
+#        [--no-rtk] [--no-save-map] [--rviz] [--rate R] [--start-offset S] [--duration D]
+#        [--set laser_mapping.key.subkey=value ...] [--no-eval]
+#   (--bag DIR is an alias of --dataset)
 # Examples:
-#   bash scripts/run_wuhu_round.sh wuhu_livo_100_baseline --mode livo
-#   bash scripts/run_wuhu_round.sh wuhu_livo_101_img_offset --mode livo --set time_offset.img_time_offset=-0.115
+#   bash scripts/run_wuhu_round.sh wuhu_livo_120 --mode livo --dataset /home/project/data/haibo/wuhu_livo/ros2bag
+#   bash scripts/run_wuhu_round.sh quick_lio --mode lio --duration 40 --no-save-map --no-eval
 set -uo pipefail
 repo=/home/project/MY-LIVO
 round=${1:?round name required, e.g. wuhu_rtk_91_ins_attitude}; shift
-mode=lio; use_rtk=true; save_map=true; use_rviz=false; rate=1.0; start_offset=0; do_eval=1; sets=(); bag=""; calibration=""
+mode=lio; use_rtk=true; save_map=true; use_rviz=false; rate=1.0; start_offset=0; duration=""; do_eval=1
+sets=(); dataset="/home/project/data/haibo/wuhu_livo/ros2bag"; calibration=""
 while (($#)); do
   case "$1" in
     --mode) mode="$2"; shift 2 ;;
@@ -23,19 +28,20 @@ while (($#)); do
     --rviz) use_rviz=true; shift ;;
     --rate) rate="$2"; shift 2 ;;
     --start-offset) start_offset="$2"; shift 2 ;;
+    --duration) duration="$2"; shift 2 ;;
     --set) sets+=("$2"); shift 2 ;;
     --no-eval) do_eval=0; shift ;;
-    --bag) bag="$2"; shift 2 ;;
+    --bag|--dataset) dataset="$2"; shift 2 ;;
     --calibration) calibration="$2"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
+case "$mode" in lio|livo) ;; *) echo "--mode must be lio or livo" >&2; exit 2 ;; esac
 if [[ -n "$calibration" ]]; then
   [[ -f "$calibration" ]] || { echo "calibration file not found: $calibration" >&2; exit 2; }
   sets+=("multi_lidar.calibration_file=$calibration")
 fi
-if [[ -n "$bag" && ! -f "$bag/metadata.yaml" ]]; then echo "prepared bag not found: $bag" >&2; exit 2; fi
-case "$mode" in lio|livo) ;; *) echo "--mode must be lio or livo" >&2; exit 2 ;; esac
+[[ -d "$dataset" ]] || { echo "dataset directory not found: $dataset" >&2; exit 2; }
 out="$repo/results/$round"
 mkdir -p "$out"
 cd "$repo"
@@ -45,6 +51,56 @@ set +u; source /opt/ros/humble/setup.bash; source install/fast_livo/share/fast_l
 export ROS_LOG_DIR="$out/roslog"; mkdir -p "$ROS_LOG_DIR"
 export FASTDDS_BUILTIN_TRANSPORTS=SHM
 export OPENBLAS_NUM_THREADS=1
+
+# Describe and validate the dataset (raw split recording or single bag) without converting it.
+if ! /usr/bin/python3 tools/livo/dataset.py "$dataset" --json > "$out/dataset.json" 2> "$out/dataset.err"; then
+  echo "dataset not readable: $dataset" >&2; cat "$out/dataset.err" >&2; exit 2
+fi
+ready_key=lio_ready; [[ "$mode" == "livo" ]] && ready_key=livo_ready
+if ! /usr/bin/python3 -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get(sys.argv[2]) else 1)" "$out/dataset.json" "$ready_key"; then
+  echo "dataset is not $ready_key (mode $mode): $dataset" >&2
+  /usr/bin/python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print('topics:', sorted(d['topics']))" "$out/dataset.json" >&2
+  exit 2
+fi
+
+# Round manifest for the Studio (phase is updated as the round progresses).
+manifest="$out/round.json"
+phase() {  # phase <name> [key=value ...]
+  /usr/bin/python3 - "$manifest" "$@" <<'PY'
+import json, sys, datetime, os
+path, phase_name, *kv = sys.argv[1:]
+doc = json.load(open(path)) if os.path.exists(path) else {}
+doc["phase"] = phase_name
+doc["updated"] = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+for item in kv:
+    k, _, v = item.partition("=")
+    try:
+        v = json.loads(v)
+    except Exception:
+        pass
+    doc[k] = v
+json.dump(doc, open(path, "w"), indent=2, ensure_ascii=False)
+PY
+}
+/usr/bin/python3 - "$manifest" "$round" "$mode" "$dataset" "$calibration" "$use_rtk" "$save_map" "$use_rviz" "$rate" "$start_offset" "$duration" "$do_eval" "${sets[@]}" <<'PY'
+import json, sys, datetime, subprocess, os
+path, round_name, mode, dataset, calibration, use_rtk, save_map, use_rviz, rate, start_offset, duration, do_eval, *sets = sys.argv[1:]
+def git(*args):
+    try:
+        return subprocess.run(["git", *args], capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        return ""
+binary = "/home/project/MY-LIVO/install/fast_livo/lib/fast_livo/fastlivo_mapping"
+doc = {"round": round_name, "mode": mode, "dataset": dataset, "calibration": calibration or None,
+       "options": {"use_rtk": use_rtk == "true", "save_map": save_map == "true", "rviz": use_rviz == "true",
+                   "rate": float(rate), "start_offset": float(start_offset),
+                   "duration": float(duration) if duration else None, "evaluate": do_eval == "1"},
+       "overrides": sets, "start": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+       "commit": git("rev-parse", "--short", "HEAD"), "branch": git("branch", "--show-current"),
+       "binary_mtime": datetime.datetime.fromtimestamp(os.path.getmtime(binary)).isoformat(timespec="seconds") if os.path.exists(binary) else None,
+       "status": "running", "phase": "starting"}
+json.dump(doc, open(path, "w"), indent=2, ensure_ascii=False)
+PY
 
 # Effective configuration: copy of the production yaml with the requested overrides applied.
 config="$out/config.yaml"
@@ -76,20 +132,21 @@ with open(dst, "w", encoding="utf-8") as f:
 PY
 
 # Refuse to start on top of a stale mapper/player from an earlier round.
-if pgrep -f 'fastlivo_mapping|ros2 bag play|wuhu_truck29.launch' >/dev/null; then
+stale='fastlivo_mapping|livo/player.py|livo.player|ros2 bag play|wuhu_truck29.launch'
+if pgrep -f "$stale" >/dev/null; then
   echo "stale ROS processes present; killing them" | tee -a "$out/run.log"
-  pkill -INT -f 'ros2 bag play' || true; sleep 1
+  pkill -INT -f 'livo/player.py|livo.player|ros2 bag play' || true; sleep 1
   pkill -TERM -f 'fastlivo_mapping' || true; sleep 2
   pkill -TERM -f 'wuhu_truck29.launch' || true; sleep 2
-  pkill -KILL -f 'fastlivo_mapping|ros2 bag play|wuhu_truck29.launch' || true
+  pkill -KILL -f "$stale" || true
 fi
 
 {
-echo "round=$round"; echo "mode=$mode use_rtk=$use_rtk save_map=$save_map rviz=$use_rviz rate=$rate start_offset=$start_offset"
+echo "round=$round"; echo "mode=$mode use_rtk=$use_rtk save_map=$save_map rviz=$use_rviz rate=$rate start_offset=$start_offset duration=${duration:-all}"
 echo "overrides=${sets[*]:-none}"
-echo "bag=${bag:-default}"; echo "calibration=${calibration:-yaml}"
+echo "bag=$dataset"; echo "dataset=$dataset"; echo "calibration=${calibration:-yaml}"
 echo "start=$(date -u +%FT%TZ)"; echo "commit=$(git rev-parse --short HEAD 2>/dev/null)"; echo "branch=$(git branch --show-current 2>/dev/null)"
-git status --short -- src include config launch scripts CMakeLists.txt 2>/dev/null | sed 's/^/dirty: /'
+git status --short -- src include config launch scripts tools CMakeLists.txt 2>/dev/null | sed 's/^/dirty: /'
 } > "$out/run.log"
 
 use_camera=false; [[ "$mode" == "livo" ]] && use_camera=true
@@ -103,14 +160,19 @@ done
 sleep 3
 mapper_pid=$(pgrep -f "fastlivo_mapping" | head -1)
 echo "launch_pid=$launch_pid mapper_pid=${mapper_pid:-none}" >> "$out/run.log"
-if [[ -z "${mapper_pid:-}" ]]; then echo "mapper did not start" | tee -a "$out/run.log"; kill -INT "$launch_pid" 2>/dev/null; exit 2; fi
+if [[ -z "${mapper_pid:-}" ]]; then
+  echo "mapper did not start" | tee -a "$out/run.log"; phase failed status=failed error='"mapper did not start"'
+  kill -INT "$launch_pid" 2>/dev/null; exit 2
+fi
 
-if [[ "$mode" == "livo" ]]; then play_args=(--with-camera); else play_args=(--lio-only); fi
-[[ -n "$bag" ]] && play_args+=(--prepared-bag "$bag")
-bash scripts/play_all_bags.sh "${play_args[@]}" --rate "$rate" --start-offset "$start_offset" > "$out/playback.log" 2>&1
+phase playing
+play_args=("$dataset" --preset "$mode" --rate "$rate" --start-offset "$start_offset")
+[[ -n "$duration" ]] && play_args+=(--duration "$duration")
+/usr/bin/python3 tools/livo/player.py "${play_args[@]}" > "$out/playback.log" 2>&1
 echo "playback_exit=$? at $(date -u +%FT%TZ)" >> "$out/run.log"
 
 # Drain: wait until the fusion frame index stops growing (tail caught up).
+phase draining
 fusion_dir=$(ls -dt "$out"/Log/fusion/*/ 2>/dev/null | head -1)
 last=-1; stable=0
 for i in $(seq 1 120); do
@@ -123,6 +185,7 @@ done
 echo "frames_csv_lines=$last drained at $(date -u +%FT%TZ)" >> "$out/run.log"
 
 # Graceful stop: the node handles SIGINT itself (finish accepted scans, final LM, export).
+phase finalizing
 kill -INT "$mapper_pid"
 for i in $(seq 1 900); do
   kill -0 "$mapper_pid" 2>/dev/null || break
@@ -139,11 +202,19 @@ wait "$launch_pid" 2>/dev/null
 echo "launch_exit=$?" >> "$out/run.log"
 pkill -KILL -f "image_transport/republish" 2>/dev/null || true
 grep -E "RTK finalized|Final keyframe|INS attitude factors|position budget|Mapping failed|RTK backend failed" "$out/launch.log" >> "$out/run.log"
-ls "$fusion_dir"/map_*.pcd 2>/dev/null | wc -l | sed 's/^/map_chunks=/' >> "$out/run.log"
+map_chunks=$(ls "$fusion_dir"/map_*.pcd 2>/dev/null | wc -l)
+echo "map_chunks=$map_chunks" >> "$out/run.log"
 echo "fusion_dir=$fusion_dir" >> "$out/run.log"
+phase exported fusion_dir="\"${fusion_dir%/}\"" map_chunks="$map_chunks"
 
 if [[ $do_eval -eq 1 && -n "${fusion_dir:-}" && -f "$fusion_dir/trajectory_optimized.txt" ]]; then
-  bash scripts/evaluate_wuhu_round.sh "$round" >> "$out/run.log" 2>&1
+  phase evaluating
+  bash scripts/evaluate_wuhu_round.sh "$round" --dataset "$dataset" >> "$out/run.log" 2>&1
+fi
+if [[ -n "${fusion_dir:-}" && -f "$fusion_dir/trajectory_optimized.txt" ]]; then
+  phase done status=done end="\"$(date -u +%FT%TZ)\""
+else
+  phase failed status=failed end="\"$(date -u +%FT%TZ)\"" error='"no optimized trajectory exported"'
 fi
 chown -R 1000:1000 "$out" 2>/dev/null || true
 echo "end=$(date -u +%FT%TZ)" >> "$out/run.log"

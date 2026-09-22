@@ -1,0 +1,36 @@
+{
+ "verdict": "fail",
+ "reasons": [
+  "native rear-axle error at 110-120 s 4.07 -> 8.75 m",
+  "native odometry scale 0.9979 -> 0.9800"
+ ],
+ "common_window": {
+  "t0": 110,
+  "t1": 120,
+  "baseline_rear_m": 4.066,
+  "candidate_rear_m": 8.753
+ },
+ "baseline": {
+  "round": "r111_cam_v007",
+  "mode": "livo use_rtk=true save_map=true rviz=false rate=1.0 start_offset=0",
+  "calibration_id": "wuhu/truck29/v007_import",
+  "duration_s": 117.83,
+  "scale": 0.9979,
+  "median_m": 2.1124,
+  "final_m": 4.0902,
+  "final_xy_m": 3.4461,
+  "yaw_p95_deg": 0.5833
+ },
+ "candidate": {
+  "round": "r105_v006cal_livo_0921_181625",
+  "mode": "livo use_rtk=true save_map=true rviz=false rate=1.0 start_offset=0",
+  "calibration_id": "wuhu/truck29/v006_camlidar",
+  "duration_s": 117.83,
+  "scale": 0.98,
+  "median_m": 5.1591,
+  "final_m": 8.6667,
+  "final_xy_m": 8.4446,
+  "yaw_p95_deg": 0.5474
+ },
+ "criteria": "scale within baseline+0.2%; rear error at last common window <= 1.10x+0.10 m; yaw P95 <= baseline+0.15 deg"
+}

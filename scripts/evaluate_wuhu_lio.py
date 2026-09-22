@@ -3,19 +3,15 @@
 
 import os
 import sys
+from pathlib import Path as _LivoPath
 
-if sys.executable != "/usr/bin/python3":
-    environment = os.environ.copy()
-    for variable in ("CONDA_PREFIX", "CONDA_DEFAULT_ENV", "PYTHONHOME", "PYTHONPATH"):
-        environment.pop(variable, None)
-    environment["PATH"] = (
-        "/opt/ros/humble/bin:/usr/local/sbin:/usr/local/bin:"
-        "/usr/sbin:/usr/bin:/sbin:/bin")
-    environment["AMENT_PREFIX_PATH"] = "/opt/ros/humble"
-    environment["PYTHONPATH"] = (
-        "/opt/ros/humble/lib/python3.10/site-packages:"
-        "/opt/ros/humble/local/lib/python3.10/dist-packages")
-    os.execve("/usr/bin/python3", ["/usr/bin/python3", *sys.argv], environment)
+for _cand in (_LivoPath(__file__).resolve().parents[1] / "tools", _LivoPath("/home/project/MY-LIVO/tools")):
+    if (_cand / "livo" / "rosenv.py").exists():
+        sys.path.insert(0, str(_cand))
+        break
+from livo import rosenv as _rosenv  # noqa: E402
+_rosenv.ensure()
+from livo.dataset import Dataset  # noqa: E402
 
 import argparse
 from pathlib import Path
@@ -113,22 +109,14 @@ def quality_at(query, quality, args):
 
 
 def load_reference(path, offset):
-    bags = [path] if (path / "metadata.yaml").is_file() else [
-        entry.parent for entry in sorted(path.glob("Perception_*/metadata.yaml"))]
-    if not bags:
-        raise ValueError(f"No perception bags at {path}")
+    # Raw split recording, legacy prepared bag or any bag folder: the dataset layer merges all
+    # segments in time order directly from the source MCAPs (no conversion step).
+    dataset = Dataset.open(path)
     times, positions, quaternions, quality = [], [], [], []
     imu_header, imu_record, lidar_header, lidar_record = [], [], [], []
     topics = ["imu_data", "imu_data/odometry", "imu_data/ins_status", "front_lidar"]
-    for bag in bags:
-        reader = rosbag2_py.SequentialReader()
-        reader.open(rosbag2_py.StorageOptions(uri=str(bag), storage_id="mcap"),
-                    rosbag2_py.ConverterOptions("", ""))
-        reader.set_filter(rosbag2_py.StorageFilter(
-            topics=topics + ["/" + topic for topic in topics]))
-        while reader.has_next():
-            topic, data, record_time = reader.read_next()
-            topic = topic.lstrip("/")
+    if True:
+        for topic, data, record_time in dataset.iter_messages(topics):
             if topic == "imu_data":
                 message = deserialize_message(data, Imu)
                 imu_header.append(stamp_seconds(message.header.stamp))
@@ -153,7 +141,6 @@ def load_reference(path, offset):
                 message = deserialize_message(data, PointCloud2)
                 lidar_header.append(stamp_seconds(message.header.stamp))
                 lidar_record.append(record_time * 1e-9)
-        del reader
     if len(times) < 2:
         raise ValueError("At least two INS rear-axle observations are required")
     for name, data in [("IMU header", imu_header), ("IMU record", imu_record),

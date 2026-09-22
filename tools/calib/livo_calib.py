@@ -6,31 +6,34 @@ config/carlibration/<mine>/<truck>/<version>/calibration.json. It is the schema-
 SLAM already reads (lidar->rear-axle matrices, camera->rear-axle transform) extended with the
 camera model and the per-truck time offsets, so a truck change never requires editing the
 algorithm yaml. Every stage creates a NEW version from a parent version and never modifies
-inputs. Stages:
+inputs. Stages (version suffix = stage; see STAGES for the operator-facing catalogue):
 
   import        normalise a supplier/factory perception JSON into version v001_import
   ground        static-start roll/pitch/z refinement of every LiDAR (scripts/refine_multi_lidar_extrinsics.py)
   driven        driven-window 6-DoF refinement (scripts/refine_multi_lidar_yaw.py); needs a LIO run
   camera-time   camera->IMU time offset from optical flow vs gyro
   camera-lidar  camera->rear-axle extrinsic refinement by LiDAR depth-edge / image-edge alignment
+                (advisory: writes overlays/ images, activate only after inspecting them)
   from-precheck adopt the corrections reported by the SLAM static-start self-check
-  list/show/activate/export/set  bookkeeping
+  list/show/validate/activate/export/set/delete  bookkeeping
+
+Every --bag argument accepts the raw ROS 2 recording root (Perception_*/Camera_* segment folders)
+or any single bag folder; nothing is converted or merged (tools/livo/dataset.py).
 
 Run inside the calibration container with the Ubuntu system python (ROS 2 Humble):
   /usr/bin/python3 tools/calib/livo_calib.py list
 """
 import os
+import pathlib as _pathlib
 import sys
 
-if sys.executable != "/usr/bin/python3":
-    env = os.environ.copy()
-    for v in ("CONDA_PREFIX", "CONDA_DEFAULT_ENV", "PYTHONHOME", "PYTHONPATH"):
-        env.pop(v, None)
-    env["PATH"] = "/opt/ros/humble/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-    env["AMENT_PREFIX_PATH"] = "/opt/ros/humble"
-    env["PYTHONPATH"] = ("/opt/ros/humble/lib/python3.10/site-packages:"
-                         "/opt/ros/humble/local/lib/python3.10/dist-packages")
-    os.execve("/usr/bin/python3", ["/usr/bin/python3", *sys.argv], env)
+sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parents[1]))
+try:
+    from livo import rosenv as _rosenv
+except ImportError:  # copied outside the repo
+    sys.path.insert(0, "/home/project/MY-LIVO/tools")
+    from livo import rosenv as _rosenv
+_rosenv.ensure()
 
 import argparse
 import copy
@@ -52,6 +55,49 @@ DEFAULT_CAMERA = {"topic": "/midrange_camera/image_raw", "width": 1920, "height"
                   "intrinsics": [1642.570556640625, 1855.53173828125, 971.0083025529602, 534.2602337509306],
                   "distortion": [0.0, 0.0, 0.0, 0.0, 0.0]}
 DEFAULT_TIME_OFFSETS = {"lidar": -0.125, "camera": 0.0, "rtk_position": 0.025, "ins_attitude": 0.0}
+
+# Operator-facing catalogue: the version suffix is the stage key. `mapping` tells which mapping
+# run the stage needs beforehand; `advisory` stages must be inspected before activation.
+STAGES = {
+    "import": {"order": 1, "label": "导入出厂标定", "command": "import",
+               "input": "厂家感知标定 JSON", "output": "LiDAR/相机外参基线 + 默认时间偏移",
+               "needs": [], "mapping": None, "advisory": False, "seconds": 1},
+    "ground": {"order": 2, "label": "静止地面精修", "command": "ground",
+               "input": "原始录制（起步前静止段）", "output": "每个 LiDAR 的 roll / pitch / z",
+               "needs": ["dataset"], "mapping": None, "advisory": False, "seconds": 60},
+    "driven": {"order": 3, "label": "行驶段 6-DoF 精修", "command": "driven",
+               "input": "原始录制 + 一次 LIO 建图结果", "output": "四个 LiDAR 之间的 6-DoF 一致性",
+               "needs": ["dataset", "run"], "mapping": "lio", "advisory": False, "seconds": 90},
+    "camtime": {"order": 4, "label": "相机时间偏移", "command": "camera-time",
+                "input": "原始录制（含相机）", "output": "time_offsets.camera（光流 vs 陀螺）",
+                "needs": ["dataset", "camera"], "mapping": None, "advisory": False, "seconds": 120},
+    "camlidar": {"order": 5, "label": "相机-LiDAR 外参精修", "command": "camera-lidar",
+                 "input": "原始录制（含相机）+ 一次 LIVO 建图结果", "output": "相机→后轴外参（含 overlays/ 叠加图供人工确认）",
+                 "needs": ["dataset", "camera", "run"], "mapping": "livo", "advisory": True, "seconds": 180},
+    "precheck": {"order": 6, "label": "采纳建图自检修正", "command": "from-precheck",
+                 "input": "一次建图结果的 Log/extrinsic_precheck.json", "output": "自检门限内的 roll / pitch / z 修正",
+                 "needs": ["run_dir"], "mapping": "any", "advisory": False, "seconds": 1},
+    "manual": {"order": 7, "label": "手动设置", "command": "set",
+               "input": "人工输入的时间偏移 / 内参 / 相机旋转修正", "output": "对应字段的新版本",
+               "needs": [], "mapping": None, "advisory": False, "seconds": 1},
+}
+
+
+def require_dataset(bag, *, camera=False, what="stage"):
+    """Open a recording (raw split root or single bag) and check the topics the stage needs."""
+    from livo.dataset import Dataset
+    try:
+        ds = Dataset.open(bag)
+    except Exception as exc:  # noqa: BLE001
+        sys.exit(f"{what}: recording not readable: {bag}: {exc}")
+    info = ds.summary()
+    if not info.get("lio_ready"):
+        sys.exit(f"{what}: recording {bag} lacks LiDAR/IMU topics (has {sorted(ds.topics)})")
+    if camera and not info.get("livo_ready"):
+        sys.exit(f"{what}: recording {bag} has no camera topic (midrange_camera/ffmpeg); "
+                 "use the raw recording root that contains the Camera_* segments")
+    return ds, {"path": str(bag), "kind": info.get("kind"), "segments": len(info.get("segments", [])),
+                "duration_s": info.get("duration_s"), "has_camera": bool(info.get("has_camera"))}
 
 
 # ----------------------------------------------------------------------------- bookkeeping
@@ -129,6 +175,53 @@ def summarize(calib):
     return out
 
 
+def changes_vs_parent(calib, parent_calib):
+    """Human-readable delta between two calibrations (cm / deg / s); empty dict when identical."""
+    out = {}
+    a, b = summarize(parent_calib), summarize(calib)
+    rows_a = {r["lidar"]: r for r in a["lidars"]}
+    for r in b["lidars"]:
+        p = rows_a.get(r["lidar"])
+        if not p:
+            out.setdefault("lidars", {})[r["lidar"]] = "new"
+            continue
+        dt = [round((x - y) * 100.0, 2) for x, y in zip(r["t"], p["t"])]
+        dr = [round(x - y, 3) for x, y in zip(r["rpy_deg"], p["rpy_deg"])]
+        if any(abs(v) >= 0.01 for v in dt) or any(abs(v) >= 0.001 for v in dr):
+            out.setdefault("lidars", {})[r["lidar"]] = {"dt_cm": dt, "drpy_deg": dr}
+    if a.get("camera_to_rear") and b.get("camera_to_rear"):
+        dt = [round((x - y) * 100.0, 2) for x, y in zip(b["camera_to_rear"]["t"], a["camera_to_rear"]["t"])]
+        dr = [round(x - y, 3) for x, y in zip(b["camera_to_rear"]["rpy_deg"], a["camera_to_rear"]["rpy_deg"])]
+        if any(abs(v) >= 0.01 for v in dt) or any(abs(v) >= 0.001 for v in dr):
+            out["camera_to_rear"] = {"dt_cm": dt, "drpy_deg": dr}
+    ta, tb = a.get("time_offsets") or {}, b.get("time_offsets") or {}
+    for k in sorted(set(ta) | set(tb)):
+        if isinstance(tb.get(k), (int, float)) or isinstance(ta.get(k), (int, float)):
+            if ta.get(k) != tb.get(k):
+                out.setdefault("time_offsets", {})[k] = {"from": ta.get(k), "to": tb.get(k)}
+    ca, cb = (a.get("camera") or {}), (b.get("camera") or {})
+    for k in ("intrinsics", "distortion"):
+        if ca.get(k) != cb.get(k):
+            out.setdefault("camera", {})[k] = {"from": ca.get(k), "to": cb.get(k)}
+    return out
+
+
+def lineage_of(vid, parent):
+    chain = [vid]
+    seen = set()
+    while parent and parent not in seen:
+        seen.add(parent)
+        chain.insert(0, parent)
+        meta_path = CAL_ROOT.joinpath(*parent.strip("/").split("/")) / "meta.json"
+        if not meta_path.exists():
+            break
+        try:
+            parent = json.loads(meta_path.read_text()).get("parent")
+        except Exception:  # noqa: BLE001
+            break
+    return chain
+
+
 def finalize_version(out_dir, calib, *, mine, truck, stage, parent, note, inputs=None, metrics=None,
                      report_lines=None, activate=False):
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -139,14 +232,27 @@ def finalize_version(out_dir, calib, *, mine, truck, stage, parent, note, inputs
     calib.setdefault("history", []).append({"stage": stage, "created": now(), "parent": parent, "note": note,
                                             "inputs": inputs or {}, "metrics": metrics or {}})
     (out_dir / "calibration.json").write_text(json.dumps(calib, indent=2, ensure_ascii=False) + "\n")
-    meta = {"id": vid, "mine": mine, "truck": truck, "version": out_dir.name, "stage": stage, "parent": parent,
+    changes = {}
+    if parent:
+        try:
+            changes = changes_vs_parent(calib, json.loads((version_dir(parent) / "calibration.json").read_text()))
+        except SystemExit:
+            changes = {}
+    stage_info = STAGES.get(stage, {})
+    meta = {"id": vid, "mine": mine, "truck": truck, "version": out_dir.name, "stage": stage,
+            "stage_label": stage_info.get("label", stage), "advisory": bool(stage_info.get("advisory")),
+            "parent": parent, "lineage": lineage_of(vid, parent),
             "created": now(), "note": note, "inputs": inputs or {}, "metrics": metrics or {},
-            "summary": summarize(calib), "calibration_file": str(out_dir / "calibration.json")}
+            "changes_vs_parent": changes, "summary": summarize(calib),
+            "calibration_file": str(out_dir / "calibration.json"),
+            "overlays": sorted(p.name for p in (out_dir / "overlays").glob("*.png")) if (out_dir / "overlays").is_dir() else []}
     (out_dir / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n")
-    lines = [f"# {vid}", "", f"- stage: {stage}", f"- parent: {parent}", f"- created: {meta['created']}",
-             f"- note: {note}", ""]
+    lines = [f"# {vid}", "", f"- stage: {stage} ({meta['stage_label']})", f"- parent: {parent}",
+             f"- lineage: {' -> '.join(meta['lineage'])}", f"- created: {meta['created']}", f"- note: {note}", ""]
     if inputs:
         lines += ["## inputs", ""] + [f"- {k}: {v}" for k, v in inputs.items()] + [""]
+    if changes:
+        lines += ["## changes vs parent", "", "```", json.dumps(changes, indent=2, ensure_ascii=False), "```", ""]
     if metrics:
         lines += ["## metrics", "", "```", json.dumps(metrics, indent=2, ensure_ascii=False), "```", ""]
     lines += ["## summary", "", "```", json.dumps(meta["summary"], indent=2, ensure_ascii=False), "```", ""]
@@ -267,6 +373,7 @@ def run_script(cmd, log_path):
 
 def cmd_ground(a):
     pdir, parent_calib, mine, truck = parent_info(a.id)
+    _, ds_info = require_dataset(a.bag, what="ground")
     out_dir = next_version_dir(mine, truck, "ground")
     out_dir.mkdir(parents=True, exist_ok=True)
     cmd = ["/usr/bin/python3", str(SCRIPTS / "refine_multi_lidar_extrinsics.py"), "--calibration",
@@ -278,12 +385,16 @@ def cmd_ground(a):
     metrics = {"corrections": calib.get("refinement", {}).get("corrections", {})}
     finalize_version(out_dir, calib, mine=mine, truck=truck, stage="ground", parent=a.id,
                      note=a.note or "static-start ground roll/pitch/z refinement",
-                     inputs={"bag": a.bag, "stationary": list(a.stationary), "moving": list(a.moving)},
+                     inputs={"bag": a.bag, "dataset": ds_info, "stationary": list(a.stationary),
+                             "moving": list(a.moving)},
                      metrics=metrics, report_lines=lines, activate=a.activate)
 
 
 def cmd_driven(a):
     pdir, parent_calib, mine, truck = parent_info(a.id)
+    _, ds_info = require_dataset(a.bag, what="driven")
+    if not (pathlib.Path(a.run) / "frames.csv").exists():
+        sys.exit(f"driven: {a.run} is not a fusion run directory (frames.csv missing); run a LIO round first")
     out_dir = next_version_dir(mine, truck, "driven")
     out_dir.mkdir(parents=True, exist_ok=True)
     lidar_offset = parent_calib.get("time_offsets", {}).get("lidar", -0.125)
@@ -297,8 +408,8 @@ def cmd_driven(a):
     calib = json.loads((out_dir / "calibration.json").read_text())
     metrics = {k: v for k, v in calib.items() if k.startswith("refinement")}
     finalize_version(out_dir, calib, mine=mine, truck=truck, stage="driven", parent=a.id,
-                     note=a.note or "driven-window 6-DoF refinement", inputs={"bag": a.bag, "run": a.run,
-                     "window": list(a.window)}, metrics={"refinement": metrics}, report_lines=lines,
+                     note=a.note or "driven-window 6-DoF refinement", inputs={"bag": a.bag, "dataset": ds_info,
+                     "run": a.run, "window": list(a.window)}, metrics={"refinement": metrics}, report_lines=lines,
                      activate=a.activate)
 
 
@@ -332,22 +443,14 @@ def cmd_from_precheck(a):
 
 # ----------------------------------------------------------------------------- camera time offset
 def read_bag_topics(bag, wanted):
-    import rosbag2_py
-    from rclpy.serialization import deserialize_message
-    from rosidl_runtime_py.utilities import get_message
-    reader = rosbag2_py.SequentialReader()
-    reader.open(rosbag2_py.StorageOptions(uri=str(bag), storage_id="mcap"), rosbag2_py.ConverterOptions("cdr", "cdr"))
-    types = {t.name: t.type for t in reader.get_all_topics_and_types()}
-    wanted = [w.strip("/") for w in wanted]
-    topics = [t for t in types if any(t.strip("/") == w or t.strip("/").endswith("/" + w) for w in wanted)]
+    """Time-ordered deserialized messages straight from the recording (raw split root or single bag)."""
+    from livo.dataset import Dataset
+    ds = Dataset.open(bag)
+    topics = ds.resolve_topics(list(wanted))
     if not topics:
-        sys.exit(f"bag {bag} has none of the topics {wanted}")
-    reader.set_filter(rosbag2_py.StorageFilter(topics=topics))
-    msgs = {t: get_message(types[t]) for t in topics}
-    while reader.has_next():
-        topic, data, _ = reader.read_next()
-        if topic in msgs:
-            yield topic, deserialize_message(data, msgs[topic])
+        sys.exit(f"recording {bag} has none of the topics {list(wanted)} (has {sorted(ds.topics)})")
+    for topic, msg, _ts in ds.read_messages(topics):
+        yield topic, msg
 
 
 def decode_hevc(stream_path, scale, keep=None):
@@ -475,6 +578,7 @@ def estimate_camera_offset(bag, out_dir, fx, fy, scale=0.25):
 
 def cmd_camera_time(a):
     pdir, parent_calib, mine, truck = parent_info(a.id)
+    _, ds_info = require_dataset(a.bag, camera=True, what="camera-time")
     out_dir = next_version_dir(mine, truck, "camtime")
     out_dir.mkdir(parents=True, exist_ok=True)
     fx, fy = parent_calib.get("camera", DEFAULT_CAMERA)["intrinsics"][:2]
@@ -488,7 +592,8 @@ def cmd_camera_time(a):
     calib["calibration_type"] = calib.get("calibration_type", "") + "+camera_time_offset"
     (out_dir / "camera_time.json").write_text(json.dumps(result, indent=2) + "\n")
     finalize_version(out_dir, calib, mine=mine, truck=truck, stage="camtime", parent=a.id,
-                     note=a.note or "camera->IMU time offset from optical flow vs gyro", inputs={"bag": a.bag},
+                     note=a.note or "camera->IMU time offset from optical flow vs gyro",
+                     inputs={"bag": a.bag, "dataset": ds_info},
                      metrics={"camera_offset_s": offsets["camera"], "yaw": result["yaw"], "pitch": result["pitch"],
                               "segments": result["segments"], "implied_fx_from_gain": result["implied_fx_from_gain"]},
                      activate=a.activate)
@@ -702,6 +807,9 @@ def camera_lidar_refine(calib, bag, run, out_dir, n_frames=12, window=(5.0, 60.0
 
 def cmd_camera_lidar(a):
     pdir, parent_calib, mine, truck = parent_info(a.id)
+    _, ds_info = require_dataset(a.bag, camera=True, what="camera-lidar")
+    if not (pathlib.Path(a.run) / "frames.csv").exists():
+        sys.exit(f"camera-lidar: {a.run} is not a fusion run directory (frames.csv missing); run a LIVO round first")
     out_dir = next_version_dir(mine, truck, "camlidar")
     out_dir.mkdir(parents=True, exist_ok=True)
     T_new, metrics = camera_lidar_refine(parent_calib, pathlib.Path(a.bag), a.run, out_dir, n_frames=a.frames,
@@ -718,7 +826,8 @@ def cmd_camera_lidar(a):
     finalize_version(out_dir, calib, mine=mine, truck=truck, stage="camlidar", parent=a.id,
                      note=a.note or ("camera->rear extrinsic refined by depth-edge alignment" if improved else
                                      "camera-lidar stage ran but did NOT improve the edge score; inspect overlays"),
-                     inputs={"bag": a.bag, "run": a.run, "frames": a.frames, "window": list(a.window)},
+                     inputs={"bag": a.bag, "dataset": ds_info, "run": a.run, "frames": a.frames,
+                             "window": list(a.window)},
                      metrics=metrics, activate=a.activate and improved)
 
 
@@ -726,12 +835,117 @@ def cmd_camera_lidar(a):
 def cmd_list(a):
     reg = load_registry()
     rows = all_versions()
+    ids = {r.get("id") for r in rows}
+    for r in rows:
+        r.setdefault("stage_label", STAGES.get(r.get("stage"), {}).get("label", r.get("stage")))
+        r.setdefault("advisory", bool(STAGES.get(r.get("stage"), {}).get("advisory")))
+        r["children"] = sorted(c.get("id") for c in rows if c.get("parent") == r.get("id"))
+        r["active"] = reg.get("active", {}).get(f"{r.get('mine')}/{r.get('truck')}") == r.get("id")
+        r["parent_missing"] = bool(r.get("parent")) and r.get("parent") not in ids
     if a.json:
-        print(json.dumps({"active": reg.get("active", {}), "versions": rows}, indent=2, ensure_ascii=False))
+        print(json.dumps({"active": reg.get("active", {}), "versions": rows, "stages": STAGES},
+                         indent=2, ensure_ascii=False))
         return
     for r in rows:
-        act = "*" if reg.get("active", {}).get(f"{r.get('mine')}/{r.get('truck')}") == r.get("id") else " "
+        act = "*" if r["active"] else " "
         print(f"{act} {r.get('id'):40s} {r.get('stage', ''):9s} {r.get('created', '')[:19]}  {r.get('note', '')[:60]}")
+
+
+def validate_calibration(calib, *, strict=False):
+    """Structural + plausibility checks; returns {"ok", "errors", "warnings"}."""
+    errors, warnings = [], []
+    lidar = calib.get("lidar") or []
+    if not lidar:
+        errors.append("lidar[] missing")
+    found = {}
+    for e in lidar:
+        for key, val in e.items():
+            if key.startswith("transform_matrix_lidar_"):
+                found[key] = val
+    for name, key in LIDAR_KEYS.items():
+        if key not in found:
+            errors.append(f"{name} ({key}) missing")
+            continue
+        m = np.asarray(found[key], float)
+        if m.size != 16:
+            errors.append(f"{key}: {m.size} values, expected 16")
+            continue
+        m = m.reshape(4, 4)
+        r = m[:3, :3]
+        dev = float(np.abs(r.T @ r - np.eye(3)).max())
+        if dev > 1e-5:
+            errors.append(f"{key}: rotation not orthonormal (max deviation {dev:.1e})")
+        if np.linalg.det(r) < 0:
+            errors.append(f"{key}: rotation is a reflection (det < 0)")
+        if float(np.linalg.norm(m[:3, 3])) > 20.0:
+            errors.append(f"{key}: translation {m[:3, 3].round(3).tolist()} m implausible")
+        rpy = rpy_deg(m)
+        if abs(rpy[0]) > 15 or abs(rpy[1]) > 15:
+            warnings.append(f"{name}: roll/pitch {rpy[:2]} deg exceed 15 deg")
+        if not (-1.0 <= m[2, 3] <= 8.0):
+            warnings.append(f"{name}: z {m[2, 3]:.3f} m outside [-1, 8]")
+    cam_tf = (calib.get("transforms") or {}).get("midrange_camera_to_rear_axle", {}).get("transform_matrix")
+    if cam_tf is None:
+        errors.append("transforms.midrange_camera_to_rear_axle.transform_matrix missing")
+    else:
+        m = np.asarray(cam_tf, float)
+        if m.size != 16:
+            errors.append(f"camera transform has {m.size} values, expected 16")
+        else:
+            r = m.reshape(4, 4)[:3, :3]
+            dev = float(np.abs(r.T @ r - np.eye(3)).max())
+            if dev > 1e-5:
+                errors.append(f"camera transform not orthonormal (max deviation {dev:.1e})")
+    cam = calib.get("camera") or {}
+    intr = cam.get("intrinsics")
+    if not intr or len(intr) != 4:
+        (errors if strict else warnings).append("camera.intrinsics missing (needed for LIVO)")
+    else:
+        fx, fy, cx, cy = [float(v) for v in intr]
+        w, h = cam.get("width", 1920), cam.get("height", 1080)
+        if not (200 <= fx <= 6000 and 200 <= fy <= 6000):
+            errors.append(f"camera fx/fy {fx:.1f}/{fy:.1f} implausible")
+        if not (0 < cx < w and 0 < cy < h):
+            errors.append(f"camera principal point ({cx:.1f}, {cy:.1f}) outside {w}x{h}")
+    offs = calib.get("time_offsets") or {}
+    for k in ("lidar", "camera"):
+        v = offs.get(k)
+        if not isinstance(v, (int, float)):
+            (errors if strict else warnings).append(f"time_offsets.{k} missing")
+        elif abs(v) > 1.0:
+            errors.append(f"time_offsets.{k} = {v} s implausible")
+    if offs.get("camera") == 0.0 and "camera_source" not in offs:
+        warnings.append("time_offsets.camera is 0.0 and unverified (run the camera-time stage)")
+    return {"ok": not errors, "errors": errors, "warnings": warnings}
+
+
+def cmd_validate(a):
+    if a.file:
+        path = pathlib.Path(a.file)
+        vid = str(path)
+    else:
+        path = version_dir(a.id) / "calibration.json"
+        vid = a.id
+    calib = json.loads(path.read_text())
+    result = validate_calibration(calib, strict=a.strict)
+    result["id"] = vid
+    result["calibration_file"] = str(path)
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    if not result["ok"]:
+        sys.exit(1)
+
+
+def cmd_delete(a):
+    d = version_dir(a.id)
+    reg = load_registry()
+    mine, truck, _ = a.id.strip("/").split("/")
+    if reg.get("active", {}).get(f"{mine}/{truck}") == a.id:
+        sys.exit(f"{a.id} is the active version; activate another version first")
+    children = [r.get("id") for r in all_versions() if r.get("parent") == a.id]
+    if children:
+        sys.exit(f"{a.id} has child versions {children}; delete them first")
+    shutil.rmtree(d)
+    print(json.dumps({"deleted": a.id, "dir": str(d)}))
 
 
 def cmd_show(a):
@@ -808,14 +1022,14 @@ def main():
     p.set_defaults(func=cmd_import)
 
     p = sub.add_parser("ground")
-    p.add_argument("--bag", required=True)
+    p.add_argument("--bag", required=True, help="recording: raw ROS 2 root (segment folders) or single bag folder")
     p.add_argument("--stationary", nargs=2, type=int, default=(2, 20))
     p.add_argument("--moving", nargs=2, type=int, default=(300, 40))
     common(p)
     p.set_defaults(func=cmd_ground)
 
     p = sub.add_parser("driven")
-    p.add_argument("--bag", required=True)
+    p.add_argument("--bag", required=True, help="recording: raw ROS 2 root (segment folders) or single bag folder")
     p.add_argument("--run", required=True, help="fusion run directory (Log/fusion/<stamp>) of a LIO round")
     p.add_argument("--window", nargs=2, type=float, default=(8.0, 40.0))
     p.add_argument("--vertical-only", action="store_true")
@@ -823,12 +1037,12 @@ def main():
     p.set_defaults(func=cmd_driven)
 
     p = sub.add_parser("camera-time")
-    p.add_argument("--bag", required=True, help="prepared bag containing midrange_camera/ffmpeg and imu_data")
+    p.add_argument("--bag", required=True, help="recording containing midrange_camera/ffmpeg and imu_data (raw root)")
     common(p)
     p.set_defaults(func=cmd_camera_time)
 
     p = sub.add_parser("camera-lidar")
-    p.add_argument("--bag", required=True)
+    p.add_argument("--bag", required=True, help="recording containing midrange_camera/ffmpeg (raw root)")
     p.add_argument("--run", required=True, help="fusion run directory of a LIVO round (frames end at image times)")
     p.add_argument("--frames", type=int, default=12)
     p.add_argument("--window", nargs=2, type=float, default=(5.0, 60.0))
@@ -859,6 +1073,14 @@ def main():
     p = sub.add_parser("show")
     p.add_argument("--id", required=True)
     p.set_defaults(func=cmd_show)
+    p = sub.add_parser("validate", help="structural/plausibility check of a version or a calibration file")
+    p.add_argument("--id")
+    p.add_argument("--file")
+    p.add_argument("--strict", action="store_true", help="camera model / time offsets are required (LIVO)")
+    p.set_defaults(func=cmd_validate)
+    p = sub.add_parser("delete", help="remove a leaf version that is not active")
+    p.add_argument("--id", required=True)
+    p.set_defaults(func=cmd_delete)
     p = sub.add_parser("activate")
     p.add_argument("--id", required=True)
     p.set_defaults(func=cmd_activate)
@@ -866,6 +1088,8 @@ def main():
     p.add_argument("--id", required=True)
     p.set_defaults(func=cmd_export)
     a = ap.parse_args()
+    if a.cmd == "validate" and not (a.id or a.file):
+        ap.error("validate needs --id or --file")
     try:
         a.func(a)
     finally:

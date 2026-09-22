@@ -3,7 +3,8 @@
 correction smoothness, and multi-epoch lamp-pole consistency from the ACTUAL saved map_*.pcd.
 
 Usage (container): /usr/bin/python3 scripts/analysis/round_summary.py <fusion_run_dir> <output_dir>
-Reads the INS reference CSV dumped by scripts/dump_bag_reference.py (results/prepared/reference_csv).
+Options: --reference <ins_odometry.csv> (default <output_dir>/reference_csv/ins_odometry.csv, dumped by
+scripts/dump_bag_reference.py from the round's recording), --no-pole (skip map_*.pcd lamp-pole scan).
 """
 import sys, pathlib, numpy as np
 from scipy.spatial.transform import Rotation as R
@@ -40,9 +41,32 @@ def stats(x):
     return f"median {np.median(x):.4f} P95 {np.percentile(x, 95):.4f} max {x.max():.4f}"
 
 
+def parse_args(argv):
+    pos, opts = [], {"reference": None, "pole": True}
+    it = iter(argv)
+    for a in it:
+        if a == "--reference": opts["reference"] = pathlib.Path(next(it))
+        elif a == "--no-pole": opts["pole"] = False
+        elif a.startswith("--"): sys.exit(f"unknown option {a}")
+        else: pos.append(a)
+    if len(pos) != 2: sys.exit(__doc__)
+    return pathlib.Path(pos[0]), pathlib.Path(pos[1]), opts
+
+
+def find_reference(out, explicit):
+    """Reference CSV: explicit path > <out>/reference_csv > legacy results/prepared/reference_csv."""
+    cands = [explicit] if explicit else []
+    cands += [out / "reference_csv" / "ins_odometry.csv", REPO / "results/prepared/reference_csv/ins_odometry.csv"]
+    for c in cands:
+        if c and c.is_file(): return c
+    sys.exit("INS reference CSV not found (%s); run scripts/dump_bag_reference.py --bag <recording> --output %s"
+             % (", ".join(str(c) for c in cands), out / "reference_csv"))
+
+
 def main():
-    run = pathlib.Path(sys.argv[1]); out = pathlib.Path(sys.argv[2]); out.mkdir(parents=True, exist_ok=True)
-    ref = REPO / "results/prepared/reference_csv/ins_odometry.csv"
+    run, out, opts = parse_args(sys.argv[1:]); out.mkdir(parents=True, exist_ok=True)
+    ref = find_reference(out, opts["reference"])
+    print(f"reference={ref}")
     ins = np.genfromtxt(ref, delimiter=",", names=True, usecols=range(14))
     params = {}
     for line in (run / "parameters.txt").read_text().splitlines():
@@ -112,6 +136,8 @@ def main():
         if r.size:
             print(f"\n{head}\nINS attitude factor residuals (deg): x {stats(np.abs(r['rx_deg']))} | y {stats(np.abs(r['ry_deg']))} | z {stats(np.abs(r['rz_deg']))}; n={r.size}")
     # ---- pole multi-epoch consistency from actual chunks ----
+    if not opts["pole"]:
+        print("\nLamp pole scan skipped (--no-pole)"); return
     try:
         from evaluate_wuhu_lio import read_pcd
     except Exception as e:
