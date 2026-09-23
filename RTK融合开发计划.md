@@ -285,3 +285,9 @@
 - 实测：LiDAR 流水线核心三步 208→140 s；camera-time 120→9.4 s；相机标准流水线 ≈15→≈11 min。
 - SLAM 验证（全量 120 s LIVO 四轮）：短包 LiDAR 外参(60 s)、camtime -0.1211、新流程 v034_driven 全部 budget PASS，优化 max 7.1/8.1/8.2 cm（基线 7.0，历史带 7.6–9.6），地面厚度/灯柱/起步 30 m 持平。30 s 单段外参使原生中位 0.39→1.51 m，故下限定为 60 s。
 - 详见 docs/mcp-calibration-efficiency.md。验证轮次 results/mcpeff_*，测试版本 v033_ground/v034_driven（未激活，激活版本仍为 v032_camloop）。
+
+### 2026-09-23 标定程序复核：前两包充分性实测 + driven 两遍求解
+- 实测 7 个 driven 窗口：8–40 s 之后再加数据外参变化 ≤0.03°/2.2 cm（等于重复运行本底），8–110 s / 40–110 s 反而被前端漂移与后段竖直结构稀少拖坏（front_left x 错 16 cm）。前两包（含起步静止 + 一次转弯）足够且不可省略前段；camloop 仍需 ≥100 s。
+- 缺陷：driven 跨时刻配准（后雷达匹配时间差中位 10.7 s）把原生 LIO 的 z 漂移（≈0.7 cm/s）吸收进外参，后雷达被压低 ≈5 cm、倾角偏 0.1°（独立地面一致性核查证实：后雷达地面比前雷达低 5.0 cm）。
+- 修正：driven 第二遍用同轮次 RTK 优化位姿只重解跨时刻雷达的 tilt/z（地面匹配）；加质量门（fail 不产出版本、退出码 3）与窗口钳位；ground 加静止判定。全量 LIVO 闭环（v034 单遍 vs v035 两遍）：位置持平（median 1.96 cm，100% ≤10 cm，max 8.4→7.8 cm），地面跨时刻厚度 5–20 m 29.4→27.6 mm、20–40 m 47.3→43.4 mm，优化姿态 vs INS pitch P95 0.31→0.25°。
+- 产物 v035_driven（未激活）；详见 docs/mcp-calibration-window-audit.md。

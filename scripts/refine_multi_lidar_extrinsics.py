@@ -70,6 +70,18 @@ def clean(Q, rmin=3.0, rmax=60.0):
     return Q[(r > rmin) & (r < rmax) & ~body & np.isfinite(Q).all(1)]
 
 
+def stationary_check(frames, rmin=3.0, rmax=60.0, voxel=0.2):
+    """Median / P90 nearest-neighbour displacement between the first and the last frame of a LiDAR.
+    Identical scenes from a standing vehicle differ only by the scan pattern (~0.1 m median here);
+    any ego-motion adds its travel distance directly."""
+    def prep(P):
+        r = np.linalg.norm(P, axis=1); P = P[(r > rmin) & (r < rmax)]
+        return voxel_down(P, voxel)
+    A, B = prep(frames[0]), prep(frames[-1])
+    d, _ = cKDTree(A).query(B)
+    return {"median_m": float(np.median(d)), "p90_m": float(np.percentile(d, 90))}
+
+
 class Target:
     def __init__(self, A, k=12):
         self.A = A; self.tree = cKDTree(A)
@@ -142,6 +154,8 @@ def main():
     ap.add_argument("--moving", type=int, nargs=2, default=(300, 40), help="first frame, count (per-frame) for the back LiDAR")
     ap.add_argument("--voxel", type=float, default=0.15)
     ap.add_argument("--min-vertical", type=int, default=400, help="vertical planar matches needed to solve yaw/xy")
+    ap.add_argument("--max-still-shift", type=float, default=0.30,
+                    help="max median scan displacement (m) between first and last stationary frame; a standing truck gives ~0.1 m from the scan pattern alone, 0.5 m/s of motion gives >0.5 m")
     a = ap.parse_args()
     calib = json.load(open(a.calibration))
     M = {}
@@ -152,6 +166,18 @@ def main():
     lines = [f"calibration={a.calibration}", f"bag={a.bag}", f"reference={REFERENCE}",
              f"stationary frames {a.stationary[0]}..{a.stationary[0]+a.stationary[1]} (aggregated) for side LiDARs; moving frames {a.moving[0]}..{a.moving[0]+a.moving[1]} (per frame) for back LiDAR"]
     stat = read_frames(a.bag, *a.stationary)
+    # The aggregation below assumes the vehicle does not move during the stationary frames; a recording
+    # that starts while driving silently biases roll/pitch/z (motion-blurred ground), so verify it.
+    still = stationary_check(stat[REFERENCE])
+    lines.append(f"stationary check ({REFERENCE}, first vs last frame of {a.stationary[1]}): scan displacement median "
+                 f"{100*still['median_m']:.1f} cm / P90 {100*still['p90_m']:.1f} cm (limit {100*a.max_still_shift:.0f} cm) -> "
+                 + ("stationary" if still["median_m"] <= a.max_still_shift else "MOVING"))
+    if still["median_m"] > a.max_still_shift:
+        msg = (f"ground stage aborted: frames {a.stationary[0]}..{a.stationary[0]+a.stationary[1]} are not stationary "
+               f"(reference scan displacement {100*still['median_m']:.0f} cm). The stage needs ~{0.1*a.stationary[1]:.0f} s of standstill; "
+               "use a recording that starts before the vehicle moves off, or point --stationary at a standstill.")
+        lines.append(msg); pathlib.Path(a.report).parent.mkdir(parents=True, exist_ok=True)
+        pathlib.Path(a.report).write_text("\n".join(lines) + "\n"); print("\n".join(lines)); sys.exit(3)
     agg = {t: voxel_down(clean(to_rear(t, np.vstack(v))), a.voxel) for t, v in stat.items()}
     for t in KEYS: lines.append(f"{t}: stationary aggregated points {len(agg[t])}")
     refined = {REFERENCE: M[REFERENCE].copy()}; corrections = {}
@@ -220,4 +246,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

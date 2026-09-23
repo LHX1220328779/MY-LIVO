@@ -119,3 +119,7 @@ ground 阶段 60 s（2 段）vs 150 s（5 段）：front_right/front_left 修正
 - 验证轮次：`results/mcpeff_livo_shortcal`（30 s LiDAR 外参）、`results/mcpeff_livo_shortcal60`（60 s LiDAR 外参）、`results/mcpeff_livo_cam121`（60 s camtime 偏移）、`results/mcpeff_livo_v034`（新流程端到端产物）、`results/mcpeff_it_lio48`（48 s LIO 供 driven）。
 - 标定版本：`v033_ground`、`v034_driven`（新流程集成测试产物，未激活；激活版本保持 v032_camloop）。
 - 探针（不入库）：`results/.cache/mcp_probe/{speed_probe.py, camtime_seg1.py, cmp_calib.py, assemble_shortcalib.py, seg1/, seg12/, cz2seg/, cz5seg/}`。
+
+## 8. 后续修正（2026-09-23 晚）
+
+- 本文 §2 的 driven 结论（8–40 s 原生位姿单遍求解即足够）经进一步复核仍成立，但发现单遍求解会把原生 LIO 的 z 漂移吸收进跨时刻雷达（后雷达 ≈5 cm）。driven 已改为两遍求解并加质量门，验证与使用建议见 docs/mcp-calibration-window-audit.md。
