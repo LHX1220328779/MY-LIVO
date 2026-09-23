@@ -278,3 +278,10 @@
 - 可视化：以 v027 的最新轮次测量——单帧原始扫描里灯杆在 13.6/33.8 m 处 r80 为 20.3/13.9 cm（36 线在 30 m 处方位角点间距 6–12 cm、竖直 ~50 cm），建图后各时间遍轴线相差 ≈10 cm（评估“灯柱多期一致性”中位 10.5 cm），叠加观感 ≈30 cm，属传感器分辨极限 + 跨时间一致性两项，非标定误差；33 m 处的路牌整块只有 40–60 个点，文字必然“糊”，要可读需要纹理化产品（相机图像投影到网格），颜色本身正确（叠加图核对）。结论写入 docs/mcp-livo-native-drift-analysis.md §9、§10。
 - 流水线幂等性验证：从 v027 复检得到 Δpitch=+0.002°（用户 20:08 从 v022 得到 −0.002°），验证轮次尺度 100.00%、终点 1.42 m、闭环 pass，已激活 v028_camloop。
 - jsdom 冒烟 29/29。
+
+### 2026-09-23 标定效率优化（短数据段标定，未改算法与求解逻辑）
+- 核查结论：ground/driven/camtime 只需含起步静止段的前 2 个分段（≈60 s）；外参与全量差 ≤0.06°/1.7 cm，camtime 偏移差 ≤6 ms（历史分段本底 6.5 ms）。ground 必须静止起步（≈2 s 即够，行驶帧冒充静止实测失败）；driven/camtime/camloop 不需要。camloop 物理上需 ≥100 s 里程尺度观测，不可缩短。
+- 实现：LiDAR 流水线 LIO 轮次默认 --duration 48（body.lidar_round_duration 覆盖，0 恢复全长）；camera-time 阶段新增 --duration，流水线默认 60 s；手动命令行不带参数时行为不变。
+- 实测：LiDAR 流水线核心三步 208→140 s；camera-time 120→9.4 s；相机标准流水线 ≈15→≈11 min。
+- SLAM 验证（全量 120 s LIVO 四轮）：短包 LiDAR 外参(60 s)、camtime -0.1211、新流程 v034_driven 全部 budget PASS，优化 max 7.1/8.1/8.2 cm（基线 7.0，历史带 7.6–9.6），地面厚度/灯柱/起步 30 m 持平。30 s 单段外参使原生中位 0.39→1.51 m，故下限定为 60 s。
+- 详见 docs/mcp-calibration-efficiency.md。验证轮次 results/mcpeff_*，测试版本 v033_ground/v034_driven（未激活，激活版本仍为 v032_camloop）。

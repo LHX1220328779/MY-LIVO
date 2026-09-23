@@ -280,6 +280,8 @@ def stage_cmd(stage, body):
             cmd += ["--moving", *[str(int(v)) for v in body["moving"]]]
     if command == "driven" and body.get("window"):
         cmd += ["--window", *[str(float(v)) for v in body["window"]]]
+    if command == "camera-time" and body.get("duration") not in (None, "", 0, "0"):
+        cmd += ["--duration", str(float(body["duration"]))]
     if command == "camera-lidar":
         cmd += ["--frames", str(int(body.get("frames") or 12))]
         if body.get("solve_intrinsics"):
@@ -453,8 +455,14 @@ def pipeline_steps(kind, body, mapping_cmd):
             "ground", {"id": parent, "dataset": dataset, "note": body.get("note") or "pipeline: ground"}),
             "after": lambda ctx, lines: ctx.__setitem__("ground_id", parse_version_id(lines))})
         round_name = f"calib_{truck}_lio_{stamp}"
-        steps.append({"title": f"LIO 建图轮次 {round_name}（用于行驶段精修）", "retry": 1, "round": round_name, "build": lambda ctx: mapping_cmd(
-            round_name, "lio", str(calibration_file(ctx["ground_id"])), body),
+        # The driven stage only reads native poses inside its window (default 8-40 s), so the LIO
+        # round does not need the whole recording: cap playback at window end + drain margin.
+        # lidar_round_duration=0 restores the previous full-length behaviour.
+        lio_duration = body.get("lidar_round_duration")
+        lio_duration = 48.0 if lio_duration in (None, "") else float(lio_duration)
+        title_extra = f"，前 {lio_duration:.0f} s" if lio_duration else ""
+        steps.append({"title": f"LIO 建图轮次 {round_name}（用于行驶段精修{title_extra}）", "retry": 1, "round": round_name, "build": lambda ctx: mapping_cmd(
+            round_name, "lio", str(calibration_file(ctx["ground_id"])), body, duration=lio_duration or None),
             "after": lambda ctx, lines: ctx.update(round=round_name, fusion_dir=latest_fusion_dir(round_name))})
         steps.append({"title": "行驶段 6-DoF 精修 (driven)", "build": lambda ctx: stage_cmd(
             "driven", {"id": ctx["ground_id"], "dataset": dataset, "run": ctx["fusion_dir"],
@@ -464,8 +472,9 @@ def pipeline_steps(kind, body, mapping_cmd):
                       "after": lambda ctx, lines: ctx.__setitem__("result_id", ctx["driven_id"])})
     elif kind == "camera":
         datasets.require(dataset, camera=True)
-        steps.append({"title": "相机时间偏移 (camera-time)", "build": lambda ctx: stage_cmd(
-            "camera-time", {"id": parent, "dataset": dataset, "note": body.get("note") or "pipeline: camera-time"}),
+        steps.append({"title": "相机时间偏移 (camera-time，前 60 s)", "build": lambda ctx: stage_cmd(
+            "camera-time", {"id": parent, "dataset": dataset, "note": body.get("note") or "pipeline: camera-time",
+                            "duration": body.get("camtime_duration") if body.get("camtime_duration") not in (None, "") else 60}),
             "after": lambda ctx, lines: ctx.__setitem__("camtime_id", parse_version_id(lines))})
         round_name = f"calib_{truck}_livo_{stamp}"
         steps.append({"title": f"LIVO 建图轮次 A {round_name}（基线，俯仰增量 0）", "retry": 1, "round": round_name, "build": lambda ctx: mapping_cmd(

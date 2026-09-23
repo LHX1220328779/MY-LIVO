@@ -478,12 +478,19 @@ def decode_hevc(stream_path, scale, keep=None):
     proc.wait()
 
 
-def dump_camera_stream(bag, out_dir):
+def dump_camera_stream(bag, out_dir, duration=None):
+    """Write the HEVC packets to one Annex-B stream. duration (s) caps the stream length from the
+    first image: the optical-flow/gyro correlation reaches full accuracy with ~60 s of driving
+    (measured spread <=1 ms vs the full recording), so the camera-time stage does not need to
+    decode the whole video."""
     stamps = []
     path = out_dir / "stream.h265"
     with open(path, "wb") as f:
         for topic, m in read_bag_topics(bag, ["midrange_camera/ffmpeg"]):
-            stamps.append(m.header.stamp.sec + m.header.stamp.nanosec * 1e-9)
+            t = m.header.stamp.sec + m.header.stamp.nanosec * 1e-9
+            if duration is not None and stamps and t - stamps[0] > duration:
+                break
+            stamps.append(t)
             f.write(bytes(m.data))
     return np.array(stamps), path
 
@@ -496,9 +503,9 @@ def read_imu(bag):
     return np.array(t), np.array(g)
 
 
-def estimate_camera_offset(bag, out_dir, fx, fy, scale=0.25):
+def estimate_camera_offset(bag, out_dir, fx, fy, scale=0.25, duration=None):
     import cv2
-    stamps, stream = dump_camera_stream(bag, out_dir)
+    stamps, stream = dump_camera_stream(bag, out_dir, duration=duration)
     ti, gyro = read_imu(bag)
     if np.abs(gyro).max() > 20:  # deg/s stream
         gyro = np.radians(gyro)
@@ -588,7 +595,7 @@ def cmd_camera_time(a):
     out_dir = next_version_dir(mine, truck, "camtime")
     out_dir.mkdir(parents=True, exist_ok=True)
     fx, fy = parent_calib.get("camera", DEFAULT_CAMERA)["intrinsics"][:2]
-    result = estimate_camera_offset(pathlib.Path(a.bag), out_dir, fx, fy)
+    result = estimate_camera_offset(pathlib.Path(a.bag), out_dir, fx, fy, duration=a.duration)
     if result["camera_offset_s"] is None:
         sys.exit("camera time offset could not be estimated (no usable flow)")
     calib = copy.deepcopy(parent_calib)
@@ -599,7 +606,7 @@ def cmd_camera_time(a):
     (out_dir / "camera_time.json").write_text(json.dumps(result, indent=2) + "\n")
     finalize_version(out_dir, calib, mine=mine, truck=truck, stage="camtime", parent=a.id,
                      note=a.note or "camera->IMU time offset from optical flow vs gyro",
-                     inputs={"bag": a.bag, "dataset": ds_info},
+                     inputs={"bag": a.bag, "dataset": ds_info, "duration": a.duration},
                      metrics={"camera_offset_s": offsets["camera"], "yaw": result["yaw"], "pitch": result["pitch"],
                               "segments": result["segments"], "implied_fx_from_gain": result["implied_fx_from_gain"]},
                      activate=a.activate)
@@ -1487,6 +1494,8 @@ def main():
 
     p = sub.add_parser("camera-time")
     p.add_argument("--bag", required=True, help="recording containing midrange_camera/ffmpeg and imu_data (raw root)")
+    p.add_argument("--duration", type=float, default=None,
+                   help="seconds of video used from the first image (default: all); ~60 s of driving is enough")
     common(p)
     p.set_defaults(func=cmd_camera_time)
 
