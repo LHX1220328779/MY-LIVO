@@ -47,10 +47,19 @@ def round_cmd(round_name, mode, calibration_file, body, *, force_save_map=False,
     return cmd
 
 
-def pipeline_round_cmd(round_name, mode, calibration_file, body):
-    """Rounds inside a calibration pipeline: always archive scans (stages read scans.bin) and evaluate
-    (evaluation/metrics.json feeds the closed-loop verdict and the results table; ~30 s)."""
-    return round_cmd(round_name, mode, calibration_file, body, force_save_map=True, evaluate=True)
+def pipeline_round_cmd(round_name, mode, calibration_file, body, **overrides):
+    """Rounds inside a calibration pipeline: archive scans (the camera-lidar stage and the overlay viewer read
+    scans.bin) and evaluate (evaluation/metrics.json feeds the closed-loop verdict and the results table).
+
+    `overrides` may carry per-step options: save_map=False (temporary scan rounds: saves ~1.5 GB and the map
+    export), quick=True (--quick-eval: trajectory + summary only, ~40 s faster; the scale used by the pitch
+    fit and the closed-loop verdict is in both cases the same)."""
+    body = {**body, **{k: v for k, v in overrides.items() if k in ("save_map", "evaluate", "duration")}}
+    cmd = round_cmd(round_name, mode, calibration_file, body,
+                    force_save_map=bool(overrides.get("save_map", True)), evaluate=overrides.get("evaluate", True))
+    if overrides.get("quick"):
+        cmd.append("--quick-eval")
+    return cmd
 
 
 def busy():
@@ -266,6 +275,19 @@ def live(round_name):
                 out["online_series"] = []
         maps = sorted(f.glob("map_*.pcd"))
         out["map_chunks"] = len(maps)
+    # per-frame rear-axle error of the optimized (delivered) and native trajectories vs RTK, written by
+    # scripts/analysis/round_summary.py at evaluation time (already downsampled to <= 600 rows)
+    hdr, rows = csv_rows(p / "evaluation" / "error_series.csv")
+    if rows:
+        col = {n: i for i, n in enumerate(hdr)}
+        series = []
+        for r in rows:
+            try:
+                series.append({"t": float(r[col["stamp"]]), "opt_rear": float(r[col["opt_rear_m"]]),
+                               "native_rear": float(r[col["native_rear_m"]])})
+            except (ValueError, KeyError, IndexError):
+                continue
+        out["error_series"] = series
         out["rgb_map_chunks"] = len(list(f.glob("rgb_map_*.pcd")))
         out["map_size_mb"] = round(sum(m.stat().st_size for m in maps) / 1e6, 1)
     pre = p / "Log" / "extrinsic_precheck.json"

@@ -71,15 +71,21 @@ STAGES = {
     "camtime": {"order": 4, "label": "相机时间偏移", "command": "camera-time",
                 "input": "原始录制（含相机）", "output": "time_offsets.camera（光流 vs 陀螺）",
                 "needs": ["dataset", "camera"], "mapping": None, "advisory": False, "seconds": 120},
-    "camlidar": {"order": 5, "label": "相机-LiDAR 外参精修", "command": "camera-lidar",
-                 "input": "原始录制（含相机）+ 一次 LIVO 建图结果", "output": "相机→后轴外参（含 overlays/ 叠加图供人工确认）",
+    "camlidar": {"order": 5, "label": "相机-LiDAR 偏航/横滚复核", "command": "camera-lidar",
+                 "input": "原始录制（含相机）+ 一次 LIVO 建图结果", "output": "相机→后轴外参的偏航/横滚（竖直边缘对齐，俯仰不变；含 overlays/ 叠加图）",
                  "needs": ["dataset", "camera", "run"], "mapping": "livo", "advisory": True, "seconds": 180},
-    "precheck": {"order": 6, "label": "采纳建图自检修正", "command": "from-precheck",
+    "camloop": {"order": 6, "label": "相机外参闭环标定", "command": "set",
+                "input": "俯仰扫描的 2–3 次 LIVO 建图（原生里程尺度 vs RTK）", "output": "相机→后轴外参的俯仰角（尺度过零点，闭环验证）",
+                "needs": [], "mapping": "livo", "advisory": False, "seconds": 900, "internal": True},
+    "precheck": {"order": 7, "label": "采纳建图自检修正", "command": "from-precheck",
                  "input": "一次建图结果的 Log/extrinsic_precheck.json", "output": "自检门限内的 roll / pitch / z 修正",
                  "needs": ["run_dir"], "mapping": "any", "advisory": False, "seconds": 1},
-    "manual": {"order": 7, "label": "手动设置", "command": "set",
+    "manual": {"order": 8, "label": "手动设置", "command": "set",
                "input": "人工输入的时间偏移 / 内参 / 相机旋转修正", "output": "对应字段的新版本",
                "needs": [], "mapping": None, "advisory": False, "seconds": 1},
+    "scan": {"order": 9, "label": "闭环扫描点（临时）", "command": "set",
+             "input": "流水线自动生成：父版本 + 固定俯仰增量", "output": "仅用于一次扫描建图，不应激活",
+             "needs": [], "mapping": None, "advisory": True, "seconds": 1, "internal": True},
 }
 
 
@@ -245,7 +251,7 @@ def finalize_version(out_dir, calib, *, mine, truck, stage, parent, note, inputs
             "created": now(), "note": note, "inputs": inputs or {}, "metrics": metrics or {},
             "changes_vs_parent": changes, "summary": summarize(calib),
             "calibration_file": str(out_dir / "calibration.json"),
-            "overlays": sorted(p.name for p in (out_dir / "overlays").glob("*.png")) if (out_dir / "overlays").is_dir() else []}
+            "overlays": sorted(p.name for p in (out_dir / "overlays").iterdir() if p.suffix in (".png", ".jpg")) if (out_dir / "overlays").is_dir() else []}
     (out_dir / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n")
     lines = [f"# {vid}", "", f"- stage: {stage} ({meta['stage_label']})", f"- parent: {parent}",
              f"- lineage: {' -> '.join(meta['lineage'])}", f"- created: {meta['created']}", f"- note: {note}", ""]
@@ -615,8 +621,18 @@ def read_run_frames(run):
 
 
 def camera_lidar_refine(calib, bag, run, out_dir, n_frames=12, window=(5.0, 60.0), accumulate=1.0,
-                        scale=0.5, max_rot_deg=2.0, max_trans_m=0.15, solve_intrinsics=False):
+                        scale=0.5, max_rot_deg=2.0, max_trans_m=0.15, solve_intrinsics=False, dof="yawroll"):
+    """Align LiDAR depth edges with image edges.
+
+    dof="yawroll" (default): only vertical structure edges (poles, building corners, trunks) are used and only
+    the camera yaw (about camera y) and roll (about camera z) are solved. Horizontal edges are NOT usable:
+    a 36-line LiDAR samples the top of an object up to one beam pitch below its true edge, so matching them
+    to image edges pulls the solution in pitch by ~0.2 deg in a repeatable direction (v006/v015/v017 all
+    did that and the closed loop rejected them). Camera pitch is determined by the closed-loop scan instead.
+    dof="full": legacy behaviour (all edges, 6-DoF), kept for diagnostics only.
+    """
     import cv2
+    vertical_only = dof != "full"
     from scipy.optimize import minimize
     from scipy.spatial.transform import Rotation as R
     fr = read_run_frames(run)
@@ -684,19 +700,30 @@ def camera_lidar_refine(calib, bag, run, out_dir, n_frames=12, window=(5.0, 60.0
         zbuf[v[order], u[order]] = depth[order]
         idx[v[order], u[order]] = order
         edge = np.zeros((h, w), bool)
-        for dy, dx in ((0, 1), (1, 0), (0, -1), (-1, 0)):
+        # vertical-only: compare horizontal neighbours only (azimuth resolution 0.1-0.2 deg is fine);
+        # vertical neighbours would add the coarse ring-quantised object tops/bottoms
+        neighbours = ((0, 1), (0, -1)) if vertical_only else ((0, 1), (1, 0), (0, -1), (-1, 0))
+        for dy, dx in neighbours:
             nb = np.roll(np.roll(zbuf, dy, 0), dx, 1)
             edge |= (np.isfinite(zbuf) & np.isfinite(nb) & (nb - zbuf > np.maximum(0.6, 0.05 * zbuf)))
         e_idx = idx[edge]
         e_idx = e_idx[e_idx >= 0]
         edge_pts = pr[e_idx]
         img = images[k]
-        canny = cv2.Canny(cv2.GaussianBlur(img, (3, 3), 0), 60, 160)
+        blur = cv2.GaussianBlur(img, (3, 3), 0)
+        canny = cv2.Canny(blur, 60, 160)
+        if vertical_only:  # keep edge pixels whose gradient is mostly horizontal (i.e. vertical structures)
+            gx = cv2.Sobel(blur, cv2.CV_32F, 1, 0, ksize=3)
+            gy = cv2.Sobel(blur, cv2.CV_32F, 0, 1, ksize=3)
+            canny = np.where(np.abs(gx) > 2.0 * np.abs(gy), canny, 0).astype(np.uint8)
         # keep only long edge chains: foliage/gravel texture produces short fragments that make
         # the distance field flat and uninformative
         n_cc, labels, stats, _ = cv2.connectedComponentsWithStats((canny > 0).astype(np.uint8), connectivity=8)
         long_cc = np.zeros(n_cc, bool)
-        long_cc[1:] = np.maximum(stats[1:, cv2.CC_STAT_WIDTH], stats[1:, cv2.CC_STAT_HEIGHT]) >= 25
+        if vertical_only:
+            long_cc[1:] = stats[1:, cv2.CC_STAT_HEIGHT] >= 25
+        else:
+            long_cc[1:] = np.maximum(stats[1:, cv2.CC_STAT_WIDTH], stats[1:, cv2.CC_STAT_HEIGHT]) >= 25
         canny = np.where(long_cc[labels], 255, 0).astype(np.uint8)
         dt_img = cv2.distanceTransform(255 - canny, cv2.DIST_L2, 3)
         dt_img = np.minimum(dt_img, 10.0)
@@ -704,7 +731,10 @@ def camera_lidar_refine(calib, bag, run, out_dir, n_frames=12, window=(5.0, 60.0
                             "speed": float(speed[j])})
 
     def score(delta, T_base=T_rear_cam, return_parts=False):
-        rv, tv = np.asarray(delta[:3]), np.asarray(delta[3:6])
+        rv, tv = np.asarray(delta[:3], float).copy(), np.asarray(delta[3:6], float).copy()
+        if vertical_only:  # pitch and translation are not observable from vertical edges: keep them fixed
+            rv[0] = 0.0
+            tv[:] = 0.0
         Kd = K.copy()
         if len(delta) >= 8:  # focal scale factors
             Kd[0, 0] *= delta[6]
@@ -737,8 +767,9 @@ def camera_lidar_refine(calib, bag, run, out_dir, n_frames=12, window=(5.0, 60.0
     # coarse rotation grid, then local 6-DoF refinement
     best, best_x = before, np.zeros(6)
     grid = np.arange(-1.0, 1.001, 0.1)
+    rx_grid = [0.0] if vertical_only else grid
     for ry in grid:      # yaw-like about camera y
-        for rx in grid:  # pitch-like about camera x
+        for rx in rx_grid:  # pitch-like about camera x
             s = score([rx, ry, 0, 0, 0, 0])
             if s < best:
                 best, best_x = s, np.array([rx, ry, 0, 0, 0, 0.0])
@@ -751,13 +782,15 @@ def camera_lidar_refine(calib, bag, run, out_dir, n_frames=12, window=(5.0, 60.0
     res = minimize(score, best_x, method="Nelder-Mead",
                    options={"xatol": 1e-3, "fatol": 1e-4, "maxiter": 1500, "initial_simplex": None})
     x = res.x if res.fun < best else best_x
+    if vertical_only:
+        x = np.array([0.0, x[1], x[2], 0.0, 0.0, 0.0])
     after, after_parts = score(x, return_parts=True)
     # focal-length scan: for each fx scale (fy fixed) re-optimise the rotation and record the score
     focal_scan = []
     for sf in (0.92, 0.96, 1.0, 1.04, 1.08, 1.12, 1.16):
         bx, bs = None, np.inf
         for ry in np.arange(-0.6, 0.601, 0.1):
-            for rx in np.arange(-0.6, 0.601, 0.1):
+            for rx in ([0.0] if vertical_only else np.arange(-0.6, 0.601, 0.1)):
                 xx = np.array([x[0] + rx, x[1] + ry, x[2], x[3], x[4], x[5], sf, 1.0])
                 sc = score(xx)
                 if sc < bs:
@@ -770,7 +803,7 @@ def camera_lidar_refine(calib, bag, run, out_dir, n_frames=12, window=(5.0, 60.0
     intr = {"fx": round(float(fx * res8.x[6]), 1), "fy": round(float(fy * res8.x[7]), 1),
             "score_px": round(float(res8.fun), 4), "delta_rot_deg_cam_xyz": np.round(res8.x[:3], 4).tolist(),
             "delta_trans_m_cam_xyz": np.round(res8.x[3:6], 4).tolist()}
-    if solve_intrinsics and res8.fun < after:
+    if solve_intrinsics and res8.fun < after and not vertical_only:
         x = res8.x
         after, after_parts = score(x, return_parts=True)
         K[0, 0] *= x[6]
@@ -799,10 +832,263 @@ def camera_lidar_refine(calib, bag, run, out_dir, n_frames=12, window=(5.0, 60.0
                "per_frame_before": np.round(before_parts, 3).tolist(), "per_frame_after": np.round(after_parts, 3).tolist(),
                "focal_hypothesis": intr, "focal_scan": focal_scan, "intrinsics_used": [round(float(K[0, 0] / scale), 2), round(float(K[1, 1] / scale), 2),
                                                              round(float(K[0, 2] / scale), 2), round(float(K[1, 2] / scale), 2)],
-               "intrinsics_solved": bool(solve_intrinsics and res8.fun < after + 1e-9), "image_scale": scale,
+               "intrinsics_solved": bool(solve_intrinsics and not vertical_only and res8.fun < after + 1e-9), "image_scale": scale,
+               "dof": "yaw+roll (vertical edges, pitch fixed)" if vertical_only else "6-DoF (all edges)",
                "frame_speeds_mps": [round(f["speed"], 2) for f in frames_data],
                "overlay_dir": str(overlays)}
     return T_new, metrics
+
+
+def accumulate_rear(fr, rot, stamps, j, half_window):
+    """Scans within +-half_window s of run frame j, expressed in the rear-axle frame of frame j."""
+    from scipy.spatial.transform import Rotation as R  # noqa: F401
+    T_imu_rear = np.eye(4)
+    T_imu_rear[:3, 3] = fr["t_li"]
+
+    def T_world_imu(i):
+        T = np.eye(4)
+        T[:3, :3] = rot[i].as_matrix()
+        T[:3, 3] = fr["pos"][i]
+        return T
+
+    sel = np.flatnonzero(np.abs(stamps - stamps[j]) <= half_window)
+    pts = []
+    for i in sel:
+        o, c = (fr["offset"][i] - 8) // 20, fr["count"][i]
+        p = np.asarray(fr["archive"][o:o + c, :3], np.float64)
+        p = p[np.isfinite(p).all(1)]
+        Tw = T_world_imu(i) @ T_imu_rear
+        pts.append(p @ Tw[:3, :3].T + Tw[:3, 3])
+    pw = np.vstack(pts)
+    T_rear_world = np.linalg.inv(T_world_imu(j) @ T_imu_rear)
+    return pw @ T_rear_world[:3, :3].T + T_rear_world[:3, 3]
+
+
+def find_poles(p_rear, cell=0.3, min_height=3.0, max_radius=0.22, max_range=45.0):
+    """Thin vertical clusters (lamp / sign posts) in a rear-axle-frame cloud (z up).
+    Returns [(bottom xyz, top xyz, radius_m, n_points)]."""
+    r_xy = np.hypot(p_rear[:, 0], p_rear[:, 1])
+    p = p_rear[(r_xy > 3.0) & (r_xy < max_range)]
+    if len(p) < 100:
+        return []
+    ij = np.floor(p[:, :2] / cell).astype(np.int64)
+    key = ij[:, 0] * 1_000_003 + ij[:, 1]
+    order = np.argsort(key)
+    key_s, p_s = key[order], p[order]
+    bounds = np.flatnonzero(np.diff(key_s)) + 1
+    starts = np.concatenate([[0], bounds])
+    ends = np.concatenate([bounds, [len(key_s)]])
+    poles = []
+    for a, b in zip(starts, ends):
+        if b - a < 12:
+            continue
+        q = p_s[a:b]
+        z0, z1 = q[:, 2].min(), q[:, 2].max()
+        if z1 - z0 < min_height:
+            continue
+        cx, cy = np.median(q[:, 0]), np.median(q[:, 1])
+        # shaft points: everything above the lowest metre, within 0.6 m of the axis, taken from the full cloud
+        near = p[(np.hypot(p[:, 0] - cx, p[:, 1] - cy) < 0.6) & (p[:, 2] > z0 + 1.0)]
+        if len(near) < 12:
+            continue
+        axis = np.median(near[:, :2], axis=0)
+        rad = np.hypot(near[:, 0] - axis[0], near[:, 1] - axis[1])
+        if np.percentile(rad, 80) > max_radius:
+            continue  # tree trunk / bush / wall
+        # isolation: few points in the 0.6-1.8 m annulus above 1.5 m
+        ann = p[(np.hypot(p[:, 0] - axis[0], p[:, 1] - axis[1]) < 1.8) & (p[:, 2] > z0 + 1.5)]
+        if len(ann) > 2.0 * len(near) + 20:
+            continue
+        zt = np.percentile(near[:, 2], 98)
+        if zt - z0 < min_height:
+            continue
+        if any(np.hypot(axis[0] - q0[0], axis[1] - q0[1]) < 1.5 for q0, _, _, _ in poles):
+            continue
+        poles.append((np.array([axis[0], axis[1], z0 + 0.5]), np.array([axis[0], axis[1], zt]),
+                      float(np.percentile(rad, 80)), int(len(near))))
+    return poles
+
+
+def measure_pole_column(img, u_axis, v_rows, bar_px, search=40):
+    """Sub-pixel image column of a thin vertical bar near the projected LiDAR axis.
+    Per row a zero-mean bar template (either polarity) is slid over +-search px; the bar width is unknown
+    (the LiDAR radius of an accumulated pole is inflated by pose noise), so several widths are tried and
+    the one whose rows agree best is kept. Returns {"du","mad","rows"} (offset image - lidar, px) or {"reason"}."""
+    h, w = img.shape
+    widths = sorted({3, 5, 7, 10, 14, 19, max(3, int(round(bar_px)))})
+    rows_ok = []
+    for v, u0 in zip(v_rows, u_axis):
+        v = int(round(v))
+        lo, hi = int(round(u0)) - search - 60, int(round(u0)) + search + 61
+        if v < 0 or v >= h or lo < 0 or hi > w:
+            continue
+        prof = img[v, lo:hi].astype(np.float32)
+        if prof.std() < 4.0:
+            continue
+        rows_ok.append((prof, lo - u0, float(prof.std())))
+    if len(rows_ok) < 8:
+        return {"reason": f"only {len(rows_ok)} textured rows inside the image"}
+    best = None
+    for bw in widths:
+        half = bw // 2
+        margin = max(3, bw)
+        offs, resps = [], []
+        for prof, base, std in rows_ok:
+            cs = np.concatenate([[0.0], np.cumsum(prof)])
+            uc = np.arange(margin + half, len(prof) - margin - half - 1)
+            inner = (cs[uc + half + 1] - cs[uc - half]) / (2 * half + 1)
+            left = (cs[uc - half] - cs[uc - half - margin]) / margin
+            right = (cs[uc + half + 1 + margin] - cs[uc + half + 1]) / margin
+            resp = np.abs(inner - 0.5 * (left + right)) - 0.5 * np.abs(left - right)
+            # restrict to the +-search window around the LiDAR axis
+            u_rel = uc + base
+            mask = np.abs(u_rel) <= search
+            if not mask.any():
+                continue
+            i = np.argmax(np.where(mask, resp, -np.inf))
+            if resp[i] < 1.5 * std:
+                continue
+            offs.append(u_rel[i])
+            resps.append(resp[i] / std)
+        if len(offs) < 8:
+            continue
+        offs = np.array(offs)
+        med = float(np.median(offs))
+        mad = float(np.median(np.abs(offs - med)))
+        score = len(offs) / (1.0 + mad)
+        if best is None or score > best["score"]:
+            best = {"du": med, "mad": mad, "rows": len(offs), "width": bw, "score": score,
+                    "snr": round(float(np.median(resps)), 2)}
+    if best is None:
+        return {"reason": f"no bar response in {len(rows_ok)} rows"}
+    if best["mad"] > 3.0:
+        return {"reason": f"rows disagree (MAD {best['mad']:.1f} px over {best['rows']} rows, width {best['width']} px)"}
+    return best
+
+
+def pole_yaw_refine(calib, bag, run, out_dir, n_frames=30, window=(5.0, 115.0), accumulate=1.0, scale=1.0):
+    """Camera yaw (rotation about camera y) from lamp / sign posts: the LiDAR pole axis is projected with the
+    current extrinsic and compared with the pole's column in the image. Poles are the only structures in a
+    mine road scene that both sensors see sharply; a 36-line LiDAR resolves them in azimuth (0.1-0.2 deg),
+    while their horizontal image position is measured to ~1 px = 0.035 deg. Pitch is left to the closed loop."""
+    import cv2
+    from scipy.spatial.transform import Rotation as R
+    fr = read_run_frames(run)
+    stamps, rot = fr["stamp"], R.from_quat(fr["quat"])
+    speed = np.linalg.norm(np.gradient(fr["pos"], stamps, axis=0), axis=1)
+    cam = calib.get("camera", DEFAULT_CAMERA)
+    fx, fy, cx, cy = cam["intrinsics"]
+    K = np.array([[fx * scale, 0, cx * scale], [0, fy * scale, cy * scale], [0, 0, 1]])
+    dist = np.array(cam.get("distortion", [0] * 5), float)
+    T_rear_cam = np.asarray(calib["transforms"]["midrange_camera_to_rear_axle"]["transform_matrix"], float).reshape(4, 4)
+    T_cam_rear = np.linalg.inv(T_rear_cam)
+    cam_offset = calib.get("time_offsets", {}).get("camera", 0.0)
+    img_stamps, stream = dump_camera_stream(bag, out_dir)
+    eff = img_stamps + cam_offset
+    t0 = stamps[0]
+    targets = []
+    for tq in np.linspace(t0 + window[0], min(t0 + window[1], stamps[-1] - 1), n_frames):
+        j = int(np.argmin(np.abs(stamps - tq)))
+        if speed[j] > 8.0:
+            continue
+        k = int(np.argmin(np.abs(eff - stamps[j])))
+        if abs(eff[k] - stamps[j]) > 0.02:
+            continue
+        targets.append((j, k))
+    if len(targets) < 4:
+        sys.exit("not enough usable image/scan pairs (need a LIVO run whose frames end at image times)")
+    # find poles first so only frames that see a pole are decoded
+    per_frame = []
+    for j, k in targets:
+        p_rear = accumulate_rear(fr, rot, stamps, j, accumulate / 2)
+        poles = []
+        for bottom, top, rad, n in find_poles(p_rear):
+            seg = np.linspace(bottom, top, 40)
+            pc = seg @ T_cam_rear[:3, :3].T + T_cam_rear[:3, 3]
+            if pc[:, 2].min() < 3.0:
+                continue
+            uv = cv2.projectPoints(pc.reshape(-1, 1, 3), np.zeros(3), np.zeros(3), K, dist)[0].reshape(-1, 2)
+            w_img, h_img = int(1920 * scale), int(1080 * scale)
+            inside = (uv[:, 0] > 60) & (uv[:, 0] < w_img - 60) & (uv[:, 1] > 5) & (uv[:, 1] < h_img - 5)
+            if inside.sum() < 20:
+                continue
+            poles.append({"bottom": bottom, "top": top, "radius": rad, "n": n, "uv": uv[inside],
+                          "depth": float(np.median(pc[inside, 2]))})
+        if poles:
+            per_frame.append((j, k, poles))
+    if not per_frame:
+        stream.unlink(missing_ok=True)
+        return None, {"error": "no lamp/sign posts found in the accumulated scans", "frames_checked": len(targets)}
+    images = {k: img for k, img in decode_hevc(stream, scale, keep={k for _, k, _ in per_frame})}
+    stream.unlink(missing_ok=True)
+    # pixel shift produced by +0.1 deg about camera y (sign convention of `set --camera-rot-delta`)
+    P = np.eye(4)
+    P[:3, :3] = R.from_euler("xyz", [0, 0.1, 0], degrees=True).as_matrix()
+    T_probe = np.linalg.inv(T_rear_cam @ P)
+
+    def du_per_deg(pt_rear):
+        a = cv2.projectPoints((pt_rear @ T_cam_rear[:3, :3].T + T_cam_rear[:3, 3]).reshape(1, 1, 3), np.zeros(3), np.zeros(3), K, dist)[0].ravel()
+        b = cv2.projectPoints((pt_rear @ T_probe[:3, :3].T + T_probe[:3, 3]).reshape(1, 1, 3), np.zeros(3), np.zeros(3), K, dist)[0].ravel()
+        return (b[0] - a[0]) / 0.1
+
+    obs, candidates = [], []
+    dbg = out_dir / "overlays"
+    dbg.mkdir(exist_ok=True)
+    n_dbg = 0
+    for j, k, poles in per_frame:
+        img = images.get(k)
+        if img is None:
+            continue
+        for pole in poles:
+            uv = pole["uv"]
+            rows = np.arange(int(np.ceil(uv[:, 1].min())), int(np.floor(uv[:, 1].max())))
+            if len(rows) < 12:
+                continue
+            u_axis = np.interp(rows, uv[np.argsort(uv[:, 1]), 1], uv[np.argsort(uv[:, 1]), 0])
+            bar_px = max(2.0, fx * scale * max(0.14, 2 * pole["radius"]) / pole["depth"])
+            m = measure_pole_column(img, u_axis, rows, bar_px)
+            if "du" not in m:
+                candidates.append({"t": round(float(stamps[j] - t0), 1), "depth_m": round(pole["depth"], 1),
+                                   "bar_px": round(bar_px, 1), "rows": int(len(rows)), "rejected": m["reason"]})
+                continue
+            du, mad, nrows = m["du"], m["mad"], m["rows"]
+            pole["width_px"] = m["width"]
+            mid = 0.5 * (pole["bottom"] + pole["top"])
+            g = du_per_deg(mid)
+            obs.append({"t": round(float(stamps[j] - t0), 1), "image": int(k), "depth_m": round(pole["depth"], 1),
+                        "height_m": round(float(pole["top"][2] - pole["bottom"][2] + 0.5), 1), "rows": int(nrows),
+                        "du_px": round(du, 2), "mad_px": round(mad, 2), "yaw_deg": round(float(du / g), 4),
+                        "bar_width_px": int(m["width"]), "snr": m["snr"], "speed_mps": round(float(speed[j]), 2)})
+            if n_dbg < 8:
+                u_c = int(np.median(u_axis))
+                v0, v1 = max(0, rows[0] - 20), min(img.shape[0], rows[-1] + 20)
+                u0, u1 = max(0, u_c - 80), min(img.shape[1], u_c + 80)
+                crop = cv2.cvtColor(img[v0:v1, u0:u1], cv2.COLOR_GRAY2BGR)
+                for v, u in zip(rows, u_axis):
+                    cv2.circle(crop, (int(round(u - u0)), int(v - v0)), 1, (0, 0, 255), -1)
+                    cv2.circle(crop, (int(round(u + du - u0)), int(v - v0)), 1, (0, 255, 0), -1)
+                crop = cv2.resize(crop, None, fx=3, fy=3, interpolation=cv2.INTER_NEAREST)
+                cv2.putText(crop, f"t+{stamps[j] - t0:.0f}s d={pole['depth']:.0f}m du={du:+.1f}px", (4, 16),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+                cv2.imwrite(str(dbg / f"pole_{n_dbg:02d}_t{int(stamps[j] - t0):03d}.jpg"), crop, [cv2.IMWRITE_JPEG_QUALITY, 88])
+                n_dbg += 1
+    metrics = {"method": "pole yaw (LiDAR pole axis vs image pole column)", "frames_checked": len(targets),
+               "frames_with_poles": len(per_frame), "observations": obs, "rejected": candidates, "image_scale": scale}
+    if len(obs) < 3:
+        metrics["error"] = f"only {len(obs)} usable pole observations"
+        return None, metrics
+    yaws = np.array([o["yaw_deg"] for o in obs])
+    med = float(np.median(yaws))
+    mad = float(np.median(np.abs(yaws - med)))
+    keep = np.abs(yaws - med) <= max(3 * mad, 0.05)
+    yaw = float(np.median(yaws[keep]))
+    metrics.update({"yaw_delta_deg": round(yaw, 4), "yaw_mad_deg": round(mad, 4), "used": int(keep.sum()),
+                    "du_median_px": round(float(np.median([o["du_px"] for o in obs])), 2),
+                    "delta_rot_deg_cam_xyz": [0.0, round(yaw, 4), 0.0], "delta_trans_m_cam_xyz": [0.0, 0.0, 0.0],
+                    "overlay_dir": str(dbg)})
+    P = np.eye(4)
+    P[:3, :3] = R.from_euler("xyz", [0, yaw, 0], degrees=True).as_matrix()
+    return T_rear_cam @ P, metrics
 
 
 def cmd_camera_lidar(a):
@@ -812,23 +1098,176 @@ def cmd_camera_lidar(a):
         sys.exit(f"camera-lidar: {a.run} is not a fusion run directory (frames.csv missing); run a LIVO round first")
     out_dir = next_version_dir(mine, truck, "camlidar")
     out_dir.mkdir(parents=True, exist_ok=True)
+    if a.method == "poles":
+        T_new, metrics = pole_yaw_refine(parent_calib, pathlib.Path(a.bag), a.run, out_dir, n_frames=a.frames,
+                                         window=tuple(a.window), accumulate=a.accumulate)
+        calib = copy.deepcopy(parent_calib)
+        metrics["max_delta_deg"] = a.max_delta
+        ok = T_new is not None and metrics.get("used", 0) >= 3 and metrics.get("yaw_mad_deg", 9) <= 0.15
+        too_big = T_new is not None and abs(metrics["yaw_delta_deg"]) > a.max_delta
+        metrics["applied"] = bool(ok and not too_big)
+        if metrics["applied"]:
+            calib["transforms"]["midrange_camera_to_rear_axle"]["transform_matrix"] = T_new.reshape(-1).tolist()
+            calib["transforms"]["midrange_camera_to_rear_axle"]["refined_by"] = "livo_calib camera-lidar pole yaw"
+            calib["calibration_type"] = calib.get("calibration_type", "") + "+camera_pole_yaw"
+            note = (f"camera yaw refined on {metrics['used']} pole observations: {metrics['yaw_delta_deg']:+.3f} deg "
+                    f"(median shift {metrics['du_median_px']:+.1f} px, MAD {metrics['yaw_mad_deg']:.3f} deg)")
+        elif too_big:
+            note = f"pole yaw {metrics['yaw_delta_deg']:+.3f} deg exceeds ±{a.max_delta} deg: NOT applied, extrinsic kept"
+        else:
+            note = f"pole yaw not applied ({metrics.get('error') or 'inconsistent observations'}): extrinsic kept"
+        finalize_version(out_dir, calib, mine=mine, truck=truck, stage="camlidar", parent=a.id, note=a.note or note,
+                         inputs={"bag": a.bag, "dataset": ds_info, "run": a.run, "frames": a.frames, "window": list(a.window)},
+                         metrics=metrics, activate=a.activate and metrics["applied"])
+        return
     T_new, metrics = camera_lidar_refine(parent_calib, pathlib.Path(a.bag), a.run, out_dir, n_frames=a.frames,
                                          window=tuple(a.window), accumulate=a.accumulate,
-                                         solve_intrinsics=a.solve_intrinsics)
+                                         solve_intrinsics=a.solve_intrinsics, dof=a.dof)
     calib = copy.deepcopy(parent_calib)
-    calib["transforms"]["midrange_camera_to_rear_axle"]["transform_matrix"] = T_new.reshape(-1).tolist()
+    improved = metrics["score_after_px"] < metrics["score_before_px"]
+    too_big = max(abs(v) for v in metrics["delta_rot_deg_cam_xyz"]) > a.max_delta
+    metrics["applied"] = bool(improved and not too_big)
+    metrics["max_delta_deg"] = a.max_delta
+    if metrics["applied"]:
+        calib["transforms"]["midrange_camera_to_rear_axle"]["transform_matrix"] = T_new.reshape(-1).tolist()
+        calib["transforms"]["midrange_camera_to_rear_axle"]["refined_by"] = f"livo_calib camera-lidar edge alignment ({metrics['dof']})"
+        calib["calibration_type"] = calib.get("calibration_type", "") + "+camera_lidar_edge_refined"
     if metrics.get("intrinsics_solved"):
         calib.setdefault("camera", copy.deepcopy(DEFAULT_CAMERA))["intrinsics"] = metrics["intrinsics_used"]
         calib["camera"]["source"] = "livo_calib camera-lidar edge alignment (focal scale solved)"
-    calib["transforms"]["midrange_camera_to_rear_axle"]["refined_by"] = "livo_calib camera-lidar depth-edge alignment"
-    calib["calibration_type"] = calib.get("calibration_type", "") + "+camera_lidar_edge_refined"
-    improved = metrics["score_after_px"] < metrics["score_before_px"]
+    if metrics["applied"]:
+        note = (f"camera yaw/roll refined by vertical-edge alignment: delta cam xyz {metrics['delta_rot_deg_cam_xyz']} deg"
+                if a.dof != "full" else "camera->rear extrinsic refined by depth-edge alignment (6-DoF)")
+    elif too_big:
+        note = f"camera-lidar solution {metrics['delta_rot_deg_cam_xyz']} deg exceeds ±{a.max_delta} deg: NOT applied, extrinsic kept"
+    else:
+        note = "camera-lidar stage ran but did NOT improve the edge score: extrinsic kept; inspect overlays"
     finalize_version(out_dir, calib, mine=mine, truck=truck, stage="camlidar", parent=a.id,
-                     note=a.note or ("camera->rear extrinsic refined by depth-edge alignment" if improved else
-                                     "camera-lidar stage ran but did NOT improve the edge score; inspect overlays"),
+                     note=a.note or note,
                      inputs={"bag": a.bag, "dataset": ds_info, "run": a.run, "frames": a.frames,
                              "window": list(a.window)},
-                     metrics=metrics, activate=a.activate and improved)
+                     metrics=metrics, activate=a.activate and metrics["applied"])
+
+
+def render_overlays(calib, bag, run, out_dir, times, accumulate=1.0, scale=0.5, max_points=60000,
+                    rot_delta=None, cam_offset=None, title=""):
+    """Project accumulated scans of a LIVO run into the camera images at the requested run times."""
+    import cv2
+    from scipy.spatial.transform import Rotation as R
+    fr = read_run_frames(run)
+    stamps, rot = fr["stamp"], R.from_quat(fr["quat"])
+    cam = calib.get("camera", DEFAULT_CAMERA)
+    fx, fy, cx, cy = cam["intrinsics"]
+    K = np.array([[fx * scale, 0, cx * scale], [0, fy * scale, cy * scale], [0, 0, 1]])
+    dist = np.array(cam.get("distortion", [0] * 5), float)
+    T_rear_cam = np.asarray(calib["transforms"]["midrange_camera_to_rear_axle"]["transform_matrix"], float).reshape(4, 4)
+    if rot_delta is not None and any(abs(v) > 0 for v in rot_delta):
+        P = np.eye(4)
+        P[:3, :3] = R.from_euler("xyz", rot_delta, degrees=True).as_matrix()
+        T_rear_cam = T_rear_cam @ P
+    if cam_offset is None:
+        cam_offset = calib.get("time_offsets", {}).get("camera", 0.0)
+    img_stamps, stream = dump_camera_stream(bag, out_dir)
+    eff = img_stamps + cam_offset
+    t0 = stamps[0]
+    targets, index = [], []
+    for t_req in times:
+        tq = t0 + float(t_req)
+        cand = np.flatnonzero(np.abs(stamps - tq) <= 1.0)
+        if len(cand) == 0:
+            index.append({"t": float(t_req), "error": "outside run"})
+            continue
+        best = None
+        for j in cand[np.argsort(np.abs(stamps[cand] - tq))]:
+            k = int(np.argmin(np.abs(eff - stamps[j])))
+            if abs(eff[k] - stamps[j]) <= 0.02:
+                best = (int(j), k)
+                break
+        if best is None:
+            index.append({"t": float(t_req), "error": "no image within 20 ms of a frame"})
+            continue
+        targets.append((float(t_req), best[0], best[1]))
+    if not targets:
+        stream.unlink(missing_ok=True)
+        return index
+    images = {k: img for k, img in decode_hevc(stream, scale, keep={k for _, _, k in targets})}
+    stream.unlink(missing_ok=True)
+    T_imu_rear = np.eye(4)
+    T_imu_rear[:3, 3] = fr["t_li"]
+    T_cam_rear = np.linalg.inv(T_rear_cam)
+
+    def T_world_imu(j):
+        T = np.eye(4)
+        T[:3, :3] = rot[j].as_matrix()
+        T[:3, 3] = fr["pos"][j]
+        return T
+
+    speed = np.linalg.norm(np.gradient(fr["pos"], stamps, axis=0), axis=1)
+    for t_req, j, k in targets:
+        if k not in images:
+            index.append({"t": t_req, "error": "frame not decoded"})
+            continue
+        sel = np.flatnonzero(np.abs(stamps - stamps[j]) <= accumulate / 2)
+        pts_world = []
+        for i in sel:
+            o, c = (fr["offset"][i] - 8) // 20, fr["count"][i]
+            p = np.asarray(fr["archive"][o:o + c, :3], np.float64)
+            p = p[np.isfinite(p).all(1)]
+            Tw = T_world_imu(i) @ T_imu_rear
+            pts_world.append(p @ Tw[:3, :3].T + Tw[:3, 3])
+        pw = np.vstack(pts_world)
+        T_rear_world = np.linalg.inv(T_world_imu(j) @ T_imu_rear)
+        p_rear = pw @ T_rear_world[:3, :3].T + T_rear_world[:3, 3]
+        pc = p_rear @ T_cam_rear[:3, :3].T + T_cam_rear[:3, 3]
+        pc = pc[pc[:, 2] > 1.0]
+        if len(pc) > max_points:
+            pc = pc[np.random.default_rng(0).choice(len(pc), max_points, replace=False)]
+        img = images[k]
+        h, w = img.shape
+        canvas = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        uv = cv2.projectPoints(pc.reshape(-1, 1, 3), np.zeros(3), np.zeros(3), K, dist)[0].reshape(-1, 2)
+        u, v = np.round(uv[:, 0]).astype(int), np.round(uv[:, 1]).astype(int)
+        inside = (u >= 0) & (u < w) & (v >= 0) & (v < h)
+        u, v, depth = u[inside], v[inside], pc[inside, 2]
+        order = np.argsort(-depth)  # far first, near overwrites
+        zbuf = np.full((h, w), np.inf)
+        zbuf[v[order], u[order]] = depth[order]
+        # colour by depth (near red -> far blue), only the nearest point per pixel is drawn
+        keep = depth[order] <= zbuf[v[order], u[order]] + 1e-6
+        uo, vo, do = u[order][keep], v[order][keep], depth[order][keep]
+        norm = np.clip(1.0 - np.log1p(do) / np.log1p(60.0), 0, 1)
+        colors = cv2.applyColorMap((norm * 255).astype(np.uint8).reshape(-1, 1), cv2.COLORMAP_JET).reshape(-1, 3)
+        canvas[vo, uo] = colors
+        for dy, dx in ((0, 1), (1, 0)):  # 2x2 splat so points stay visible at half resolution
+            vv, uu = np.clip(vo + dy, 0, h - 1), np.clip(uo + dx, 0, w - 1)
+            canvas[vv, uu] = colors
+        label = f"t=+{t_req:.1f}s  {speed[j]:.1f} m/s  {len(do)} pts  {title}"
+        if rot_delta is not None and any(abs(v) > 0 for v in rot_delta):
+            label += f"  delta cam xyz {tuple(round(float(v), 3) for v in rot_delta)} deg"
+        cv2.putText(canvas, label, (8, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+        name = f"overlay_t{int(round(t_req)):03d}.jpg"
+        cv2.imwrite(str(out_dir / name), canvas, [cv2.IMWRITE_JPEG_QUALITY, 88])
+        index.append({"t": t_req, "file": name, "frame": j, "image": k, "points": int(len(do)),
+                      "speed_mps": round(float(speed[j]), 2), "image_dt_ms": round(float((eff[k] - stamps[j]) * 1e3), 1)})
+    return index
+
+
+def cmd_overlay(a):
+    pdir, calib, mine, truck = parent_info(a.id)
+    require_dataset(a.bag, camera=True, what="overlay")
+    run = pathlib.Path(a.run)
+    if not (run / "frames.csv").exists() or not (run / "scans.bin").exists():
+        sys.exit(f"overlay: {run} has no frames.csv/scans.bin (run a LIVO round with save_map)")
+    out_dir = pathlib.Path(a.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    times = [float(v) for v in str(a.times).split(",") if v.strip()]
+    index = render_overlays(calib, pathlib.Path(a.bag), run, out_dir, times, accumulate=a.accumulate, scale=a.scale,
+                            max_points=a.max_points, rot_delta=a.camera_rot_delta, cam_offset=a.camera_offset,
+                            title=a.id.split("/")[-1])
+    doc = {"id": a.id, "run": str(run), "bag": str(a.bag), "camera_rot_delta_deg_cam_xyz": a.camera_rot_delta,
+           "camera_offset": a.camera_offset, "frames": index, "created": now()}
+    (out_dir / "index.json").write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
+    print(json.dumps(doc, ensure_ascii=False))
 
 
 # ----------------------------------------------------------------------------- bookkeeping cmds
@@ -995,9 +1434,19 @@ def cmd_set(a):
         changes["camera_rot_delta_deg_cam_xyz"] = list(a.camera_rot_delta)
     if not changes:
         sys.exit("nothing to set")
-    out_dir = next_version_dir(mine, truck, "manual")
-    finalize_version(out_dir, calib, mine=mine, truck=truck, stage="manual", parent=a.id,
-                     note=a.note or "operator-entered values", metrics={"changes": changes}, activate=a.activate)
+    stage = a.stage or "manual"
+    if stage == "camloop":
+        calib["transforms"]["midrange_camera_to_rear_axle"]["refined_by"] = "livo_calib closed-loop pitch scan (native odometry scale vs RTK)"
+        calib["calibration_type"] = calib.get("calibration_type", "") + "+camera_closed_loop"
+    metrics = {"changes": changes}
+    if a.metrics_json:
+        try:
+            metrics.update(json.loads(a.metrics_json))
+        except json.JSONDecodeError as exc:
+            sys.exit(f"--metrics-json is not valid JSON: {exc}")
+    out_dir = next_version_dir(mine, truck, stage)
+    finalize_version(out_dir, calib, mine=mine, truck=truck, stage=stage, parent=a.id,
+                     note=a.note or "operator-entered values", metrics=metrics, activate=a.activate)
 
 
 def main():
@@ -1044,11 +1493,16 @@ def main():
     p = sub.add_parser("camera-lidar")
     p.add_argument("--bag", required=True, help="recording containing midrange_camera/ffmpeg (raw root)")
     p.add_argument("--run", required=True, help="fusion run directory of a LIVO round (frames end at image times)")
-    p.add_argument("--frames", type=int, default=12)
-    p.add_argument("--window", nargs=2, type=float, default=(5.0, 60.0))
+    p.add_argument("--frames", type=int, default=30, help="image/scan pairs to inspect (poles are found in a subset)")
+    p.add_argument("--window", nargs=2, type=float, default=(5.0, 115.0))
     p.add_argument("--accumulate", type=float, default=1.0, help="seconds of scans accumulated around each image")
+    p.add_argument("--method", choices=("poles", "edges"), default="poles",
+                   help="poles: camera yaw from lamp/sign posts (default); edges: generic depth-edge alignment (legacy)")
     p.add_argument("--solve-intrinsics", action="store_true",
-                   help="also solve fx/fy scale factors and write them to camera.intrinsics when the score improves")
+                   help="also solve fx/fy scale factors and write them to camera.intrinsics when the score improves (dof=full only)")
+    p.add_argument("--dof", choices=("yawroll", "full"), default="yawroll",
+                   help="yawroll: vertical edges, solve camera yaw/roll only (pitch comes from the closed loop); full: legacy 6-DoF")
+    p.add_argument("--max-delta", type=float, default=0.5, help="reject solutions whose rotation exceeds this (deg)")
     common(p)
     p.set_defaults(func=cmd_camera_lidar)
 
@@ -1064,8 +1518,25 @@ def main():
     p.add_argument("--lidar-offset", type=float)
     p.add_argument("--intrinsics", nargs=4, type=float)
     p.add_argument("--distortion", nargs=5, type=float)
+    p.add_argument("--stage", choices=("manual", "camloop", "scan"), default="manual",
+                   help="version suffix: manual (default), camloop (closed-loop pitch result), scan (temporary scan point)")
+    p.add_argument("--metrics-json", help="extra metrics recorded in the version (JSON object)")
     common(p)
     p.set_defaults(func=cmd_set)
+
+    p = sub.add_parser("overlay", help="project the LiDAR scans of a LIVO round into camera frames (visual check)")
+    p.add_argument("--bag", required=True, help="recording containing midrange_camera/ffmpeg (raw root)")
+    p.add_argument("--run", required=True, help="fusion run directory of a LIVO round (frames.csv + scans.bin)")
+    p.add_argument("--out", required=True, help="output directory for overlay_*.jpg + index.json")
+    p.add_argument("--times", default="20,60,100", help="seconds after run start, comma separated")
+    p.add_argument("--camera-rot-delta", nargs=3, type=float, metavar=("RX", "RY", "RZ"),
+                   help="preview an additional camera-frame rotation (deg) on top of the version's extrinsic")
+    p.add_argument("--camera-offset", type=float, help="override time_offsets.camera (s) for the preview")
+    p.add_argument("--accumulate", type=float, default=1.0)
+    p.add_argument("--scale", type=float, default=0.5)
+    p.add_argument("--max-points", type=int, default=60000)
+    common(p)
+    p.set_defaults(func=cmd_overlay)
 
     p = sub.add_parser("list")
     p.add_argument("--json", action="store_true")

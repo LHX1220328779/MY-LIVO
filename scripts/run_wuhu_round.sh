@@ -18,7 +18,7 @@
 set -uo pipefail
 repo=/home/project/MY-LIVO
 round=${1:?round name required, e.g. wuhu_rtk_91_ins_attitude}; shift
-mode=lio; use_rtk=true; save_map=true; use_rviz=false; rate=1.0; start_offset=0; duration=""; do_eval=1
+mode=lio; use_rtk=true; save_map=true; use_rviz=false; rate=1.0; start_offset=0; duration=""; do_eval=1; quick_eval=0
 sets=(); dataset="/home/project/data/haibo/wuhu_livo/ros2bag"; calibration=""
 while (($#)); do
   case "$1" in
@@ -31,6 +31,7 @@ while (($#)); do
     --duration) duration="$2"; shift 2 ;;
     --set) sets+=("$2"); shift 2 ;;
     --no-eval) do_eval=0; shift ;;
+    --quick-eval) quick_eval=1; shift ;;   # trajectory + summary only (scan rounds of the closed loop)
     --bag|--dataset) dataset="$2"; shift 2 ;;
     --calibration) calibration="$2"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
@@ -202,6 +203,9 @@ wait "$launch_pid" 2>/dev/null
 echo "launch_exit=$?" >> "$out/run.log"
 pkill -KILL -f "image_transport/republish" 2>/dev/null || true
 grep -E "RTK finalized|Final keyframe|INS attitude factors|position budget|Mapping failed|RTK backend failed" "$out/launch.log" >> "$out/run.log"
+# The node aborts on an input IMU gap (> maximum_time_gap, e.g. one dropped 100 Hz message under load) and
+# exports only the prefix: keep the output for diagnosis but mark the round incomplete (exit 4).
+mapper_error=$(grep -m1 -oE "Mapping failed: [^\r]*|RTK backend failed[^\r]*" "$out/launch.log" | head -1 | sed 's/"/\\"/g')
 map_chunks=$(ls "$fusion_dir"/map_*.pcd 2>/dev/null | wc -l)
 echo "map_chunks=$map_chunks" >> "$out/run.log"
 echo "fusion_dir=$fusion_dir" >> "$out/run.log"
@@ -209,13 +213,19 @@ phase exported fusion_dir="\"${fusion_dir%/}\"" map_chunks="$map_chunks"
 
 if [[ $do_eval -eq 1 && -n "${fusion_dir:-}" && -f "$fusion_dir/trajectory_optimized.txt" ]]; then
   phase evaluating
-  bash scripts/evaluate_wuhu_round.sh "$round" --dataset "$dataset" >> "$out/run.log" 2>&1
+  eval_args=(--dataset "$dataset"); (( quick_eval )) && eval_args+=(--quick)
+  bash scripts/evaluate_wuhu_round.sh "$round" "${eval_args[@]}" >> "$out/run.log" 2>&1
 fi
-if [[ -n "${fusion_dir:-}" && -f "$fusion_dir/trajectory_optimized.txt" ]]; then
+rc=0
+if [[ -n "${fusion_dir:-}" && -f "$fusion_dir/trajectory_optimized.txt" && -z "$mapper_error" ]]; then
   phase done status=done end="\"$(date -u +%FT%TZ)\""
+elif [[ -n "${fusion_dir:-}" && -f "$fusion_dir/trajectory_optimized.txt" ]]; then
+  phase done status=incomplete end="\"$(date -u +%FT%TZ)\"" error="\"$mapper_error\""
+  echo "INCOMPLETE: $mapper_error" >> "$out/run.log"; rc=4
 else
-  phase failed status=failed end="\"$(date -u +%FT%TZ)\"" error='"no optimized trajectory exported"'
+  phase failed status=failed end="\"$(date -u +%FT%TZ)\"" error='"no optimized trajectory exported"'; rc=3
 fi
 chown -R 1000:1000 "$out" 2>/dev/null || true
 echo "end=$(date -u +%FT%TZ)" >> "$out/run.log"
 tail -25 "$out/run.log"
+exit $rc

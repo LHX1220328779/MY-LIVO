@@ -36,7 +36,7 @@
 
 | 位置 | 负责 | 不负责 |
 |---|---|---|
-| 离线标定工具 / Studio 标定页 | 生成并版本化正式外参与时间偏移；LiDAR 流水线（ground → LIO → driven）、相机流水线（camtime → LIVO → camlidar 复核） | 运行时修改 |
+| 离线标定工具 / Studio 标定页 | 生成并版本化正式外参与时间偏移；LiDAR 流水线（ground → LIO → driven）、相机流水线（camtime → LIVO A → camlidar 灯柱偏航 → 俯仰扫描 ±0.05° 两轮 LIVO → 过零点 camloop → LIVO 验证 → 闭环判定）、相机外参闭环微调（只做俯仰闭环） | 运行时修改 |
 | 算法内 `multi_lidar.precheck`（已有） | 起步静止段核对地面 roll/pitch/z，小修正当次生效，大偏差告警，写 `Log/extrinsic_precheck.json` | 改写标定文件（固化用 `from-precheck`） |
 | SLAM | 只读取一个激活的 `calibration_file`（含相机内参与时间偏移） | 任何标定搜索 |
 
@@ -65,3 +65,12 @@
 - `results/prepared/`（约 7 GB）可以删除；`prepare_wuhu_bag.py` 仅为兼容保留。
 - 未跟踪的旧实验文件 `config/perception_truck29_auto_refined.json`、`config/perception_truck29_cam_sanitized.json`、`scripts/auto_precorrect_truck.py`、`scripts/carlib_densify_and_calibrate.py` 与本次无关，建议按需清理或纳入版本。
 - 后续优化 SLAM 时只需保持：`results/<round>/round.json` 字段、`Log/fusion/<stamp>/{trajectory_optimized.txt,diagnostics.csv,online_path.csv,frames.csv,scans.bin}` 以及 `Log/extrinsic_precheck.json` 的约定，控制台无需改动。
+
+## 9. 2026-09-22 晚：相机外参标定 v3（详见 `docs/mcp-livo-native-drift-analysis.md` §4、§8）
+
+* `camera-lidar` 默认改为 `--method poles`：灯柱 LiDAR 轴线 vs 图像灯柱列 → 只改偏航（v014 上 +0.097°，6 个灯柱观测，MAD 0.024°）；通用边缘对齐保留为 `--method edges --dof full|yawroll`（诊断用）。
+* 俯仰由闭环扫描确定：新增阶段 `camloop`（结果）与 `scan`（临时）、`set --stage/--metrics-json`、`scripts/analysis/camera_pitch_fit.py`；Studio 相机流水线 13 步、新增“相机外参闭环微调”流水线；仅闭环通过时自动激活。
+* 新增 `livo_calib.py overlay` 与 Studio `POST /api/calibrations/overlay`（版本详情“目视复核”面板：任选 LIVO 轮次/时刻/试探旋转，≈ 10 s 出图，可保存为手动版本）。
+* 轮次鲁棒性：`run_wuhu_round.sh` 识别 `Mapping failed`（IMU 间隙）→ `status=incomplete`/退出码 4；流水线建图步骤自动重试一次；拟合与判定拒绝时长不一致的轮次。
+* 结果图：优化后轨迹 vs RTK 实线（`evaluation/error_series.csv`，由 `round_summary.py` 写出）+ 在线轨迹虚线。
+* 修复：版本详情抽屉在无 `closed_loop.json` 的版本上因 `stage` 提前引用而报错（TDZ）；`meta.json` 的 overlays 列表只收 `*.png` 而实际为 `*.jpg`。jsdom 冒烟 28/28。

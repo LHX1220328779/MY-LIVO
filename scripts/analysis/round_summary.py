@@ -98,6 +98,13 @@ def main():
         print(f"[{name}] attitude - INS (deg): x(pitch) {stats(np.abs(att[:,0]))} | y(roll) {stats(np.abs(att[:,1]))} | z(yaw) {stats(np.abs(att[:,2]))}")
     t, att, rear_err, imu_err = results["optimized"]
     tn, attn, rear_n, imu_n = results["native"]
+    # per-frame error series for the console chart (optimized = delivered map trajectory), <= 600 rows
+    step = max(1, len(t) // 600)
+    with (out / "error_series.csv").open("w") as f:
+        f.write("stamp,t_rel_s,opt_rear_m,opt_imu_m,native_rear_m,native_imu_m\n")
+        for i in range(0, len(t), step):
+            k = int(np.argmin(np.abs(tn - t[i])))
+            f.write(f"{t[i]:.3f},{t[i]-t0:.2f},{rear_err[i]:.4f},{imu_err[i]:.4f},{rear_n[k]:.4f},{imu_n[k]:.4f}\n")
     print("\nwindow(s)  opt: dpitch droll dyaw | rear imu (med) || native: dpitch droll dyaw | rear")
     for w in range(0, 120, 10):
         m = (t - t0 >= w) & (t - t0 < w + 10); mn = (tn - t0 >= w) & (tn - t0 < w + 10)

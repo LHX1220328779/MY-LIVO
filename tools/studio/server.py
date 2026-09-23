@@ -149,6 +149,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, calibration.version_detail(q["id"]))
         if path == "/api/calibrations/file":
             return self._file(calibration.version_file(q["id"], q["name"]))
+        if path == "/api/overlays/file":
+            return self._file(calibration.overlay_file(q.get("key"), q.get("name", "")))
         if path == "/api/jobs":
             return self._send(200, jobs.list_jobs(kind=q.get("kind"), limit=int(q.get("limit", 60))))
         m = re.match(r"^/api/jobs/([0-9a-f]+)$", path)
@@ -207,9 +209,11 @@ class Handler(BaseHTTPRequestHandler):
                 raise StudioError("已有建图/流水线任务在运行，请先等待其结束")
             kind = body.get("kind") or "lidar"
             steps, info = calibration.pipeline_steps(kind, body, mapping.pipeline_round_cmd)
-            title = ("LiDAR 标定流水线" if kind == "lidar" else "相机标定流水线") + f" · {info['truck']}"
+            title = {"lidar": "LiDAR 标定流水线", "camera": "相机标定流水线", "camloop": "相机外参闭环微调"}.get(kind, kind) + f" · {info['truck']}"
             job = jobs.start("pipeline", title, steps, meta={"kind": kind, **info, "options": body})
             return self._send(200, job.to_json())
+        if path == "/api/calibrations/overlay":
+            return self._send(200, calibration.overlay(body))
         if path == "/api/calibrations/activate":
             return self._send(200, calibration.activate(body["id"]))
         if path == "/api/calibrations/validate":

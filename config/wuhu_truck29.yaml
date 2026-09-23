@@ -285,9 +285,12 @@ laser_mapping:
       # 75 s, forced acc bias to 0.32 m/s^2, and diverged velocity to 19 m/s on
       # the final degenerate straight.
       initial_gyr_bias_sigma: 0.0001
-      # 100 Hz source: allow one missing sample, but never interpolate across
-      # a long hole while deskewing a scan.
-      maximum_time_gap: 0.011
+      # 100 Hz source, sample period 0.010 s. 0.011 only tolerated a 1 ms late sample, so a SINGLE
+      # dropped message (0.020 s measured gap) aborted the whole run - that killed 4 of ~50 rounds
+      # (152050 @88 s, 192528 @58 s, 200825.failed1 and studio_livo_202841 @88 s; the gap is exactly
+      # 0.020000 s, i.e. one lost sample on the UDP/SHM path while the mapper was busy in VIO).
+      # 0.031 tolerates two consecutive drops and still refuses real recording holes (>= 0.05 s).
+      maximum_time_gap: 0.031
       gravity_est_en: true
       ba_bg_est_en: true
 

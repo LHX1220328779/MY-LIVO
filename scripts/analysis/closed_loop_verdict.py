@@ -45,10 +45,12 @@ def pick(doc):
 
 
 def main():
-    args, vdir, it = [], None, iter(sys.argv[1:])
+    args, vdir, margin, it = [], None, 0.002, iter(sys.argv[1:])
     for a in it:
         if a == "--version-dir":
             vdir = pathlib.Path(next(it, ""))
+        elif a == "--scale-margin":
+            margin = float(next(it, 0.002))
         elif a.startswith("--"):
             continue
         else:
@@ -65,17 +67,21 @@ def main():
         if wc["native"]["rear_m"] > 1.10 * wb["native"]["rear_m"] + 0.10:
             ok = False; reasons.append(f"native rear-axle error at {wb['t0']}-{wb['t1']} s {wb['native']['rear_m']:.2f} -> {wc['native']['rear_m']:.2f} m")
     if b["scale"] and c["scale"]:
-        if abs(c["scale"] - 1) > abs(b["scale"] - 1) + 0.002:
+        if abs(c["scale"] - 1) > abs(b["scale"] - 1) + margin:
             ok = False; reasons.append(f"native odometry scale {b['scale']:.4f} -> {c['scale']:.4f}")
     if b["yaw_p95_deg"] is not None and c["yaw_p95_deg"] is not None and c["yaw_p95_deg"] > b["yaw_p95_deg"] + 0.15:
         ok = False; reasons.append(f"native yaw P95 vs INS {b['yaw_p95_deg']:.2f} -> {c['yaw_p95_deg']:.2f} deg")
     if not n and not (b["scale"] and c["scale"]):
         ok = False; reasons.append("insufficient evaluation data (no window table / path lengths)")
+    if b.get("duration_s") and c.get("duration_s") and min(b["duration_s"], c["duration_s"]) < 0.9 * max(b["duration_s"], c["duration_s"]):
+        ok = False; reasons.append(f"round durations differ ({b['duration_s']:.0f} vs {c['duration_s']:.0f} s): one run is incomplete")
     for d in (b, c):
         d.pop("windows", None)
     out = {"verdict": "pass" if ok else "fail", "reasons": reasons, "common_window": common,
            "baseline": b, "candidate": c,
-           "criteria": "scale within baseline+0.2%; rear error at last common window <= 1.10x+0.10 m; yaw P95 <= baseline+0.15 deg"}
+           "scale_margin": margin,
+           "criteria": f"scale within baseline+{margin*100:.1f}%; rear error at last common window <= 1.10x+0.10 m; "
+                       "yaw P95 <= baseline+0.15 deg; round durations within 10%"}
     text = json.dumps(out, ensure_ascii=False, indent=1)
     print(text)
     if vdir:

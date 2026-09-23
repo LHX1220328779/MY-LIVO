@@ -14,7 +14,7 @@ import threading
 import time
 
 from . import common
-from .common import JOBS_DIR, REPO, ROS_PROCESS_PATTERN, now
+from .common import JOBS_DIR, REPO, RESULTS, ROS_PROCESS_PATTERN, now
 
 _lock = threading.RLock()
 JOBS = {}
@@ -75,25 +75,40 @@ class Job:
                     self._log(f"=== [{i + 1}/{len(self.steps)}] {step['title']}: {exc}")
                     break
                 cmd = [str(c) for c in cmd]
-                self._log(f"=== [{i + 1}/{len(self.steps)}] {step['title']}\n$ {' '.join(cmd)}")
-                lines = []
-                try:
-                    self.proc = subprocess.Popen(cmd, cwd=REPO, env=self._env(), stdout=subprocess.PIPE,
-                                                 stderr=subprocess.STDOUT, text=True, bufsize=1,
-                                                 start_new_session=True)
-                except Exception as exc:  # noqa: BLE001
-                    step["status"], step["finished"], step["returncode"] = "failed", now(), 127
-                    self.error = f"failed to start: {exc}"
-                    self._log(self.error)
+                retries = int(spec.get("retry") or 0)
+                rc, lines, start_failed = None, [], False
+                for attempt in range(retries + 1):
+                    if attempt:
+                        # keep the failed attempt for diagnosis and re-run under the same round name
+                        self._log(f"!!! {step['title']}: 退出码 {rc}，重试 {attempt}/{retries}")
+                        if spec.get("round"):
+                            src = RESULTS / spec["round"]
+                            if src.is_dir():
+                                src.rename(RESULTS / f"{spec['round']}.failed{attempt}")
+                    self._log(f"=== [{i + 1}/{len(self.steps)}] {step['title']}\n$ {' '.join(cmd)}")
+                    lines = []
+                    try:
+                        self.proc = subprocess.Popen(cmd, cwd=REPO, env=self._env(), stdout=subprocess.PIPE,
+                                                     stderr=subprocess.STDOUT, text=True, bufsize=1,
+                                                     start_new_session=True)
+                    except Exception as exc:  # noqa: BLE001
+                        step["status"], step["finished"], step["returncode"] = "failed", now(), 127
+                        self.error = f"failed to start: {exc}"
+                        self._log(self.error)
+                        start_failed = True
+                        break
+                    self.pid = self.proc.pid
+                    self._save()
+                    for line in self.proc.stdout:
+                        line = line.rstrip("\n")
+                        lines.append(line)
+                        self._log(line)
+                    self.proc.wait()
+                    rc = self.proc.returncode
+                    if rc == 0 or self.stop_mode == "abort":
+                        break
+                if start_failed:
                     break
-                self.pid = self.proc.pid
-                self._save()
-                for line in self.proc.stdout:
-                    line = line.rstrip("\n")
-                    lines.append(line)
-                    self._log(line)
-                self.proc.wait()
-                rc = self.proc.returncode
                 step["returncode"], step["finished"] = rc, now()
                 if rc != 0:
                     step["status"] = "stopped" if self.stop_mode == "abort" else "failed"

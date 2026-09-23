@@ -5,6 +5,7 @@ const S = {
   page: "home", state: null, system: null, vehicles: [], stages: {}, runs: [], jobs: [], dataset: null,
   cal: null, versionDetail: null, runDetail: null, live: null, job: null, jobLog: [], jobLogNext: 0,
   fs: null, drawer: null, fsTarget: null, busy: false, calibForm: { stage: "ground" }, timers: {},
+  overlayForm: { times: "20,60,100", delta: "0 0 0", run: "" }, overlay: null, overlayBusy: false,
 };
 const $ = (sel, root = document) => root.querySelector(sel);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -107,6 +108,7 @@ function patchLive() {
 }
 
 // ------------------------------------------------------------------ shared components
+function calibFlags() { return (S.state && S.state.calibration) || {}; }
 function vehicle() { const v = S.state?.vehicle || {}; return S.vehicles.find((x) => x.mine === v.mine && x.truck === v.truck) || S.vehicles[0] || null; }
 function jobPill() {
   const j = S.job;
@@ -155,21 +157,42 @@ function stepperHtml(v) {
     ["livo", "LIVO 建图", hasRun("livo") || done.has("camlidar")], ["camlidar", "相机外参复核", done.has("camlidar"), true],
     ["active", "激活生产版本", !!v?.active],
   ];
-  const nextKey = v?.next?.stage === "import" ? "import" : v?.next?.pipeline === "lidar" ? "ground" : v?.next?.pipeline === "camera" ? "camtime" : null;
+  const nextKey = v?.next?.stage === "import" ? "import" : v?.next?.pipeline === "lidar" ? "ground" : v?.next?.pipeline === "camera" ? "camtime" : v?.next?.pipeline === "camloop" ? "camloop" : null;
   return `<div class="stepper">${items.map(([k, l, ok, opt], i) => `<div class="step ${ok ? "done" : ""} ${k === nextKey ? "next" : ""} ${opt ? "optional" : ""}"><div class="n">${ok ? "✓" : i + 1}</div><div class="l">${l}</div><div class="d">${opt ? "可选 · 人工确认" : ""}</div></div>`).join("")}</div>`;
 }
 function stageLabel(stage) { return (S.stages[stage] || {}).label || stage; }
 function chart(series, key, color = "#0071e3", ymaxHint) {
-  const pts = (series || []).filter((p) => p[key] != null && Number.isFinite(p[key]));
-  if (pts.length < 2) return `<div class="empty small">暂无曲线数据</div>`;
+  return multiChart([{ series, key, color, label: "" }], ymaxHint);
+}
+// lines: [{series, key, color, label, dash}] drawn on a shared time axis (t of the first line defines 0)
+function multiChart(lines, ymaxHint) {
+  const L0 = lines.map((l) => ({ ...l, pts: (l.series || []).filter((p) => p && p[l.key] != null && Number.isFinite(p[l.key])) })).filter((l) => l.pts.length >= 2);
+  if (!L0.length) return `<div class="empty small">暂无曲线数据</div>`;
   const W = 640, H = 150, L = 42, R = 8, T = 8, B = 20;
-  const t0 = pts[0].t, t1 = pts[pts.length - 1].t || t0 + 1;
-  const ymax = Math.max(ymaxHint || 0, ...pts.map((p) => p[key])) * 1.1 || 1;
+  const t0 = Math.min(...L0.map((l) => l.pts[0].t)), t1 = Math.max(...L0.map((l) => l.pts[l.pts.length - 1].t), t0 + 1);
+  const ymax = Math.max(ymaxHint || 0, ...L0.flatMap((l) => l.pts.map((p) => p[l.key]))) * 1.1 || 1;
   const x = (t) => L + ((t - t0) / Math.max(1e-6, t1 - t0)) * (W - L - R);
-  const y = (v) => T + (1 - v / ymax) * (H - T - B);
-  const d = pts.map((p, i) => `${i ? "L" : "M"}${x(p.t).toFixed(1)},${y(p[key]).toFixed(1)}`).join(" ");
+  const y = (v) => T + (1 - Math.min(v, ymax) / ymax) * (H - T - B);
+  const paths = L0.map((l) => `<path d="${l.pts.map((p, i) => `${i ? "L" : "M"}${x(p.t).toFixed(1)},${y(p[l.key]).toFixed(1)}`).join(" ")}" fill="none" stroke="${l.color}" stroke-width="${l.dash ? 1.2 : 1.8}" ${l.dash ? `stroke-dasharray="${l.dash}"` : ""}/>`).join("");
   const ticks = [0, 0.25, 0.5, 0.75, 1].map((f) => `<line x1="${L}" x2="${W - R}" y1="${y(ymax * f)}" y2="${y(ymax * f)}"/><text x="2" y="${y(ymax * f) + 3}">${(ymax * f).toFixed(ymax < 1 ? 2 : 1)}</text>`).join("");
-  return `<svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"><g class="grid">${ticks}</g><path d="${d}" fill="none" stroke="${color}" stroke-width="1.6"/><text x="${L}" y="${H - 4}">${(t1 - t0).toFixed(0)} s</text></svg>`;
+  const labelled = L0.filter((l) => l.label);
+  const legend = labelled.length ? `<g class="legend">${labelled.map((l, i) => `<line x1="${L + 6}" x2="${L + 26}" y1="${T + 8 + i * 13}" y2="${T + 8 + i * 13}" stroke="${l.color}" stroke-width="2" ${l.dash ? `stroke-dasharray="${l.dash}"` : ""}/><text x="${L + 30}" y="${T + 11 + i * 13}">${esc(l.label)}</text>`).join("")}</g>` : "";
+  return `<svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"><g class="grid">${ticks}</g>${paths}${legend}<text x="${L}" y="${H - 4}">${(t1 - t0).toFixed(0)} s</text></svg>`;
+}
+// Trajectory-vs-RTK panel: the optimized (delivered map) trajectory is the primary solid line; the online
+// published pose is the dashed secondary. Before evaluation the backend keyframe residual stands in.
+function trajectoryChart(live) {
+  const es = live?.error_series;
+  if (es && es.length >= 2) {
+    return multiChart([
+      { series: es, key: "opt_rear", color: "#0071e3", label: "优化后轨迹 vs RTK（后轴，评估）" },
+      { series: live.online_series, key: "latest", color: "#5e5ce6", dash: "5 4", label: "在线轨迹 vs INS（实时）" },
+    ], 0.1);
+  }
+  return multiChart([
+    { series: live?.diagnostics, key: "rtk_residual_m", color: "#0071e3", label: "优化后关键帧 RTK 残差（实时）" },
+    { series: live?.online_series, key: "latest", color: "#5e5ce6", dash: "5 4", label: "在线轨迹 vs INS（实时）" },
+  ], 0.1);
 }
 
 // ------------------------------------------------------------------ live monitor
@@ -189,7 +212,7 @@ function liveMonitor() {
   return `<div id="live-monitor" class="card" style="border:1px solid var(--accent-soft)">
     <div class="card-h"><h2><span class="dot ${j ? "run" : rec?.status === "done" ? "ok" : rec?.status === "failed" ? "bad" : ""}"></span>${esc(round || j?.title || "")} ${rec?.mode || j?.meta?.mode ? `<span class="badge">${esc((rec?.mode || j?.meta?.mode || "").toUpperCase())}</span>` : ""}</h2>${stopBtns}</div>
     ${stepInfo}
-    <div class="phases" style="margin:8px 0 10px">${PHASES.map(([k, l], i) => `<span class="phase ${k === phase ? "on" : i < phaseIdx ? "done" : ""}">${l}</span>`).join("")}${rec?.status === "failed" ? `<span class="phase" style="background:var(--bad-soft);color:var(--bad)">失败</span>` : ""}</div>
+    <div class="phases" style="margin:8px 0 10px">${PHASES.map(([k, l], i) => `<span class="phase ${k === phase ? "on" : i < phaseIdx ? "done" : ""}">${l}</span>`).join("")}${rec?.status === "failed" ? `<span class="phase" style="background:var(--bad-soft);color:var(--bad)">失败</span>` : rec?.status === "incomplete" ? `<span class="phase" style="background:var(--warn-soft, #fff4e5);color:var(--warn)" title="${esc(rec.error || "")}">不完整</span>` : ""}</div>
     <div class="progress"><div style="width:${pct}%"></div></div>
     <div class="row small muted" style="margin-top:6px;justify-content:space-between"><span>${player.t != null ? `回放 ${player.t.toFixed(1)} / ${player.total.toFixed(1)} s · ${player.msgs} 条 · 延迟 ${player.lag_ms} ms` : !round && j ? "当前步骤不是建图轮次（见任务日志）" : phase === "starting" ? "正在启动建图节点…" : ""}</span><span>${rec?.start ? `开始 ${fmtT(rec.start)}` : ""}</span></div>
     ${rec?.error ? `<div class="callout bad" style="margin-top:8px">${esc(rec.error)}</div>` : ""}
@@ -201,7 +224,7 @@ function liveMonitor() {
     </div>
     <div class="grid g2" style="margin-top:12px">
       <div><h4>前端 RTK 残差 (m)</h4>${chart(live?.diagnostics, "frontend_rtk_residual_m", "#0071e3", 0.1)}</div>
-      <div><h4>在线轨迹 vs INS 差 (m)</h4>${chart(live?.online_series, "latest", "#5e5ce6", 0.1)}</div>
+      <div><h4>优化后轨迹 vs RTK (m)　<span class="small muted">虚线：在线轨迹 vs INS</span></h4>${trajectoryChart(live)}</div>
     </div>
     ${live?.launch_events?.length ? `<details style="margin-top:10px"><summary>算法事件（${live.launch_events.length}）</summary><div class="events">${live.launch_events.slice(-40).map((e) => `<div class="${/WARN/.test(e) ? "warn" : /ERROR|FATAL|died/.test(e) ? "bad" : ""}">${esc(e)}</div>`).join("")}</div></details>` : ""}
   </div>`;
@@ -226,7 +249,7 @@ function pageHome() {
   const canLIVO = d && d.livo_ready, canLIO = d && d.lio_ready;
   const mode = m.mode === "livo" && !canLIVO ? "lio" : m.mode;
   const nextBtn = !v ? `<button class="btn primary" data-act="go" data-page="calib">导入出厂标定</button>`
-    : v.next.pipeline ? `<button class="btn primary" data-act="pipeline" data-kind="${v.next.pipeline}" ${running ? "disabled" : ""}>${v.next.pipeline === "lidar" ? "运行 LiDAR 标定流水线" : "运行相机标定流水线"}</button>`
+    : v.next.pipeline ? `<button class="btn primary" data-act="pipeline" data-kind="${v.next.pipeline}" ${running ? "disabled" : ""}>${{ lidar: "运行 LiDAR 标定流水线", camera: "运行相机标定流水线", camloop: "运行相机外参闭环微调" }[v.next.pipeline]}</button>`
     : v.next.stage === "import" ? `<button class="btn primary" data-act="go" data-page="calib">导入出厂标定</button>` : `<span class="badge ok">标定完整</span>`;
   return `
   <div class="hero" style="margin-bottom:18px"><div><h1>工作台</h1><div class="muted">标准流程：① 选择原始录制 → ② 确认车辆标定 → ③ 一键建图，结果自动评估并归档到 results/&lt;轮次&gt;/。原始 ROS 2 mcap 直接使用，不需要转换。</div></div></div>
@@ -272,7 +295,7 @@ function metricCells(r) {
 }
 function runsTable(runs, compact = false) {
   if (!runs.length) return `<div class="empty">还没有建图结果</div>`;
-  const badge = (r) => r.status === "running" ? '<span class="badge accent"><span class="dot run"></span>运行中</span>' : r.status === "done" ? '<span class="badge ok">完成</span>' : r.status === "failed" ? '<span class="badge bad">失败</span>' : r.status === "lost" ? '<span class="badge warn">中断</span>' : `<span class="badge">${esc(r.status)}</span>`;
+  const badge = (r) => r.status === "running" ? '<span class="badge accent"><span class="dot run"></span>运行中</span>' : r.status === "done" ? '<span class="badge ok">完成</span>' : r.status === "failed" ? '<span class="badge bad">失败</span>' : r.status === "lost" ? '<span class="badge warn">中断</span>' : r.status === "incomplete" ? `<span class="badge warn" title="${esc(r.error || "")}">不完整</span>` : `<span class="badge">${esc(r.status)}</span>`;
   const head = compact
     ? "<th>原生轨迹 vs RTK</th><th>RTK 优化后</th>"
     : `<th title="前端里程计（RViz 红线）后轴 3D 误差，全程、无对齐，随里程累积">原生轨迹 vs RTK（全程）</th><th title="RTK/INS 融合结果（蓝线）后轴 3D 误差">RTK 优化后（中位 / P95 / 最大）</th><th title="5–20 m 地面同点平面厚度，原生 → 优化后">地面厚度 5–20 m</th><th title="同一灯柱在不同地图块中的轴线 XY 分离">灯柱多期一致性</th>`;
@@ -312,7 +335,7 @@ function pageCalib() {
   const versions = cal.versions.filter((x) => v && x.mine === v.mine && x.truck === v.truck).sort((a, b) => (a.version > b.version ? -1 : 1));
   const d = S.dataset; const running = S.job && S.job.status === "running";
   const c = S.state.calibration; const f = S.calibForm;
-  const stageOpts = Object.entries(S.stages).sort((a, b) => a[1].order - b[1].order).filter(([k]) => k !== "import");
+  const stageOpts = Object.entries(S.stages).sort((a, b) => a[1].order - b[1].order).filter(([k, st]) => k !== "import" && !st.internal);
   const info = S.stages[f.stage] || {};
   const needs = info.needs || [];
   const modeForRun = info.mapping;
@@ -325,9 +348,10 @@ function pageCalib() {
     ${stepperHtml(v)}
     <div class="grid g2" style="margin-top:8px">
       <div class="stat" style="padding:14px"><div class="row" style="justify-content:space-between"><div><b>LiDAR 标定流水线</b><div class="small muted">静止地面精修 → LIO 建图（保存地图）→ 行驶段 6-DoF 精修 → 校验${c.auto_activate ? " → 激活" : ""}</div><div class="small muted">约 5 分钟（含一次完整回放）· 需要 LiDAR/IMU 数据源</div></div><button class="btn primary" data-act="pipeline" data-kind="lidar" ${running || !v?.active || !d?.lio_ready ? "disabled" : ""}>运行</button></div></div>
-      <div class="stat" style="padding:14px"><div class="row" style="justify-content:space-between"><div><b>相机标定流水线</b><div class="small muted">相机时间偏移 → LIVO 建图 A → 相机-LiDAR 外参复核（叠加图）→ LIVO 建图 B（复核版本）→ 闭环判定 A/B（原生里程尺度 / 后轴误差 / 偏航）</div><div class="small muted">约 12 分钟（两次完整回放）· 需要含相机的数据源 · 复核版本仅在闭环通过后才建议激活</div></div><button class="btn primary" data-act="pipeline" data-kind="camera" ${running || !v?.active || !d?.livo_ready ? "disabled" : ""}>运行</button></div></div>
+      <div class="stat" style="padding:14px"><div class="row" style="justify-content:space-between"><div><b>相机标定流水线</b><div class="small muted">相机时间偏移 → LIVO 建图 A（基线）→ 偏航复核（灯柱投影列偏差，俯仰不动）→ 俯仰闭环（标准＝±0.05° 扫描两轮拟合斜率；快速＝沿用历史斜率 0.105/°，只测零点）→ 闭环版本 → LIVO 验证建图 → 闭环判定 A/验证 → 校验${c.auto_activate ? " → 通过则激活" : ""}</div><div class="small muted">标准 ≈15–17 min（4 次回放）· 快速 ≈10 min（2 次回放）· 需要含相机的数据源 · 未通过闭环的版本不会被激活</div></div><button class="btn primary" data-act="pipeline" data-kind="camera" ${running || !v?.active || !d?.livo_ready ? "disabled" : ""}>运行</button></div></div>
+      <div class="stat" style="padding:14px"><div class="row" style="justify-content:space-between"><div><b>相机外参闭环微调（日常，最快）</b><div class="small muted">以当前激活版本为起点：<b>复用最近一次同版本 LIVO 轮次</b>作为零俯仰点（无需重跑）→ 用已知斜率算出过零点 → 闭环版本 → 一轮 LIVO 验证 → 闭环判定${c.auto_activate ? " → 通过则激活" : ""}</div><div class="small muted">快速 ≈4–5 min（1 次回放）· 标准 ≈8 min（2 次回放，需切换为“标准”）· 复用要求该轮次已评估且时长 ≥110 s</div></div><button class="btn primary" data-act="pipeline" data-kind="camloop" ${running || !v?.active || !d?.livo_ready ? "disabled" : ""}>运行</button></div></div>
     </div>
-    <div class="row" style="margin-top:10px;justify-content:space-between"><div class="small muted">父版本：<b>${esc(v?.active || "—")}</b> · 数据源：<b>${esc(d?.name || "未选择")}</b> ${datasetBadges(d)}</div><label class="check small">${`<input type="checkbox" data-act="toggle" data-section="calibration" data-key="auto_activate" ${c.auto_activate ? "checked" : ""}><span class="switch"></span><span>流水线完成后自动激活（相机外参复核除外）</span>`}</label></div>
+    <div class="row" style="margin-top:10px;justify-content:space-between"><div class="small muted">父版本：<b>${esc(v?.active || "—")}</b> · 数据源：<b>${esc(d?.name || "未选择")}</b> ${datasetBadges(d)}</div><div class="row" style="gap:18px"><label class="check small">${`<input type="checkbox" data-act="toggle" data-section="calibration" data-key="auto_activate" ${c.auto_activate ? "checked" : ""}><span class="switch"></span><span>流水线完成后自动激活（仅在闭环判定通过时）</span>`}</label><label class="check small">${`<input type="checkbox" data-act="toggle" data-section="calibration" data-key="fast" ${c.fast !== false ? "checked" : ""}><span class="switch"></span><span>快速模式（沿用历史俯仰斜率、复用最近同版本轮次；取消勾选＝标准扫描）</span>`}</label></div></div>
   </div>
   <div class="grid" style="grid-template-columns: 1fr 380px; margin-top:16px">
     <div class="card"><div class="card-h"><h2>版本（${versions.length}）</h2><span class="small muted">点击查看详情 · ★ 为激活版本</span></div>
@@ -341,7 +365,7 @@ function pageCalib() {
         ${needs.includes("run") ? `<div class="field"><label>建图结果（${modeForRun === "livo" ? "LIVO" : "LIO"} 轮次，需保存了地图）</label><select data-act="calib-field" data-key="run">${runOpts.map((r) => `<option value="${esc(r.fusion_dir)}" ${f.run === r.fusion_dir ? "selected" : ""}>${esc(r.round)} · ${fmtT(r.start)}</option>`).join("") || "<option value=''>（没有可用轮次）</option>"}</select></div>` : ""}
         ${needs.includes("run_dir") ? `<div class="field"><label>建图轮次（含 Log/extrinsic_precheck.json）</label><select data-act="calib-field" data-key="run_dir">${S.runs.filter((r) => r.precheck).map((r) => `<option value="${esc(r.path)}" ${f.run_dir === r.path ? "selected" : ""}>${esc(r.round)}</option>`).join("") || "<option value=''>（没有自检记录）</option>"}</select></div>` : ""}
         ${f.stage === "manual" ? `<div class="form"><div class="field"><label>相机时间偏移 (s)</label><input type="number" step="0.001" data-act="calib-field" data-key="camera_offset" value="${esc(f.camera_offset ?? "")}"></div><div class="field"><label>LiDAR 时间偏移 (s)</label><input type="number" step="0.001" data-act="calib-field" data-key="lidar_offset" value="${esc(f.lidar_offset ?? "")}"></div><div class="field wide"><label>相机旋转修正 rx ry rz (deg, 相机系)</label><input type="text" data-act="calib-field" data-key="camera_rot_delta" value="${esc(f.camera_rot_delta ?? "")}" placeholder="0 0 0"></div></div>` : ""}
-        ${f.stage === "camlidar" ? `<div class="field"><label>参与对齐的图像帧数</label><input type="number" data-act="calib-field" data-key="frames" value="${esc(f.frames ?? 12)}"></div>` : ""}
+        ${f.stage === "camlidar" ? `<div class="field"><label>检查的图像帧数（其中含灯柱的帧参与偏航估计）</label><input type="number" data-act="calib-field" data-key="frames" value="${esc(f.frames ?? 30)}"></div>` : ""}
         <div class="field"><label>说明</label><input type="text" data-act="calib-field" data-key="note" value="${esc(f.note ?? "")}" placeholder="可选备注，写入版本记录"></div>
         <label class="check"><input type="checkbox" data-act="calib-field" data-key="activate" ${f.activate ? "checked" : ""}><span class="switch"></span><span>完成后激活</span></label>
         <button class="btn primary" data-act="run-stage" ${running || !versions.length ? "disabled" : ""}>执行 ${esc(info.label || "")}</button>
@@ -460,11 +484,11 @@ function drawerVersion() {
   const offs = sum.time_offsets || {};
   const offHtml = Object.entries(offs).filter(([k, v]) => typeof v === "number").map(([k, v]) => `<span class="badge ${ch.time_offsets?.[k] ? "accent" : ""}">${esc(k)} ${v} s${ch.time_offsets?.[k] ? ` (原 ${ch.time_offsets[k].from})` : ""}</span>`).join(" ");
   const metrics = m.metrics && Object.keys(m.metrics).length ? `<details><summary>阶段指标</summary><pre class="small">${esc(JSON.stringify(m.metrics, null, 1))}</pre></details>` : "";
-  const cl = d.closed_loop;
-  const closedLoop = cl ? `<div class="callout ${cl.verdict === "pass" ? "ok" : "bad"}" style="margin:10px 0"><b>LIVO 闭环验证${cl.verdict === "pass" ? "通过" : "未通过"}</b>（原生轨迹 A/B：${esc(cl.baseline?.round || "")} → ${esc(cl.candidate?.round || "")}）<div class="small" style="margin-top:4px">原生里程尺度 ${cl.baseline?.scale != null ? (cl.baseline.scale * 100).toFixed(2) + "%" : "—"} → ${cl.candidate?.scale != null ? (cl.candidate.scale * 100).toFixed(2) + "%" : "—"}${cl.common_window ? ` · 后轴误差@${cl.common_window.t0}–${cl.common_window.t1} s ${f2(cl.common_window.baseline_rear_m)} → ${f2(cl.common_window.candidate_rear_m)} m` : ""} · 偏航 P95 ${f2(cl.baseline?.yaw_p95_deg)} → ${f2(cl.candidate?.yaw_p95_deg)}°${cl.reasons?.length ? `<br>原因：${esc(cl.reasons.join("；"))}` : ""}${cl.verdict !== "pass" ? "<br><b>请勿激活该版本</b>；继续使用其父版本（相机时间偏移版本）。" : ""}</div></div>` : (stage.advisory ? `<div class="callout warn" style="margin:10px 0">该版本仅供参考：相机-LiDAR 边缘对齐分数对外参误差不敏感，激活前必须做 LIVO 闭环验证（用该版本跑一轮 LIVO，比较「原生里程尺度」与「原生后轴误差」是否优于父版本）。相机流水线现已自动完成此验证。</div>` : "");
-  const files = Object.entries(d.files || {}).map(([n, t]) => `<details><summary>${esc(n)}</summary><pre class="small" style="max-height:300px;overflow:auto">${esc(t)}</pre></details>`).join("");
-  const overlays = d.overlays.length ? `<div class="sep"></div><h3>相机投影叠加图（${d.overlays.length}）</h3><div class="small muted" style="margin:4px 0 8px">“相机-LiDAR 外参复核”阶段把 LiDAR 深度边缘投影到图像上生成这些图（before/after）。该阶段结果仅供参考：请确认 after 图中边缘更贴合后再激活。</div><div class="overlays">${d.overlays.map((n) => `<a href="/api/calibrations/file?id=${encodeURIComponent(d.id)}&name=overlays/${encodeURIComponent(n)}" target="_blank"><img loading="lazy" src="/api/calibrations/file?id=${encodeURIComponent(d.id)}&name=overlays/${encodeURIComponent(n)}" title="${esc(n)}"><div class="small muted ellipsis">${esc(n)}</div></a>`).join("")}</div>` : "";
   const stage = d.stage_info || {};
+  const cl = d.closed_loop;
+  const closedLoop = cl ? `<div class="callout ${cl.verdict === "pass" ? "ok" : "bad"}" style="margin:10px 0"><b>LIVO 闭环验证${cl.verdict === "pass" ? "通过" : "未通过"}</b>（原生轨迹 A/B：${esc(cl.baseline?.round || "")} → ${esc(cl.candidate?.round || "")}）<div class="small" style="margin-top:4px">原生里程尺度 ${cl.baseline?.scale != null ? (cl.baseline.scale * 100).toFixed(2) + "%" : "—"} → ${cl.candidate?.scale != null ? (cl.candidate.scale * 100).toFixed(2) + "%" : "—"}${cl.common_window ? ` · 后轴误差@${cl.common_window.t0}–${cl.common_window.t1} s ${f2(cl.common_window.baseline_rear_m)} → ${f2(cl.common_window.candidate_rear_m)} m` : ""} · 偏航 P95 ${f2(cl.baseline?.yaw_p95_deg)} → ${f2(cl.candidate?.yaw_p95_deg)}°${cl.reasons?.length ? `<br>原因：${esc(cl.reasons.join("；"))}` : ""}${cl.verdict !== "pass" ? "<br><b>请勿激活该版本</b>；继续使用基线版本。" : ""}</div></div>` : (stage.advisory ? `<div class="callout warn" style="margin:10px 0">该版本仅供参考，尚未做 LIVO 闭环验证：相机俯仰只能由闭环（原生里程尺度 vs RTK）确定，投影对齐只用于偏航复核。请通过“相机外参闭环微调”流水线验证后再激活。</div>` : "");
+  const files = Object.entries(d.files || {}).map(([n, t]) => `<details><summary>${esc(n)}</summary><pre class="small" style="max-height:300px;overflow:auto">${esc(t)}</pre></details>`).join("");
+  const overlays = d.overlays.length ? `<div class="sep"></div><h3>阶段叠加图（${d.overlays.length}）</h3><div class="small muted" style="margin:4px 0 8px">偏航复核阶段的灯柱裁剪图：红＝按父版本外参投影的 LiDAR 灯柱轴线，绿＝图像中量得的灯柱中心列；两者的列偏差（像素）÷ 焦距即偏航修正量（0.1° ≈ 3 px）。</div><div class="overlays">${d.overlays.map((n) => `<a href="/api/calibrations/file?id=${encodeURIComponent(d.id)}&name=overlays/${encodeURIComponent(n)}" target="_blank"><img loading="lazy" src="/api/calibrations/file?id=${encodeURIComponent(d.id)}&name=overlays/${encodeURIComponent(n)}" title="${esc(n)}"><div class="small muted ellipsis">${esc(n)}</div></a>`).join("")}</div>` : "";
   return `<div class="drawer-h"><div><h2>${esc(d.id)} ${d.active ? '<span class="badge dark">激活</span>' : ""}</h2><div class="small muted">${esc(m.stage_label || stage.label || m.stage)}${stage.advisory ? ' · <span class="warn">仅供参考</span>' : ""} · ${fmtT(m.created)} · 父版本 ${esc(m.parent || "无")}</div></div>
     <div class="row"><button class="btn primary" data-act="activate" data-id="${esc(d.id)}" ${d.active ? "disabled" : ""}>激活</button><button class="btn" data-act="validate" data-id="${esc(d.id)}">校验</button><button class="btn" data-act="use-parent" data-id="${esc(d.id)}">作为父版本</button><button class="btn danger sm" data-act="delete-version" data-id="${esc(d.id)}" ${d.active || d.children.length ? "disabled" : ""} title="${d.children.length ? "存在子版本" : d.active ? "激活中" : ""}">删除</button><button class="btn sm" data-act="close">关闭</button></div></div>
     <div class="callout ${val.ok ? (val.warnings?.length ? "warn" : "ok") : "bad"}">${val.ok ? "校验通过" : "校验失败"}${(val.errors || []).map((e) => `<div>✕ ${esc(e)}</div>`).join("")}${(val.warnings || []).map((e) => `<div>△ ${esc(e)}</div>`).join("")}</div>
@@ -472,7 +496,24 @@ function drawerVersion() {
     <h3>外参摘要（后轴系，t 单位 m，rpy 单位 °）</h3>
     <table style="margin:6px 0 10px"><thead><tr><th>传感器</th><th>t (x,y,z)</th><th>rpy</th><th>相对父版本</th></tr></thead><tbody>${lidars}${cam}</tbody></table>
     <div class="row">${offHtml}${sum.camera?.intrinsics ? `<span class="badge">fx/fy/cx/cy ${sum.camera.intrinsics.map((x) => x.toFixed(1)).join(" / ")}</span>` : ""}</div>
-    ${closedLoop}<div class="sep"></div>${metrics}${files}${overlays}`;
+    ${closedLoop}<div class="sep"></div>${overlayPanel(d)}${metrics}${files}${overlays}`;
+}
+function overlayPanel(d) {
+  const f = S.overlayForm; const ds = S.dataset; const o = S.overlay && S.overlay.id === d.id ? S.overlay : null;
+  const runs = S.runs.filter((r) => r.fusion_dir && r.status === "done" && r.mode === "livo");
+  const run = f.run || (runs.find((r) => r.calibration_id === d.id) || runs[0] || {}).fusion_dir || "";
+  const deltaVals = (f.delta || "").trim().split(/[\s,]+/).map(Number);
+  const hasDelta = deltaVals.length === 3 && deltaVals.every(Number.isFinite) && deltaVals.some((v) => v !== 0);
+  return `<details class="overlay-tool" ${o ? "open" : ""}><summary><b>目视复核：LiDAR 点云投影到相机图像</b> <span class="small muted">（用一次 LIVO 建图的扫描存档，约 10 s；用于确认外参没有粗大错误，不作为标定手段——肉眼分辨约 2–3 px ≈ 0.1°，而尺度漂移要求 0.02°）</span></summary>
+    <div class="form" style="margin-top:8px">
+      <div class="field wide"><label>LIVO 建图轮次（需保存了地图/扫描存档）</label><select data-act="ov-field" data-key="run">${runs.map((r) => `<option value="${esc(r.fusion_dir)}" ${run === r.fusion_dir ? "selected" : ""}>${esc(r.round)} · ${esc((r.calibration_id || "").split("/").pop())} · ${fmtT(r.start)}</option>`).join("") || "<option value=''>（没有可用的 LIVO 轮次）</option>"}</select></div>
+      <div class="field"><label>时刻（秒，逗号分隔）</label><input type="text" data-act="ov-field" data-key="times" value="${esc(f.times)}"></div>
+      <div class="field"><label>试探旋转 rx ry rz（°，相机系；仅预览）</label><input type="text" class="mono" data-act="ov-field" data-key="delta" value="${esc(f.delta)}" placeholder="0 0 0"></div>
+      <div class="field" style="justify-content:flex-end;gap:8px"><button class="btn primary" data-act="ov-render" data-id="${esc(d.id)}" ${S.overlayBusy || !run || !ds?.livo_ready ? "disabled" : ""}>${S.overlayBusy ? "生成中…" : "生成叠加图"}</button>${hasDelta ? `<button class="btn" data-act="ov-save" data-id="${esc(d.id)}" title="以该版本为父版本，按上面的旋转修正生成 manual 版本（激活前请做闭环验证）">保存为手动版本</button>` : ""}</div>
+    </div>
+    <div class="small muted" style="margin:6px 0">rx 绕相机 x（右）轴＝俯仰：正值使投影点上移；ry 绕 y（下）轴＝偏航：正值使投影点左移；rz＝横滚。颜色：红近 → 蓝远（对数深度，60 m 以上为深蓝）。</div>
+    ${o ? `<div class="overlays big">${(o.images || []).map((im) => `<a href="${im.url}" target="_blank"><img loading="lazy" src="${im.url}" title="t=+${im.t}s"><div class="small muted">t=+${im.t} s · ${im.speed_mps} m/s · ${im.points} 点${o.camera_rot_delta_deg_cam_xyz ? ` · Δ ${o.camera_rot_delta_deg_cam_xyz.join("/")}°` : ""}</div></a>`).join("")}</div>${(o.frames || []).filter((x) => x.error).map((x) => `<div class="small bad">t=+${x.t}s：${esc(x.error)}</div>`).join("")}` : ""}
+  </details>`;
 }
 function metricsPanel(l) {
   const h = l.metrics || {}; const d = l.metrics_full;
@@ -545,7 +586,7 @@ function drawerRun() {
     ${r.error ? `<div class="callout bad">${esc(r.error)}</div>` : ""}
     <div class="kv small" style="margin:10px 0"><div class="k">数据源</div><div class="mono">${esc(r.dataset)}</div><div class="k">标定</div><div class="mono">${esc(r.calibration || "config yaml 内置")}</div><div class="k">参数</div><div class="mono">${esc(JSON.stringify(r.options || {}))} ${esc(Array.isArray(r.overrides) ? r.overrides.join(" ") : r.overrides || "")}</div><div class="k">fusion</div><div class="mono">${esc(l.fusion_dir || "")}</div><div class="k">地图</div><div>${l.map_chunks ?? 0} 块 · ${l.map_size_mb ?? 0} MB${l.rgb_map_chunks ? ` · RGB ${l.rgb_map_chunks} 块` : ""}</div></div>
     ${metricsPanel(l)}
-    <div class="grid g2" style="margin:12px 0"><div><h4>前端 RTK 残差 (m)</h4>${chart(l.diagnostics, "frontend_rtk_residual_m", "#0071e3", 0.1)}</div><div><h4>在线轨迹 vs INS (m)</h4>${chart(l.online_series, "latest", "#5e5ce6", 0.1)}</div></div>
+    <div class="grid g2" style="margin:12px 0"><div><h4>前端 RTK 残差 (m)</h4>${chart(l.diagnostics, "frontend_rtk_residual_m", "#0071e3", 0.1)}</div><div><h4>优化后轨迹 vs RTK (m)　<span class="small muted">虚线：在线轨迹 vs INS</span></h4>${trajectoryChart(l)}</div></div>
     ${l.summary ? `<details><summary>评估摘要原文（summary.txt）</summary><pre class="small" style="max-height:320px;overflow:auto">${esc(l.summary.join("\n"))}</pre></details>` : ""}
     ${preHtml}
     <details><summary>算法事件（${(l.launch_events || []).length}）</summary><div class="events">${(l.launch_events || []).map((e) => `<div class="${/WARN/.test(e) ? "warn" : /ERROR|FATAL|died/.test(e) ? "bad" : ""}">${esc(e)}</div>`).join("")}</div></details>
@@ -584,9 +625,10 @@ const A = {
   async pipeline(el) {
     const v = vehicle(); const d = S.dataset; const kind = el.dataset.kind; const c = S.state.calibration;
     if (!v?.active) return toast("请先导入并激活一个标定版本", "bad");
-    const label = kind === "lidar" ? "LiDAR 标定流水线（地面精修 → LIO 建图 → 行驶段精修）" : "相机标定流水线（时间偏移 → LIVO 建图 A → 相机外参复核 → LIVO 建图 B → 闭环判定）";
+    const std = c.fast === false;
+    const label = { lidar: "LiDAR 标定流水线（地面精修 → LIO 建图 → 行驶段精修）", camera: `相机标定流水线（时间偏移 → LIVO 建图 A → 灯柱偏航复核 → 俯仰闭环${std ? "扫描" : "（快速）"} → 验证建图 → 闭环判定）`, camloop: `相机外参闭环微调（${std ? "标准" : "快速"}：${std ? "两轮扫描" : "复用已有轮次 + 一轮验证"} → 闭环判定）` }[kind];
     if (!confirm(`运行 ${label}\n父版本：${v.active}\n数据源：${d?.path}\n流水线包含一次完整回放建图，请勿同时启动其他建图。`)) return;
-    await act(async () => { const job = await api("/api/calibrations/pipeline", "POST", { kind, id: v.active, dataset: d.path, activate: c.auto_activate !== false, use_rtk: true, rate: 1.0, note: "" }); S.job = job; S.jobLog = []; S.jobLogNext = 0; S.drawer = "job"; await loadOverview(); render(); }, "流水线已启动");
+    await act(async () => { const job = await api("/api/calibrations/pipeline", "POST", { kind, id: v.active, dataset: d.path, activate: c.auto_activate !== false, use_rtk: true, rate: 1.0, note: "", mode: c.fast === false ? "standard" : "fast" }); S.job = job; S.jobLog = []; S.jobLogNext = 0; S.drawer = "job"; await loadOverview(); render(); }, "流水线已启动");
   },
   "toggle-import"() { S.showImport = !S.showImport; render(); },
   async import() {
@@ -600,6 +642,24 @@ const A = {
     const body = { stage: f.stage, id: f.parent || v?.active, dataset: d?.path, run: f.run || ($("select[data-key=run]") || {}).value, run_dir: f.run_dir || ($("select[data-key=run_dir]") || {}).value, note: f.note, activate: !!f.activate, frames: f.frames };
     if (f.stage === "manual") { if (f.camera_offset !== "" && f.camera_offset != null) body.camera_offset = Number(f.camera_offset); if (f.lidar_offset !== "" && f.lidar_offset != null) body.lidar_offset = Number(f.lidar_offset); if (f.camera_rot_delta && f.camera_rot_delta.trim()) body.camera_rot_delta = f.camera_rot_delta.trim().split(/[\s,]+/).map(Number); }
     await act(async () => { const job = await api("/api/calibrations/stage", "POST", body); S.job = job; S.jobLog = []; S.jobLogNext = 0; S.drawer = "job"; render(); }, "阶段已启动");
+  },
+  "ov-field"(el) { S.overlayForm[el.dataset.key] = el.value; if (el.dataset.key === "run" || el.dataset.key === "delta") renderDrawer(); },
+  async "ov-render"(el) {
+    const f = S.overlayForm; const d = S.dataset; const sel = $("select[data-key=run]");
+    const run = f.run || (sel ? sel.value : "");
+    const delta = (f.delta || "").trim() ? f.delta.trim().split(/[\s,]+/).map(Number) : null;
+    S.overlayBusy = true; renderDrawer();
+    try {
+      S.overlay = await api("/api/calibrations/overlay", "POST", { id: el.dataset.id, run, dataset: d?.path, times: f.times, camera_rot_delta: delta });
+      S.overlay.id = el.dataset.id;
+    } catch (e) { toast(e.message || String(e), "bad"); }
+    S.overlayBusy = false; renderDrawer();
+  },
+  async "ov-save"(el) {
+    const f = S.overlayForm; const delta = f.delta.trim().split(/[\s,]+/).map(Number);
+    if (delta.length !== 3 || !delta.every(Number.isFinite)) return toast("旋转修正需要 3 个数", "bad");
+    if (!confirm(`以 ${el.dataset.id.split("/").pop()} 为父版本生成手动版本：相机旋转修正 ${delta.join(" / ")}°？\n该版本不会自动激活，请先用“相机外参闭环微调”或一轮 LIVO 建图验证。`)) return;
+    await act(async () => { const job = await api("/api/calibrations/stage", "POST", { stage: "manual", id: el.dataset.id, camera_rot_delta: delta, note: `目视复核后的相机旋转修正 ${delta.join("/")}°（未闭环验证）` }); S.job = job; S.jobLog = []; S.jobLogNext = 0; S.drawer = "job"; render(); }, "已生成手动版本任务");
   },
   async "open-version"(el) { const id = el.dataset.id; S.drawer = "version"; S.versionDetail = null; renderDrawer(); await act(async () => { S.versionDetail = await api(`/api/calibrations/version?id=${encodeURIComponent(id)}`); render(); }); },
   async activate(el) {
