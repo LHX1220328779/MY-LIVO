@@ -151,13 +151,14 @@ function stepperHtml(v) {
   const done = new Set(v?.stages_done || []);
   const hasRun = (mode) => S.runs.some((r) => r.mode === mode && r.status === "done");
   const items = [
-    ["import", "导入出厂标定", done.has("import")], ["ground", "静止地面精修", done.has("ground") || done.has("precheck")],
+    ["import", "导入出厂标定", done.has("import")], ["axle", "后轴对齐", !!(v?.checks || []).find((c) => c.key === "axle")?.ok],
+    ["ground", "静止地面精修", done.has("ground") || done.has("precheck")],
     ["lio", "LIO 建图", hasRun("lio") || done.has("driven")], ["driven", "行驶段精修", done.has("driven")],
     ["camtime", "相机时间偏移", !!(v?.checks || []).find((c) => c.key === "camtime")?.ok],
     ["livo", "LIVO 建图", hasRun("livo") || done.has("camlidar")], ["camlidar", "相机外参复核", done.has("camlidar"), true],
     ["active", "激活生产版本", !!v?.active],
   ];
-  const nextKey = v?.next?.stage === "import" ? "import" : v?.next?.pipeline === "lidar" ? "ground" : v?.next?.pipeline === "camera" ? "camtime" : v?.next?.pipeline === "camloop" ? "camloop" : null;
+  const nextKey = v?.next?.stage === "import" ? "import" : v?.next?.pipeline === "lidar" ? (v.next.stage || "ground") : v?.next?.pipeline === "camera" ? "camtime" : v?.next?.pipeline === "camloop" ? "camloop" : null;
   return `<div class="stepper">${items.map(([k, l, ok, opt], i) => `<div class="step ${ok ? "done" : ""} ${k === nextKey ? "next" : ""} ${opt ? "optional" : ""}"><div class="n">${ok ? "✓" : i + 1}</div><div class="l">${l}</div><div class="d">${opt ? "可选 · 人工确认" : ""}</div></div>`).join("")}</div>`;
 }
 function stageLabel(stage) { return (S.stages[stage] || {}).label || stage; }
@@ -347,7 +348,7 @@ function pageCalib() {
     ${S.showImport || !S.vehicles.length ? importForm(c) : ""}
     ${stepperHtml(v)}
     <div class="grid g2" style="margin-top:8px">
-      <div class="stat" style="padding:14px"><div class="row" style="justify-content:space-between"><div><b>LiDAR 标定流水线</b><div class="small muted">静止地面精修 → LIO 建图（保存地图）→ 行驶段 6-DoF 精修 → 校验${c.auto_activate ? " → 激活" : ""}</div><div class="small muted">约 5 分钟（含一次完整回放）· 需要 LiDAR/IMU 数据源</div></div><button class="btn primary" data-act="pipeline" data-kind="lidar" ${running || !v?.active || !d?.lio_ready ? "disabled" : ""}>运行</button></div></div>
+      <div class="stat" style="padding:14px"><div class="row" style="justify-content:space-between"><div><b>LiDAR 标定流水线</b><div class="small muted">后轴对齐（RTK/INS 位姿，参考雷达→后轴，整机修正）→ 静止地面精修 → LIO 建图（保存地图）→ 行驶段 6-DoF 精修 → 校验${c.auto_activate ? " → 激活" : ""}</div><div class="small muted">约 6 分钟（含一次 48 s 回放）· 需要 LiDAR/IMU/INS 数据源 · 原始出厂外参与已精修父版本都可直接运行</div></div><button class="btn primary" data-act="pipeline" data-kind="lidar" ${running || !v?.active || !d?.lio_ready ? "disabled" : ""}>运行</button></div></div>
       <div class="stat" style="padding:14px"><div class="row" style="justify-content:space-between"><div><b>相机标定流水线</b><div class="small muted">相机时间偏移 → LIVO 建图 A（基线）→ 偏航复核（灯柱投影列偏差，俯仰不动）→ 俯仰闭环（标准＝±0.05° 扫描两轮拟合斜率；快速＝沿用历史斜率 0.105/°，只测零点）→ 闭环版本 → LIVO 验证建图 → 闭环判定 A/验证 → 校验${c.auto_activate ? " → 通过则激活" : ""}</div><div class="small muted">标准 ≈15–17 min（4 次回放）· 快速 ≈10 min（2 次回放）· 需要含相机的数据源 · 未通过闭环的版本不会被激活</div></div><button class="btn primary" data-act="pipeline" data-kind="camera" ${running || !v?.active || !d?.livo_ready ? "disabled" : ""}>运行</button></div></div>
       <div class="stat" style="padding:14px"><div class="row" style="justify-content:space-between"><div><b>相机外参闭环微调（日常，最快）</b><div class="small muted">以当前激活版本为起点：<b>复用最近一次同版本 LIVO 轮次</b>作为零俯仰点（无需重跑）→ 用已知斜率算出过零点 → 闭环版本 → 一轮 LIVO 验证 → 闭环判定${c.auto_activate ? " → 通过则激活" : ""}</div><div class="small muted">快速 ≈4–5 min（1 次回放）· 标准 ≈8 min（2 次回放，需切换为“标准”）· 复用要求该轮次已评估且时长 ≥110 s</div></div><button class="btn primary" data-act="pipeline" data-kind="camloop" ${running || !v?.active || !d?.livo_ready ? "disabled" : ""}>运行</button></div></div>
     </div>
@@ -374,7 +375,7 @@ function pageCalib() {
 }
 function importForm(c) {
   const sources = (S.cal?.sources || []);
-  return `<div class="callout" style="margin-bottom:14px"><b>导入出厂标定</b>：把厂家/感知标定 JSON 规范化为 v001_import（矩阵正交化、相机内参、默认时间偏移）。新矿山/新车直接填写名称即可创建。
+  return `<div class="callout" style="margin-bottom:14px"><b>导入出厂标定</b>：把厂家/感知标定 JSON（厂家原始导出 <span class="mono">lidar[] + tf_lidar_to_camera</span> 或 schema-5 文件）规范化为 v001_import（矩阵正交化、相机→后轴外参、相机内参、默认时间偏移）。原始出厂外参导入后先运行 LiDAR 标定流水线（第一步“后轴对齐”自动修正参考雷达→后轴）。新矿山/新车直接填写名称即可创建。
     <div class="form" style="margin-top:10px">
       <div class="field"><label>矿山</label><input type="text" id="imp-mine" value="${esc(S.state.vehicle.mine)}"></div>
       <div class="field"><label>车辆编号</label><input type="text" id="imp-truck" value="${esc(S.state.vehicle.truck)}"></div>

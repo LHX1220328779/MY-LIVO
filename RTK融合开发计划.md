@@ -291,3 +291,11 @@
 - 缺陷：driven 跨时刻配准（后雷达匹配时间差中位 10.7 s）把原生 LIO 的 z 漂移（≈0.7 cm/s）吸收进外参，后雷达被压低 ≈5 cm、倾角偏 0.1°（独立地面一致性核查证实：后雷达地面比前雷达低 5.0 cm）。
 - 修正：driven 第二遍用同轮次 RTK 优化位姿只重解跨时刻雷达的 tilt/z（地面匹配）；加质量门（fail 不产出版本、退出码 3）与窗口钳位；ground 加静止判定。全量 LIVO 闭环（v034 单遍 vs v035 两遍）：位置持平（median 1.96 cm，100% ≤10 cm，max 8.4→7.8 cm），地面跨时刻厚度 5–20 m 29.4→27.6 mm、20–40 m 47.3→43.4 mm，优化姿态 vs INS pitch P95 0.31→0.25°。
 - 产物 v035_driven（未激活）；详见 docs/mcp-calibration-window-audit.md。
+
+### 2026-09-24 原始出厂外参直接标定：axle 阶段（参考雷达→后轴，RTK/INS）+ LiDAR 时间偏移（未改算法）
+- 根因：ground/driven/静态自检都只修其余雷达相对参考雷达，参考雷达→后轴从未被标定（v001–v035 的 lidar_6 逐位等于手调值）；`import` 不认厂家原始导出。
+- 实现：`import` 支持原始导出（相机→后轴由 `tf_lidar_to_camera` 与参考雷达推出）；新增 `axle`：INS 后轴位姿逐点去畸变拼前雷达，跨时刻点到面联合解整机修正（roll/pitch/yaw/x/y）+ LiDAR 时间偏移，施加到全部雷达与相机，无需建图（≈1 min）；`--dof auto` 原始导入全解、已对齐父版本只应用杠杆臂与时间偏移；Studio LiDAR 流水线第一步。
+- 原始外参全流程（LiDAR 4 min + 相机 16 min，闭环 pass）：LIVO 1.54/3.45/8.10 cm、起步 30 m 1.45 cm、地面 27.0 mm、姿态因子残差 P95 0.06/0.06/0.13°，均优于历史；LIO 1.97/4.55/7.84 cm、地面 23.5 mm、灯柱 8.96 cm。唯一未达项：LIVO 单灯柱中位 13.6 cm（历史 ≈9 cm），已排除时间偏移/横滚/偏航/平移/相机，详见文档 §5.3。
+- 手调谱系 v035 只加杠杆臂 + 时间偏移（默认微调模式）：LIVO 1.92/4.21/8.24 → 1.50/3.26/7.78 cm、起步 2.24 → 1.43 cm、地面 27.8 → 25.8 mm，灯柱持平。
+- 标定发现：`time_offsets.lidar` −0.125 → −0.146 s（5 种设置离散 ≤5 ms，LIO/LIVO 均验证）；手调前向杠杆臂比数据一致解短 ≈23 cm。
+- 详见 docs/mcp-raw-extrinsic-rear-axle-alignment.md；版本 truck29raw/v001–v009（truck29raw 激活 v009）、truck29/v036_axle（未激活，truck29 激活仍为 v032_camloop）。

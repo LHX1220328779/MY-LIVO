@@ -15,14 +15,15 @@ _lock = threading.Lock()
 # Fallback catalogue used until livo_calib.py reports its own (same keys as STAGES in the tool).
 STAGE_FALLBACK = {
     "import": {"order": 1, "label": "导入出厂标定", "command": "import", "advisory": False, "mapping": None},
-    "ground": {"order": 2, "label": "静止地面精修", "command": "ground", "advisory": False, "mapping": None},
-    "driven": {"order": 3, "label": "行驶段 6-DoF 精修", "command": "driven", "advisory": False, "mapping": "lio"},
-    "camtime": {"order": 4, "label": "相机时间偏移", "command": "camera-time", "advisory": False, "mapping": None},
-    "camlidar": {"order": 5, "label": "相机-LiDAR 偏航/横滚复核", "command": "camera-lidar", "advisory": True, "mapping": "livo"},
-    "camloop": {"order": 6, "label": "相机外参闭环标定", "command": "set", "advisory": False, "mapping": "livo", "internal": True},
-    "precheck": {"order": 7, "label": "采纳建图自检修正", "command": "from-precheck", "advisory": False, "mapping": "any"},
-    "manual": {"order": 8, "label": "手动设置", "command": "set", "advisory": False, "mapping": None},
-    "scan": {"order": 9, "label": "闭环扫描点（临时）", "command": "set", "advisory": True, "mapping": None, "internal": True},
+    "axle": {"order": 2, "label": "后轴对齐（RTK/INS）", "command": "axle", "advisory": False, "mapping": None},
+    "ground": {"order": 3, "label": "静止地面精修", "command": "ground", "advisory": False, "mapping": None},
+    "driven": {"order": 4, "label": "行驶段 6-DoF 精修", "command": "driven", "advisory": False, "mapping": "lio"},
+    "camtime": {"order": 5, "label": "相机时间偏移", "command": "camera-time", "advisory": False, "mapping": None},
+    "camlidar": {"order": 6, "label": "相机-LiDAR 偏航/横滚复核", "command": "camera-lidar", "advisory": True, "mapping": "livo"},
+    "camloop": {"order": 7, "label": "相机外参闭环标定", "command": "set", "advisory": False, "mapping": "livo", "internal": True},
+    "precheck": {"order": 8, "label": "采纳建图自检修正", "command": "from-precheck", "advisory": False, "mapping": "any"},
+    "manual": {"order": 9, "label": "手动设置", "command": "set", "advisory": False, "mapping": None},
+    "scan": {"order": 10, "label": "闭环扫描点（临时）", "command": "set", "advisory": True, "mapping": None, "internal": True},
 }
 SCAN_STEP_DEG = 0.05  # pitch increment of the closed-loop scan rounds (0.55 % scale change, 20x the run-to-run noise)
 DEFAULT_PITCH_SLOPE = 0.105  # path-length ratio change per degree of camera pitch (measured 0.104-0.106 on truck29)
@@ -107,6 +108,9 @@ def vehicle_status(cat, mine, truck):
         calib = read_json(CAL_ROOT.joinpath(*active_id.split("/")) / "calibration.json", {}) or {}
     ctype = str(calib.get("calibration_type", ""))
     offsets = calib.get("time_offsets") or {}
+    # a raw supplier import is not aligned to the rear axle until the axle stage ran; the hand-tuned
+    # schema-5 lineage (multi_lidar_to_rear_axle_manual) was aligned manually
+    axle_done = "axle" in stages_done or "rear_axle_alignment" in ctype or not ctype.startswith("supplier_raw")
     lidar_refined = any(s in ("ground", "driven", "precheck") for s in stages_done) or "refined" in ctype
     driven_done = "driven" in stages_done or "driven" in ctype or "stage2" in ctype
     camera_time_ok = isinstance(offsets.get("camera"), (int, float)) and (offsets.get("camera") != 0.0 or "camera_source" in offsets)
@@ -114,6 +118,7 @@ def vehicle_status(cat, mine, truck):
     camera_loop_done = "camloop" in stages_done or "camera_closed_loop" in ctype
     checks = [
         {"key": "import", "label": "出厂标定已导入", "ok": bool(active), "stage": "import"},
+        {"key": "axle", "label": "参考雷达已对齐后轴（RTK/INS 位姿）", "ok": axle_done, "stage": "axle"},
         {"key": "lidar", "label": "LiDAR 外参已精修（地面/行驶段）", "ok": lidar_refined, "stage": "ground"},
         {"key": "driven", "label": "多 LiDAR 6-DoF 一致性已校正", "ok": driven_done, "stage": "driven"},
         {"key": "camtime", "label": "相机时间偏移已确认", "ok": camera_time_ok, "stage": "camtime",
@@ -124,8 +129,9 @@ def vehicle_status(cat, mine, truck):
     if not active:
         next_step = {"stage": "import", "pipeline": None, "reason": "该车辆还没有标定版本，先导入出厂标定 JSON"}
         level = "none"
-    elif not lidar_refined or not driven_done:
-        next_step = {"stage": "ground", "pipeline": "lidar", "reason": "运行 LiDAR 标定流水线（地面精修 → LIO 建图 → 行驶段精修）"}
+    elif not axle_done or not lidar_refined or not driven_done:
+        next_step = {"stage": "axle" if not axle_done else "ground", "pipeline": "lidar",
+                     "reason": "运行 LiDAR 标定流水线（后轴对齐 → 地面精修 → LIO 建图 → 行驶段精修）"}
         level = "lio"
     elif not camera_time_ok:
         next_step = {"stage": "camtime", "pipeline": "camera", "reason": "运行相机标定流水线（时间偏移 → LIVO 建图 → 灯柱偏航复核 → 俯仰闭环扫描 → 验证）"}
@@ -267,7 +273,7 @@ def stage_cmd(stage, body):
         return import_cmd(body)
     parent = _parent(body)
     cmd = [PY, str(CALIB_TOOL), command, "--id", parent]
-    if command in ("ground", "driven", "camera-time", "camera-lidar"):
+    if command in ("axle", "ground", "driven", "camera-time", "camera-lidar"):
         dataset = str(safe_path(body.get("dataset") or ""))
         datasets.require(dataset, camera=command in ("camera-time", "camera-lidar"))
         cmd += ["--bag", dataset]
@@ -278,6 +284,13 @@ def stage_cmd(stage, body):
             cmd += ["--stationary", *[str(int(v)) for v in body["stationary"]]]
         if body.get("moving"):
             cmd += ["--moving", *[str(int(v)) for v in body["moving"]]]
+    if command == "axle":
+        if body.get("window"):
+            cmd += ["--window", *[str(float(v)) for v in body["window"]]]
+        if body.get("dof") in ("rpy_xy", "rpy", "xy"):
+            cmd += ["--dof", body["dof"]]
+        if body.get("keep_time_offset"):
+            cmd.append("--keep-time-offset")
     if command == "driven" and body.get("window"):
         cmd += ["--window", *[str(float(v)) for v in body["window"]]]
     if command == "camera-time" and body.get("duration") not in (None, "", 0, "0"):
@@ -432,7 +445,8 @@ def _camloop_steps(steps, body, mapping_cmd, *, truck, stamp, auto_activate, bas
 def pipeline_steps(kind, body, mapping_cmd):
     """Standard pipelines. `mapping_cmd(round_name, mode, calibration_file, body)` builds the round command.
 
-    lidar  : ground -> LIO round (save_map, evaluated) -> driven -> validate [-> activate]
+    lidar  : axle (reference LiDAR -> rear axle from RTK/INS, rig correction; skip_axle=true skips it)
+             -> ground -> LIO round (save_map, evaluated) -> driven -> validate [-> activate]
     camera : camera-time -> LIVO round A -> camera-lidar (pole yaw, pitch untouched)
              -> pitch scan (2 temporary versions, 2 LIVO rounds) -> zero crossing -> camloop version
              -> LIVO verify round -> closed-loop verdict A vs verify -> validate [-> activate if pass]
@@ -451,8 +465,16 @@ def pipeline_steps(kind, body, mapping_cmd):
     steps = []
     if kind == "lidar":
         datasets.require(dataset)
+        if body.get("skip_axle"):
+            steps.append({"title": "跳过后轴对齐（沿用父版本的参考雷达外参）", "build": lambda ctx: ["/bin/echo", "axle skipped"],
+                          "after": lambda ctx, lines: ctx.__setitem__("axle_id", parent)})
+        else:
+            steps.append({"title": "后轴对齐 (axle：参考雷达→后轴，RTK/INS 位姿，整机刚体修正 + LiDAR 时间偏移)",
+                          "build": lambda ctx: stage_cmd("axle", {"id": parent, "dataset": dataset,
+                                                                  "note": body.get("note") or "pipeline: axle"}),
+                          "after": lambda ctx, lines: ctx.__setitem__("axle_id", parse_version_id(lines))})
         steps.append({"title": "静止地面精修 (ground)", "build": lambda ctx: stage_cmd(
-            "ground", {"id": parent, "dataset": dataset, "note": body.get("note") or "pipeline: ground"}),
+            "ground", {"id": ctx["axle_id"], "dataset": dataset, "note": body.get("note") or "pipeline: ground"}),
             "after": lambda ctx, lines: ctx.__setitem__("ground_id", parse_version_id(lines))})
         round_name = f"calib_{truck}_lio_{stamp}"
         # The driven stage only reads native poses inside its window (default 8-40 s), so the LIO

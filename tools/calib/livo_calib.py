@@ -8,7 +8,10 @@ camera model and the per-truck time offsets, so a truck change never requires ed
 algorithm yaml. Every stage creates a NEW version from a parent version and never modifies
 inputs. Stages (version suffix = stage; see STAGES for the operator-facing catalogue):
 
-  import        normalise a supplier/factory perception JSON into version v001_import
+  import        normalise a supplier/factory perception JSON (schema-5 file or the raw supplier export with
+                lidar[] + midrange_camera[0].tf_lidar_to_camera) into version v001_import
+  axle          reference-LiDAR -> rear-axle alignment from the recording's RTK/INS poses (rig correction for
+                every LiDAR and the camera + LiDAR time shift; scripts/refine_rear_axle_extrinsic.py); no mapping run
   ground        static-start roll/pitch/z refinement of every LiDAR (scripts/refine_multi_lidar_extrinsics.py)
   driven        driven-window 6-DoF refinement (scripts/refine_multi_lidar_yaw.py); needs a LIO run
   camera-time   camera->IMU time offset from optical flow vs gyro
@@ -62,28 +65,32 @@ STAGES = {
     "import": {"order": 1, "label": "导入出厂标定", "command": "import",
                "input": "厂家感知标定 JSON", "output": "LiDAR/相机外参基线 + 默认时间偏移",
                "needs": [], "mapping": None, "advisory": False, "seconds": 1},
-    "ground": {"order": 2, "label": "静止地面精修", "command": "ground",
+    "axle": {"order": 2, "label": "后轴对齐（RTK/INS）", "command": "axle",
+             "input": "原始录制（INS/RTK 位姿 + 前雷达，无需建图）",
+             "output": "参考雷达→后轴 roll/pitch/yaw/x/y（整机刚体修正，所有雷达与相机同步）+ LiDAR 时间偏移",
+             "needs": ["dataset"], "mapping": None, "advisory": False, "seconds": 90},
+    "ground": {"order": 3, "label": "静止地面精修", "command": "ground",
                "input": "原始录制（起步前静止段）", "output": "每个 LiDAR 的 roll / pitch / z",
                "needs": ["dataset"], "mapping": None, "advisory": False, "seconds": 60},
-    "driven": {"order": 3, "label": "行驶段 6-DoF 精修", "command": "driven",
+    "driven": {"order": 4, "label": "行驶段 6-DoF 精修", "command": "driven",
                "input": "原始录制 + 一次 LIO 建图结果", "output": "四个 LiDAR 之间的 6-DoF 一致性",
                "needs": ["dataset", "run"], "mapping": "lio", "advisory": False, "seconds": 90},
-    "camtime": {"order": 4, "label": "相机时间偏移", "command": "camera-time",
+    "camtime": {"order": 5, "label": "相机时间偏移", "command": "camera-time",
                 "input": "原始录制（含相机）", "output": "time_offsets.camera（光流 vs 陀螺）",
                 "needs": ["dataset", "camera"], "mapping": None, "advisory": False, "seconds": 120},
-    "camlidar": {"order": 5, "label": "相机-LiDAR 偏航/横滚复核", "command": "camera-lidar",
+    "camlidar": {"order": 6, "label": "相机-LiDAR 偏航/横滚复核", "command": "camera-lidar",
                  "input": "原始录制（含相机）+ 一次 LIVO 建图结果", "output": "相机→后轴外参的偏航/横滚（竖直边缘对齐，俯仰不变；含 overlays/ 叠加图）",
                  "needs": ["dataset", "camera", "run"], "mapping": "livo", "advisory": True, "seconds": 180},
-    "camloop": {"order": 6, "label": "相机外参闭环标定", "command": "set",
+    "camloop": {"order": 7, "label": "相机外参闭环标定", "command": "set",
                 "input": "俯仰扫描的 2–3 次 LIVO 建图（原生里程尺度 vs RTK）", "output": "相机→后轴外参的俯仰角（尺度过零点，闭环验证）",
                 "needs": [], "mapping": "livo", "advisory": False, "seconds": 900, "internal": True},
-    "precheck": {"order": 7, "label": "采纳建图自检修正", "command": "from-precheck",
+    "precheck": {"order": 8, "label": "采纳建图自检修正", "command": "from-precheck",
                  "input": "一次建图结果的 Log/extrinsic_precheck.json", "output": "自检门限内的 roll / pitch / z 修正",
                  "needs": ["run_dir"], "mapping": "any", "advisory": False, "seconds": 1},
-    "manual": {"order": 8, "label": "手动设置", "command": "set",
+    "manual": {"order": 9, "label": "手动设置", "command": "set",
                "input": "人工输入的时间偏移 / 内参 / 相机旋转修正", "output": "对应字段的新版本",
                "needs": [], "mapping": None, "advisory": False, "seconds": 1},
-    "scan": {"order": 9, "label": "闭环扫描点（临时）", "command": "set",
+    "scan": {"order": 10, "label": "闭环扫描点（临时）", "command": "set",
              "input": "流水线自动生成：父版本 + 固定俯仰增量", "output": "仅用于一次扫描建图，不应激活",
              "needs": [], "mapping": None, "advisory": True, "seconds": 1, "internal": True},
 }
@@ -312,8 +319,29 @@ def cmd_import(a):
                     notes.append(f"{key}: re-orthonormalised (max deviation {err:.1e})")
     tr = calib.setdefault("transforms", {})
     cam_tf = tr.get("midrange_camera_to_rear_axle", {}).get("transform_matrix")
-    if cam_tf is None:
-        sys.exit("source file lacks transforms.midrange_camera_to_rear_axle.transform_matrix")
+    raw_supplier = cam_tf is None
+    if raw_supplier:
+        # Raw supplier export: only camera<-reference-LiDAR (midrange_camera[0].tf_lidar_to_camera) is given.
+        # camera->rear = rear<-reference * inverse(camera<-reference); the reference is the correlated LiDAR.
+        ref_key = calib.get("calibration_reference_lidar") or calib.get("correlated_lidar_matrix_tf") or LIDAR_KEYS["front_lidar"]
+        mc = calib.get("midrange_camera")
+        tf = mc[0].get("tf_lidar_to_camera") if isinstance(mc, list) and mc and isinstance(mc[0], dict) else None
+        ref = next((e[ref_key] for e in calib["lidar"] if ref_key in e), None)
+        if tf is None or ref is None:
+            sys.exit("source file has neither transforms.midrange_camera_to_rear_axle nor "
+                     f"midrange_camera[0].tf_lidar_to_camera + lidar[].{ref_key}")
+        tf = np.asarray(tf, float)
+        if tf.size == 18:
+            tf = tf[2:]
+            notes.append("tf_lidar_to_camera: dropped two leading padding values (18 -> 16)")
+        cam_from_ref = orthonormalize(tf.reshape(4, 4))
+        cam_tf = (np.asarray(ref, float).reshape(4, 4) @ np.linalg.inv(cam_from_ref)).reshape(-1).tolist()
+        tr["midrange_camera_to_rear_axle"] = {"source_frame": "midrange_camera", "target_frame": "vehicle_rear_axle",
+                                             "transform_semantics": "target_from_source",
+                                             "derived_from": f"{ref_key} * inverse(midrange_camera[0].tf_lidar_to_camera)"}
+        calib["calibration_reference_lidar"] = ref_key
+        notes.append(f"raw supplier export: camera->rear-axle derived from {ref_key} and tf_lidar_to_camera")
+        notes.append("rig-to-rear-axle alignment of a supplier file is unverified: run the axle stage next")
     m = np.asarray(cam_tf, float)
     if m.size == 18:  # legacy export with two leading padding values
         m = m[2:]
@@ -352,7 +380,8 @@ def cmd_import(a):
         offsets["camera"] = a.camera_offset
     offsets["source"] = "import (verify with camera-time / LIO evaluation)"
     calib["time_offsets"] = offsets
-    calib["calibration_type"] = calib.get("calibration_type", "") or "multi_lidar_to_rear_axle_manual"
+    calib["calibration_type"] = calib.get("calibration_type", "") or (
+        "supplier_raw_lidar_to_rear_axle" if raw_supplier else "multi_lidar_to_rear_axle_manual")
     out_dir = next_version_dir(a.mine, a.truck, "import")
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "source.json").write_text(src.read_text())
@@ -375,6 +404,31 @@ def run_script(cmd, log_path):
     if proc.returncode != 0:
         sys.exit(f"stage failed with exit code {proc.returncode}; see {log_path}")
     return lines
+
+
+def cmd_axle(a):
+    pdir, parent_calib, mine, truck = parent_info(a.id)
+    _, ds_info = require_dataset(a.bag, what="axle")
+    out_dir = next_version_dir(mine, truck, "axle")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dof = a.dof
+    if dof == "auto":  # a raw supplier import needs the rotation; an aligned parent keeps it (see the script docstring)
+        ctype = str(parent_calib.get("calibration_type", ""))
+        dof = "rpy_xy" if ctype.startswith("supplier_raw") and "rear_axle_alignment" not in ctype else "xy"
+        print(f"axle: --dof auto -> {dof} (parent calibration_type {ctype or '-'})", flush=True)
+    cmd = ["/usr/bin/python3", str(SCRIPTS / "refine_rear_axle_extrinsic.py"), "--calibration",
+           str(pdir / "calibration.json"), "--bag", a.bag, "--output", str(out_dir / "calibration.json"),
+           "--report", str(out_dir / "stage_report.txt"), "--window", str(a.window[0]), str(a.window[1]), "--dof", dof]
+    if a.keep_time_offset:
+        cmd.append("--keep-time-offset")
+    lines = run_script(cmd, out_dir / "stage.log")
+    calib = json.loads((out_dir / "calibration.json").read_text())
+    metrics = {"rear_axle_alignment": calib.get("refinement", {}).get("rear_axle_alignment", {})}
+    finalize_version(out_dir, calib, mine=mine, truck=truck, stage="axle", parent=a.id,
+                     note=a.note or "reference-LiDAR -> rear-axle alignment from RTK/INS poses (rig correction)",
+                     inputs={"bag": a.bag, "dataset": ds_info, "window": list(a.window), "dof": dof,
+                             "time_offset": "kept" if a.keep_time_offset else "estimated"},
+                     metrics=metrics, report_lines=lines, activate=a.activate)
 
 
 def cmd_ground(a):
@@ -1476,6 +1530,17 @@ def main():
     p.add_argument("--camera-offset", type=float)
     common(p, need_id=False)
     p.set_defaults(func=cmd_import)
+
+    p = sub.add_parser("axle", help="reference-LiDAR -> rear-axle alignment from RTK/INS poses (no mapping run)")
+    p.add_argument("--bag", required=True, help="recording: raw ROS 2 root (segment folders) or single bag folder")
+    p.add_argument("--window", nargs=2, type=float, default=(0.0, 1e9),
+                   help="seconds after the first reference scan (default: whole recording; turns improve x/y/roll)")
+    p.add_argument("--dof", choices=("auto", "rpy_xy", "rpy", "xy"), default="auto",
+                   help="auto (default): rpy_xy for a raw supplier import, xy (keep rotation, refine lever arm + time) "
+                        "for an already aligned parent; rpy_xy / rpy / xy force the solved DoF")
+    p.add_argument("--keep-time-offset", action="store_true", help="do not estimate/apply the LiDAR time shift")
+    common(p)
+    p.set_defaults(func=cmd_axle)
 
     p = sub.add_parser("ground")
     p.add_argument("--bag", required=True, help="recording: raw ROS 2 root (segment folders) or single bag folder")

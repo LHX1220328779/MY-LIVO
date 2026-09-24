@@ -1,0 +1,271 @@
+{
+  "id": "wuhu/truck29raw/v006_camlidar",
+  "mine": "wuhu",
+  "truck": "truck29raw",
+  "version": "v006_camlidar",
+  "stage": "camlidar",
+  "stage_label": "相机-LiDAR 偏航/横滚复核",
+  "advisory": true,
+  "parent": "wuhu/truck29raw/v005_camtime",
+  "lineage": [
+    "wuhu/truck29raw/v001_import",
+    "wuhu/truck29raw/v002_axle",
+    "wuhu/truck29raw/v003_ground",
+    "wuhu/truck29raw/v004_driven",
+    "wuhu/truck29raw/v005_camtime",
+    "wuhu/truck29raw/v006_camlidar"
+  ],
+  "created": "2026-09-24T10:23:20+08:00",
+  "note": "camera yaw refined on 3 pole observations: +0.164 deg (median shift -4.8 px, MAD 0.035 deg)",
+  "inputs": {
+    "bag": "/home/project/data/haibo/wuhu_livo/ros2bag",
+    "dataset": {
+      "path": "/home/project/data/haibo/wuhu_livo/ros2bag",
+      "kind": "raw_split",
+      "segments": 8,
+      "duration_s": 120.13,
+      "has_camera": true
+    },
+    "run": "/home/project/MY-LIVO/results/calib_truck29raw_livo_0924_101925/Log/fusion/1790216375315775273",
+    "frames": 30,
+    "window": [
+      5.0,
+      115.0
+    ]
+  },
+  "metrics": {
+    "method": "pole yaw (LiDAR pole axis vs image pole column)",
+    "frames_checked": 30,
+    "frames_with_poles": 8,
+    "observations": [
+      {
+        "t": 5.0,
+        "image": 210,
+        "depth_m": 33.7,
+        "height_m": 5.9,
+        "rows": 251,
+        "du_px": -5.23,
+        "mad_px": 0.38,
+        "yaw_deg": 0.1819,
+        "bar_width_px": 5,
+        "snr": 2.36,
+        "speed_mps": 2.15
+      },
+      {
+        "t": 8.8,
+        "image": 324,
+        "depth_m": 24.2,
+        "height_m": 7.7,
+        "rows": 446,
+        "du_px": -0.1,
+        "mad_px": 0.91,
+        "yaw_deg": 0.0033,
+        "bar_width_px": 7,
+        "snr": 2.59,
+        "speed_mps": 2.38
+      },
+      {
+        "t": 50.5,
+        "image": 1576,
+        "depth_m": 21.5,
+        "height_m": 8.6,
+        "rows": 362,
+        "du_px": -5.19,
+        "mad_px": 1.31,
+        "yaw_deg": 0.1642,
+        "bar_width_px": 10,
+        "snr": 2.61,
+        "speed_mps": 6.55
+      },
+      {
+        "t": 58.1,
+        "image": 1803,
+        "depth_m": 22.1,
+        "height_m": 8.1,
+        "rows": 439,
+        "du_px": -4.77,
+        "mad_px": 0.87,
+        "yaw_deg": 0.1468,
+        "bar_width_px": 7,
+        "snr": 2.33,
+        "speed_mps": 6.23
+      },
+      {
+        "t": 65.7,
+        "image": 2031,
+        "depth_m": 22.1,
+        "height_m": 8.6,
+        "rows": 309,
+        "du_px": 0.23,
+        "mad_px": 0.59,
+        "yaw_deg": -0.0067,
+        "bar_width_px": 3,
+        "snr": 2.74,
+        "speed_mps": 6.47
+      }
+    ],
+    "rejected": [
+      {
+        "t": 27.8,
+        "depth_m": 22.2,
+        "bar_px": 26.0,
+        "rows": 490,
+        "rejected": "rows disagree (MAD 8.4 px over 466 rows, width 10 px)"
+      },
+      {
+        "t": 35.3,
+        "depth_m": 22.0,
+        "bar_px": 20.8,
+        "rows": 494,
+        "rejected": "rows disagree (MAD 5.4 px over 474 rows, width 14 px)"
+      },
+      {
+        "t": 42.9,
+        "depth_m": 27.9,
+        "bar_px": 24.7,
+        "rows": 428,
+        "rejected": "rows disagree (MAD 3.3 px over 383 rows, width 7 px)"
+      }
+    ],
+    "image_scale": 1.0,
+    "yaw_delta_deg": 0.1642,
+    "yaw_mad_deg": 0.0351,
+    "used": 3,
+    "du_median_px": -4.77,
+    "delta_rot_deg_cam_xyz": [
+      0.0,
+      0.1642,
+      0.0
+    ],
+    "delta_trans_m_cam_xyz": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "overlay_dir": "/home/project/MY-LIVO/config/carlibration/wuhu/truck29raw/v006_camlidar/overlays",
+    "max_delta_deg": 0.5,
+    "applied": true
+  },
+  "changes_vs_parent": {
+    "camera_to_rear": {
+      "dt_cm": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "drpy_deg": [
+        -0.005,
+        -0.018,
+        -0.163
+      ]
+    }
+  },
+  "summary": {
+    "lidars": [
+      {
+        "lidar": "front_right_lidar",
+        "key": "transform_matrix_lidar_1",
+        "t": [
+          2.756,
+          5.9895,
+          1.8333
+        ],
+        "rpy_deg": [
+          -1.001,
+          -3.026,
+          -1.433
+        ]
+      },
+      {
+        "lidar": "back_lidar",
+        "key": "transform_matrix_lidar_2",
+        "t": [
+          -0.1094,
+          -0.311,
+          0.6862
+        ],
+        "rpy_deg": [
+          -1.079,
+          0.746,
+          -91.392
+        ]
+      },
+      {
+        "lidar": "front_left_lidar",
+        "key": "transform_matrix_lidar_3",
+        "t": [
+          -3.1269,
+          5.7908,
+          1.9755
+        ],
+        "rpy_deg": [
+          -3.418,
+          -0.801,
+          178.584
+        ]
+      },
+      {
+        "lidar": "front_lidar",
+        "key": "transform_matrix_lidar_6",
+        "t": [
+          -0.108,
+          8.0271,
+          0.051
+        ],
+        "rpy_deg": [
+          1.452,
+          -1.533,
+          89.921
+        ]
+      }
+    ],
+    "camera_to_rear": {
+      "t": [
+        0.0037,
+        8.0291,
+        1.7517
+      ],
+      "rpy_deg": [
+        -96.51,
+        1.617,
+        0.258
+      ]
+    },
+    "camera": {
+      "topic": "/midrange_camera/image_raw",
+      "width": 1920,
+      "height": 1080,
+      "intrinsics": [
+        1642.570556640625,
+        1855.53173828125,
+        971.0083025529602,
+        534.2602337509306
+      ],
+      "distortion": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "source": "defaults (wuhu truck29 yaml)"
+    },
+    "time_offsets": {
+      "lidar": -0.1463,
+      "camera": -0.1211,
+      "rtk_position": 0.025,
+      "ins_attitude": 0.0,
+      "source": "import (verify with camera-time / LIO evaluation)",
+      "lidar_source": "rear-axle alignment (cross-time consistency vs INS poses)",
+      "camera_source": "optical flow vs gyro on /home/project/data/haibo/wuhu_livo/ros2bag (corr 0.92)"
+    }
+  },
+  "calibration_file": "/home/project/MY-LIVO/config/carlibration/wuhu/truck29raw/v006_camlidar/calibration.json",
+  "overlays": [
+    "pole_00_t005.jpg",
+    "pole_01_t008.jpg",
+    "pole_02_t050.jpg",
+    "pole_03_t058.jpg",
+    "pole_04_t065.jpg"
+  ]
+}
