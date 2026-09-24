@@ -46,6 +46,13 @@ const sdeg = (v) => v == null ? "—" : `${Number(v) > 0 ? "+" : ""}${Number(v).
 const secondsBetween = (a, b) => (a && b) ? Math.max(0, (new Date(b) - new Date(a)) / 1000) : null;
 const baseName = (p) => String(p || "").replace(/\/+$/, "").split("/").pop();
 function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
+function captureForms() {
+  // keep uncontrolled form fields across re-renders (poller re-renders while the user types)
+  S.drafts = S.drafts || {};
+  document.querySelectorAll("#page input[id], #page select[id], #page textarea[id]").forEach((el) => {
+    S.drafts[el.id] = el.type === "checkbox" ? el.checked : el.value;
+  });
+}
 const saveState = debounce((patch) => api("/api/state", "POST", patch).then((s) => { S.state = s; }).catch((e) => toast(e.message, "bad")), 400);
 
 // ------------------------------------------------------------------ data loading
@@ -63,15 +70,24 @@ async function loadJobs() { S.jobs = await api("/api/jobs?limit=80"); }
 async function pollJob() {
   if (!S.job) return;
   const doc = await api(`/api/jobs/${S.job.id}?offset=${S.jobLogNext}`);
-  const log = doc.log; delete doc.log;
+  const log = doc.log || { lines: [], next: S.jobLogNext, offset: S.jobLogNext };
+  delete doc.log;
   if (log.offset !== S.jobLogNext) { S.jobLog = []; }
-  S.jobLog.push(...log.lines); S.jobLogNext = log.next;
+  S.jobLog.push(...(log.lines || [])); S.jobLogNext = log.next ?? S.jobLogNext;
   if (S.jobLog.length > 4000) S.jobLog.splice(0, S.jobLog.length - 4000);
   const finished = S.job.status === "running" && doc.status !== "running";
+  const stepChanged = (S.job.current ?? -1) !== (doc.current ?? -1);
   S.job = doc;
   if (finished) {
     toast(doc.status === "done" ? `✓ ${doc.title} 完成` : `${doc.title}：${doc.error || doc.status}`, doc.status === "done" ? "ok" : "bad");
     await Promise.all([loadOverview(), loadCatalogue(true), loadRuns()]);
+    render();
+    return;
+  }
+  if (stepChanged) {
+    // pipeline steps land new calibration versions on disk: refresh so the stepper/checklist turn green live
+    await loadCatalogue(true);
+    await loadOverview();
     render();
   }
 }
@@ -92,7 +108,14 @@ function schedule() {
   S.timers.main = setInterval(async () => {
     try {
       const running = S.job && S.job.status === "running";
-      if (running) { await pollJob(); await pollLive(); patchLive(); }
+      if (running) {
+        try { await pollJob(); S.pollFails = 0; }
+        catch (e) {
+          S.pollFails = (S.pollFails || 0) + 1;  // never leave the console button-locked on a dead poll
+          if (S.pollFails >= 15) { S.job = null; toast("任务状态轮询失败，已解除运行锁定（可在“系统”页查看历史）", "bad"); render(); }
+        }
+        await pollLive(); patchLive();
+      }
       else if (S.tick++ % 3 === 0) { await loadOverview(); if (S.page === "results" && S.runDetail) await pollLive(); patchLive(); }
     } catch (e) { /* transient */ }
   }, 2000);
@@ -233,6 +256,7 @@ function liveMonitor() {
 
 // ------------------------------------------------------------------ pages
 function render() {
+  captureForms();
   document.querySelectorAll("#nav a").forEach((a) => a.classList.toggle("active", a.dataset.page === S.page));
   $("#crumbs").innerHTML = `LIVO Studio <span>/ ${PAGES[S.page]}</span>`;
   const v = vehicle(); const d = S.dataset;
@@ -349,8 +373,8 @@ function pageCalib() {
     ${stepperHtml(v)}
     <div class="grid g2" style="margin-top:8px">
       <div class="stat" style="padding:14px"><div class="row" style="justify-content:space-between"><div><b>LiDAR 标定流水线</b><div class="small muted">后轴对齐（RTK/INS 位姿，参考雷达→后轴，整机修正）→ 静止地面精修 → LIO 建图（保存地图）→ 行驶段 6-DoF 精修 → 校验${c.auto_activate ? " → 激活" : ""}</div><div class="small muted">约 6 分钟（含一次 48 s 回放）· 需要 LiDAR/IMU/INS 数据源 · 原始出厂外参与已精修父版本都可直接运行</div></div><button class="btn primary" data-act="pipeline" data-kind="lidar" ${running || !v?.active || !d?.lio_ready ? "disabled" : ""}>运行</button></div></div>
-      <div class="stat" style="padding:14px"><div class="row" style="justify-content:space-between"><div><b>相机标定流水线</b><div class="small muted">相机时间偏移 → LIVO 建图 A（基线）→ 偏航复核（灯柱投影列偏差，俯仰不动）→ 俯仰闭环（标准＝±0.05° 扫描两轮拟合斜率；快速＝沿用历史斜率 0.105/°，只测零点）→ 闭环版本 → LIVO 验证建图 → 闭环判定 A/验证 → 校验${c.auto_activate ? " → 通过则激活" : ""}</div><div class="small muted">标准 ≈15–17 min（4 次回放）· 快速 ≈10 min（2 次回放）· 需要含相机的数据源 · 未通过闭环的版本不会被激活</div></div><button class="btn primary" data-act="pipeline" data-kind="camera" ${running || !v?.active || !d?.livo_ready ? "disabled" : ""}>运行</button></div></div>
-      <div class="stat" style="padding:14px"><div class="row" style="justify-content:space-between"><div><b>相机外参闭环微调（日常，最快）</b><div class="small muted">以当前激活版本为起点：<b>复用最近一次同版本 LIVO 轮次</b>作为零俯仰点（无需重跑）→ 用已知斜率算出过零点 → 闭环版本 → 一轮 LIVO 验证 → 闭环判定${c.auto_activate ? " → 通过则激活" : ""}</div><div class="small muted">快速 ≈4–5 min（1 次回放）· 标准 ≈8 min（2 次回放，需切换为“标准”）· 复用要求该轮次已评估且时长 ≥110 s</div></div><button class="btn primary" data-act="pipeline" data-kind="camloop" ${running || !v?.active || !d?.livo_ready ? "disabled" : ""}>运行</button></div></div>
+      <div class="stat" style="padding:14px"><div class="row" style="justify-content:space-between"><div><b>相机标定流水线</b><div class="small muted">相机时间偏移 → LIVO 建图 A（基线）→ 偏航复核（灯柱投影列偏差，俯仰不动）→ 俯仰闭环（标准＝±0.05° 扫描两轮拟合斜率；快速＝沿用历史斜率 0.105/°，只测零点）→ 闭环版本 → LIVO 验证建图 → 闭环判定 A/验证 → 校验${c.auto_activate ? " → 通过则激活" : ""}</div><div class="small muted">标准 ≈12 min（4 × 60 s 回放）· 快速 ≈8 min（2 × 60 s）· 默认只回放前 60 s（前两轮数据）· 需要含相机的数据源 · 未通过闭环的版本不会被激活</div></div><button class="btn primary" data-act="pipeline" data-kind="camera" ${running || !v?.active || !d?.livo_ready ? "disabled" : ""}>运行</button></div></div>
+      <div class="stat" style="padding:14px"><div class="row" style="justify-content:space-between"><div><b>相机外参闭环微调（日常，最快）</b><div class="small muted">以当前激活版本为起点：<b>复用最近一次同版本 LIVO 轮次</b>作为零俯仰点（无需重跑）→ 用已知斜率算出过零点 → 闭环版本 → 一轮 LIVO 验证 → 闭环判定${c.auto_activate ? " → 通过则激活" : ""}</div><div class="small muted">快速 ≈4–5 min（1 次回放）· 标准 ≈15 min（4 次回放）· 复用要求该轮次已评估且时长 ≥50 s（60 s 短轮次可复用）</div></div><button class="btn primary" data-act="pipeline" data-kind="camloop" ${running || !v?.active || !d?.livo_ready ? "disabled" : ""}>运行</button></div></div>
     </div>
     <div class="row" style="margin-top:10px;justify-content:space-between"><div class="small muted">父版本：<b>${esc(v?.active || "—")}</b> · 数据源：<b>${esc(d?.name || "未选择")}</b> ${datasetBadges(d)}</div><div class="row" style="gap:18px"><label class="check small">${`<input type="checkbox" data-act="toggle" data-section="calibration" data-key="auto_activate" ${c.auto_activate ? "checked" : ""}><span class="switch"></span><span>流水线完成后自动激活（仅在闭环判定通过时）</span>`}</label><label class="check small">${`<input type="checkbox" data-act="toggle" data-section="calibration" data-key="fast" ${c.fast !== false ? "checked" : ""}><span class="switch"></span><span>快速模式（沿用历史俯仰斜率、复用最近同版本轮次；取消勾选＝标准扫描）</span>`}</label></div></div>
   </div>
@@ -380,8 +404,8 @@ function importForm(c) {
       <div class="field"><label>矿山</label><input type="text" id="imp-mine" value="${esc(S.state.vehicle.mine)}"></div>
       <div class="field"><label>车辆编号</label><input type="text" id="imp-truck" value="${esc(S.state.vehicle.truck)}"></div>
       <div class="field wide"><label>出厂标定 JSON</label><div class="inline-path"><input type="text" id="imp-source" list="imp-sources" value="${esc(c.source_file || "")}"><datalist id="imp-sources">${sources.map((s) => `<option value="${esc(s)}">`).join("")}</datalist></div></div>
-      <div class="field"><label>LiDAR 时间偏移 (s)</label><input type="number" step="0.001" id="imp-lidar" value="${esc(c.lidar_offset ?? -0.125)}"></div>
-      <div class="field"><label>相机时间偏移 (s，未知填 0)</label><input type="number" step="0.001" id="imp-camera" value="${esc(c.camera_offset ?? 0)}"></div>
+      <div class="field"><label>LiDAR 时间偏移 (s)</label><input type="number" step="0.001" id="imp-lidar" value="${esc(S.drafts?.["imp-lidar"] ?? "")}" placeholder="留空 = 不改写，由 axle 阶段自动实测"></div>
+      <div class="field"><label>相机时间偏移 (s)</label><input type="number" step="0.001" id="imp-camera" value="${esc(S.drafts?.["imp-camera"] ?? "")}" placeholder="留空 = 由 camtime 自动实测"></div>
       <div class="field"><label>说明</label><input type="text" id="imp-note" placeholder="例如：2026-05 出厂标定"></div>
       <div class="field" style="justify-content:flex-end"><button class="btn primary" data-act="import">导入并激活</button></div>
     </div></div>`;
@@ -483,7 +507,11 @@ function drawerVersion() {
   const lidars = (sum.lidars || []).map((l) => `<tr><td>${esc(l.lidar)}</td><td class="mono small">${l.t.map((x) => x.toFixed(3)).join(", ")}</td><td class="mono small">${l.rpy_deg.map((x) => x.toFixed(2)).join(", ")}</td><td class="mono small">${ch.lidars?.[l.lidar] ? `Δt ${ch.lidars[l.lidar].dt_cm.join("/")} cm · Δrpy ${ch.lidars[l.lidar].drpy_deg.join("/")}°` : '<span class="faint">无变化</span>'}</td></tr>`).join("");
   const cam = sum.camera_to_rear ? `<tr><td>camera→rear</td><td class="mono small">${sum.camera_to_rear.t.map((x) => x.toFixed(3)).join(", ")}</td><td class="mono small">${sum.camera_to_rear.rpy_deg.map((x) => x.toFixed(2)).join(", ")}</td><td class="mono small">${ch.camera_to_rear ? `Δt ${ch.camera_to_rear.dt_cm.join("/")} cm · Δrpy ${ch.camera_to_rear.drpy_deg.join("/")}°` : '<span class="faint">无变化</span>'}</td></tr>` : "";
   const offs = sum.time_offsets || {};
-  const offHtml = Object.entries(offs).filter(([k, v]) => typeof v === "number").map(([k, v]) => `<span class="badge ${ch.time_offsets?.[k] ? "accent" : ""}">${esc(k)} ${v} s${ch.time_offsets?.[k] ? ` (原 ${ch.time_offsets[k].from})` : ""}</span>`).join(" ");
+  const tsrc = (d.calibration && d.calibration.time_offsets) || {};
+  const offHtml = Object.entries(offs).filter(([k, v]) => typeof v === "number").map(([k, v]) => {
+    const src = tsrc[`${k}_source`] || "";
+    return `<span class="badge ${ch.time_offsets?.[k] ? "accent" : ""}" title="${esc(src)}">${esc(k)} ${v} s${ch.time_offsets?.[k] ? ` (原 ${ch.time_offsets[k].from})` : (src ? ` · ${esc(src)}` : "")}</span>`;
+  }).join(" ");
   const metrics = m.metrics && Object.keys(m.metrics).length ? `<details><summary>阶段指标</summary><pre class="small">${esc(JSON.stringify(m.metrics, null, 1))}</pre></details>` : "";
   const stage = d.stage_info || {};
   const cl = d.closed_loop;
@@ -627,14 +655,18 @@ const A = {
     const v = vehicle(); const d = S.dataset; const kind = el.dataset.kind; const c = S.state.calibration;
     if (!v?.active) return toast("请先导入并激活一个标定版本", "bad");
     const std = c.fast === false;
-    const label = { lidar: "LiDAR 标定流水线（地面精修 → LIO 建图 → 行驶段精修）", camera: `相机标定流水线（时间偏移 → LIVO 建图 A → 灯柱偏航复核 → 俯仰闭环${std ? "扫描" : "（快速）"} → 验证建图 → 闭环判定）`, camloop: `相机外参闭环微调（${std ? "标准" : "快速"}：${std ? "两轮扫描" : "复用已有轮次 + 一轮验证"} → 闭环判定）` }[kind];
+    const label = { lidar: "LiDAR 标定流水线（后轴对齐 → 地面精修 → LIO 建图 → 行驶段精修 → 校验）", camera: `相机标定流水线（时间偏移 → LIVO 建图 A → 灯柱偏航复核 → 俯仰闭环${std ? "扫描" : "（快速）"} → 验证建图 → 闭环判定）`, camloop: `相机外参闭环微调（${std ? "标准" : "快速"}：${std ? "两轮扫描" : "复用已有轮次 + 一轮验证"} → 闭环判定）` }[kind];
     if (!confirm(`运行 ${label}\n父版本：${v.active}\n数据源：${d?.path}\n流水线包含一次完整回放建图，请勿同时启动其他建图。`)) return;
     await act(async () => { const job = await api("/api/calibrations/pipeline", "POST", { kind, id: v.active, dataset: d.path, activate: c.auto_activate !== false, use_rtk: true, rate: 1.0, note: "", mode: c.fast === false ? "standard" : "fast" }); S.job = job; S.jobLog = []; S.jobLogNext = 0; S.drawer = "job"; await loadOverview(); render(); }, "流水线已启动");
   },
   "toggle-import"() { S.showImport = !S.showImport; render(); },
   async import() {
-    const body = { mine: $("#imp-mine").value.trim(), truck: $("#imp-truck").value.trim(), source: $("#imp-source").value.trim(), lidar_offset: $("#imp-lidar").value, camera_offset: $("#imp-camera").value, note: $("#imp-note").value.trim(), activate: true };
-    await act(async () => { const job = await api("/api/calibrations/import", "POST", body); S.state.vehicle = { mine: body.mine, truck: body.truck }; saveState({ vehicle: S.state.vehicle, calibration: { source_file: body.source, lidar_offset: Number(body.lidar_offset), camera_offset: Number(body.camera_offset) } }); S.job = job; S.jobLog = []; S.jobLogNext = 0; S.drawer = "job"; S.showImport = false; render(); }, "导入已开始");
+    const body = { mine: $("#imp-mine").value.trim(), truck: $("#imp-truck").value.trim(), source: $("#imp-source").value.trim(), note: $("#imp-note").value.trim(), activate: true };
+    const lidar = ($("#imp-lidar").value || "").trim();
+    const camera = ($("#imp-camera").value || "").trim();
+    if (lidar !== "") body.lidar_offset = lidar;  // 留空 = 不传，程序自动检测时间偏移
+    if (camera !== "") body.camera_offset = camera;
+    await act(async () => { const job = await api("/api/calibrations/import", "POST", body); S.state.vehicle = { mine: body.mine, truck: body.truck }; saveState({ vehicle: S.state.vehicle, calibration: { source_file: body.source, lidar_offset: lidar === "" ? null : Number(lidar), camera_offset: camera === "" ? null : Number(camera) } }); S.drafts = {}; S.job = job; S.jobLog = []; S.jobLogNext = 0; S.drawer = "job"; S.showImport = false; render(); }, "导入已开始");
   },
   "calib-stage"(el) { S.calibForm.stage = el.value; render(); },
   "calib-field"(el) { S.calibForm[el.dataset.key] = el.type === "checkbox" ? el.checked : el.value; },

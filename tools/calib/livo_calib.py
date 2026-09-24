@@ -376,8 +376,12 @@ def cmd_import(a):
     offsets = dict(DEFAULT_TIME_OFFSETS)
     if a.lidar_offset is not None:
         offsets["lidar"] = a.lidar_offset
+        offsets["lidar_source"] = "operator import"
+    else:
+        offsets["lidar_source"] = "import default (unmeasured; run the axle stage to auto-measure)"
     if a.camera_offset is not None:
         offsets["camera"] = a.camera_offset
+        offsets["camera_source"] = "operator import"
     offsets["source"] = "import (verify with camera-time / LIO evaluation)"
     calib["time_offsets"] = offsets
     calib["calibration_type"] = calib.get("calibration_type", "") or (

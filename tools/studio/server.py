@@ -34,6 +34,44 @@ from studio.app.common import (CAL_ROOT, MAPPER_BINARY, REPO, RESULTS, STUDIO_DI
 
 VERSION = "2.0"
 
+_APP_MTIMES = {}
+
+
+def reload_app_modules() -> None:
+    """Hot-reload studio.app.* modules when their sources change (never under a running job).
+
+    A long-lived Studio server used to keep executing stale pipeline code while serving fresh UI
+    files (2026-09-23: the console listed the new 后轴对齐 step but the server ran the old pipeline).
+    jobs.py keeps live job state and is never reloaded here.
+    """
+    import importlib
+    try:
+        busy = jobs.active()
+    except Exception:  # noqa: BLE001
+        busy = None
+    for name in ("studio.app.common", "studio.app.datasets", "studio.app.calibration", "studio.app.mapping"):
+        mod = sys.modules.get(name)
+        path = getattr(mod, "__file__", None) if mod is not None else None
+        if not path:
+            continue
+        try:
+            mt = os.stat(path).st_mtime_ns
+        except OSError:
+            continue
+        prev = _APP_MTIMES.get(name)
+        if prev is None:
+            _APP_MTIMES[name] = mt
+            continue
+        if mt == prev or busy:
+            continue
+        try:
+            importlib.reload(mod)
+            _APP_MTIMES[name] = mt
+            print(f"[studio] hot-reloaded {name} (source changed)", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[studio] hot-reload {name} failed: {exc}", flush=True)
+
+
 
 def system_info():
     du = shutil.disk_usage(RESULTS if RESULTS.exists() else REPO)
@@ -102,6 +140,7 @@ class Handler(BaseHTTPRequestHandler):
         self._dispatch(self._post)
 
     def _dispatch(self, fn):
+        reload_app_modules()
         try:
             fn()
         except StudioError as exc:
