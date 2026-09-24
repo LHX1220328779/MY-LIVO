@@ -66,6 +66,8 @@ BODY_BOX = (-2.8, 2.8, -4.5, 9.5)   # own-vehicle returns (rear-axle x/y), same 
 COARSE_ITERS, MAX_ITERS = 8, 24
 # quality gate: a correction beyond these limits is not a calibration but a wrong reference/recording
 GATE_MAX_ROT_DEG, GATE_MAX_TRANS_M, GATE_MAX_DT_S = 6.0, 0.6, 0.08
+GATE_MAX_ABS_DT_S = 0.25   # |final time offset| beyond this is not a calibration but a wrong recording
+PROFILE = tuple(np.arange(-0.18, 0.0001, 0.03))  # candidate time-shift baselines for the auto-detect
 WARN_SPLIT_ROT_DEG, WARN_SPLIT_TRANS_M, WARN_SPLIT_DT_S = 0.2, 0.2, 0.01
 
 
@@ -190,12 +192,13 @@ def assemble(scans, poses, T_ref, vmin, motion_age):
     return data, skipped
 
 
-def solve(data, T0, active, *, solve_dt, gap, nq, K=20, prior=(5.0, 0.5, 0.1), iters=MAX_ITERS, fine=False, seed=0):
+def solve(data, T0, active, *, solve_dt, gap, nq, K=20, prior=(5.0, 0.5, 0.1), iters=MAX_ITERS, fine=False, seed=0, dt0=0.0):
     """Joint robust GN for the rig correction (rotvec about the LiDAR position, translation) + time shift."""
     rng = np.random.default_rng(seed)
     P, Rw, tw, tau, vel, om = data["P"], data["R"], data["t"], data["tau"], data["vel"], data["om"]
     N = len(P)
-    T = T0.copy(); total = np.zeros(7); hist = []
+    T = T0.copy(); total = np.zeros(7); total[6] = dt0; hist = []
+    prior_c = np.zeros(7); prior_c[6] = dt0  # prior pulls toward dt0, not toward 0
     act = np.r_[active, bool(solve_dt)]
     Hp = np.diag([1 / np.radians(prior[0]) ** 2] * 3 + [1 / prior[1] ** 2] * 3 + [1 / prior[2] ** 2])
     H = np.zeros((7, 7)); quiet = 0
@@ -241,7 +244,7 @@ def solve(data, T0, active, *, solve_dt, gap, nq, K=20, prior=(5.0, 0.5, 0.1), i
         r = np.concatenate(res); nzz = np.concatenate(nz)
         a = np.flatnonzero(act)
         step = np.zeros(7)
-        step[a] = -np.linalg.solve((H + Hp)[np.ix_(a, a)], (g + Hp @ total)[a])
+        step[a] = -np.linalg.solve((H + Hp)[np.ix_(a, a)], (g + Hp @ (total - prior_c))[a])
         T[:3, :3] = R.from_rotvec(step[:3]).as_matrix() @ T[:3, :3]
         T[:3, 3] = T[:3, 3] + step[3:6]
         total += step
@@ -281,6 +284,7 @@ def main():
     ap.add_argument("--max-scans", type=int, default=700, help="scans used at most (evenly thinned)")
     ap.add_argument("--samples", type=int, default=200000, help="residuals sampled per iteration")
     ap.add_argument("--no-split", action="store_true", help="skip the two half-recording repeatability solves")
+    ap.add_argument("--no-profile", action="store_true", help="skip the fixed-dt time-offset profile (start the joint solve at dt=0)")
     ap.add_argument("--no-gate", action="store_true", help="write the output even when the quality gate fails")
     a = ap.parse_args()
     t_start = time.time()
@@ -315,7 +319,41 @@ def main():
                   f"{'' if a.keep_time_offset else ' + LiDAR time shift'}; cross-time gap > {a.gap} s")
     active = np.array([True] * 5 + [False])   # z is unobservable (moves the whole map vertically)
     solve_dt = not a.keep_time_offset
-    sol = solve(data, T_ref, active, solve_dt=solve_dt, gap=a.gap, nq=a.samples)
+    # Time-offset auto-detection: profile the residual over a grid of FIXED time shifts (extrinsics
+    # re-solved at each) and start the joint solve at the minimum. A parent with no/wrong offset (raw
+    # import, offsets left unset) starts far from the truth, where the joint solve couples rotation and
+    # time into a worse local minimum; the profile is cheap, unimodal at plausible offsets and doubles
+    # as the documented evidence for the measured value.
+    profile, T_start, dt_start, gts_final = [], T_ref, 0.0, 0.0
+    if solve_dt and not a.no_profile:
+        # Time-offset auto-detection. The first-order time-shift model inside solve() is only valid
+        # for |dt| <~ 40 ms (turn curvature), so a far parent offset biases any single solve toward
+        # zero. Candidate baselines RE-POSE the points at exactly shifted times and each runs a small
+        # local joint solve: near the true offset the solve reaches the deep minimum, far from it the
+        # residual stays shallow, so the candidates rank the offset exactly.
+        def shifted(gts):
+            d2 = dict(data)
+            Rw2, tw2 = poses.at(data["tau"] + gts)
+            d2["R"], d2["t"] = Rw2, tw2
+            return d2
+        for gts in PROFILE:
+            s_ = solve(shifted(float(gts)), T_ref, active, solve_dt=True, gap=a.gap,
+                       nq=max(a.samples // 2, 100000), iters=14, fine=False, seed=1, dt0=0.0)
+            if s_ is not None and s_["hist"]:
+                eff = float(gts) + s_["dt"]
+                profile.append({"baseline_s": round(float(gts), 4), "dt_s": round(eff, 4),
+                                "median_cm": round(s_["hist"][-1]["median_cm"], 3),
+                                "ground_cm": round(s_["hist"][-1]["ground_cm"], 3), "T": s_["T"]})
+        if profile:
+            best = min(profile, key=lambda q_: q_["median_cm"])
+            gts_final, T_start = best["dt_s"], best["T"]
+            data = shifted(gts_final)   # exact re-pose at the detected offset; solve() refines around 0
+            report.append("time-offset candidates (exact re-pose baseline + local joint solve): "
+                          + ", ".join(f"{p_['baseline_s']:+.3f}/{p_['dt_s']:+.3f}s:{p_['median_cm']:.2f}cm"
+                                      for p_ in profile))
+            report.append(f"detected time shift {gts_final:+.3f} s (median {best['median_cm']:.2f} cm) -> final joint solve")
+    sol = solve(data, T_start, active, solve_dt=solve_dt, gap=a.gap, nq=a.samples, dt0=dt_start)
+    dt_total = gts_final + sol["dt"] if solve_dt else 0.0
     if sol is None:
         report.append("no planar cross-time matches"); pathlib.Path(a.report).write_text("\n".join(report) + "\n")
         print("\n".join(report)); sys.exit(3)
@@ -334,7 +372,7 @@ def main():
                   f"z(yaw) {rv_full[2]:+.3f} deg; translation x {dt_full[0]:+.1f}, y {dt_full[1]:+.1f} cm")
     report.append(f"applied ({a.dof}): rotvec x(pitch) {rv[0]:+.3f}, y(roll) {rv[1]:+.3f}, z(yaw) {rv[2]:+.3f} deg; "
                   f"translation x {dtcm[0]:+.1f}, y {dtcm[1]:+.1f}, z {dtcm[2]:+.1f} cm"
-                  + ("" if a.keep_time_offset else f"; LiDAR time shift {1000 * sol['dt']:+.1f} ms -> time_offsets.lidar {lidar_off + sol['dt']:+.4f} s"))
+                  + ("" if a.keep_time_offset else f"; LiDAR time shift {1000 * dt_total:+.1f} ms -> time_offsets.lidar {lidar_off + dt_total:+.4f} s"))
     # observability: square-root information per DoF (unit weights, relative scale only)
     idx = np.flatnonzero(np.r_[active, solve_dt])
     info = {n_: float(np.sqrt(max(sol["H"][i, i], 0))) for n_, i in zip(("rx", "ry", "rz", "tx", "ty", "tz", "dt"), range(7)) if i in idx}
@@ -344,7 +382,7 @@ def main():
         for part in (used[rel <= mid], used[rel > mid]):
             m = np.isin(data["scan"], part)
             s = solve({k: v[m] for k, v in data.items()}, sol["T"], active, solve_dt=solve_dt, gap=a.gap, nq=a.samples // 2,
-                      iters=10, fine=True, seed=1)
+                      iters=10, fine=True, seed=1, dt0=float(sol["dt"]))
             halves.append(s)
         if all(s is not None for s in halves):
             d_rot = np.degrees(R.from_matrix(halves[0]["T"][:3, :3] @ halves[1]["T"][:3, :3].T).as_rotvec())
@@ -358,7 +396,12 @@ def main():
     rot_deg, trans_m = float(np.linalg.norm(rv_full)), float(np.linalg.norm(dt_full) / 100)
     if rot_deg > GATE_MAX_ROT_DEG: reasons.append(f"rotation correction {rot_deg:.2f} deg > {GATE_MAX_ROT_DEG}"); level = "fail"
     if trans_m > GATE_MAX_TRANS_M: reasons.append(f"translation correction {100 * trans_m:.0f} cm > {100 * GATE_MAX_TRANS_M:.0f}"); level = "fail"
-    if abs(sol["dt"]) > GATE_MAX_DT_S: reasons.append(f"time shift {1000 * sol['dt']:.0f} ms > {1000 * GATE_MAX_DT_S:.0f}"); level = "fail"
+    abs_dt = abs(lidar_off + dt_total) if solve_dt else abs(lidar_off)
+    if solve_dt and abs_dt > GATE_MAX_ABS_DT_S:
+        reasons.append(f"absolute LiDAR time offset {1000 * abs_dt:.0f} ms implausible (> {1000 * GATE_MAX_ABS_DT_S:.0f})"); level = "fail"
+    if solve_dt and abs(dt_total) > GATE_MAX_DT_S:
+        reasons.append(f"time shift {1000 * dt_total:+.0f} ms is a large change vs the parent offset (candidates/longer recording confirms it)")
+        level = "warn" if level == "ok" else level
     if h1["median_cm"] > h0["median_cm"] + 0.05: reasons.append("residual did not improve"); level = "fail"
     if not sol["converged"]:
         reasons.append(f"not converged in {MAX_ITERS} iterations"); level = "warn" if level == "ok" else level
@@ -383,18 +426,20 @@ def main():
     if cam and cam.get("transform_matrix"):
         cam["transform_matrix"] = (C @ np.asarray(cam["transform_matrix"], float).reshape(4, 4)).reshape(-1).tolist()
     if solve_dt:
-        out.setdefault("time_offsets", {})["lidar"] = round(lidar_off + sol["dt"], 4)
+        out.setdefault("time_offsets", {})["lidar"] = round(lidar_off + dt_total, 4)
         out["time_offsets"]["lidar_source"] = "rear-axle alignment (cross-time consistency vs INS poses)"
     out["calibration_type"] = calib.get("calibration_type", "") + "+rtk_rear_axle_alignment"
     out.setdefault("refinement", {})["rear_axle_alignment"] = {
         "reference": REFERENCE_KEY, "poses": f"{INS_TOPIC} (RTK fixed)", "applied_to": "all LiDARs and the camera (rig correction)",
         "solution_rotvec_deg": np.round(rv_full, 4).tolist(), "solution_translation_cm": np.round(dt_full, 2).tolist(),
         "correction_rotvec_deg": np.round(rv, 4).tolist(), "correction_translation_cm": np.round(dtcm, 2).tolist(),
-        "correction_matrix": C.reshape(-1).tolist(), "time_shift_s": None if a.keep_time_offset else round(sol["dt"], 4),
+        "correction_matrix": C.reshape(-1).tolist(), "time_shift_s": None if a.keep_time_offset else round(dt_total, 4),
         "time_offsets_used": {"lidar": lidar_off, "rtk_position": dt_pos, "ins_attitude": dt_att},
         "residual_cm": {"before": round(h0["median_cm"], 3), "after": round(h1["median_cm"], 3),
                         "ground_after": round(h1["ground_cm"], 3), "vertical_after": round(h1["vertical_cm"], 3)},
         "sqrt_information": {k: round(v, 1) for k, v in info.items()}, "repeatability_halves": split,
+        "time_profile": [{k: v for k, v in p_.items() if k != "T"} for p_ in profile],
+        "time_profile_min_dt_s": round(gts_final, 4) if profile else None,
         "scans_used": int(len(used)), "window_s": [round(float(rel.min()), 1), round(float(rel.max()), 1)], "dof": a.dof,
         "iterations": h1["iter"], "converged": sol["converged"], "quality": level, "reasons": reasons,
         "runtime_s": round(time.time() - t_start, 1)}
