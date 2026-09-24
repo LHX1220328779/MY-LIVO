@@ -9,7 +9,8 @@ algorithm yaml. Every stage creates a NEW version from a parent version and neve
 inputs. Stages (version suffix = stage; see STAGES for the operator-facing catalogue):
 
   import        normalise a supplier/factory perception JSON (schema-5 file or the raw supplier export with
-                lidar[] + midrange_camera[0].tf_lidar_to_camera) into version v001_import
+                lidar[] + midrange_camera[0].tf_lidar_to_camera) into version v001_import; without explicit
+                intrinsics the camera model is recovered from the supplier ground-distance curves (equation_*m)
   axle          reference-LiDAR -> rear-axle alignment from the recording's RTK/INS poses (rig correction for
                 every LiDAR and the camera + LiDAR time shift; scripts/refine_rear_axle_extrinsic.py); no mapping run
   ground        static-start roll/pitch/z refinement of every LiDAR (scripts/refine_multi_lidar_extrinsics.py)
@@ -18,6 +19,8 @@ inputs. Stages (version suffix = stage; see STAGES for the operator-facing catal
   camera-lidar  camera->rear-axle extrinsic refinement by LiDAR depth-edge / image-edge alignment
                 (advisory: writes overlays/ images, activate only after inspecting them)
   from-precheck adopt the corrections reported by the SLAM static-start self-check
+  windows       motion profile of a recording (INS odometry) -> stationary / driving windows for the stages and
+                calibration rounds (a recording that starts with a long standstill must not be calibrated on it)
   list/show/validate/activate/export/set/delete  bookkeeping
 
 Every --bag argument accepts the raw ROS 2 recording root (Perception_*/Camera_* segment folders)
@@ -300,6 +303,139 @@ def orthonormalize(m):
     return out
 
 
+def ground_equations(mc0):
+    """Supplier ground-distance curves `midrange_camera[0].equation_<d>m`: (mantissa, exponent) pairs = coefficients
+    (highest power first) of the image row of the flat-ground circle of radius d m as a polynomial in the image
+    column. Returns {d: coefficients}, sorted by distance."""
+    eqs = {}
+    for key, val in (mc0 or {}).items():
+        m = re.fullmatch(r"equation_(\d+(?:\.\d+)?)m", str(key))
+        if not m or not isinstance(val, (list, tuple)):
+            continue
+        v = np.asarray(val, float).reshape(-1)
+        if v.size < 4 or v.size % 2 or not np.isfinite(v).all():
+            continue
+        c = v.reshape(-1, 2)
+        eqs[float(m.group(1))] = c[:, 0] * 10.0 ** c[:, 1]
+    return dict(sorted(eqs.items()))
+
+
+def intrinsics_from_ground_equations(eqs, T_rear_cam, width=1920, height=1080):
+    """Recover the pinhole intrinsics the supplier used to draw its ground-distance curves.
+
+    Each curve is the image of a flat-ground circle (radius d, centre (x0, y0) at height zg in the rear-axle frame)
+    seen through the supplier's own camera extrinsic T_rear_cam, so the curves fix fx, fy, cx, cy (+ x0, y0, zg).
+    fy and zg trade off weakly, so the square-pixel model is preferred whenever it fits as well as the free one.
+    Checked on truck29 (whose yaml intrinsics are known): fx/cx/cy within 2.2 px, fy within 0.5 %.
+    Returns (intrinsics [fx, fy, cx, cy] or None, info)."""
+    from scipy.optimize import least_squares
+    info = {"curves": len(eqs), "distances_m": [float(d) for d in eqs]}
+    if len(eqs) < 4:
+        info["reason"] = f"only {len(eqs)} ground-distance curves (need >= 4)"
+        return None, info
+    T = np.asarray(T_rear_cam, float).reshape(4, 4)
+    T_cam_rear = np.linalg.inv(T)
+    cols = np.arange(0.0, float(width), 40.0)
+    ang = np.radians(np.linspace(-89.0, 89.0, 1601))
+    targets = [(d, np.polyval(c, cols)) for d, c in eqs.items()]
+
+    def rows(fx, fy, cx, cy, x0, y0, zg, d):
+        P = np.vstack([x0 + d * np.sin(ang), y0 + d * np.cos(ang), np.full_like(ang, zg)])
+        pc = T_cam_rear[:3, :3] @ P + T_cam_rear[:3, 3:4]
+        ok = pc[2] > 0.5
+        u, v = cx + fx * pc[0, ok] / pc[2, ok], cy + fy * pc[1, ok] / pc[2, ok]
+        o = np.argsort(u)
+        return np.interp(cols, u[o], v[o], left=np.nan, right=np.nan)
+
+    def residuals(p, square):
+        fx, fy, rest = (p[0], p[0], p[1:]) if square else (p[0], p[1], p[2:])
+        out = []
+        for d, ve in targets:
+            m = (ve > 0) & (ve < height)
+            r = rows(fx, fy, *rest, d)[m] - ve[m]
+            out.append(np.where(np.isfinite(r), r, 200.0))
+        return np.concatenate(out)
+
+    f0 = 0.5 * width / np.tan(np.radians(30.0))
+    cam_z = float(T[2, 3])
+    fits = {}
+    for square in (False, True):
+        best = None
+        for zg0 in (cam_z - 2.5, cam_z - 3.5, cam_z - 4.5):
+            p0 = ([f0] if square else [f0, f0]) + [width / 2.0, height / 2.0, float(T[0, 3]), float(T[1, 3]), zg0]
+            try:
+                s = least_squares(residuals, p0, args=(square,), x_scale="jac", max_nfev=4000)
+            except Exception:  # noqa: BLE001
+                continue
+            if best is None or s.cost < best.cost:
+                best = s
+        if best is None:
+            continue
+        p = [float(v) for v in best.x]
+        if square:
+            p = [p[0]] + p
+        fits["square" if square else "free"] = {
+            "intrinsics": [round(v, 2) for v in p[:4]], "rms_px": round(float(np.sqrt(np.mean(best.fun ** 2))), 3),
+            "circle_centre_rear_m": [round(p[4], 3), round(p[5], 3)], "ground_z_rear_m": round(p[6], 3)}
+    info["fits"] = fits
+    if "free" not in fits:
+        info["reason"] = "ground-curve fit did not converge"
+        return None, info
+    free, sq = fits["free"], fits.get("square")
+    pick = sq if sq and sq["rms_px"] <= max(1.1 * free["rms_px"], free["rms_px"] + 0.02) else free
+    fx, fy, cx, cy = pick["intrinsics"]
+    h_cam = cam_z - pick["ground_z_rear_m"]
+    info.update({"model": "square pixels (fx = fy)" if pick is sq else "independent fx / fy",
+                 "rms_px": pick["rms_px"], "camera_height_m": round(h_cam, 3)})
+    problems = []
+    if pick["rms_px"] > 1.0:
+        problems.append(f"rms {pick['rms_px']} px > 1 px")
+    if not (0.3 * width < fx < 5 * width and 0.3 * width < fy < 5 * width):
+        problems.append(f"focal length {fx:.0f}/{fy:.0f} px implausible")
+    if not (0.25 * width < cx < 0.75 * width and 0.25 * height < cy < 0.75 * height):
+        problems.append(f"principal point ({cx:.0f}, {cy:.0f}) far from the image centre")
+    if not (0.5 < h_cam < 8.0):
+        problems.append(f"camera height {h_cam:.2f} m above the curve ground implausible")
+    if problems:
+        info["reason"] = "; ".join(problems)
+        return None, info
+    return [fx, fy, cx, cy], info
+
+
+# Intrinsics that agree with the truck29 defaults this closely are the same camera model: keep the yaml values
+# (the curves determine fy only to ~0.5 %), otherwise the curve fit replaces the borrowed defaults.
+SAME_CAMERA_TOL = {"focal_rel": 0.015, "centre_px": 15.0}
+
+
+def supplier_camera_model(mc0, T_rear_cam, camera):
+    """Camera intrinsics for a supplier file without camera_in_params: (intrinsics, source, check, note).
+    intrinsics is None when the defaults stay (confirmed or no usable curves)."""
+    eqs = ground_equations(mc0)
+    default = DEFAULT_CAMERA["intrinsics"]
+    if not eqs:
+        return None, "defaults (wuhu truck29 yaml)", None, (
+            "WARNING camera intrinsics: the supplier file has neither camera_in_params nor equation_*m curves; the "
+            "truck29 defaults are used unverified - set the real intrinsics (livo_calib.py set --intrinsics)")
+    fit, info = intrinsics_from_ground_equations(eqs, T_rear_cam, camera.get("width", 1920), camera.get("height", 1080))
+    check = {"method": "supplier ground-distance curves (midrange_camera[0].equation_*m)", **info}
+    if fit is None:
+        return None, "defaults (wuhu truck29 yaml)", check, (
+            f"WARNING camera intrinsics: truck29 defaults kept unverified, the ground-curve fit was rejected "
+            f"({info.get('reason')}) - check the camera model before LIVO")
+    dev = {"fx_pct": round(100 * (fit[0] / default[0] - 1), 2), "fy_pct": round(100 * (fit[1] / default[1] - 1), 2),
+           "cx_px": round(fit[2] - default[2], 1), "cy_px": round(fit[3] - default[3], 1)}
+    check["deviation_vs_truck29_defaults"] = dev
+    same = (max(abs(dev["fx_pct"]), abs(dev["fy_pct"])) <= 100 * SAME_CAMERA_TOL["focal_rel"]
+            and max(abs(dev["cx_px"]), abs(dev["cy_px"])) <= SAME_CAMERA_TOL["centre_px"])
+    if same:
+        return None, f"defaults (wuhu truck29 yaml), confirmed by the supplier ground-distance curves (rms {info['rms_px']} px)", \
+            check, "camera intrinsics: truck29 defaults confirmed by the supplier ground-distance curves"
+    return fit, f"supplier ground-distance curves equation_*m ({info['model']}, rms {info['rms_px']} px)", check, (
+        f"camera intrinsics recovered from the supplier ground-distance curves: fx {fit[0]:.1f} fy {fit[1]:.1f} "
+        f"cx {fit[2]:.1f} cy {fit[3]:.1f} (the truck29 defaults would be off by fx {dev['fx_pct']:+.1f} % "
+        f"fy {dev['fy_pct']:+.1f} % cx {dev['cx_px']:+.0f} px cy {dev['cy_px']:+.0f} px)")
+
+
 def cmd_import(a):
     src = pathlib.Path(a.source).resolve()
     calib = json.loads(src.read_text())
@@ -369,6 +505,15 @@ def cmd_import(a):
     if a.intrinsics:
         camera["intrinsics"] = [float(v) for v in a.intrinsics]
         source = "command line"
+    elif source.startswith("defaults") and isinstance(mc, list) and mc and isinstance(mc[0], dict):
+        # Raw supplier exports carry no intrinsics, only ground-distance curves drawn with them. Borrowing the
+        # truck29 model silently is wrong for any other camera (truck05: fx 1849 vs 1643, principal point 32 px off).
+        fit, source, check, note = supplier_camera_model(mc[0], m, camera)
+        if fit is not None:
+            camera["intrinsics"] = fit
+        if check is not None:
+            camera["intrinsics_check"] = check
+        notes.append(note)
     if a.distortion:
         camera["distortion"] = [float(v) for v in a.distortion]
     camera["source"] = source
@@ -536,16 +681,21 @@ def decode_hevc(stream_path, scale, keep=None):
     proc.wait()
 
 
-def dump_camera_stream(bag, out_dir, duration=None):
+def dump_camera_stream(bag, out_dir, duration=None, start=0.0):
     """Write the HEVC packets to one Annex-B stream. duration (s) caps the stream length from the
     first image: the optical-flow/gyro correlation reaches full accuracy with ~60 s of driving
     (measured spread <=1 ms vs the full recording), so the camera-time stage does not need to
-    decode the whole video."""
+    decode the whole video. start (s after the first image) skips a standstill head; the kept
+    stream begins at a key frame so every written packet decodes (index == packet index)."""
     stamps = []
     path = out_dir / "stream.h265"
+    t_first = None
     with open(path, "wb") as f:
         for topic, m in read_bag_topics(bag, ["midrange_camera/ffmpeg"]):
             t = m.header.stamp.sec + m.header.stamp.nanosec * 1e-9
+            t_first = t if t_first is None else t_first
+            if start and not stamps and (t - t_first < start or not int(getattr(m, "flags", 0)) & 1):
+                continue
             if duration is not None and stamps and t - stamps[0] > duration:
                 break
             stamps.append(t)
@@ -561,9 +711,9 @@ def read_imu(bag):
     return np.array(t), np.array(g)
 
 
-def estimate_camera_offset(bag, out_dir, fx, fy, scale=0.25, duration=None):
+def estimate_camera_offset(bag, out_dir, fx, fy, scale=0.25, duration=None, start=0.0):
     import cv2
-    stamps, stream = dump_camera_stream(bag, out_dir, duration=duration)
+    stamps, stream = dump_camera_stream(bag, out_dir, duration=duration, start=start)
     ti, gyro = read_imu(bag)
     if np.abs(gyro).max() > 20:  # deg/s stream
         gyro = np.radians(gyro)
@@ -647,27 +797,183 @@ def estimate_camera_offset(bag, out_dir, fx, fy, scale=0.25, duration=None):
     return result
 
 
+# Gates of the flow/gyro offset. truck29 (camera 7.6 m ahead of the rear axle, open road): segment spread 3.9-6.6 ms,
+# flow/gyro gain 1.15-1.25. truck05 (same lever arm, pitched 10 deg down, slopes 8-15 m away): gain 2.0-2.4, spread
+# 22.6 ms, estimate -35 ms, and LIVO diverged in 3 of 4 turns with it while 0 ms mapped repeatably (1.06 / 1.01 m).
+# Lateral camera motion in turns (yaw rate x lever arm / depth) adds flow in phase with the gyro but with a
+# time-varying weight, which shifts the lag; the gain exposes it.
+CAMTIME_MAX_SPREAD_MS = 12.0
+CAMTIME_MAX_GAIN = 1.6
+CAMTIME_MIN_CORR = 0.8
+
+
+def camera_time_quality(result):
+    """Whether a camera-time estimate is trustworthy enough to overwrite the parent's offset."""
+    problems = []
+    yaw = result.get("yaw") or {}
+    spread = result.get("segment_spread_ms")
+    gain = abs(float(yaw.get("gain") or float("nan")))
+    if spread is not None and spread > CAMTIME_MAX_SPREAD_MS:
+        problems.append(f"30 s segments disagree by {spread:.1f} ms (limit {CAMTIME_MAX_SPREAD_MS:.0f} ms)")
+    if np.isfinite(gain) and gain > CAMTIME_MAX_GAIN:
+        problems.append(f"image yaw flow is {gain:.2f}x the gyro rate (limit {CAMTIME_MAX_GAIN}): lateral camera motion in "
+                        "turns (near scene, camera far ahead of the rear axle) biases the lag")
+    if float(yaw.get("corr") or 0.0) < CAMTIME_MIN_CORR:
+        problems.append(f"flow/gyro correlation {float(yaw.get('corr') or 0.0):.2f} < {CAMTIME_MIN_CORR}")
+    return {"ok": not problems, "problems": problems, "segment_spread_ms": spread,
+            "gain": round(gain, 3) if np.isfinite(gain) else None}
+
+
 def cmd_camera_time(a):
     pdir, parent_calib, mine, truck = parent_info(a.id)
     _, ds_info = require_dataset(a.bag, camera=True, what="camera-time")
     out_dir = next_version_dir(mine, truck, "camtime")
     out_dir.mkdir(parents=True, exist_ok=True)
     fx, fy = parent_calib.get("camera", DEFAULT_CAMERA)["intrinsics"][:2]
-    result = estimate_camera_offset(pathlib.Path(a.bag), out_dir, fx, fy, duration=a.duration)
+    start = a.start
+    if start is None:  # skip a standstill head: the flow/gyro correlation needs yaw excitation
+        start = suggest_windows(motion_profile(a.bag))["camera_time_start_s"]
+    result = estimate_camera_offset(pathlib.Path(a.bag), out_dir, fx, fy, duration=a.duration, start=start)
+    result["start_s"] = start
     if result["camera_offset_s"] is None:
         sys.exit("camera time offset could not be estimated (no usable flow)")
     calib = copy.deepcopy(parent_calib)
     offsets = calib.setdefault("time_offsets", dict(DEFAULT_TIME_OFFSETS))
-    offsets["camera"] = round(result["camera_offset_s"], 4)
-    offsets["camera_source"] = f"optical flow vs gyro on {a.bag} (corr {result['yaw']['corr']:.2f})"
-    calib["calibration_type"] = calib.get("calibration_type", "") + "+camera_time_offset"
+    quality = camera_time_quality(result)
+    result["quality"] = quality
+    if quality["ok"]:
+        offsets["camera"] = round(result["camera_offset_s"], 4)
+        offsets["camera_source"] = f"optical flow vs gyro on {a.bag} (corr {result['yaw']['corr']:.2f})"
+        calib["calibration_type"] = calib.get("calibration_type", "") + "+camera_time_offset"
+    print(f"quality: {'ok' if quality['ok'] else 'warn'}  estimate {1000 * result['camera_offset_s']:+.1f} ms"
+          + ("" if quality["ok"] else f" NOT applied, parent value {offsets.get('camera')} kept ({'; '.join(quality['problems'])})"),
+          flush=True)
     (out_dir / "camera_time.json").write_text(json.dumps(result, indent=2) + "\n")
     finalize_version(out_dir, calib, mine=mine, truck=truck, stage="camtime", parent=a.id,
                      note=a.note or "camera->IMU time offset from optical flow vs gyro",
-                     inputs={"bag": a.bag, "dataset": ds_info, "duration": a.duration},
-                     metrics={"camera_offset_s": offsets["camera"], "yaw": result["yaw"], "pitch": result["pitch"],
+                     inputs={"bag": a.bag, "dataset": ds_info, "duration": a.duration, "start_s": start},
+                     metrics={"camera_offset_s": offsets["camera"], "estimated_offset_s": round(result["camera_offset_s"], 4),
+                              "applied": quality["ok"], "quality": quality, "yaw": result["yaw"], "pitch": result["pitch"],
                               "segments": result["segments"], "implied_fx_from_gain": result["implied_fx_from_gain"]},
                      activate=a.activate)
+
+
+# ----------------------------------------------------------------------------- motion windows
+MOTION_CACHE = REPO / "results" / ".studio" / "motion"
+MOVING_MPS = 0.5          # driving when the INS speed exceeds this for MOVING_HOLD_S
+MOVING_HOLD_S = 3.0
+STATIONARY_MPS = 0.05
+ROUND_LEAD_S = 8.0        # standstill kept before the first motion: IMU initialisation of the mapper
+MIN_SHIFT_S = 5.0         # recordings that start moving within ROUND_LEAD_S + this keep offset 0 (unchanged)
+
+
+def motion_profile(bag, refresh=False):
+    """1 Hz speed / yaw / distance profile of a recording from the INS odometry (plus IMU sample gaps), relative to
+    the dataset start (the player's --start-offset origin). Cached per recording under results/.studio/motion/."""
+    import hashlib
+    from livo.dataset import Dataset
+    from scipy.spatial.transform import Rotation as R
+    ds = Dataset.open(bag)
+    key = hashlib.sha1(f"{pathlib.Path(bag).resolve()}|{ds.start_ns}|{ds.end_ns}".encode()).hexdigest()[:16]
+    cache = MOTION_CACHE / f"{key}.json"
+    if cache.exists() and not refresh:
+        try:
+            return json.loads(cache.read_text())
+        except Exception:  # noqa: BLE001
+            pass
+    t0 = ds.start_ns * 1e-9
+    t, p, yaw, ti = [], [], [], []
+    for topic, m, _ts in ds.read_messages(ds.resolve_topics(["imu_data/odometry", "imu_data"])):
+        st = m.header.stamp.sec + m.header.stamp.nanosec * 1e-9 - t0
+        if topic.endswith("odometry"):
+            q = m.pose.pose.orientation
+            t.append(st)
+            p.append([m.pose.pose.position.x, m.pose.pose.position.y])
+            yaw.append(R.from_quat([q.x, q.y, q.z, q.w]).as_euler("zyx")[0])
+        else:
+            ti.append(st)
+    if len(t) < 100:
+        sys.exit(f"windows: {bag} has no usable INS odometry (imu_data/odometry)")
+    t, p, yaw = np.array(t), np.array(p), np.unwrap(np.array(yaw))
+    step = np.r_[0.0, np.linalg.norm(np.diff(p, axis=0), axis=1)]
+    dist = np.cumsum(step)
+    secs = np.arange(0, int(np.ceil(t[-1])) + 1)
+    d1 = np.interp(secs, t, dist)
+    y1 = np.interp(secs, t, yaw)
+    speed = np.r_[np.diff(d1), 0.0]
+    dyaw = np.r_[np.abs(np.diff(y1)), 0.0]
+    dti = np.diff(np.asarray(ti)) if len(ti) > 1 else np.array([])
+    gaps = [{"t_s": round(float(ti[i]), 2), "gap_ms": round(float(1000 * dti[i]), 1)} for i in np.flatnonzero(dti > 0.025)]
+    prof = {"bag": str(bag), "duration_s": round(float(t[-1]), 2), "path_m": round(float(dist[-1]), 1),
+            "speed_mps": [round(float(v), 3) for v in speed], "yaw_rate_dps": [round(float(np.degrees(v)), 3) for v in dyaw],
+            "imu_gaps": gaps, "imu_median_dt_ms": round(float(1000 * np.median(dti)), 2) if len(dti) else None}
+    try:
+        MOTION_CACHE.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps(prof) + "\n")
+    except OSError:
+        pass
+    return prof
+
+
+def _straight(v, w, s, min_mps=1.5, max_dps=2.0):
+    """4 s starting at second s are straight driving (ground stage moving frames)."""
+    return s + 4 <= len(v) and float(v[s:s + 4].min()) >= min_mps and float(np.degrees(w[s:s + 4]).max()) <= max_dps
+
+
+def suggest_windows(prof, round_duration=60.0):
+    """Stationary / driving windows from a motion profile.
+
+    round_start: every calibration round (LIO for the driven stage, LIVO for the camera loop) starts ROUND_LEAD_S
+    before the standstill->driving transition whose round_duration window holds the most driving (distance + turns),
+    so the mapper still initialises at rest. Recordings that start moving within the first ~13 s keep offset 0 (the
+    behaviour validated on truck29). The ground stage gets its stationary frames from the standstill before that
+    transition and its moving frames from a straight drive (the default 30-34 s when that is one, otherwise the
+    straightest 4 s at >= 1.5 m/s after the first drive; front LiDAR frame indices at 10 Hz)."""
+    v = np.asarray(prof["speed_mps"], float)
+    w = np.radians(np.asarray(prof["yaw_rate_dps"], float))
+    n = len(v)
+    hold = int(MOVING_HOLD_S)
+    moving = np.array([v[i] > MOVING_MPS and (v[i:i + hold] > 0.3).all() for i in range(n)])
+    rest = v < 0.1
+    # standstill -> driving transitions only (>= 4 s at rest right before): the round must start at rest
+    starts = [i for i in range(5, n) if moving[i] and not moving[i - 1] and rest[i - 5:i - 1].all()]
+    if moving[:1].any() or not starts:  # moving right away (or never resting): the validated offset-0 round
+        starts = [0] + starts
+    cands = []
+    for s in starts:
+        rs = max(0.0, s - ROUND_LEAD_S)
+        if rs < MIN_SHIFT_S:
+            rs = 0.0
+        a, b = int(rs), int(min(n, rs + round_duration))
+        score = float(v[a:b].sum() + 20.0 * np.degrees(w[a:b]).sum() / 90.0)  # 90 deg of turning ~ 20 m of driving
+        cands.append({"motion_start_s": float(s), "round_start_s": rs, "driving_m": round(float(v[a:b].sum()), 1),
+                      "turning_deg": round(float(np.degrees(w[a:b]).sum()), 1), "score": round(score, 1)})
+    best = max(cands, key=lambda c: c["score"]) if cands else {"motion_start_s": 0.0, "round_start_s": 0.0,
+                                                                  "driving_m": 0.0, "turning_deg": 0.0, "score": 0.0}
+    ms, rs = best["motion_start_s"], best["round_start_s"]
+    still = np.flatnonzero(v[: int(ms)] < STATIONARY_MPS) if ms > 0 else np.array([], int)
+    stat_first = int(still[0]) if len(still) else 0
+    stationary = (max(2, 10 * stat_first + 2), 20)
+    moving_frames = (300, 40)  # validated default (30-34 s); must be straight driving: the back LiDAR is solved
+    if not _straight(v, w, 30):  # per frame, and a hard turn (lever arm, deskew) biases its roll/pitch by ~1 deg
+        straight = [s for s in range(int(ms), n - 4) if _straight(v, w, s)]
+        if straight:
+            s_best = min(straight, key=lambda s: (float(np.degrees(w[s:s + 4]).max()), s))
+            moving_frames = (10 * s_best, 40)
+    gaps = [g for g in prof.get("imu_gaps", []) if rs <= g["t_s"] <= rs + round_duration]
+    return {"round_start_s": rs, "round_duration_s": round_duration, "motion_start_s": ms,
+            "camera_time_start_s": max(0.0, ms - 2.0) if rs > 0 else 0.0,
+            "ground_stationary_frames": list(stationary), "ground_moving_frames": list(moving_frames),
+            "driving_m": best["driving_m"], "turning_deg": best["turning_deg"], "candidates": cands,
+            "imu_gaps_in_round": gaps, "max_imu_gap_ms": max([g["gap_ms"] for g in prof.get("imu_gaps", [])], default=0.0),
+            "stationary_head_s": float(ms) if rs > 0 else 0.0}
+
+
+def cmd_windows(a):
+    prof = motion_profile(a.bag, refresh=a.refresh)
+    win = suggest_windows(prof, round_duration=a.round_duration)
+    win.update({"bag": str(a.bag), "duration_s": prof["duration_s"], "path_m": prof["path_m"]})
+    print(json.dumps(win, ensure_ascii=False))
 
 
 # ----------------------------------------------------------------------------- camera-LiDAR
@@ -1411,6 +1717,11 @@ def validate_calibration(calib, *, strict=False):
             errors.append(f"camera fx/fy {fx:.1f}/{fy:.1f} implausible")
         if not (0 < cx < w and 0 < cy < h):
             errors.append(f"camera principal point ({cx:.1f}, {cy:.1f}) outside {w}x{h}")
+        truck = str((calib.get("identity") or {}).get("truck") or "")
+        source = str(cam.get("source") or "")
+        if source.startswith("defaults") and "confirmed" not in source and truck and not truck.startswith("truck29"):
+            warnings.append("camera intrinsics are the truck29 defaults, unverified for this camera: derive them "
+                            "(livo_calib.py set --intrinsics-from-supplier) or enter measured values")
     offs = calib.get("time_offsets") or {}
     for k in ("lidar", "camera"):
         v = offs.get(k)
@@ -1479,13 +1790,32 @@ def cmd_set(a):
     changes = {}
     if a.camera_offset is not None:
         calib.setdefault("time_offsets", dict(DEFAULT_TIME_OFFSETS))["camera"] = a.camera_offset
+        calib["time_offsets"]["camera_source"] = f"operator set (livo_calib.py set): {a.note}" if a.note else "operator set"
         changes["time_offsets.camera"] = a.camera_offset
     if a.lidar_offset is not None:
         calib.setdefault("time_offsets", dict(DEFAULT_TIME_OFFSETS))["lidar"] = a.lidar_offset
         changes["time_offsets.lidar"] = a.lidar_offset
     if a.intrinsics:
         calib.setdefault("camera", copy.deepcopy(DEFAULT_CAMERA))["intrinsics"] = [float(v) for v in a.intrinsics]
+        calib["camera"]["source"] = "operator entered (livo_calib.py set --intrinsics)"
         changes["camera.intrinsics"] = calib["camera"]["intrinsics"]
+    elif a.intrinsics_from_supplier:
+        root = lineage_of(a.id, json.loads((pdir / "meta.json").read_text()).get("parent"))[0]
+        rdir = version_dir(root)
+        if not (rdir / "source.json").exists():
+            sys.exit(f"--intrinsics-from-supplier: lineage root {root} has no source.json (not an import)")
+        supplier = json.loads((rdir / "source.json").read_text())
+        mc = supplier.get("midrange_camera")
+        mc0 = mc[0] if isinstance(mc, list) and mc and isinstance(mc[0], dict) else {}
+        T_sup = json.loads((rdir / "calibration.json").read_text())["transforms"]["midrange_camera_to_rear_axle"]["transform_matrix"]
+        cam = calib.setdefault("camera", copy.deepcopy(DEFAULT_CAMERA))
+        fit, info = intrinsics_from_ground_equations(ground_equations(mc0), T_sup, cam.get("width", 1920), cam.get("height", 1080))
+        if fit is None:
+            sys.exit(f"--intrinsics-from-supplier: {info.get('reason')}")
+        cam["intrinsics"] = fit
+        cam["source"] = f"supplier ground-distance curves equation_*m of {root} ({info['model']}, rms {info['rms_px']} px)"
+        cam["intrinsics_check"] = {"method": "supplier ground-distance curves (midrange_camera[0].equation_*m)", **info}
+        changes["camera.intrinsics"] = fit
     if a.distortion:
         calib.setdefault("camera", copy.deepcopy(DEFAULT_CAMERA))["distortion"] = [float(v) for v in a.distortion]
         changes["camera.distortion"] = calib["camera"]["distortion"]
@@ -1565,8 +1895,17 @@ def main():
     p.add_argument("--bag", required=True, help="recording containing midrange_camera/ffmpeg and imu_data (raw root)")
     p.add_argument("--duration", type=float, default=None,
                    help="seconds of video used from the first image (default: all); ~60 s of driving is enough")
+    p.add_argument("--start", type=float, default=None,
+                   help="seconds skipped at the beginning (default: from the motion profile, i.e. the standstill "
+                        "head is skipped; 0 = from the first image)")
     common(p)
     p.set_defaults(func=cmd_camera_time)
+
+    p = sub.add_parser("windows", help="motion profile -> stationary/driving windows for stages and rounds (JSON)")
+    p.add_argument("--bag", required=True, help="recording: raw ROS 2 root (segment folders) or single bag folder")
+    p.add_argument("--round-duration", type=float, default=60.0, help="length of a calibration round (s)")
+    p.add_argument("--refresh", action="store_true", help="ignore the cached profile")
+    p.set_defaults(func=cmd_windows)
 
     p = sub.add_parser("camera-lidar")
     p.add_argument("--bag", required=True, help="recording containing midrange_camera/ffmpeg (raw root)")
@@ -1595,6 +1934,8 @@ def main():
     p.add_argument("--camera-offset", type=float)
     p.add_argument("--lidar-offset", type=float)
     p.add_argument("--intrinsics", nargs=4, type=float)
+    p.add_argument("--intrinsics-from-supplier", action="store_true",
+                   help="recover fx fy cx cy from the supplier ground-distance curves of the lineage's import")
     p.add_argument("--distortion", nargs=5, type=float)
     p.add_argument("--stage", choices=("manual", "camloop", "scan"), default="manual",
                    help="version suffix: manual (default), camloop (closed-loop pitch result), scan (temporary scan point)")

@@ -289,8 +289,13 @@ laser_mapping:
       # dropped message (0.020 s measured gap) aborted the whole run - that killed 4 of ~50 rounds
       # (152050 @88 s, 192528 @58 s, 200825.failed1 and studio_livo_202841 @88 s; the gap is exactly
       # 0.020000 s, i.e. one lost sample on the UDP/SHM path while the mapper was busy in VIO).
-      # 0.031 tolerates two consecutive drops and still refuses real recording holes (>= 0.05 s).
-      maximum_time_gap: 0.031
+      # 0.031 tolerated two consecutive drops, but recordings themselves contain short holes: truck05
+      # 20260914 has 68 single drops plus 40 ms @77.2 s, 60 ms @429.2 s and 30 ms @586.2 s in the bag
+      # (header and receive stamps agree), so every truck05 round crossing 77 s aborted. Propagation and
+      # deskew integrate across a gap with the mean of the two bracketing samples, i.e. linear
+      # interpolation, which is exact to ~1 cm / 0.01 deg over 0.1 s at haul-truck dynamics. 0.1 s bridges
+      # up to 9 lost samples; longer outages still stop the run instead of being bridged.
+      maximum_time_gap: 0.1
       gravity_est_en: true
       ba_bg_est_en: true
 

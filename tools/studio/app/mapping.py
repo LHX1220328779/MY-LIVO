@@ -53,8 +53,9 @@ def pipeline_round_cmd(round_name, mode, calibration_file, body, **overrides):
 
     `overrides` may carry per-step options: save_map=False (temporary scan rounds: saves ~1.5 GB and the map
     export), quick=True (--quick-eval: trajectory + summary only, ~40 s faster; the scale used by the pitch
-    fit and the closed-loop verdict is in both cases the same)."""
-    body = {**body, **{k: v for k, v in overrides.items() if k in ("save_map", "evaluate", "duration")}}
+    fit and the closed-loop verdict is in both cases the same), start_offset (s, motion-profile window of the
+    pipeline; None = from the start of the recording)."""
+    body = {**body, **{k: v for k, v in overrides.items() if k in ("save_map", "evaluate", "duration", "start_offset")}}
     cmd = round_cmd(round_name, mode, calibration_file, body,
                     force_save_map=bool(overrides.get("save_map", True)), evaluate=overrides.get("evaluate", True))
     if overrides.get("quick"):

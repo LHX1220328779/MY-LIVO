@@ -72,7 +72,7 @@ def main():
             out["reason"] = f"slope {b:.4f}/deg outside the expected {EXPECTED_SLOPE}"
         elif abs(a0 - 1.0) > 0.02:
             out["reason"] = (f"current native scale {a0:.4f} is off by more than 2%: the linear model around this working "
-                             "point does not hold, run the standard scan instead")
+                             "point does not hold; the pipeline continues with the standard scan (or run it manually)")
         else:
             dp_star = (a.target - a0) / b
             clamped = abs(dp_star) > a.max_abs
@@ -94,7 +94,10 @@ def main():
             out["reason"] = (f"slope {b:.4f}/deg outside the expected {EXPECTED_SLOPE} (rounds not comparable or "
                              "camera not contributing); pitch left unchanged")
         elif rms > 0.004:
-            out["reason"] = f"fit residual {rms:.4f} too large (run-to-run repeatability is ~0.0003)"
+            out["reason"] = (f"fit residual {rms:.4f} too large (truck29 repeatability is ~0.0003): the native LIVO scale is "
+                             "not repeatable in this window (dynamic objects in view, image-degenerate turns, wrong camera "
+                             "intrinsics?), so it cannot resolve the camera pitch - check the camera model, pick another "
+                             "window (start_offset) or keep the pitch")
         else:
             dp_star = (a.target - a0) / b
             clamped = abs(dp_star) > a.max_abs

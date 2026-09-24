@@ -315,6 +315,8 @@ def stage_cmd(stage, body):
         cmd += ["--window", *[str(float(v)) for v in body["window"]]]
     if command == "camera-time" and body.get("duration") not in (None, "", 0, "0"):
         cmd += ["--duration", str(float(body["duration"]))]
+    if command == "camera-time" and body.get("start") not in (None, ""):
+        cmd += ["--start", str(float(body["start"]))]
     if command == "camera-lidar":
         cmd += ["--frames", str(int(body.get("frames") or 12))]
         if body.get("solve_intrinsics"):
@@ -369,6 +371,29 @@ def latest_fusion_dir(round_name):
     return str(runs[-1]).rstrip("/")
 
 
+def _round_start(ctx, body):
+    """Playback offset of every calibration round: the operator's explicit start_offset wins, otherwise the
+    motion-profile window (standstill head skipped, ROUND_LEAD_S of rest kept for the IMU initialisation)."""
+    if body.get("start_offset") not in (None, ""):
+        return float(body["start_offset"]) or None
+    return float((ctx.get("win") or {}).get("round_start_s") or 0.0) or None
+
+
+def _windows_step(steps, dataset, round_duration):
+    steps.append({"title": "运动分析：选择标定窗口（跳过起步前静止段，保留 8 s 静止用于 IMU 初始化）",
+                  "build": lambda ctx: [PY, str(CALIB_TOOL), "windows", "--bag", dataset,
+                                        "--round-duration", f"{float(round_duration or 60):.0f}"],
+                  "after": lambda ctx, lines: ctx.__setitem__("win", _json_tail(lines))})
+
+
+def _camera_key(vid):
+    c = read_json(calibration_file(vid), {}) or {}
+    offs = c.get("time_offsets") or {}
+    return json.dumps([(c.get("transforms") or {}).get("midrange_camera_to_rear_axle", {}).get("transform_matrix"),
+                       (c.get("camera") or {}).get("intrinsics"), (c.get("camera") or {}).get("distortion"),
+                       offs.get("camera"), offs.get("lidar"), c.get("lidar")], sort_keys=True)
+
+
 def _json_tail(lines):
     for line in reversed(lines):
         line = line.strip()
@@ -390,55 +415,85 @@ def _camloop_steps(steps, body, mapping_cmd, *, truck, stamp, auto_activate, bas
     standard: two temporary `scan` versions (pitch +-SCAN_STEP_DEG about the camera x axis) are mapped and the
               three native path-length ratios are fitted (slope + residual checked). ~11 min, 4 rounds.
     fast    : one measured point (the zero-pitch round) with the slope taken from the vehicle's last standard
-              run (`pitch_slope`), i.e. only the intercept is measured. ~4 min, 2 rounds. Falls back to the
-              standard fit when the vehicle has no measured slope yet or the scale is off by > 2 %.
+              run (`pitch_slope`), i.e. only the intercept is measured. ~4 min, 2 rounds. A vehicle without a
+              measured slope runs the standard scan (pipeline_steps); when the one-point fit is rejected (native
+              scale off by > 2 %: outside the linear range) the two scan rounds of the standard mode run
+              automatically instead of failing the pipeline.
+    Every round starts at _round_start (motion-profile window) so standstill heads are not calibrated on.
     """
     round_duration = body.get("_cam_round_duration")
     if round_duration is not None:
         round_duration = float(round_duration) or None
     has_zero_round = bool(body.get("_has_zero_round"))
-    reuse = None
-    if not standard and body.get("reuse_round", True):
-        reuse = reusable_round(body.get("_parent_id") or "",
-                               min_duration=float(body.get("min_reuse_s") or (round_duration and round_duration * 0.9) or 55))
-    if reuse:
-        steps.append({"title": f"复用已有零俯仰轮次 {reuse['round']}（同版本，{reuse['duration_s']:.0f} s，尺度 {reuse.get('scale')}）",
-                      "build": lambda ctx, r=reuse["round"]: ["/bin/echo", f"reuse round {r} as the zero-pitch point"],
-                      "after": lambda ctx, lines, r=reuse["round"]: ctx.__setitem__(round0_key, r)})
-    elif not standard or not has_zero_round:
-        # no reusable round: map the zero-pitch point ourselves (fast camera pipelines already mapped
-        # round A before camlidar, so only camloop-kind / fast runs land here)
-        rn = f"calib_{truck}_livo_{stamp}_base"
-        steps.append({"title": f"LIVO 零俯仰建图 {rn}（当前版本）", "retry": 1, "round": rn, "build": lambda ctx, rn=rn: mapping_cmd(
-            rn, "livo", str(calibration_file(ctx[base_key])), body, duration=round_duration),
-            "after": lambda ctx, lines, rn=rn: ctx.__setitem__(round0_key, rn)})
-    if standard:
-        for sign, tag in ((+1, "up"), (-1, "dn")):
-            dp = sign * SCAN_STEP_DEG
-            steps.append({"title": f"俯仰扫描点 Δpitch {dp:+.2f}°（临时版本，不导出地图）", "build": lambda ctx, dp=dp: [
-                PY, str(CALIB_TOOL), "set", "--id", ctx[base_key], "--camera-rot-delta", f"{dp:.3f}", "0", "0",
-                "--stage", "scan", "--note", f"闭环俯仰扫描点 Δpitch={dp:+.2f}°（流水线临时版本，勿激活）"],
-                "after": lambda ctx, lines, tag=tag: ctx.__setitem__(f"scan_{tag}_id", parse_version_id(lines))})
-            rn = f"calib_{truck}_livo_{stamp}_scan_{tag}"
-            steps.append({"title": f"LIVO 扫描建图 {rn}（Δpitch {dp:+.2f}°，只评估轨迹）", "retry": 1, "round": rn,
-                          "build": lambda ctx, rn=rn, tag=tag: mapping_cmd(
-                              rn, "livo", str(calibration_file(ctx[f"scan_{tag}_id"])), body,
-                              duration=round_duration, save_map=False, quick=True),
-                          "after": lambda ctx, lines, rn=rn, tag=tag: ctx.__setitem__(f"scan_{tag}_round", rn)})
-        steps.append({"title": "拟合原生里程尺度 vs 俯仰增量，求过零点", "build": lambda ctx: [
-            PY, str(REPO / "scripts" / "analysis" / "camera_pitch_fit.py"),
-            "--point", f"{ctx[round0_key]}=0", "--point", f"{ctx['scan_up_round']}={SCAN_STEP_DEG}",
-            "--point", f"{ctx['scan_dn_round']}={-SCAN_STEP_DEG}"],
-            "after": lambda ctx, lines: ctx.update(pitch_fit=_json_tail(lines),
-                                                   pitch_delta_deg=_json_tail(lines).get("pitch_delta_deg"))})
+    fit_script = str(REPO / "scripts" / "analysis" / "camera_pitch_fit.py")
+    rn0 = f"calib_{truck}_livo_{stamp}_base"
+    if has_zero_round:
+        # camera pipeline: round A was mapped with the camera-time version; it is the zero point unless the
+        # camera-lidar stage actually changed the camera (then the zero point is re-mapped with the new version)
+        def zero_build(ctx, rn=rn0):
+            if _camera_key(ctx[base_key]) == _camera_key(ctx["camtime_id"]):
+                return ["/bin/echo", f"camera-lidar left the camera unchanged: round {ctx[round0_key]} is the zero-pitch point"]
+            return mapping_cmd(rn, "livo", str(calibration_file(ctx[base_key])), body, duration=round_duration,
+                               start_offset=_round_start(ctx, body))
+
+        def zero_after(ctx, lines, rn=rn0):
+            if not any("is the zero-pitch point" in line for line in lines):
+                ctx[round0_key] = rn
+        steps.append({"title": f"零俯仰点：camera-lidar 未改动相机时复用轮次 A，否则建图 {rn0}", "retry": 1, "round": rn0,
+                      "build": zero_build, "after": zero_after})
     else:
-        steps.append({"title": f"用已知俯仰斜率 {body.get('pitch_slope', DEFAULT_PITCH_SLOPE):.4f}/° 求过零点（只测零点）",
-                      "build": lambda ctx: [
-            PY, str(REPO / "scripts" / "analysis" / "camera_pitch_fit.py"), "--point", f"{ctx[round0_key]}=0",
-            "--slope", f"{body.get('pitch_slope', DEFAULT_PITCH_SLOPE):.4f}", "--max-abs", "0.15"],
-            "after": lambda ctx, lines: ctx.update(pitch_fit=_json_tail(lines),
-                                                   pitch_delta_deg=_json_tail(lines).get("pitch_delta_deg"),
-                                                   pitch_slope_source=body.get("pitch_slope_source"))})
+        # camloop pipeline: its base IS the parent, so in fast mode a finished round of the parent that played the
+        # same window is a free zero point; otherwise it is mapped
+        def base_build(ctx, rn=rn0):
+            if not standard and body.get("reuse_round", True):
+                r = reusable_round(body.get("_parent_id") or "",
+                                   min_duration=float(body.get("min_reuse_s") or (round_duration and round_duration * 0.9) or 55),
+                                   start_offset=_round_start(ctx, body) or 0.0)
+                if r:
+                    ctx["_reused_round"] = r["round"]
+                    return ["/bin/echo", f"reuse round {r['round']} ({r['duration_s']:.0f} s, scale {r.get('scale')}) as the zero-pitch point"]
+            return mapping_cmd(rn, "livo", str(calibration_file(ctx[base_key])), body, duration=round_duration,
+                               start_offset=_round_start(ctx, body))
+        steps.append({"title": f"LIVO 零俯仰建图 {rn0}（当前版本{'；快速模式优先复用同窗口的已有轮次' if not standard else ''}）",
+                      "retry": 1, "round": rn0, "build": base_build,
+                      "after": lambda ctx, lines, rn=rn0: ctx.__setitem__(round0_key, ctx.pop("_reused_round", None) or rn)})
+    if not standard:
+        slope = float(body.get("pitch_slope", DEFAULT_PITCH_SLOPE))
+        steps.append({"title": f"用已知俯仰斜率 {slope:.4f}/° 求过零点（只测零点；被拒绝时自动转标准扫描）",
+                      "build": lambda ctx: [PY, fit_script, "--point", f"{ctx[round0_key]}=0", "--slope", f"{slope:.4f}",
+                                            "--max-abs", "0.15", "--exit-zero"],
+                      "after": lambda ctx, lines: ctx.update(pitch_fit=_json_tail(lines),
+                                                             pitch_delta_deg=_json_tail(lines).get("pitch_delta_deg"),
+                                                             pitch_slope_source=body.get("pitch_slope_source"))})
+
+    def scan_needed(ctx):
+        if "scan_needed" not in ctx:
+            ctx["scan_needed"] = standard or not (ctx.get("pitch_fit") or {}).get("ok")
+            if not standard and ctx["scan_needed"]:
+                ctx["fast_fallback"] = (ctx.get("pitch_fit") or {}).get("reason")
+        return ctx["scan_needed"]
+
+    skip = "（快速拟合通过时跳过）" if not standard else ""
+    for sign, tag in ((+1, "up"), (-1, "dn")):
+        dp = sign * SCAN_STEP_DEG
+        steps.append({"title": f"俯仰扫描点 Δpitch {dp:+.2f}°（临时版本，不导出地图）{skip}", "build": lambda ctx, dp=dp: [
+            PY, str(CALIB_TOOL), "set", "--id", ctx[base_key], "--camera-rot-delta", f"{dp:.3f}", "0", "0",
+            "--stage", "scan", "--note", f"闭环俯仰扫描点 Δpitch={dp:+.2f}°（流水线临时版本，勿激活）"]
+            if scan_needed(ctx) else ["/bin/echo", "one-point fit accepted: scan point skipped"],
+            "after": lambda ctx, lines, tag=tag: ctx.__setitem__(f"scan_{tag}_id", parse_version_id(lines)) if scan_needed(ctx) else None})
+        rn = f"calib_{truck}_livo_{stamp}_scan_{tag}"
+        steps.append({"title": f"LIVO 扫描建图 {rn}（Δpitch {dp:+.2f}°，只评估轨迹）{skip}", "retry": 1, "round": rn,
+                      "build": lambda ctx, rn=rn, tag=tag: mapping_cmd(
+                          rn, "livo", str(calibration_file(ctx[f"scan_{tag}_id"])), body,
+                          duration=round_duration, save_map=False, quick=True, start_offset=_round_start(ctx, body))
+                      if scan_needed(ctx) else ["/bin/echo", "one-point fit accepted: scan round skipped"],
+                      "after": lambda ctx, lines, rn=rn, tag=tag: ctx.__setitem__(f"scan_{tag}_round", rn) if scan_needed(ctx) else None})
+    steps.append({"title": f"拟合原生里程尺度 vs 俯仰增量，求过零点{skip}", "build": lambda ctx: [
+        PY, fit_script, "--point", f"{ctx[round0_key]}=0", "--point", f"{ctx['scan_up_round']}={SCAN_STEP_DEG}",
+        "--point", f"{ctx['scan_dn_round']}={-SCAN_STEP_DEG}"] if scan_needed(ctx)
+        else ["/bin/echo", "one-point fit accepted: standard fit skipped"],
+        "after": lambda ctx, lines: ctx.update(pitch_fit=_json_tail(lines), pitch_delta_deg=_json_tail(lines).get("pitch_delta_deg"),
+                                               pitch_slope_source=None) if scan_needed(ctx) else None})
 
     def set_cmd(ctx):
         fit = ctx["pitch_fit"]
@@ -451,12 +506,12 @@ def _camloop_steps(steps, body, mapping_cmd, *, truck, stamp, auto_activate, bas
                   "after": lambda ctx, lines: ctx.update(camloop_id=parse_version_id(lines), result_id=parse_version_id(lines))})
     rv = f"calib_{truck}_livo_{stamp}_verify"
     steps.append({"title": f"LIVO 验证建图 {rv}（闭环版本）", "retry": 1, "round": rv, "build": lambda ctx: mapping_cmd(
-        rv, "livo", str(calibration_file(ctx["camloop_id"])), body, duration=round_duration),
+        rv, "livo", str(calibration_file(ctx["camloop_id"])), body, duration=round_duration, start_offset=_round_start(ctx, body)),
         "after": lambda ctx, lines: ctx.__setitem__("verify_round", rv)})
-    margin = "0.002" if standard else "0.0005"
     steps.append({"title": "闭环判定：基线轮次 vs 闭环版本（原生里程尺度 / 后轴误差 / 偏航）", "build": lambda ctx: [
         PY, str(REPO / "scripts" / "analysis" / "closed_loop_verdict.py"), ctx[baseline_key], ctx["verify_round"],
-        "--version-dir", str(CAL_ROOT.joinpath(*ctx["camloop_id"].split("/"))), "--scale-margin", margin, "--exit-zero"],
+        "--version-dir", str(CAL_ROOT.joinpath(*ctx["camloop_id"].split("/"))),
+        "--scale-margin", "0.002" if ctx.get("scan_needed", standard) else "0.0005", "--exit-zero"],
         "after": lambda ctx, lines: ctx.update(closed_loop=_verdict(lines))})
     steps.append({"title": "校验新版本", "build": lambda ctx: [PY, str(CALIB_TOOL), "validate", "--id", ctx["camloop_id"], "--strict"]})
 
@@ -486,8 +541,13 @@ def pipeline_steps(kind, body, mapping_cmd):
     mine, truck = parent.split("/")[:2]
     standard = (body.get("mode") or "standard") != "fast"
     slope_info = pitch_slope(mine, truck)
+    mode_note = None
+    if not standard and slope_info["source"] is None and kind in ("camera", "camloop"):
+        # the slope depends on the camera geometry (mount pitch/height, focal length): another truck's value is no
+        # prior for this one, so the first closed loop of a vehicle measures it with the standard scan
+        standard, mode_note = True, "本车尚无实测俯仰斜率（其他车的斜率不适用），已自动改用标准扫描"
     cam_dur = body.get("cam_round_duration")
-    cam_dur = 60.0 if cam_dur in (None, "") else (float(cam_dur) or None)  # default: first two segments; 0 = full
+    cam_dur = 60.0 if cam_dur in (None, "") else (float(cam_dur) or None)  # default: 60 s rounds; 0 = full
     body = {**body, "_parent_id": parent, "pitch_slope": slope_info["slope"], "pitch_slope_source": slope_info["source"],
             "_cam_round_duration": cam_dur, "_has_zero_round": kind == "camera"}
     stamp = dt.datetime.now().strftime("%m%d_%H%M%S")
@@ -495,6 +555,9 @@ def pipeline_steps(kind, body, mapping_cmd):
     steps = []
     if kind == "lidar":
         datasets.require(dataset)
+        lio_duration = body.get("lidar_round_duration")
+        lio_duration = 48.0 if lio_duration in (None, "") else float(lio_duration)
+        _windows_step(steps, dataset, lio_duration or 60)
         if body.get("skip_axle"):
             steps.append({"title": "跳过后轴对齐（沿用父版本的参考雷达外参）", "build": lambda ctx: ["/bin/echo", "axle skipped"],
                           "after": lambda ctx, lines: ctx.__setitem__("axle_id", parent)})
@@ -503,18 +566,19 @@ def pipeline_steps(kind, body, mapping_cmd):
                           "build": lambda ctx: stage_cmd("axle", {"id": parent, "dataset": dataset,
                                                                   "note": body.get("note") or "pipeline: axle"}),
                           "after": lambda ctx, lines: ctx.__setitem__("axle_id", parse_version_id(lines))})
-        steps.append({"title": "静止地面精修 (ground)", "build": lambda ctx: stage_cmd(
-            "ground", {"id": ctx["axle_id"], "dataset": dataset, "note": body.get("note") or "pipeline: ground"}),
+        steps.append({"title": "静止地面精修 (ground：静止帧取起步前，运动帧取行驶段)", "build": lambda ctx: stage_cmd(
+            "ground", {"id": ctx["axle_id"], "dataset": dataset, "note": body.get("note") or "pipeline: ground",
+                       "stationary": ctx["win"]["ground_stationary_frames"], "moving": ctx["win"]["ground_moving_frames"]}),
             "after": lambda ctx, lines: ctx.__setitem__("ground_id", parse_version_id(lines))})
         round_name = f"calib_{truck}_lio_{stamp}"
-        # The driven stage only reads native poses inside its window (default 8-40 s), so the LIO
-        # round does not need the whole recording: cap playback at window end + drain margin.
+        # The driven stage only reads native poses inside its window (default 8-40 s after the round start), so
+        # the LIO round does not need the whole recording: cap playback at window end + drain margin. The round
+        # starts ROUND_LEAD_S before the first drive (motion window), so 8-40 s is driving, not a standstill.
         # lidar_round_duration=0 restores the previous full-length behaviour.
-        lio_duration = body.get("lidar_round_duration")
-        lio_duration = 48.0 if lio_duration in (None, "") else float(lio_duration)
-        title_extra = f"，前 {lio_duration:.0f} s" if lio_duration else ""
+        title_extra = f"，{lio_duration:.0f} s（起点按运动窗口）" if lio_duration else ""
         steps.append({"title": f"LIO 建图轮次 {round_name}（用于行驶段精修{title_extra}）", "retry": 1, "round": round_name, "build": lambda ctx: mapping_cmd(
-            round_name, "lio", str(calibration_file(ctx["ground_id"])), body, duration=lio_duration or None),
+            round_name, "lio", str(calibration_file(ctx["ground_id"])), body, duration=lio_duration or None,
+            start_offset=_round_start(ctx, body)),
             "after": lambda ctx, lines: ctx.update(round=round_name, fusion_dir=latest_fusion_dir(round_name))})
         steps.append({"title": "行驶段 6-DoF 精修 (driven)", "build": lambda ctx: stage_cmd(
             "driven", {"id": ctx["ground_id"], "dataset": dataset, "run": ctx["fusion_dir"],
@@ -524,13 +588,15 @@ def pipeline_steps(kind, body, mapping_cmd):
                       "after": lambda ctx, lines: ctx.__setitem__("result_id", ctx["driven_id"])})
     elif kind == "camera":
         datasets.require(dataset, camera=True)
-        steps.append({"title": "相机时间偏移 (camera-time，前 60 s)", "build": lambda ctx: stage_cmd(
+        _windows_step(steps, dataset, cam_dur or 60)
+        steps.append({"title": "相机时间偏移 (camera-time，行驶段 60 s)", "build": lambda ctx: stage_cmd(
             "camera-time", {"id": parent, "dataset": dataset, "note": body.get("note") or "pipeline: camera-time",
-                            "duration": body.get("camtime_duration") if body.get("camtime_duration") not in (None, "") else 60}),
+                            "duration": body.get("camtime_duration") if body.get("camtime_duration") not in (None, "") else 60,
+                            "start": ctx["win"].get("camera_time_start_s", 0.0)}),
             "after": lambda ctx, lines: ctx.__setitem__("camtime_id", parse_version_id(lines))})
         round_name = f"calib_{truck}_livo_{stamp}"
         steps.append({"title": f"LIVO 建图轮次 A {round_name}（基线，俯仰增量 0）", "retry": 1, "round": round_name, "build": lambda ctx: mapping_cmd(
-            round_name, "livo", str(calibration_file(ctx["camtime_id"])), body, duration=cam_dur),
+            round_name, "livo", str(calibration_file(ctx["camtime_id"])), body, duration=cam_dur, start_offset=_round_start(ctx, body)),
             "after": lambda ctx, lines: ctx.update(round=round_name, fusion_dir=latest_fusion_dir(round_name))})
         steps.append({"title": "相机-LiDAR 偏航复核 (camera-lidar：灯柱投影列偏差，俯仰不动)", "build": lambda ctx: stage_cmd(
             "camera-lidar", {"id": ctx["camtime_id"], "dataset": dataset, "run": ctx["fusion_dir"],
@@ -540,6 +606,7 @@ def pipeline_steps(kind, body, mapping_cmd):
                        base_key="camlidar_id", round0_key="round", baseline_key="round", standard=standard)
     elif kind == "camloop":
         datasets.require(dataset, camera=True)
+        _windows_step(steps, dataset, cam_dur or 60)
         steps.append({"title": "当前版本作为待微调版本", "build": lambda ctx: ["/bin/echo", "base version prepared"],
                       "after": lambda ctx, lines: ctx.__setitem__("base_id", parent)})
         _camloop_steps(steps, body, mapping_cmd, truck=truck, stamp=stamp, auto_activate=auto_activate,
@@ -547,7 +614,7 @@ def pipeline_steps(kind, body, mapping_cmd):
     else:
         raise StudioError(f"未知流水线 {kind}")
     return steps, {"mine": mine, "truck": truck, "parent": parent, "dataset": dataset,
-                   "mode": "standard" if standard else "fast",
+                   "mode": "standard" if standard else "fast", "mode_note": mode_note,
                    "pitch_slope": None if standard else slope_info["slope"],
                    "pitch_slope_source": None if standard else slope_info["source"]}
 
@@ -600,14 +667,17 @@ def pitch_slope(mine, truck):
     for d in sorted(root.glob("v*_*"), reverse=True):
         fit = ((read_json(d / "meta.json", {}) or {}).get("metrics") or {}).get("pitch_fit") or {}
         b = fit.get("slope_per_deg")
+        if fit.get("slope_source") or len(fit.get("points") or []) < 3:
+            continue  # a fast run records the slope it ASSUMED: only a standard scan measures one
         if isinstance(b, (int, float)) and 0.03 <= b <= 0.4:
             return {"slope": float(b), "source": f"{mine}/{truck}/{d.name}"}
     return {"slope": DEFAULT_PITCH_SLOPE, "source": None}
 
 
-def reusable_round(calibration_id, min_duration=110.0):
+def reusable_round(calibration_id, min_duration=110.0, start_offset=None):
     """The newest finished LIVO round that already ran with this calibration: a free zero-pitch point for the
-    closed loop (same version, full length), so the fast mode only has to map the verify round."""
+    closed loop (same version, full length), so the fast mode only has to map the verify round. With
+    start_offset given, only a round that played the same window qualifies (native scale is window dependent)."""
     from . import mapping as mapping_module
     target = str(calibration_file(calibration_id))
     for r in mapping_module.list_runs(limit=40):
@@ -615,6 +685,10 @@ def reusable_round(calibration_id, min_duration=110.0):
             continue
         if str(r.get("calibration") or "") != target:
             continue
+        if start_offset is not None:
+            man = read_json(pathlib.Path(r["path"]) / "round.json", {}) or {}
+            if abs(float(man.get("start_offset") or 0.0) - float(start_offset)) > 0.5:
+                continue
         doc = read_json(pathlib.Path(r["path"]) / "evaluation" / "metrics.json", {}) or {}
         run = doc.get("run") or {}
         dur = float(run.get("duration_s") or 0)

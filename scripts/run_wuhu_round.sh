@@ -172,18 +172,25 @@ play_args=("$dataset" --preset "$mode" --rate "$rate" --start-offset "$start_off
 /usr/bin/python3 tools/livo/player.py "${play_args[@]}" > "$out/playback.log" 2>&1
 echo "playback_exit=$? at $(date -u +%FT%TZ)" >> "$out/run.log"
 
-# Drain: wait until the fusion frame index stops growing (tail caught up).
+# Drain: wait until the mapper has caught up with the played data (tail processed). With save_map the fusion
+# frame index frames.csv grows per frame; --no-save-map rounds (closed-loop scan rounds) write nothing before
+# the export, so the mapper log (per-frame timing tables) is watched instead. Watching only frames.csv
+# stopped those rounds 5 s after playback while the mapper still lagged 6-12 s (truck29 LIVO: 48 of 60 s
+# mapped), so scan rounds and their zero round were compared over different spans.
 phase draining
 fusion_dir=$(ls -dt "$out"/Log/fusion/*/ 2>/dev/null | head -1)
+progress="$fusion_dir/frames.csv"
+[[ -f "$progress" ]] || progress="$out/launch.log"
 last=-1; stable=0
 for i in $(seq 1 120); do
-  n=$(wc -l < "$fusion_dir/frames.csv" 2>/dev/null || echo 0)
+  n=$(stat -c %s "$progress" 2>/dev/null || echo 0)
   if [[ "$n" == "$last" ]]; then stable=$((stable+1)); else stable=0; fi
   last=$n
   [[ $stable -ge 5 ]] && break
   sleep 1
 done
-echo "frames_csv_lines=$last drained at $(date -u +%FT%TZ)" >> "$out/run.log"
+frames_lines=0; [[ -f "$fusion_dir/frames.csv" ]] && frames_lines=$(wc -l < "$fusion_dir/frames.csv")
+echo "frames_csv_lines=$frames_lines drained at $(date -u +%FT%TZ) (watched $(basename "$progress"))" >> "$out/run.log"
 
 # Graceful stop: the node handles SIGINT itself (finish accepted scans, final LM, export).
 phase finalizing
