@@ -1,0 +1,10 @@
+calibration=/home/project/MY-LIVO/config/carlibration/wuhu/truck05/v003_ground/calibration.json
+run=/home/project/MY-LIVO/results/calib_truck05_lio_0924_142354/Log/fusion/1790231486106403040
+window 8.0..40.0 s, lidar_time_offset -0.0368
+pass 1 poses: native frames.csv (6 DoF); pass 2 poses: RTK-optimized trajectory_optimized.txt (tilt about x/y and z of LiDARs with median match time gap > 2.0 s)
+scans used: front_right_lidar:322, back_lidar:322, front_left_lidar:322, front_lidar:322
+reference front_lidar: 228479 world points
+front_right_lidar: pass 1 matches 12173->12197 |res| median 8.77->8.63 cm; ground 9.10->9.17 (n=10380); vertical 7.61->5.42 (n=1174); match time gap median 1.3 s; correction rot deg (x,y,z)=(-0.029,-0.003,-0.048) trans cm=(+1.2,+7.3,+2.1); iters 21  [quality: warn; only 1174 vertical planar matches (yaw/x/y weakly observed)]
+front_left_lidar: pass 1 matches 10964->11061 |res| median 8.29->8.17 cm; ground 8.64->8.66 (n=9636); vertical 6.06->5.43 (n=889); match time gap median 1.6 s; correction rot deg (x,y,z)=(+0.131,-0.007,-0.199) trans cm=(-1.9,+3.6,-4.9); iters 25  [quality: warn; not converged in 25 iterations; only 889 vertical planar matches (yaw/x/y weakly observed)]
+back_lidar: insufficient matches; manual matrix kept  [quality: warn]
+quality: warn  (front_right_lidar: only 1174 vertical planar matches (yaw/x/y weakly observed); front_left_lidar: not converged in 25 iterations, only 889 vertical planar matches (yaw/x/y weakly observed); back_lidar: insufficient matches; matrix kept)

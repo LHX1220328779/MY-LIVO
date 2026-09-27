@@ -1,0 +1,36 @@
+{
+ "verdict": "fail",
+ "reasons": [
+  "native yaw P95 vs INS 2.85 -> 3.01 deg"
+ ],
+ "common_window": {
+  "t0": 110,
+  "t1": 120,
+  "baseline_rear_m": 23.228,
+  "candidate_rear_m": 24.012
+ },
+ "baseline": {
+  "round": "calib_truck29_livo_0924_112920_base",
+  "mode": "livo",
+  "calibration_id": "wuhu/truck29/v041_camlidar",
+  "duration_s": 117.7,
+  "scale": 0.9957,
+  "median_m": 15.7008,
+  "final_m": 22.1589,
+  "final_xy_m": 7.9258,
+  "yaw_p95_deg": 2.8477
+ },
+ "candidate": {
+  "round": "calib_truck29_livo_0924_112920_verify",
+  "mode": "livo",
+  "calibration_id": "wuhu/truck29/v042_camloop",
+  "duration_s": 117.7,
+  "scale": 0.9989,
+  "median_m": 16.0435,
+  "final_m": 22.8981,
+  "final_xy_m": 8.0226,
+  "yaw_p95_deg": 3.0054
+ },
+ "scale_margin": 0.0005,
+ "criteria": "scale within baseline+0.1%; rear error at last common window <= 1.10x+0.10 m; yaw P95 <= baseline+0.15 deg; round durations within 10%"
+}

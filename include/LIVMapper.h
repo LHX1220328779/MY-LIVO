@@ -146,6 +146,7 @@ public:
   double plot_time;
   int frame_cnt;
   double img_time_offset = 0.0;
+  double rtk_reference_time_shift_ = 0.0;
   deque<PointCloudXYZI::Ptr> lid_raw_data_buffer;
   deque<double> lid_header_time_buffer;
 

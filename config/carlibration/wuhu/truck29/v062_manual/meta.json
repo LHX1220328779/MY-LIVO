@@ -1,0 +1,143 @@
+{
+  "id": "wuhu/truck29/v062_manual",
+  "mine": "wuhu",
+  "truck": "truck29",
+  "version": "v062_manual",
+  "stage": "manual",
+  "stage_label": "手动设置",
+  "advisory": false,
+  "parent": "wuhu/truck29/v061_camloop",
+  "lineage": [
+    "wuhu/truck29/v055_import",
+    "wuhu/truck29/v056_axle",
+    "wuhu/truck29/v057_ground",
+    "wuhu/truck29/v058_driven",
+    "wuhu/truck29/v059_camtime",
+    "wuhu/truck29/v060_camlidar",
+    "wuhu/truck29/v061_camloop",
+    "wuhu/truck29/v062_manual"
+  ],
+  "created": "2026-09-26T21:28:49+08:00",
+  "note": "时间偏移改回 IMU 硬件对齐对（lidar -0.125 / camera -0.115）：axle 解 -0.1459 含 INS 链路延迟，喂给前端后 21ms 错位打花高角速率段的去畸变与颜色采样（灯柱白度 51.5%→79.3%，牌面着色同步改善）；融合精度在该区间平坦（LIVO 120s xy max 7.12→7.08 cm，达标）。证据链见 docs/mcp-color-regression-time-offsets.md",
+  "inputs": {},
+  "metrics": {
+    "changes": {
+      "time_offsets.camera": -0.115,
+      "time_offsets.lidar": -0.125
+    }
+  },
+  "changes_vs_parent": {
+    "time_offsets": {
+      "camera": {
+        "from": -0.1211,
+        "to": -0.115
+      },
+      "lidar": {
+        "from": -0.1459,
+        "to": -0.125
+      }
+    }
+  },
+  "summary": {
+    "lidars": [
+      {
+        "lidar": "front_right_lidar",
+        "key": "transform_matrix_lidar_1",
+        "t": [
+          2.7591,
+          6.0014,
+          1.8338
+        ],
+        "rpy_deg": [
+          -1.005,
+          -3.032,
+          -1.426
+        ]
+      },
+      {
+        "lidar": "back_lidar",
+        "key": "transform_matrix_lidar_2",
+        "t": [
+          -0.095,
+          -0.2998,
+          0.6874
+        ],
+        "rpy_deg": [
+          -1.084,
+          0.749,
+          -91.412
+        ]
+      },
+      {
+        "lidar": "front_left_lidar",
+        "key": "transform_matrix_lidar_3",
+        "t": [
+          -3.1289,
+          5.8056,
+          1.9748
+        ],
+        "rpy_deg": [
+          -3.413,
+          -0.811,
+          178.588
+        ]
+      },
+      {
+        "lidar": "front_lidar",
+        "key": "transform_matrix_lidar_6",
+        "t": [
+          -0.1088,
+          8.0401,
+          0.051
+        ],
+        "rpy_deg": [
+          1.452,
+          -1.532,
+          89.924
+        ]
+      }
+    ],
+    "camera_to_rear": {
+      "t": [
+        0.0029,
+        8.0422,
+        1.7517
+      ],
+      "rpy_deg": [
+        -96.512,
+        1.62,
+        0.291
+      ]
+    },
+    "camera": {
+      "topic": "/midrange_camera/image_raw",
+      "width": 1920,
+      "height": 1080,
+      "intrinsics": [
+        1642.570556640625,
+        1855.53173828125,
+        971.0083025529602,
+        534.2602337509306
+      ],
+      "distortion": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "source": "defaults (wuhu truck29 yaml)"
+    },
+    "time_offsets": {
+      "lidar": -0.125,
+      "camera": -0.115,
+      "rtk_position": 0.025,
+      "ins_attitude": 0.0,
+      "lidar_source": "rear-axle alignment (cross-time consistency vs INS poses)",
+      "source": "import (verify with camera-time / LIO evaluation)",
+      "camera_source": "operator set (livo_calib.py set): 时间偏移改回 IMU 硬件对齐对（lidar -0.125 / camera -0.115）：axle 解 -0.1459 含 INS 链路延迟，喂给前端后 21ms 错位打花高角速率段的去畸变与颜色采样（灯柱白度 51.5%→79.3%，牌面着色同步改善）；融合精度在该区间平坦（LIVO 120s xy max 7.12→7.08 cm，达标）。证据链见 docs/mcp-color-regression-time-offsets.md"
+    }
+  },
+  "calibration_file": "/home/project/MY-LIVO/config/carlibration/wuhu/truck29/v062_manual/calibration.json",
+  "overlays": []
+}

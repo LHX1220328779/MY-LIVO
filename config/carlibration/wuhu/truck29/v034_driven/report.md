@@ -1,0 +1,295 @@
+# wuhu/truck29/v034_driven
+
+- stage: driven (行驶段 6-DoF 精修)
+- parent: wuhu/truck29/v033_ground
+- lineage: wuhu/truck29/v007_import -> wuhu/truck29/v012_ground -> wuhu/truck29/v013_driven -> wuhu/truck29/v014_camtime -> wuhu/truck29/v018_camtime -> wuhu/truck29/v019_camlidar -> wuhu/truck29/v022_camloop -> wuhu/truck29/v023_camtime -> wuhu/truck29/v024_camlidar -> wuhu/truck29/v027_camloop -> wuhu/truck29/v028_camloop -> wuhu/truck29/v029_camtime -> wuhu/truck29/v030_camlidar -> wuhu/truck29/v031_camloop -> wuhu/truck29/v032_camloop -> wuhu/truck29/v033_ground -> wuhu/truck29/v034_driven
+- created: 2026-09-23T17:28:17+08:00
+- note: 效率集成测试 driven
+
+## inputs
+
+- bag: /home/project/data/haibo/wuhu_livo/ros2bag
+- dataset: {'path': '/home/project/data/haibo/wuhu_livo/ros2bag', 'kind': 'raw_split', 'segments': 8, 'duration_s': 120.13, 'has_camera': True}
+- run: results/mcpeff_it_lio48/Log/fusion/1790155569020849680/
+- window: [8.0, 40.0]
+
+## changes vs parent
+
+```
+{
+  "lidars": {
+    "front_right_lidar": {
+      "dt_cm": [
+        0.46,
+        0.45,
+        -2.79
+      ],
+      "drpy_deg": [
+        0.089,
+        -0.077,
+        0.004
+      ]
+    },
+    "back_lidar": {
+      "dt_cm": [
+        0.71,
+        -0.61,
+        -9.56
+      ],
+      "drpy_deg": [
+        -0.199,
+        0.051,
+        0.025
+      ]
+    },
+    "front_left_lidar": {
+      "dt_cm": [
+        1.08,
+        0.21,
+        -0.97
+      ],
+      "drpy_deg": [
+        -0.078,
+        -0.082,
+        0.013
+      ]
+    }
+  }
+}
+```
+
+## metrics
+
+```
+{
+  "refinement": {
+    "refinement": {
+      "reference": "front_lidar",
+      "corrections": {
+        "front_right_lidar": {
+          "rotvec_deg": [
+            -0.06279989033418391,
+            0.08102088773519586,
+            0.0
+          ],
+          "trans_cm": [
+            0.0,
+            0.0,
+            1.7613630321548095
+          ],
+          "yaw_xy_solved": false,
+          "about": "lidar position in rear-axle frame"
+        },
+        "front_left_lidar": {
+          "rotvec_deg": [
+            -0.06810100620629238,
+            -0.08768849328270907,
+            0.0
+          ],
+          "trans_cm": [
+            0.0,
+            0.0,
+            0.5435033678453096
+          ],
+          "yaw_xy_solved": false,
+          "about": "lidar position in rear-axle frame"
+        },
+        "back_lidar": {
+          "rotvec_deg": [
+            -0.024074345309057624,
+            -0.16682449694268928,
+            0.0
+          ],
+          "trans_cm": [
+            0.0,
+            0.0,
+            8.33551275752048
+          ],
+          "yaw_xy_solved": false,
+          "about": "lidar position in rear-axle frame"
+        }
+      },
+      "source": "/home/project/data/haibo/wuhu_livo/ros2bag",
+      "stationary_frames": [
+        2,
+        20
+      ],
+      "moving_frames": [
+        300,
+        40
+      ],
+      "stage2_6dof": {
+        "reference": "front_lidar",
+        "corrections": {
+          "front_right_lidar": {
+            "rotvec_deg": [
+              0.08693878099704276,
+              -0.07895986281198775,
+              0.009035668135969677
+            ],
+            "trans_cm": [
+              0.460771062300374,
+              0.44423406092574297,
+              -2.7898957483254416
+            ],
+            "about": "lidar position in rear-axle frame"
+          },
+          "front_left_lidar": {
+            "rotvec_deg": [
+              0.08023748365600163,
+              0.08079716098521324,
+              0.012485057318525434
+            ],
+            "trans_cm": [
+              1.077237302428994,
+              0.2133954847083079,
+              -0.9693154127419282
+            ],
+            "about": "lidar position in rear-axle frame"
+          },
+          "back_lidar": {
+            "rotvec_deg": [
+              0.05468032788474807,
+              0.19849147705324574,
+              0.027776560725180994
+            ],
+            "trans_cm": [
+              0.7056156832664023,
+              -0.606543362073177,
+              -9.559777906268243
+            ],
+            "about": "lidar position in rear-axle frame"
+          }
+        },
+        "run": "results/mcpeff_it_lio48/Log/fusion/1790155569020849680",
+        "window": [
+          8.0,
+          40.0
+        ],
+        "prior": [
+          0.5,
+          0.1
+        ]
+      }
+    }
+  }
+}
+```
+
+## summary
+
+```
+{
+  "lidars": [
+    {
+      "lidar": "front_right_lidar",
+      "key": "transform_matrix_lidar_1",
+      "t": [
+        2.8396,
+        5.7735,
+        1.799
+      ],
+      "rpy_deg": [
+        -0.778,
+        -3.127,
+        -1.208
+      ]
+    },
+    {
+      "lidar": "back_lidar",
+      "key": "transform_matrix_lidar_2",
+      "t": [
+        0.0147,
+        -0.5353,
+        0.5964
+      ],
+      "rpy_deg": [
+        -1.011,
+        0.824,
+        -91.147
+      ]
+    },
+    {
+      "lidar": "front_left_lidar",
+      "key": "transform_matrix_lidar_3",
+      "t": [
+        -3.0222,
+        5.547,
+        1.9461
+      ],
+      "rpy_deg": [
+        -3.594,
+        -0.654,
+        178.839
+      ]
+    },
+    {
+      "lidar": "front_lidar",
+      "key": "transform_matrix_lidar_6",
+      "t": [
+        -0.033,
+        7.793,
+        0.051
+      ],
+      "rpy_deg": [
+        1.3,
+        -1.67,
+        90.16
+      ]
+    }
+  ],
+  "camera_to_rear": {
+    "t": [
+      0.0742,
+      7.7914,
+      1.7519
+    ],
+    "rpy_deg": [
+      -96.347,
+      1.471,
+      0.557
+    ]
+  },
+  "camera": {
+    "topic": "/midrange_camera/image_raw",
+    "width": 1920,
+    "height": 1080,
+    "intrinsics": [
+      1642.570556640625,
+      1855.53173828125,
+      971.0083025529602,
+      534.2602337509306
+    ],
+    "distortion": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "source": "defaults (wuhu truck29 yaml)"
+  },
+  "time_offsets": {
+    "lidar": -0.125,
+    "camera": -0.115,
+    "rtk_position": 0.025,
+    "ins_attitude": 0.0,
+    "source": "import (verify with camera-time / LIO evaluation)",
+    "camera_source": "optical flow vs gyro on /home/project/data/haibo/wuhu_livo/ros2bag (corr 0.92)"
+  }
+}
+```
+
+## stage report
+
+```
+calibration=/home/project/MY-LIVO/config/carlibration/wuhu/truck29/v033_ground/calibration.json
+run=results/mcpeff_it_lio48/Log/fusion/1790155569020849680
+window 8.0..40.0 s, lidar_time_offset -0.125
+scans used: front_right_lidar:322, back_lidar:322, front_left_lidar:322, front_lidar:322
+reference front_lidar: 515009 world points
+front_right_lidar: matches 206544->206048 |res| median 3.44->3.14 cm; ground 3.34->3.02 (n=169335); vertical 3.93->3.83 (n=18098); correction rot deg (x,y,z)=(+0.087,-0.079,+0.009) trans cm=(+0.5,+0.4,-2.8); iters 15
+front_left_lidar: matches 232952->233002 |res| median 5.25->4.97 cm; ground 5.28->5.02 (n=155200); vertical 3.85->3.82 (n=26944); correction rot deg (x,y,z)=(+0.080,+0.081,+0.012) trans cm=(+1.1,+0.2,-1.0); iters 15
+back_lidar: matches 47460->47725 |res| median 8.81->3.42 cm; ground 10.17->3.25 (n=38635); vertical 4.21->4.03 (n=3338); correction rot deg (x,y,z)=(+0.055,+0.198,+0.028) trans cm=(+0.7,-0.6,-9.6); iters 14
+written /home/project/MY-LIVO/config/carlibration/wuhu/truck29/v034_driven/calibration.json
+```

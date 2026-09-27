@@ -11,6 +11,7 @@
 #include <pcl_conversions/pcl_conversions.h>
 #include <charconv>
 #include <set>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace
@@ -36,7 +37,7 @@ gtsam::ISAM2Params fusionSolverParameters()
 
 RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
     const M3D &rotation, const V3D &translation, const V3D &reference_lever,
-    const std::string &output_root)
+    const std::string &output_root, double reference_time_shift)
     : node(node_in), lidar_rotation(rotation), lidar_translation(translation),
       lever(reference_lever), solver(fusionSolverParameters())
 {
@@ -51,6 +52,13 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   parameters.param<double>("rtk/time_offset_sec", time_offset, 0.0);
   parameters.param<double>("rtk/attitude_time_offset_sec", attitude_time_offset, time_offset);
   if (!std::isfinite(attitude_time_offset)) throw std::runtime_error("rtk/attitude_time_offset_sec must be finite");
+  // Calibration-driven split of the lidar time semantics: frame stamps run on the
+  // hardware IMU base (time_offsets.lidar_frontend) while the INS association keeps
+  // the axle-calibrated alignment via this shift (= lidar - lidar_frontend).
+  if (!std::isfinite(reference_time_shift))
+    throw std::runtime_error("reference_time_shift must be finite");
+  time_offset += reference_time_shift;
+  attitude_time_offset += reference_time_shift;
   parameters.param("rtk/accepted_position_modes", accepted_modes, std::vector<int>{4});
   const std::pair<const char *, double *> doubles[] = {
       {"status_max_age_sec", &status_age}, {"interpolation_max_gap_sec", &interpolation_gap},
@@ -63,6 +71,7 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
       {"position_factor_interval_sec", &position_factor_interval},
       {"geometry_anchor_interval_sec", &geometry_anchor_interval},
       {"keyframe_translation_m", &key_translation}, {"keyframe_rotation_deg", &key_rotation},
+      {"keyframe_discontinuity_m", &key_discontinuity},
       {"plane_voxel_m", &plane_voxel}, {"plane_max_thickness_m", &plane_thickness},
       {"plane_model_sigma_m", &plane_noise_floor},
       {"motion_huber_rate_per_sqrt_sec", &motion_huber_rate},
@@ -173,6 +182,11 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   std::ofstream settings(directory / "parameters.txt");
   settings.exceptions(std::ios::badbit | std::ios::failbit);
   settings << "model=native_lio_global_correction; attitude_observation=ins_body_attitude_with_installation_misalignment; map_projection=native_deskew_world_point_with_point_time_correction; surface_factor_model=scan_end_rigid; surface_residual=common_support_mean_squared_point_distance; motion_residual=so3_and_endpoint_position; motion_rotation_loss=component_huber; motion_translation_loss=component_huber; local_geometry=bounded_shared_support; overlap_selection=observed_surface_covisibility; geometry_validation=observable_baseline_consistency; association_lifetime=verified_observation\n";
+  // EFFECTIVE INS association offsets (after the calibration-driven reference shift).
+  // Written first on purpose: the evaluation greps the first match.
+  settings << std::setprecision(17)
+           << "rtk.time_offset_sec=" << time_offset << '\n'
+           << "rtk.attitude_time_offset_sec=" << attitude_time_offset << '\n';
   for (const auto &name : node->list_parameters({}, 0).names)
   {
     const auto parameter = node->get_parameter(name);
@@ -1640,6 +1654,38 @@ void RtkFusion::process(Frame frame)
   // One scan of latency lets same-stamp INS/status callbacks arrive before
   // matching. A late RTK seed must not leave permanently frozen wrong matches.
   const Frame &candidate = recent_frames.size() > 1 ? recent_frames[recent_frames.size() - 2] : frame;
+  // Detect a native discontinuity between the two newest frames: the front
+  // end can settle/jump by several centimetres right after IMU
+  // initialization (and after any relocalization) while the vehicle and the
+  // INS reference barely move. Such a step between sparse knots would be
+  // smeared across the whole keyframe interval by the interpolated global
+  // correction, so bracket it with immediate knots on both sides instead.
+  bool discontinuity_key = pending_discontinuity_key;
+  pending_discontinuity_key = false;
+  if (frames.size() >= 2)
+  {
+    const Frame &previous = frames[frames.size() - 2];
+    const double step_dt = frame.stamp - previous.stamp;
+    Observation previous_reference, current_reference;
+    if (step_dt > 0 && step_dt < 0.5 &&
+        referenceAt(previous.stamp, previous_reference) &&
+        referenceAt(frame.stamp, current_reference) &&
+        previous_reference.imu_position.allFinite() &&
+        current_reference.imu_position.allFinite())
+    {
+      const V3D native_step = frame.raw.translation() - previous.raw.translation();
+      const V3D reference_step = current_reference.imu_position - previous_reference.imu_position;
+      const double mismatch = (native_step - reference_step).norm();
+      if (mismatch > key_discontinuity)
+      {
+        discontinuity_key = true;
+        pending_discontinuity_key = true;
+        RCLCPP_INFO(node->get_logger(),
+            "Native pose discontinuity %.3f m within %.3f s at %.3f; bracketing correction knots",
+            mismatch, step_dt, frame.stamp);
+      }
+    }
+  }
   bool keyframe = keyframes.empty();
   if (!keyframe)
   {
@@ -1648,6 +1694,7 @@ void RtkFusion::process(Frame frame)
     keyframe = dt >= key_min_interval && (dt >= key_interval ||
         relative.translation().norm() >= key_translation ||
         gtsam::Rot3::Logmap(relative.rotation()).norm() >= key_rotation);
+    if (discontinuity_key && dt > 1e-6) keyframe = true;
   }
   if (keyframe) optimizeKeyframe(candidate);
   // Do not label a failed native extrapolation beyond the newest correction
@@ -1995,9 +2042,19 @@ void RtkFusion::exportMap()
       color_archive.flush();
       std::ifstream input(directory / "colors.bin", std::ios::binary);
       input.exceptions(std::ios::failbit | std::ios::badbit);
-      PointCloudXYZRGB chunk;
-      for (const Frame &metadata : frames)
+      // Every frame recolors the surfaces inside its frustum, so the archive holds
+      // many color instances of the same physical spot. Instances taken while the
+      // camera swept fast (close pass, turning: motion blur + residual time skew)
+      // used to be aggregated together with the clean far/slow observations, which
+      // turned white poles gray and smeared sign patterns. Keep, per 3 cm voxel,
+      // only the instance with the slowest image-plane motion (rad/s + lateral
+      // translation rate over range as a pixel-rate proxy).
+      struct ScoredRGB { PointTypeRGB point; float score; };
+      std::unordered_map<std::uint64_t, ScoredRGB> best;
+      best.reserve(1 << 22);
+      for (std::size_t fi = 0; fi < frames.size(); ++fi)
       {
+        const Frame &metadata = frames[fi];
         if (metadata.color_count == 0) continue;
         Frame frame = metadata;
         auto cloud = std::make_shared<PointCloudXYZRGB>();
@@ -2013,8 +2070,38 @@ void RtkFusion::exportMap()
           point.g = static_cast<std::uint8_t>(packed[6 * i + 4]);
           point.b = static_cast<std::uint8_t>(packed[6 * i + 5]);
         }
-        frame.color_cloud = cloud;
-        appendDisplayCloud(frame, chunk);
+        double omega = 0.0, speed = 0.0;
+        if (fi + 1 < frames.size())
+        {
+          const double dt = std::max(frames[fi + 1].stamp - frames[fi].stamp, 1e-3);
+          const auto delta = frames[fi].raw.between(frames[fi + 1].raw);
+          omega = gtsam::Rot3::Logmap(delta.rotation()).norm() / dt;
+          speed = delta.translation().norm() / dt;
+        }
+        const auto correction = correctionAt(frame.stamp);
+        const V3D origin = frame.raw.translation();
+        for (const PointTypeRGB &point : *cloud)
+        {
+          const V3D native(point.x, point.y, point.z);
+          const double range = std::max((native - origin).norm(), 3.0);
+          const float score = static_cast<float>(omega + speed / range);
+          const V3D p = correction.transformFrom(native);
+          PointTypeRGB out = point;
+          out.x = static_cast<float>(p.x());
+          out.y = static_cast<float>(p.y());
+          out.z = static_cast<float>(p.z());
+          const auto cell = [](double v) {
+            return static_cast<std::uint64_t>(static_cast<std::int64_t>(std::floor(v / 0.03)) & 0x1FFFFF);
+          };
+          const std::uint64_t key = (cell(p.x()) << 42) | (cell(p.y()) << 21) | cell(p.z());
+          const auto it = best.find(key);
+          if (it == best.end() || score < it->second.score) best[key] = {out, score};
+        }
+      }
+      PointCloudXYZRGB chunk;
+      for (const auto &entry : best)
+      {
+        chunk.push_back(entry.second.point);
         if (chunk.size() >= static_cast<std::size_t>(export_chunk_points))
         {
           const auto file = directory / ("rgb_map_" + std::to_string(chunk_index++) + ".pcd");

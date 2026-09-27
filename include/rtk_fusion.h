@@ -169,6 +169,13 @@ struct RtkFusion
   double position_factor_interval = 0.5;
   double geometry_anchor_interval = 0.5;
   double key_translation = 3, key_rotation = 3;
+  // Native pose steps that disagree with the INS-derived IMU step by more
+  // than this within one frame interval (front-end init settling, map
+  // relocalization) get bracketed by immediate correction knots so the
+  // interpolated global correction never smears a native discontinuity
+  // across a full keyframe interval.
+  double key_discontinuity = 0.05;
+  bool pending_discontinuity_key = false;
   double plane_voxel = 2, plane_thickness = 0.05, plane_noise_floor = 0.05;
   double revisit_radius = 8, revisit_age = 15, match_distance = 1.2;
   double publish_interval = 1, last_publish = -1;
@@ -226,7 +233,7 @@ struct RtkFusion
 
   RtkFusion(const rclcpp::Node::SharedPtr &node_in, const M3D &rotation,
             const V3D &translation, const V3D &reference_lever,
-            const std::string &output_root);
+            const std::string &output_root, double reference_time_shift = 0.0);
   ~RtkFusion();
   void observe(const nav_msgs::Odometry &message);
   void observeStatus(const diagnostic_msgs::msg::DiagnosticArray &message);

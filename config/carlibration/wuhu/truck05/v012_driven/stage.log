@@ -1,0 +1,17 @@
+calibration=/home/project/MY-LIVO/config/carlibration/wuhu/truck05/v011_ground/calibration.json
+run=/home/project/MY-LIVO/results/calib_truck05_lio_0924_161043/Log/fusion/1790237459871651002
+window 8.0..40.0 s, lidar_time_offset -0.0368
+pass 1 poses: native frames.csv (6 DoF); pass 2 poses: RTK-optimized trajectory_optimized.txt (tilt about x/y and z of LiDARs with median match time gap > 2.0 s)
+scans used: front_right_lidar:322, back_lidar:322, front_left_lidar:322, front_lidar:322
+reference front_lidar: 582402 world points
+front_right_lidar: pass 1 matches 288192->288000 |res| median 4.32->4.12 cm; ground 4.35->4.26 (n=153044); vertical 4.11->3.80 (n=100940); match time gap median 8.9 s; correction rot deg (x,y,z)=(+0.065,+0.059,-0.038) trans cm=(+2.9,+2.3,-1.5); iters 14
+    pass 2 (cross-time LiDAR, drift-free poses, ground only): ground 4.10->3.97 cm (n=134789); tilt about x/y adjusted by (+0.011,-0.070) deg, z by -1.4 cm; iters 10
+    final correction rot deg (x,y,z)=(+0.076,-0.011,-0.038) trans cm=(+2.9,+2.3,-2.9)  [quality: ok]
+front_left_lidar: pass 1 matches 303083->302469 |res| median 5.01->4.17 cm; ground 4.90->4.83 (n=174138); vertical 5.10->2.92 (n=90749); match time gap median 7.8 s; correction rot deg (x,y,z)=(+0.033,-0.044,-0.228) trans cm=(+1.7,+0.9,-1.2); iters 16
+    pass 2 (cross-time LiDAR, drift-free poses, ground only): ground 4.42->4.26 cm (n=146774); tilt about x/y adjusted by (-0.020,+0.044) deg, z by -1.8 cm; iters 9
+    final correction rot deg (x,y,z)=(+0.013,-0.000,-0.228) trans cm=(+1.7,+0.9,-3.0)  [quality: ok]
+back_lidar: pass 1 matches 191585->190717 |res| median 4.44->3.62 cm; ground 7.57->4.30 (n=64623); vertical 3.21->3.13 (n=105396); match time gap median 19.5 s; correction rot deg (x,y,z)=(+0.249,+0.047,+0.064) trans cm=(-1.1,+0.8,-0.8); iters 18
+    pass 2 (cross-time LiDAR, drift-free poses, ground only): ground 5.16->4.92 cm (n=54604); tilt about x/y adjusted by (-0.169,+0.088) deg, z by -5.2 cm; iters 15
+    final correction rot deg (x,y,z)=(+0.081,+0.135,+0.064) trans cm=(-1.1,+0.8,-6.0)  [quality: ok]
+quality: ok
+written /home/project/MY-LIVO/config/carlibration/wuhu/truck05/v012_driven/calibration.json

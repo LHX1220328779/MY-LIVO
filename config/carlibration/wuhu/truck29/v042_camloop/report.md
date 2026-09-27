@@ -1,0 +1,165 @@
+# wuhu/truck29/v042_camloop
+
+- stage: camloop (相机外参闭环标定)
+- parent: wuhu/truck29/v041_camlidar
+- lineage: wuhu/truck29/v037_import -> wuhu/truck29/v038_ground -> wuhu/truck29/v039_driven -> wuhu/truck29/v040_camtime -> wuhu/truck29/v041_camlidar -> wuhu/truck29/v042_camloop
+- created: 2026-09-24T11:36:37+08:00
+- note: 相机俯仰闭环：Δpitch=+0.041°（尺度斜率 0.106/°，沿用历史值 wuhu/truck29/v032_camloop，1 轮，预测原生尺度 1.0000）
+
+## changes vs parent
+
+```
+{
+  "camera_to_rear": {
+    "dt_cm": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "drpy_deg": [
+      0.041,
+      0.0,
+      0.0
+    ]
+  }
+}
+```
+
+## metrics
+
+```
+{
+  "changes": {
+    "camera_rot_delta_deg_cam_xyz": [
+      0.0406,
+      0.0,
+      0.0
+    ]
+  },
+  "pitch_fit": {
+    "ok": true,
+    "points": [
+      {
+        "round": "calib_truck29_livo_0924_112920_base",
+        "pitch_delta_deg": 0.0,
+        "path_length_ratio": 0.9957,
+        "duration_s": 117.7
+      }
+    ],
+    "target": 1.0,
+    "errors": [],
+    "slope_per_deg": 0.106,
+    "slope_source": "model/previous run",
+    "intercept": 0.9957,
+    "rms": 0.0,
+    "pitch_delta_deg": 0.0406,
+    "clamped": false,
+    "predicted_ratio": 1.0,
+    "reason": "zero crossing with the known slope"
+  }
+}
+```
+
+## summary
+
+```
+{
+  "lidars": [
+    {
+      "lidar": "front_right_lidar",
+      "key": "transform_matrix_lidar_1",
+      "t": [
+        2.8388,
+        5.4968,
+        1.9005
+      ],
+      "rpy_deg": [
+        -0.341,
+        -5.478,
+        -2.546
+      ]
+    },
+    {
+      "lidar": "back_lidar",
+      "key": "transform_matrix_lidar_2",
+      "t": [
+        -0.0994,
+        -0.7164,
+        0.6068
+      ],
+      "rpy_deg": [
+        1.363,
+        1.373,
+        -92.506
+      ]
+    },
+    {
+      "lidar": "front_left_lidar",
+      "key": "transform_matrix_lidar_3",
+      "t": [
+        -3.0322,
+        5.4076,
+        1.8285
+      ],
+      "rpy_deg": [
+        -4.016,
+        1.776,
+        177.447
+      ]
+    },
+    {
+      "lidar": "front_lidar",
+      "key": "transform_matrix_lidar_6",
+      "t": [
+        0.1069,
+        7.6128,
+        0.051
+      ],
+      "rpy_deg": [
+        -1.002,
+        -2.072,
+        88.958
+      ]
+    }
+  ],
+  "camera_to_rear": {
+    "t": [
+      0.1455,
+      7.5982,
+      1.7548
+    ],
+    "rpy_deg": [
+      -95.945,
+      -0.821,
+      -0.616
+    ]
+  },
+  "camera": {
+    "topic": "/midrange_camera/image_raw",
+    "width": 1920,
+    "height": 1080,
+    "intrinsics": [
+      1642.570556640625,
+      1855.53173828125,
+      971.0083025529602,
+      534.2602337509306
+    ],
+    "distortion": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "source": "defaults (wuhu truck29 yaml)"
+  },
+  "time_offsets": {
+    "lidar": 0.0,
+    "camera": -0.1211,
+    "rtk_position": 0.025,
+    "ins_attitude": 0.0,
+    "source": "import (verify with camera-time / LIO evaluation)",
+    "camera_source": "optical flow vs gyro on /home/project/data/haibo/wuhu_livo/ros2bag (corr 0.92)"
+  }
+}
+```

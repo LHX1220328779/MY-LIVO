@@ -92,7 +92,8 @@ LIVMapper::LIVMapper(const rclcpp::Node::SharedPtr &node)
   {
     if (!imu_standard_rfu || !rear_axle_to_imu_enabled)
       throw std::runtime_error("RTK fusion requires standard_rfu IMU and physical-IMU reference_frame_conversion.enabled");
-    rtk_fusion_ = std::make_unique<RtkFusion>(node_, extR, extT, imu_to_rear_axle, root_dir);
+    rtk_fusion_ = std::make_unique<RtkFusion>(node_, extR, extT, imu_to_rear_axle, root_dir,
+                                              rtk_reference_time_shift_);
     RCLCPP_INFO(node_->get_logger(), "RTK backend enabled for %s frontend",
                 slam_mode_ == LIVO ? "LIVO" : "LIO");
   }
@@ -587,6 +588,25 @@ void LIVMapper::loadMultiLidarCalibration()
       lidar_time_offset = offsets["lidar"].asDouble();
     if (offsets.isMember("camera") && offsets["camera"].isNumeric())
       img_time_offset = offsets["camera"].asDouble();
+    // Calibration determines BOTH time semantics; the mapper stays a generic tool:
+    //   lidar_frontend  scan<->IMU hardware offset -> front-end sync/deskew/image pairing
+    //   lidar           scan<->INS alignment (axle stage) -> fusion reference association
+    // With lidar_frontend present the front-end runs on the hardware base and the
+    // INS-side offsets are shifted by (lidar - lidar_frontend), so the fusion keeps the
+    // calibrated association. parameters.txt records the effective values and the
+    // evaluation follows automatically.
+    if (offsets.isMember("lidar_frontend") && offsets["lidar_frontend"].isNumeric())
+    {
+      const double frontend = offsets["lidar_frontend"].asDouble();
+      const double ins_aligned = lidar_time_offset;
+      lidar_time_offset = frontend;
+      const double shift = (offsets.isMember("lidar") && offsets["lidar"].isNumeric())
+                               ? (ins_aligned - frontend) : 0.0;
+      rtk_reference_time_shift_ = shift;
+      RCLCPP_INFO(node_->get_logger(),
+                  "Front-end lidar offset %+.4f s (hardware IMU base); INS alignment %+.4f s kept via reference shift %+.4f s",
+                  frontend, ins_aligned, shift);
+    }
     RCLCPP_INFO(node_->get_logger(),
                 "Time offsets from calibration file: lidar %+.4f s, camera %+.4f s",
                 lidar_time_offset, img_time_offset);

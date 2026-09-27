@@ -170,6 +170,14 @@ laser_mapping:
       keyframe_min_interval_sec: 0.49
       keyframe_translation_m: 3.0
       keyframe_rotation_deg: 3.0
+      # Native front-end settling right after IMU initialization (and any
+      # later relocalization) can step the native pose by ~10 cm within one
+      # frame while the vehicle is stationary. A step between sparse knots is
+      # smeared across the whole 0.5 s interval by the interpolated global
+      # correction (startup transient reached 10 cm for ~0.5 s). When the
+      # per-frame native step disagrees with the INS-derived IMU step by more
+      # than this, both frames around the step become correction knots.
+      keyframe_discontinuity_m: 0.05
       # RFU relative-motion uncertainty per sqrt(second); engineering model,
       # not the inverse of a fixed-map Hessian. Sigmas scale with sqrt(dt).
       # At 0.5 s: rotation [0.02,0.02,0.03] deg, translation [3,3,2] cm.
@@ -196,7 +204,14 @@ laser_mapping:
       plane_max_thickness_m: 0.05
       # Effective SURFACE MODEL sigma, including calibration/normal/model
       # uncertainty. It is not the single-return range noise or fit threshold.
-      plane_model_sigma_m: 0.05
+      # 0.2 (was 0.05): with 0.05 the cross-time surface anchors overpowered
+      # the RTK position factors whenever the native map drifted in bursts
+      # (truck05 turns drift 4-6 cm/s; the anchors dragged the fused pose
+      # 10+ cm off RTK and smeared the error acausally 2-3 s before the
+      # burst). 0.2 keeps revisit surfaces as a supplement without letting
+      # them veto RTK: truck05 W1/W2 max 11-13 -> 6-8 cm, truck29 LIO/LIVO
+      # unchanged or better (6.67 -> 6.56, 6.50 -> 5.02 cm).
+      plane_model_sigma_m: 0.2
       # Each surface belongs to one native deskewed scan-end pose, exactly
       # matching export. A multi-scan patch cannot stay rigid when C(t) changes.
       max_planes_per_frame: 800

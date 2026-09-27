@@ -1,0 +1,8 @@
+calibration=/home/project/MY-LIVO/config/carlibration/wuhu/truck29/v033_ground/calibration.json
+run=results/mcpeff_it_lio48/Log/fusion/1790155569020849680
+window 8.0..40.0 s, lidar_time_offset -0.125
+scans used: front_right_lidar:322, back_lidar:322, front_left_lidar:322, front_lidar:322
+reference front_lidar: 515009 world points
+front_right_lidar: matches 206544->206048 |res| median 3.44->3.14 cm; ground 3.34->3.02 (n=169335); vertical 3.93->3.83 (n=18098); correction rot deg (x,y,z)=(+0.087,-0.079,+0.009) trans cm=(+0.5,+0.4,-2.8); iters 15
+front_left_lidar: matches 232952->233002 |res| median 5.25->4.97 cm; ground 5.28->5.02 (n=155200); vertical 3.85->3.82 (n=26944); correction rot deg (x,y,z)=(+0.080,+0.081,+0.012) trans cm=(+1.1,+0.2,-1.0); iters 15
+back_lidar: matches 47460->47725 |res| median 8.81->3.42 cm; ground 10.17->3.25 (n=38635); vertical 4.21->4.03 (n=3338); correction rot deg (x,y,z)=(+0.055,+0.198,+0.028) trans cm=(+0.7,-0.6,-9.6); iters 14

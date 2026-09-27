@@ -336,7 +336,7 @@ def main():
             Rw2, tw2 = poses.at(data["tau"] + gts)
             d2["R"], d2["t"] = Rw2, tw2
             return d2
-        for gts in PROFILE:
+        def candidate(gts):
             s_ = solve(shifted(float(gts)), T_ref, active, solve_dt=True, gap=a.gap,
                        nq=max(a.samples // 2, 100000), iters=14, fine=False, seed=1, dt0=0.0)
             if s_ is not None and s_["hist"]:
@@ -344,6 +344,25 @@ def main():
                 profile.append({"baseline_s": round(float(gts), 4), "dt_s": round(eff, 4),
                                 "median_cm": round(s_["hist"][-1]["median_cm"], 3),
                                 "ground_cm": round(s_["hist"][-1]["ground_cm"], 3), "T": s_["T"]})
+        for gts in PROFILE:
+            candidate(gts)
+        # The default grid covers truck29-like offsets (-0.18..0). Other vehicles
+        # can sit outside it (truck05: effective offset near/above 0); while the
+        # best candidate lies on a grid edge, extend the grid in that direction
+        # so the detected offset is an interior minimum, never a grid boundary
+        # artifact silently far from the truth.
+        step, limit = 0.03, 0.30
+        while profile and len(profile) <= 25:
+            count = len(profile)
+            bases = sorted(p_["baseline_s"] for p_ in profile)
+            best = min(profile, key=lambda q_: q_["median_cm"])
+            lo, hi = bases[0], bases[-1]
+            if best["baseline_s"] <= lo + 1e-9 and lo - step >= -limit:
+                candidate(lo - step)
+            elif best["baseline_s"] >= hi - 1e-9 and hi + step <= limit:
+                candidate(hi + step)
+            if len(profile) == count:
+                break
         if profile:
             best = min(profile, key=lambda q_: q_["median_cm"])
             gts_final, T_start = best["dt_s"], best["T"]

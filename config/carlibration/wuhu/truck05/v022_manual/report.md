@@ -1,0 +1,191 @@
+# wuhu/truck05/v022_manual
+
+- stage: manual (手动设置)
+- parent: wuhu/truck05/v021_manual
+- lineage: wuhu/truck05/v008_import -> wuhu/truck05/v017_axle -> wuhu/truck05/v018_ground -> wuhu/truck05/v019_driven -> wuhu/truck05/v020_manual -> wuhu/truck05/v021_manual -> wuhu/truck05/v022_manual
+- created: 2026-09-27T16:10:22+08:00
+- note: lidar_frontend 按车队规则推定：INS 链路延迟为车队常数 -0.0209（truck29 实测），故 τ_h = τ_INS-axle + 0.0209 = -0.0119；-0.125 假设已被 full720 恶化(7.25→12.59)证伪
+
+## changes vs parent
+
+```
+{
+  "time_offsets": {
+    "lidar_frontend": {
+      "from": -0.125,
+      "to": -0.0119
+    }
+  }
+}
+```
+
+## metrics
+
+```
+{
+  "changes": {
+    "time_offsets.lidar_frontend": -0.0119
+  }
+}
+```
+
+## summary
+
+```
+{
+  "lidars": [
+    {
+      "lidar": "front_right_lidar",
+      "key": "transform_matrix_lidar_1",
+      "t": [
+        2.8517,
+        5.5544,
+        1.946
+      ],
+      "rpy_deg": [
+        0.696,
+        -2.271,
+        -1.14
+      ]
+    },
+    {
+      "lidar": "back_lidar",
+      "key": "transform_matrix_lidar_2",
+      "t": [
+        0.137,
+        -0.6639,
+        0.7946
+      ],
+      "rpy_deg": [
+        -1.053,
+        0.992,
+        -90.25
+      ]
+    },
+    {
+      "lidar": "front_left_lidar",
+      "key": "transform_matrix_lidar_3",
+      "t": [
+        -2.9725,
+        5.476,
+        1.9103
+      ],
+      "rpy_deg": [
+        -0.428,
+        -1.941,
+        179.676
+      ]
+    },
+    {
+      "lidar": "front_lidar",
+      "key": "transform_matrix_lidar_6",
+      "t": [
+        -0.0755,
+        7.6571,
+        0.5356
+      ],
+      "rpy_deg": [
+        0.058,
+        -5.285,
+        89.869
+      ]
+    }
+  ],
+  "camera_to_rear": {
+    "t": [
+      0.0232,
+      7.6631,
+      2.2531
+    ],
+    "rpy_deg": [
+      -100.4,
+      -0.011,
+      -0.455
+    ]
+  },
+  "camera": {
+    "topic": "/midrange_camera/image_raw",
+    "width": 1920,
+    "height": 1080,
+    "intrinsics": [
+      1849.37,
+      1849.37,
+      1003.31,
+      502.72
+    ],
+    "distortion": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "intrinsics_check": {
+      "method": "supplier ground-distance curves (midrange_camera[0].equation_*m)",
+      "curves": 10,
+      "distances_m": [
+        10.0,
+        20.0,
+        30.0,
+        40.0,
+        50.0,
+        60.0,
+        70.0,
+        80.0,
+        90.0,
+        100.0
+      ],
+      "fits": {
+        "free": {
+          "intrinsics": [
+            1849.32,
+            1831.26,
+            1004.09,
+            499.42
+          ],
+          "rms_px": 0.05,
+          "circle_centre_rear_m": [
+            -0.002,
+            7.529
+          ],
+          "ground_z_rear_m": -1.283
+        },
+        "square": {
+          "intrinsics": [
+            1849.37,
+            1849.37,
+            1003.31,
+            502.72
+          ],
+          "rms_px": 0.05,
+          "circle_centre_rear_m": [
+            0.001,
+            7.535
+          ],
+          "ground_z_rear_m": -1.249
+        }
+      },
+      "model": "square pixels (fx = fy)",
+      "rms_px": 0.05,
+      "camera_height_m": 3.502,
+      "deviation_vs_truck29_defaults": {
+        "fx_pct": 12.59,
+        "fy_pct": -0.33,
+        "cx_px": 32.3,
+        "cy_px": -31.5
+      }
+    },
+    "source": "supplier ground-distance curves equation_*m (square pixels (fx = fy), rms 0.05 px)"
+  },
+  "time_offsets": {
+    "lidar": -0.0328,
+    "camera": -0.115,
+    "rtk_position": 0.025,
+    "ins_attitude": 0.0,
+    "lidar_source": "rear-axle alignment (cross-time consistency vs INS poses)",
+    "source": "import (verify with camera-time / LIO evaluation)",
+    "lidar_frontend": -0.0119,
+    "camera_source": "operator set (livo_calib.py set): 相机时间偏移取硬件家族值 -0.115（同 truck29 同型相机；truck05 光流门限未过，0 值系未标定而非实测）"
+  }
+}
+```

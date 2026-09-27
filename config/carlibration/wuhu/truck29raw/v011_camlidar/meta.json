@@ -1,0 +1,266 @@
+{
+  "id": "wuhu/truck29raw/v011_camlidar",
+  "mine": "wuhu",
+  "truck": "truck29raw",
+  "version": "v011_camlidar",
+  "stage": "camlidar",
+  "stage_label": "相机-LiDAR 偏航/横滚复核",
+  "advisory": true,
+  "parent": "wuhu/truck29raw/v009_camloop",
+  "lineage": [
+    "wuhu/truck29raw/v001_import",
+    "wuhu/truck29raw/v002_axle",
+    "wuhu/truck29raw/v003_ground",
+    "wuhu/truck29raw/v004_driven",
+    "wuhu/truck29raw/v005_camtime",
+    "wuhu/truck29raw/v006_camlidar",
+    "wuhu/truck29raw/v009_camloop",
+    "wuhu/truck29raw/v011_camlidar"
+  ],
+  "created": "2026-09-26T18:12:01+08:00",
+  "note": "mcp-full-dof-intrinsics-diagnostic",
+  "inputs": {
+    "bag": "/home/project/data/haibo/wuhu_livo/ros2bag",
+    "dataset": {
+      "path": "/home/project/data/haibo/wuhu_livo/ros2bag",
+      "kind": "raw_split",
+      "segments": 8,
+      "duration_s": 120.13,
+      "has_camera": true
+    },
+    "run": "results/mcp_t29raw_p02_livo120_r2/Log/fusion/1790413711524616733/",
+    "frames": 16,
+    "window": [
+      5.0,
+      115.0
+    ]
+  },
+  "metrics": {
+    "method": "pole yaw (LiDAR pole axis vs image pole column)",
+    "frames_checked": 16,
+    "frames_with_poles": 7,
+    "observations": [
+      {
+        "t": 5.0,
+        "image": 210,
+        "depth_m": 33.7,
+        "height_m": 5.9,
+        "rows": 254,
+        "du_px": -0.51,
+        "mad_px": 0.38,
+        "yaw_deg": 0.0178,
+        "bar_width_px": 5,
+        "snr": 2.36,
+        "speed_mps": 2.13
+      },
+      {
+        "t": 12.3,
+        "image": 430,
+        "depth_m": 28.4,
+        "height_m": 8.2,
+        "rows": 392,
+        "du_px": 8.8,
+        "mad_px": 0.35,
+        "yaw_deg": -0.3062,
+        "bar_width_px": 5,
+        "snr": 2.38,
+        "speed_mps": 2.55
+      },
+      {
+        "t": 49.0,
+        "image": 1530,
+        "depth_m": 31.5,
+        "height_m": 8.9,
+        "rows": 255,
+        "du_px": 0.79,
+        "mad_px": 1.68,
+        "yaw_deg": -0.0262,
+        "bar_width_px": 7,
+        "snr": 2.28,
+        "speed_mps": 6.69
+      },
+      {
+        "t": 56.3,
+        "image": 1750,
+        "depth_m": 33.3,
+        "height_m": 5.4,
+        "rows": 213,
+        "du_px": 0.41,
+        "mad_px": 1.09,
+        "yaw_deg": -0.0134,
+        "bar_width_px": 3,
+        "snr": 5.17,
+        "speed_mps": 6.47
+      },
+      {
+        "t": 63.7,
+        "image": 1970,
+        "depth_m": 34.5,
+        "height_m": 7.8,
+        "rows": 323,
+        "du_px": 2.48,
+        "mad_px": 1.16,
+        "yaw_deg": -0.0792,
+        "bar_width_px": 3,
+        "snr": 4.08,
+        "speed_mps": 6.36
+      }
+    ],
+    "rejected": [
+      {
+        "t": 27.0,
+        "depth_m": 26.6,
+        "bar_px": 22.1,
+        "rows": 447,
+        "rejected": "rows disagree (MAD 5.9 px over 393 rows, width 5 px)"
+      },
+      {
+        "t": 34.3,
+        "depth_m": 28.6,
+        "bar_px": 13.8,
+        "rows": 439,
+        "rejected": "rows disagree (MAD 4.0 px over 439 rows, width 7 px)"
+      }
+    ],
+    "image_scale": 1.0,
+    "yaw_delta_deg": -0.0198,
+    "yaw_mad_deg": 0.044,
+    "used": 4,
+    "du_median_px": 0.79,
+    "delta_rot_deg_cam_xyz": [
+      0.0,
+      -0.0198,
+      0.0
+    ],
+    "delta_trans_m_cam_xyz": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "overlay_dir": "/home/project/MY-LIVO/config/carlibration/wuhu/truck29raw/v011_camlidar/overlays",
+    "max_delta_deg": 0.5,
+    "applied": true
+  },
+  "changes_vs_parent": {
+    "camera_to_rear": {
+      "dt_cm": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "drpy_deg": [
+        0.0,
+        0.002,
+        0.019
+      ]
+    }
+  },
+  "summary": {
+    "lidars": [
+      {
+        "lidar": "front_right_lidar",
+        "key": "transform_matrix_lidar_1",
+        "t": [
+          2.756,
+          5.9895,
+          1.8333
+        ],
+        "rpy_deg": [
+          -1.001,
+          -3.026,
+          -1.433
+        ]
+      },
+      {
+        "lidar": "back_lidar",
+        "key": "transform_matrix_lidar_2",
+        "t": [
+          -0.1094,
+          -0.311,
+          0.6862
+        ],
+        "rpy_deg": [
+          -1.079,
+          0.746,
+          -91.392
+        ]
+      },
+      {
+        "lidar": "front_left_lidar",
+        "key": "transform_matrix_lidar_3",
+        "t": [
+          -3.1269,
+          5.7908,
+          1.9755
+        ],
+        "rpy_deg": [
+          -3.418,
+          -0.801,
+          178.584
+        ]
+      },
+      {
+        "lidar": "front_lidar",
+        "key": "transform_matrix_lidar_6",
+        "t": [
+          -0.108,
+          8.0271,
+          0.051
+        ],
+        "rpy_deg": [
+          1.452,
+          -1.533,
+          89.921
+        ]
+      }
+    ],
+    "camera_to_rear": {
+      "t": [
+        0.0037,
+        8.0291,
+        1.7517
+      ],
+      "rpy_deg": [
+        -96.497,
+        1.619,
+        0.277
+      ]
+    },
+    "camera": {
+      "topic": "/midrange_camera/image_raw",
+      "width": 1920,
+      "height": 1080,
+      "intrinsics": [
+        1642.570556640625,
+        1855.53173828125,
+        971.0083025529602,
+        534.2602337509306
+      ],
+      "distortion": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "source": "defaults (wuhu truck29 yaml)"
+    },
+    "time_offsets": {
+      "lidar": -0.1463,
+      "camera": -0.1211,
+      "rtk_position": 0.025,
+      "ins_attitude": 0.0,
+      "source": "import (verify with camera-time / LIO evaluation)",
+      "lidar_source": "rear-axle alignment (cross-time consistency vs INS poses)",
+      "camera_source": "optical flow vs gyro on /home/project/data/haibo/wuhu_livo/ros2bag (corr 0.92)"
+    }
+  },
+  "calibration_file": "/home/project/MY-LIVO/config/carlibration/wuhu/truck29raw/v011_camlidar/calibration.json",
+  "overlays": [
+    "pole_00_t005.jpg",
+    "pole_01_t012.jpg",
+    "pole_02_t048.jpg",
+    "pole_03_t056.jpg",
+    "pole_04_t063.jpg"
+  ]
+}

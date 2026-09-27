@@ -1,0 +1,17 @@
+calibration=/home/project/MY-LIVO/config/carlibration/wuhu/truck29/v033_ground/calibration.json
+run=results/mcpeff_it_lio48/Log/fusion/1790155569020849680
+window 8.0..40.0 s, lidar_time_offset -0.125
+pass 1 poses: native frames.csv (6 DoF); pass 2 poses: RTK-optimized trajectory_optimized.txt (tilt about x/y and z of LiDARs with median match time gap > 2.0 s)
+scans used: front_right_lidar:322, back_lidar:322, front_left_lidar:322, front_lidar:322
+reference front_lidar: 515009 world points
+front_right_lidar: pass 1 matches 206544->206048 |res| median 3.44->3.14 cm; ground 3.34->3.02 (n=169335); vertical 3.93->3.83 (n=18098); match time gap median 3.2 s; correction rot deg (x,y,z)=(+0.087,-0.079,+0.009) trans cm=(+0.5,+0.4,-2.8); iters 15
+    pass 2 (cross-time LiDAR, drift-free poses, ground only): ground 3.46->3.08 cm (n=166096); tilt about x/y adjusted by (-0.045,-0.024) deg, z by +1.9 cm; iters 9
+    final correction rot deg (x,y,z)=(+0.042,-0.103,+0.009) trans cm=(+0.5,+0.4,-0.9)  [quality: ok]
+front_left_lidar: pass 1 matches 232952->233002 |res| median 5.25->4.97 cm; ground 5.28->5.02 (n=155200); vertical 3.85->3.82 (n=26944); match time gap median 5.6 s; correction rot deg (x,y,z)=(+0.080,+0.081,+0.012) trans cm=(+1.1,+0.2,-1.0); iters 15
+    pass 2 (cross-time LiDAR, drift-free poses, ground only): ground 5.12->5.05 cm (n=149974); tilt about x/y adjusted by (-0.021,-0.047) deg, z by +1.4 cm; iters 11
+    final correction rot deg (x,y,z)=(+0.059,+0.034,+0.012) trans cm=(+1.1,+0.2,+0.4)  [quality: ok]
+back_lidar: pass 1 matches 47460->47725 |res| median 8.81->3.42 cm; ground 10.17->3.25 (n=38635); vertical 4.21->4.03 (n=3338); match time gap median 10.7 s; correction rot deg (x,y,z)=(+0.055,+0.198,+0.028) trans cm=(+0.7,-0.6,-9.6); iters 14
+    pass 2 (cross-time LiDAR, drift-free poses, ground only): ground 4.41->3.30 cm (n=37746); tilt about x/y adjusted by (+0.081,-0.078) deg, z by +5.5 cm; iters 9
+    final correction rot deg (x,y,z)=(+0.135,+0.120,+0.028) trans cm=(+0.7,-0.6,-4.1)  [quality: ok]
+quality: ok
+written /home/project/MY-LIVO/config/carlibration/wuhu/truck29/v035_driven/calibration.json
