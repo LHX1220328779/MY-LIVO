@@ -93,9 +93,25 @@ LIVMapper::LIVMapper(const rclcpp::Node::SharedPtr &node)
     if (!imu_standard_rfu || !rear_axle_to_imu_enabled)
       throw std::runtime_error("RTK fusion requires standard_rfu IMU and physical-IMU reference_frame_conversion.enabled");
     rtk_fusion_ = std::make_unique<RtkFusion>(node_, extR, extT, imu_to_rear_axle, root_dir,
-                                              rtk_reference_time_shift_);
+                                              rtk_reference_time_shift_,
+                                              calib_rtk_position_offset_,
+                                              calib_ins_attitude_offset_);
     RCLCPP_INFO(node_->get_logger(), "RTK backend enabled for %s frontend",
                 slam_mode_ == LIVO ? "LIVO" : "LIO");
+    {
+      std::ostringstream lever_text;
+      lever_text << std::setprecision(17) << imu_to_rear_axle.x() << ' ' << imu_to_rear_axle.y() << ' ' << imu_to_rear_axle.z();
+      const auto num = [](double v) { std::ostringstream s; s << std::setprecision(17) << v; return s.str(); };
+      rtk_fusion_->appendParameters({
+          {"effective.lidar_time_offset_sec", num(lidar_time_offset)},
+          {"effective.img_time_offset_sec", num(img_time_offset)},
+          {"effective.rtk_reference_time_shift_sec", num(rtk_reference_time_shift_)},
+          {"effective.imu_to_rear_axle", lever_text.str()},
+          {"effective.camera_mode", img_en ? (vio_ekf_update_en ? "livo" : "colour_only") : "off"},
+          {"effective.camera_frame_divider", std::to_string(camera_frame_divider)},
+          {"calibration.file", calibration_file_},
+          {"calibration.id", calibration_identity_}});
+    }
   }
   else if (rtk_enabled)
     RCLCPP_WARN(node_->get_logger(), "RTK backend requires an IMU-enabled LIO/LIVO frontend");
@@ -104,6 +120,7 @@ LIVMapper::LIVMapper(const rclcpp::Node::SharedPtr &node)
   imu_reference_path.header.frame_id = "mine";
   tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(node_);
   alignment_broadcaster_ = std::make_unique<tf2_ros::StaticTransformBroadcaster>(node_);
+  printCalibrationSummary("startup");
 }
 
 LIVMapper::~LIVMapper() {}
@@ -285,6 +302,10 @@ void LIVMapper::readParameters()
   nh.param<int>("vio/patch_pyrimid_level", patch_pyrimid_level, 3);
   nh.param<int>("vio/patch_size", patch_size, 8);
   nh.param<double>("vio/outlier_threshold", outlier_threshold, 1000);
+  // false: camera colours the LiDAR map only; the estimator is pure LIO.
+  nh.param<bool>("vio/ekf_update_en", vio_ekf_update_en, true);
+  nh.param<bool>("debug/print_frame_timing", print_frame_timing, false);
+  nh.param<double>("debug/status_interval_sec", status_interval_sec, 10.0);
 
   nh.param<double>("time_offset/exposure_time_init", exposure_time_init, 0.0);
   nh.param<double>("time_offset/img_time_offset", img_time_offset, 0.0);
@@ -530,6 +551,13 @@ void LIVMapper::loadMultiLidarCalibration()
                  ["transform_matrix"];
   const Eigen::Matrix4d rear_from_camera = parse_rigid_transform(
       rear_from_camera_values, "midrange_camera_to_rear_axle");
+  rear_from_camera_ = rear_from_camera;
+  calibration_file_ = calibration_path.string();
+  if (calibration.isMember("identity") && calibration["identity"].isObject() &&
+      calibration["identity"].isMember("id"))
+    calibration_identity_ = calibration["identity"]["id"].asString();
+  if (calibration.isMember("calibration_type"))
+    calibration_type_ = calibration["calibration_type"].asString();
   const M3D camera_from_rear_rotation =
       rear_from_camera.block<3, 3>(0, 0).transpose();
   const V3D camera_from_rear_translation =
@@ -588,6 +616,14 @@ void LIVMapper::loadMultiLidarCalibration()
       lidar_time_offset = offsets["lidar"].asDouble();
     if (offsets.isMember("camera") && offsets["camera"].isNumeric())
       img_time_offset = offsets["camera"].asDouble();
+    calib_lidar_ins_offset_ = lidar_time_offset;
+    // INS association offsets travel with the calibration as well (the axle
+    // stage solves time_offsets.lidar under exactly these two values), so the
+    // mapper must not silently use different yaml values.
+    if (offsets.isMember("rtk_position") && offsets["rtk_position"].isNumeric())
+      calib_rtk_position_offset_ = offsets["rtk_position"].asDouble();
+    if (offsets.isMember("ins_attitude") && offsets["ins_attitude"].isNumeric())
+      calib_ins_attitude_offset_ = offsets["ins_attitude"].asDouble();
     // Calibration determines BOTH time semantics; the mapper stays a generic tool:
     //   lidar_frontend  scan<->IMU hardware offset -> front-end sync/deskew/image pairing
     //   lidar           scan<->INS alignment (axle stage) -> fusion reference association
@@ -600,6 +636,7 @@ void LIVMapper::loadMultiLidarCalibration()
       const double frontend = offsets["lidar_frontend"].asDouble();
       const double ins_aligned = lidar_time_offset;
       lidar_time_offset = frontend;
+      calib_lidar_frontend_offset_ = frontend;
       const double shift = (offsets.isMember("lidar") && offsets["lidar"].isNumeric())
                                ? (ins_aligned - frontend) : 0.0;
       rtk_reference_time_shift_ = shift;
@@ -720,6 +757,8 @@ void LIVMapper::initializeComponents()
   vio_manager->patch_pyrimid_level = patch_pyrimid_level;
   vio_manager->exposure_estimate_en = exposure_estimate_en;
   vio_manager->colmap_output_en = colmap_output_en;
+  vio_manager->ekf_update_en = vio_ekf_update_en;
+  vio_manager->print_frame_timing = print_frame_timing;
   vio_manager->initializeVIO();
 
   p_imu->set_extrinsic(extT, extR);
@@ -1102,7 +1141,8 @@ void LIVMapper::handleVIO()
     return;
   }
     
-  std::cout << "[ VIO ] Raw feature num: " << pcl_w_wait_pub->points.size() << std::endl;
+  if (print_frame_timing)
+    std::cout << "[ VIO ] Raw feature num: " << pcl_w_wait_pub->points.size() << std::endl;
 
   if (fabs((LidarMeasures.last_lio_update_time - _first_lidar_time) - plot_time) < (frame_cnt / 2 * 0.1)) 
   {
@@ -1345,7 +1385,7 @@ void LIVMapper::handleLIO()
         voxelmap_manager->cross_mat_list_[i], voxelmap_manager->body_cov_list_[i]);
   }
   voxelmap_manager->UpdateVoxelMap(voxelmap_manager->pv_list_);
-  std::cout << "[ LIO ] Update Voxel Map" << std::endl;
+  if (print_frame_timing) std::cout << "[ LIO ] Update Voxel Map" << std::endl;
   _pv_list = voxelmap_manager->pv_list_;
   
   double t4 = omp_get_wtime();
@@ -1428,6 +1468,19 @@ void LIVMapper::handleLIO()
   // printf("\033[1;36m[ LIO mapping time ]: current scan: icp: %0.6f secs, map incre: %0.6f secs, total: %0.6f secs.\033[0m\n"
   //         "\033[1;36m[ LIO mapping time ]: average: icp: %0.6f secs, map incre: %0.6f secs, total: %0.6f secs.\033[0m\n",
   //         t2 - t1, t4 - t3, t4 - t0, aver_time_icp, aver_time_map_inre, aver_time_consu);
+  if (status_interval_sec > 0.0 &&
+      LidarMeasures.last_lio_update_time - last_status_print_time_ >= status_interval_sec)
+  {
+    last_status_print_time_ = LidarMeasures.last_lio_update_time;
+    RCLCPP_INFO(node_->get_logger(),
+                "[status] t=%+.1f s frame %d: LIO %.1f ms (avg %.1f), points %zu, VIO avg %.1f ms%s",
+                LidarMeasures.last_lio_update_time - _first_lidar_time, frame_num,
+                1000.0 * (t4 - t0), 1000.0 * aver_time_consu, feats_down_body->points.size(),
+                1000.0 * vio_manager->ave_total,
+                slam_mode_ == LIVO ? (vio_ekf_update_en ? " [LIVO]" : " [LIVO colour-only]") : " [LIO]");
+  }
+  if (print_frame_timing)
+  {
   printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
   printf("\033[1;34m|                         LIO Mapping Time                    |\033[0m\n");
   printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
@@ -1440,8 +1493,9 @@ void LIVMapper::handleLIO()
   printf("\033[1;36m| %-29s | %-27f |\033[0m\n", "Current Total Time", t4 - t0);
   printf("\033[1;36m| %-29s | %-27f |\033[0m\n", "Average Total Time", aver_time_consu);
   printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
+  }
 
-  if (multi_lidar_enabled && !current_lidar_ts_info.sources.empty())
+  if (print_frame_timing && multi_lidar_enabled && !current_lidar_ts_info.sources.empty())
   {
     const auto &ts = current_lidar_ts_info;
     std::size_t max_topic_len = 12;
@@ -1561,6 +1615,90 @@ void LIVMapper::run(const volatile std::sig_atomic_t &stop_requested)
   if (fout_lidar_pos.is_open()) fout_lidar_pos.flush();
   if (rtk_fusion_) rtk_fusion_->finish();
   savePCD();
+  printCalibrationSummary("final");
+}
+
+namespace
+{
+// ZYX (yaw-pitch-roll) Euler angles in degrees, same convention as
+// tools/calib/livo_calib.py rpy_deg (scipy "xyz" extrinsic).
+Eigen::Vector3d rpyDegrees(const Eigen::Matrix3d &R)
+{
+  const double roll = std::atan2(R(2, 1), R(2, 2));
+  const double pitch = std::atan2(-R(2, 0), std::sqrt(R(2, 1) * R(2, 1) + R(2, 2) * R(2, 2)));
+  const double yaw = std::atan2(R(1, 0), R(0, 0));
+  return Eigen::Vector3d(roll, pitch, yaw) * (180.0 / M_PI);
+}
+}  // namespace
+
+void LIVMapper::printCalibrationSummary(const char *stage) const
+{
+  // One block that a person can read on the console: which calibration is in
+  // effect, every extrinsic, and every time offset with its meaning. Printed at
+  // startup and again after the backend finished, so it stays visible at the
+  // end of a run.
+  std::ostringstream out;
+  out << std::fixed;
+  const char *line = "------------------------------------------------------------------------------------------";
+  out << "\n" << line << "\n"
+      << "  CALIBRATION IN EFFECT (" << stage << ")"
+      << (calibration_identity_.empty() ? "" : "  " + calibration_identity_) << "\n"
+      << line << "\n";
+  if (!calibration_file_.empty()) out << "  file : " << calibration_file_ << "\n";
+  if (!calibration_type_.empty()) out << "  type : " << calibration_type_ << "\n";
+  out << "  LiDAR -> rear axle (RFU)                 x[m]      y[m]      z[m]   roll[deg] pitch[deg]  yaw[deg]\n";
+  for (const auto &source : lidar_sources)
+  {
+    const Eigen::Vector3d rpy = rpyDegrees(source->rear_from_lidar_rotation);
+    const Eigen::Vector3d &t = source->rear_from_lidar_translation;
+    out << "   " << std::left << std::setw(40) << (source->topic + " (" + source->transform_key + ")") << std::right
+        << std::setprecision(3) << std::setw(9) << t.x() << std::setw(10) << t.y() << std::setw(10) << t.z()
+        << std::setw(10) << rpy.x() << std::setw(11) << rpy.y() << std::setw(10) << rpy.z() << "\n";
+  }
+  if (img_en)
+  {
+    const Eigen::Vector3d rpy = rpyDegrees(rear_from_camera_.block<3, 3>(0, 0));
+    const Eigen::Vector3d t = rear_from_camera_.block<3, 1>(0, 3);
+    out << "   " << std::left << std::setw(40) << "camera -> rear axle" << std::right
+        << std::setprecision(3) << std::setw(9) << t.x() << std::setw(10) << t.y() << std::setw(10) << t.z()
+        << std::setw(10) << rpy.x() << std::setw(11) << rpy.y() << std::setw(10) << rpy.z() << "\n";
+    out << "   camera intrinsics fx " << std::setprecision(2) << camera_intrinsics[0] << " fy " << camera_intrinsics[1]
+        << " cx " << camera_intrinsics[2] << " cy " << camera_intrinsics[3] << " (" << camera_width << "x" << camera_height
+        << "), distortion [" << std::setprecision(4) << camera_distortion[0] << " " << camera_distortion[1] << " "
+        << camera_distortion[2] << " " << camera_distortion[3] << " " << camera_distortion[4] << "]\n";
+  }
+  out << "  rear axle -> physical IMU lever [m]      " << std::setprecision(3) << std::setw(9) << imu_to_rear_axle.x()
+      << std::setw(10) << imu_to_rear_axle.y() << std::setw(10) << imu_to_rear_axle.z()
+      << (rear_axle_to_imu_enabled ? "  (estimator body = IMU)" : "  (not applied)") << "\n";
+  out << std::setprecision(4);
+  out << "  time offsets [s] (added to the sensor header stamps)\n";
+  out << "   scan  <-> IMU  (front-end deskew/propagation)  " << std::showpos << lidar_time_offset << std::noshowpos
+      << (std::isfinite(calib_lidar_frontend_offset_) ? "  [calibration time_offsets.lidar_frontend]"
+                                                       : (std::isfinite(calib_lidar_ins_offset_) ? "  [calibration time_offsets.lidar]" : "  [yaml lidar_time_offset]"))
+      << "\n";
+  if (std::isfinite(calib_lidar_frontend_offset_))
+    out << "   scan  <-> INS  (axle-stage alignment)          " << std::showpos << calib_lidar_ins_offset_ << std::noshowpos
+        << "  -> reference shift " << std::showpos << rtk_reference_time_shift_ << std::noshowpos << " applied to the INS association\n";
+  if (img_en)
+    out << "   image <-> IMU  (camera)                        " << std::showpos << img_time_offset << std::noshowpos << "\n";
+  if (rtk_fusion_)
+  {
+    const double pos = rtk_fusion_->positionTimeOffset();
+    const double att = rtk_fusion_->attitudeTimeOffset();
+    out << "   INS association (effective): position " << std::showpos << pos << ", attitude " << att << std::noshowpos
+        << (std::isfinite(calib_rtk_position_offset_) ? "  [calibration rtk_position/ins_attitude + shift]" : "  [yaml rtk.time_offset_sec + shift]") << "\n"
+        << "   => scan stamped t (after the scan<->IMU offset) uses INS position at t" << std::showpos << pos
+        << " and INS attitude at t" << att << std::noshowpos << "\n";
+    const Eigen::Vector3d mis = rtk_fusion_->installationMisalignmentDeg();
+    if (mis.allFinite() && mis.norm() > 0.0)
+      out << "   INS installation misalignment estimated by the backend [deg]: " << std::setprecision(4)
+          << mis.x() << " " << mis.y() << " " << mis.z() << "\n";
+  }
+  out << "  camera mode: " << (img_en ? (vio_ekf_update_en ? "LIVO (photometric ESIKF update on)" : "colour-only (vio.ekf_update_en=false, estimator = LIO)")
+                                      : "off (LIO)")
+      << (img_en && camera_frame_divider > 1 ? ", frame divider " + std::to_string(camera_frame_divider) : "") << "\n";
+  out << line;
+  RCLCPP_INFO(node_->get_logger(), "%s", out.str().c_str());
 }
 
 void LIVMapper::prop_imu_once(StatesGroup &imu_prop_state, const double dt, V3D acc_avr, V3D angvel_avr)
@@ -2427,7 +2565,7 @@ void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg_in)
   // double msg_header_time =  msg->header.stamp.toSec();
   double msg_header_time = stampToSec(msg->header.stamp) + img_time_offset;
   if (abs(msg_header_time - last_timestamp_img) < 0.001) return;
-  ROS_INFO("Get image, its header time: %.6f", msg_header_time);
+  if (print_frame_timing) ROS_INFO("Get image, its header time: %.6f", msg_header_time);
   if (last_timestamp_lidar < 0) return;
 
   if (msg_header_time < last_timestamp_img)

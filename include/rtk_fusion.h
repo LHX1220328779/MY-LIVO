@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common_lib.h"
+#include <limits>
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <gtsam/geometry/Pose3.h>
 #include <gtsam/nonlinear/ISAM2.h>
@@ -162,6 +163,14 @@ struct RtkFusion
   // INS attitude can carry a different latency than the INS position output.
   // Scan time s uses the INS orientation sample stamped s + attitude_time_offset.
   double attitude_time_offset = 0;
+  double positionTimeOffset() const { return time_offset; }
+  // Append effective front-end settings to parameters.txt (values the node
+  // parameters do not show because the calibration file overrides them).
+  void appendParameters(const std::vector<std::pair<std::string, std::string>> &items) const;
+  const std::filesystem::path &outputDirectory() const { return directory; }
+  double attitudeTimeOffset() const { return attitude_time_offset; }
+  Eigen::Vector3d installationMisalignmentDeg() const { return final_misalignment_deg_; }
+  V3D final_misalignment_deg_ = V3D::Zero();
   double horizontal_sigma = 0.03, vertical_sigma = 0.05, covariance_scale = 1;
   double reported_model_sigma_xy = 0, reported_model_sigma_z = 0;
   double max_horizontal_sigma = 0.15, max_vertical_sigma = 0.25;
@@ -233,7 +242,9 @@ struct RtkFusion
 
   RtkFusion(const rclcpp::Node::SharedPtr &node_in, const M3D &rotation,
             const V3D &translation, const V3D &reference_lever,
-            const std::string &output_root, double reference_time_shift = 0.0);
+            const std::string &output_root, double reference_time_shift = 0.0,
+            double position_time_offset_override = std::numeric_limits<double>::quiet_NaN(),
+            double attitude_time_offset_override = std::numeric_limits<double>::quiet_NaN());
   ~RtkFusion();
   void observe(const nav_msgs::Odometry &message);
   void observeStatus(const diagnostic_msgs::msg::DiagnosticArray &message);

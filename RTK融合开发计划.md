@@ -309,3 +309,13 @@
 - 验收:120 s 整程 2.50/6.23/12.33 cm + 预算 PASS;首 60 s 1.60/3.69/5.36 cm 优于历史最佳口径。历史最佳(1.82/4.13/7.06)仍略领先整程,差距在后半程难段 + 杆对旋转约定(开放问题)。
 - 时间偏移扫描(4×60 s):-0.125 已被否定,-0.154±5 ms 最优;相机 -0.1211 s。导入不设偏移时全自动检测成立。
 - 遗留:① 杆对/后半程差距(坐标约定,待供应商定义);② `开发日志.md` 历史行(mcp-02/03 期)的表述保持原样仅追加;③ 版本目录 v049–v054 未入库(与现场习惯一致)。
+
+### 2026-09-27 colour-only 模式 + 时间偏移审计 + 评估侧修复（未改 LIO/后端求解）
+- 结论：VIO 光度更新是把两车精度拖到 8.5 cm 以上的主因；`camera.frame_divider=3` + `vio.ekf_update_en=false`（图像只上色）后 truck29 120 s 后轴 xy max 5.92 → **5.02 cm**、truck05 W40 **4.32**、W598 11.3 → **5.65 cm**，全程 720 s 见 docs。yaml 默认已切到该模式（`--set vio.ekf_update_en=true` 回旧 LIVO）。
+- 控制台：启动/结束打印 `CALIBRATION IN EFFECT`（四雷达/相机→后轴、内参、杆臂、四个时间偏移及作用路径、后端 INS 安装角、相机模式）；`parameters.txt` 新增 `effective.*`。
+- 修复：`round_summary.py`/`round_metrics.py` 读 `parameters.txt` 取了 yaml 转储的最后一次 `rtk.time_offset_sec`（+0.025）而非生效值，旧 `summary.txt`/`error_series.csv` 误差偏大（truck29 优化后中位 11 cm vs 真实 0.9 cm）；`metrics.json["trajectory"]` 一直正确。
+- 时间偏移审计：语义链路核对无误；truck29 三项偏移由陀螺/沿迹回归/相机边缘法（联合峰 −0.7 ms）独立证实；truck05 `lidar_frontend` 与 INS 位置关联在 ±15 ms 内**不可辨识**（原生偏航角速度法对 lidar_frontend 不敏感——同数据 −0.0119 与 −0.125 两值滞后仅 +10.2/+8.6 ms；速度互相关法自相矛盾，已删），本轮不改，几何仲裁列为后续。
+- 确定性：truck05 运行期 precheck 每轮对 front_left/right 施加 +5.5/+4.6 cm（front_right 在 4 cm 阈值边缘时施时不施）→ `from-precheck` 固化为 v024_precheck，720 s 全程 precheck 回到 confirmed。
+- 新工具：`scripts/analysis/time_sync_check.py`（INS 链路/关联时间自检）、`camera_sync_check.py`（LiDAR 深度边缘 vs 图像梯度定相机时间）、`camera_overlay_check.py`（投影叠加目视外参）；`livo_calib.py set --rtk-position-offset/--ins-attitude-offset`；`decode_hevc` 加 `-nostdin`。
+- 详见 docs/mcp-colour-only-and-time-offset-audit.md；轮次 results/mcp_t29_colour_120、mcp_t05_colour_w40、mcp_t05_colour_w598、mcp_t05_colour_full。
+- 全程 720 s（mcp_t05_colour_full）：xy 中位 0.72 / P95 2.69 / max 13.47 cm、z max 44 cm，**未达标**；超差全部在回放丢帧→多雷达合帧器失配（`Dropping unmatched … scan-start span 97 ms exceeds 1.0 ms`）→LIO 断更的 5 处帧空洞（184–199/277/330/352–372 s），其余 700 s xy ≤ 8.3 cm；播放器已加按建图进度节流（`--pace-topic/--max-lead/--hold-timeout`），合帧器失配恢复是 C++ 首要遗留项。

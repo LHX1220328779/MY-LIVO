@@ -1798,7 +1798,16 @@ void VIOManager::processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unor
 
   new_frame_.reset(new Frame(cam, img));
   updateFrameState(*state);
-  
+
+  if (!ekf_update_en)
+  {
+    // Colour-only mode: this image only colours the LiDAR returns of the
+    // current update (publish_frame_world uses new_frame_ = LIO pose at the
+    // image time). No visual map, no photometric update.
+    frame_count++;
+    return;
+  }
+
   resetGrid();
 
   double t1 = omp_get_wtime();
@@ -1848,6 +1857,7 @@ void VIOManager::processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unor
   // cout << BLUE << "ave_build_residual_time: " << ave_build_residual_time << RESET << endl;
   // cout << BLUE << "ave_ekf_time: " << ave_ekf_time << RESET << endl;
   
+  if (!print_frame_timing) return;
   printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
   printf("\033[1;34m|                         VIO Time                            |\033[0m\n");
   printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");

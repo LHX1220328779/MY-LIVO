@@ -69,10 +69,12 @@ laser_mapping:
       intrinsics: [1642.570556640625, 1855.53173828125,
                    971.0083025529602, 534.2602337509306]
       distortion: [0.0, 0.0, 0.0, 0.0, 0.0]
-      # Process every N-th image (1 = all). 30 Hz 1080p VIO is not real-time on the
-      # current machine (~10% behind after 2 min); 2-3 keeps LIVO real-time with a
-      # small loss in native accuracy (run 104: 10 Hz still passes the route budget).
-      frame_divider: 1
+      # Process every N-th image (1 = all). Default 3 = 10 Hz images: in colour-only
+      # mode (vio.ekf_update_en=false, below) the images only colour the map and 10 Hz
+      # is enough; it also keeps the LIO update cadence at the LiDAR rate (measured
+      # 2026-09: truck29 fused xy max 5.02 cm, truck05 W1/W2 4.32/5.65 cm, both better
+      # than full-rate LIVO 5.92 / 11.3 cm and than LIO-only 6.56 / 6.0 cm).
+      frame_divider: 3
 
     mine:
       # rosbag2 publishes this prepared MCAP with RELIABLE QoS. Matching it
@@ -315,6 +317,11 @@ laser_mapping:
       ba_bg_est_en: true
 
     vio:
+      # false = colour-only camera: the estimator is the LIO alone, images are only
+      # used to colour the map (rgb_map_*.pcd). The photometric VIO update degraded the
+      # fused result on both wuhu trucks (truck05 W598 LIVO 11.3 cm vs colour-only
+      # 5.65 cm xy max; truck29 5.92 vs 5.02 cm). Set true to re-enable the VIO update.
+      ekf_update_en: false
       max_iterations: 5
       outlier_threshold: 300.0
       img_point_cov: 100.0
@@ -371,5 +378,8 @@ laser_mapping:
       interval: 1
 
     debug:
+      # true prints one line per processed image with LIO/VIO timings (noisy; the
+      # 10 s [status] line already carries the averages).
+      print_frame_timing: false
       plot_time: -10.0
       frame_cnt: 6

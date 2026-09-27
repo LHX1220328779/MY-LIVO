@@ -71,7 +71,10 @@ def main():
     params = {}
     for line in (run / "parameters.txt").read_text().splitlines():
         if "=" in line and not line.startswith("model="):
-            k, v = line.split("=", 1); params[k.strip()] = v.strip()
+            k, v = line.split("=", 1); params.setdefault(k.strip(), v.strip())  # effective values come first
+    global LEVER
+    if params.get("effective.imu_to_rear_axle"):
+        LEVER = np.array([float(v) for v in params["effective.imu_to_rear_axle"].split()])
     time_offset = float(params.get("rtk.time_offset_sec", TIME_OFFSET))
     att_offset = float(params.get("rtk.attitude_time_offset_sec", time_offset))
     print(f"time offsets: position {time_offset:+.3f} s, attitude {att_offset:+.3f} s (from parameters.txt)")

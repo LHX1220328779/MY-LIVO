@@ -85,11 +85,13 @@ def read_parameters(fd):
         for line in (fd / "parameters.txt").read_text(errors="replace").splitlines():
             if "=" in line and not line.startswith("model="):
                 k, v = line.split("=", 1)
-                p[k.strip()] = v.strip()
+                p.setdefault(k.strip(), v.strip())  # effective values are written first
     keep = ("camera.frame_divider", "lio.max_iterations", "vio.max_iterations", "vio.img_point_cov", "vio.patch_size",
             "vio.exposure_estimate_en", "time_offset.img_time_offset", "time_offset.lidar_time_offset",
             "rtk.time_offset_sec", "rtk.attitude_time_offset_sec", "rtk.attitude_enabled", "rtk.frontend_attitude_aiding",
-            "multi_lidar.precheck.enabled", "multi_lidar.precheck.apply")
+            "multi_lidar.precheck.enabled", "multi_lidar.precheck.apply", "vio.ekf_update_en",
+            "effective.lidar_time_offset_sec", "effective.img_time_offset_sec", "effective.rtk_reference_time_shift_sec",
+            "effective.camera_mode", "effective.camera_frame_divider", "calibration.id")
     out = {k: p[k] for k in keep if k in p}
     out["time_offset_sec"] = fnum(p.get("rtk.time_offset_sec"))
     out["attitude_time_offset_sec"] = fnum(p.get("rtk.attitude_time_offset_sec"))

@@ -670,9 +670,11 @@ def decode_hevc(stream_path, scale, keep=None):
     """Decode an Annex-B HEVC stream with ffmpeg; yields (index, gray frame)."""
     import cv2  # noqa: F401
     w, h = int(1920 * scale), int(1080 * scale)
-    cmd = ["ffmpeg", "-loglevel", "error", "-f", "hevc", "-i", str(stream_path), "-vf", f"scale={w}:{h}",
+    cmd = ["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "hevc", "-i", str(stream_path), "-vf", f"scale={w}:{h}",
            "-pix_fmt", "gray", "-f", "rawvideo", "-"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=10 ** 7)
+    # -nostdin + DEVNULL: ffmpeg otherwise reads interactive commands from the caller's stdin (it swallowed the
+    # rest of a shell script piped through stdin once).
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL, bufsize=10 ** 7)
     n = w * h
     k = 0
     while True:
@@ -2046,6 +2048,12 @@ def cmd_set(a):
     if getattr(a, "lidar_frontend_offset", None) is not None:
         calib.setdefault("time_offsets", dict(DEFAULT_TIME_OFFSETS))["lidar_frontend"] = a.lidar_frontend_offset
         changes["time_offsets.lidar_frontend"] = a.lidar_frontend_offset
+    if getattr(a, "rtk_position_offset", None) is not None:
+        calib.setdefault("time_offsets", dict(DEFAULT_TIME_OFFSETS))["rtk_position"] = a.rtk_position_offset
+        changes["time_offsets.rtk_position"] = a.rtk_position_offset
+    if getattr(a, "ins_attitude_offset", None) is not None:
+        calib.setdefault("time_offsets", dict(DEFAULT_TIME_OFFSETS))["ins_attitude"] = a.ins_attitude_offset
+        changes["time_offsets.ins_attitude"] = a.ins_attitude_offset
     if a.intrinsics:
         calib.setdefault("camera", copy.deepcopy(DEFAULT_CAMERA))["intrinsics"] = [float(v) for v in a.intrinsics]
         calib["camera"]["source"] = "operator entered (livo_calib.py set --intrinsics)"
@@ -2199,6 +2207,10 @@ def main():
     p.add_argument("--lidar-frontend-offset", type=float,
                    help="scan<->IMU hardware offset consumed by the SLAM front-end (deskew/image pairing); "
                         "time_offsets.lidar keeps the INS alignment for the fusion")
+    p.add_argument("--rtk-position-offset", type=float,
+                   help="INS position association offset added to the (INS-aligned) scan time; the mapper reads it "
+                        "from the calibration (time_offsets.rtk_position), yaml rtk.time_offset_sec is only the fallback")
+    p.add_argument("--ins-attitude-offset", type=float, help="INS attitude association offset (time_offsets.ins_attitude)")
     p.add_argument("--intrinsics", nargs=4, type=float)
     p.add_argument("--intrinsics-from-supplier", action="store_true",
                    help="recover fx fy cx cy from the supplier ground-distance curves of the lineage's import")

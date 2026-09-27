@@ -37,7 +37,8 @@ gtsam::ISAM2Params fusionSolverParameters()
 
 RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
     const M3D &rotation, const V3D &translation, const V3D &reference_lever,
-    const std::string &output_root, double reference_time_shift)
+    const std::string &output_root, double reference_time_shift,
+    double position_time_offset_override, double attitude_time_offset_override)
     : node(node_in), lidar_rotation(rotation), lidar_translation(translation),
       lever(reference_lever), solver(fusionSolverParameters())
 {
@@ -51,6 +52,20 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
     throw std::runtime_error("Global correction requires unassisted native LIO; frontend_position_aiding must be false");
   parameters.param<double>("rtk/time_offset_sec", time_offset, 0.0);
   parameters.param<double>("rtk/attitude_time_offset_sec", attitude_time_offset, time_offset);
+  // The calibration file is the single source of truth for the INS association
+  // offsets when it carries them (time_offsets.rtk_position / ins_attitude).
+  if (std::isfinite(position_time_offset_override))
+  {
+    RCLCPP_INFO(node->get_logger(), "INS position association offset %+.4f s from the calibration file (yaml %+.4f s)",
+                position_time_offset_override, time_offset);
+    time_offset = position_time_offset_override;
+  }
+  if (std::isfinite(attitude_time_offset_override))
+  {
+    RCLCPP_INFO(node->get_logger(), "INS attitude association offset %+.4f s from the calibration file (yaml %+.4f s)",
+                attitude_time_offset_override, attitude_time_offset);
+    attitude_time_offset = attitude_time_offset_override;
+  }
   if (!std::isfinite(attitude_time_offset)) throw std::runtime_error("rtk/attitude_time_offset_sec must be finite");
   // Calibration-driven split of the lidar time semantics: frame stamps run on the
   // hardware IMU base (time_offsets.lidar_frontend) while the INS association keeps
@@ -281,6 +296,13 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
       rclcpp::shutdown();
     }
   });
+}
+
+void RtkFusion::appendParameters(const std::vector<std::pair<std::string, std::string>> &items) const
+{
+  std::ofstream settings(directory / "parameters.txt", std::ios::app);
+  settings.exceptions(std::ios::badbit | std::ios::failbit);
+  for (const auto &item : items) settings << item.first << '=' << item.second << '\n';
 }
 
 RtkFusion::~RtkFusion()
@@ -1885,6 +1907,7 @@ void RtkFusion::exportMap()
     const gtsam::Rot3 misalignment = misalignment_initialized ?
         estimate.at<gtsam::Rot3>(gtsam::Symbol('m', 0)) : gtsam::Rot3();
     const V3D mis = gtsam::Rot3::Logmap(misalignment) * 180 / M_PI;
+    final_misalignment_deg_ = mis;
     attitude << "# installation_misalignment_deg(body x,y,z) " << mis.transpose() << '\n';
     attitude << "stamp,rx_deg,ry_deg,rz_deg,robust_cost\n";
     for (const auto &item : solver.getFactorsUnsafe())

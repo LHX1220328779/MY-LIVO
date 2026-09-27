@@ -69,13 +69,51 @@ class Player:
         self.rclpy = rclpy
         self.node = rclpy.create_node("livo_player")
         reliable = self.args.qos == "reliable"
-        qos = QoSProfile(depth=10, history=HistoryPolicy.KEEP_LAST,
-                         reliability=ReliabilityPolicy.RELIABLE if reliable else ReliabilityPolicy.BEST_EFFORT,
-                         durability=DurabilityPolicy.VOLATILE)
+
+        def make_qos(type_name):
+            # Writer history depth per message class. A RELIABLE writer with KEEP_LAST(10) still loses
+            # samples: when the reader stalls > max_blocking_time (100 ms) the oldest samples are
+            # overwritten. That produced an exact 0.100 s hole in a clean 100 Hz IMU stream (10 samples)
+            # at t=537 s of a 720 s round while the mapper was busy, and the strict deskew aborted the
+            # run (results/mcp_t05_colour_full, 2026-09-27). Small high-rate topics get a deep history;
+            # point clouds stay shallow to bound memory (1.5 MB each).
+            # Images/HEVC packets deliberately keep the shallow history: when the decoder (republish)
+            # falls behind, late packets must be dropped, otherwise the images reach the mapper seconds
+            # late, the LIVO frame cadence collapses and the fusion aborts ("Invalid LIO pose or scan
+            # interval", observed with depth 300 at t=93 s of the same 720 s round).
+            # Point clouds: depth 20 is the validated value (720 s truck05 round completed). Depth 60
+            # made the mapper 2-3x slower (reliable repair traffic on 1.5 MB samples) and the multi-LiDAR
+            # merger lost its 1 ms scan-start alignment and never recovered ("Dropping unmatched ...
+            # scan-start span 97 ms exceeds 1.0 ms" forever) - see docs/mcp-colour-only-and-time-offset-audit.md.
+            if "PointCloud2" in type_name:
+                depth = 20
+            elif "Image" in type_name or "FFMPEG" in type_name or "CompressedImage" in type_name:
+                depth = 10
+            else:
+                depth = 3000
+            return QoSProfile(depth=depth, history=HistoryPolicy.KEEP_LAST,
+                              reliability=ReliabilityPolicy.RELIABLE if reliable else ReliabilityPolicy.BEST_EFFORT,
+                              durability=DurabilityPolicy.VOLATILE)
         self.pubs = {}
         for name in self.topics:
-            msg_type = get_message(self.dataset.topics[name])
-            self.pubs[name] = self.node.create_publisher(msg_type, "/" + name, qos)
+            type_name = self.dataset.topics[name]
+            msg_type = get_message(type_name)
+            self.pubs[name] = self.node.create_publisher(msg_type, "/" + name, make_qos(type_name))
+        # Flow control: follow the mapper's progress (its odometry header stamp) and hold the
+        # playback when the data time runs more than --max-lead seconds ahead of it. Without this a
+        # 720 s colour-only round fell 48 s behind between t=250 and 450 s (LIO 80-95 ms/frame), the
+        # mapper's reader histories overflowed (LiDAR 20 s, IMU 50 s) and the run aborted on an IMU gap
+        # that does not exist in the recording (results/mcp_t05_colour_full_* 2026-09-27).
+        self.mapper_progress = None
+        self.pace_sub = None
+        if self.args.pace_topic:
+            from nav_msgs.msg import Odometry
+            pace_qos = QoSProfile(depth=10, history=HistoryPolicy.KEEP_LAST,
+                                  reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.VOLATILE)
+
+            def on_progress(msg):
+                self.mapper_progress = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+            self.pace_sub = self.node.create_subscription(Odometry, self.args.pace_topic, on_progress, pace_qos)
         self.clock_msg = Clock()
         self.clock_pub = None
         if self.args.clock:
@@ -130,6 +168,7 @@ class Player:
         last_progress = time.monotonic()
         clock_period = int(1e9 / a.clock_hz)
         max_lag = 0.0
+        paced_total = 0.0
         t_begin = time.monotonic()
         try:
             for topic, data, ts in self.dataset.iter_messages(self.topics, self.start_ns, self.end_ns, stats):
@@ -142,11 +181,37 @@ class Player:
                 target = wall0 + (ts - first_ts) / 1e9 / rate
                 now = time.monotonic()
                 if target > now:
-                    time.sleep(target - now)
+                    if self.pace_sub is not None:
+                        self.rclpy.spin_once(self.node, timeout_sec=target - now)
+                        now = time.monotonic()
+                        if target > now:
+                            time.sleep(target - now)
+                    else:
+                        time.sleep(target - now)
                 else:
                     lag = now - target
                     if lag > max_lag:
                         max_lag = lag
+                    if self.pace_sub is not None and msgs % 20 == 0:
+                        self.rclpy.spin_once(self.node, timeout_sec=0.0)
+                if self.pace_sub is not None and self.mapper_progress is not None:
+                    hold0 = None
+                    while not self.stop_requested and ts / 1e9 - self.mapper_progress > a.max_lead:
+                        if hold0 is None:
+                            hold0 = time.monotonic()
+                            prog0 = self.mapper_progress
+                        elif time.monotonic() - hold0 > a.hold_timeout and self.mapper_progress == prog0:
+                            # The mapper is not consuming what it already has (e.g. the multi-LiDAR merger
+                            # lost its alignment and drops every frame); holding forever would deadlock.
+                            log(f"mapper made no progress for {a.hold_timeout:.0f} s while held at t="
+                                f"{(ts - self.start_ns) / 1e9:.1f} s; releasing the playback")
+                            self.mapper_progress = None
+                            break
+                        self.rclpy.spin_once(self.node, timeout_sec=0.05)
+                    if hold0 is not None:
+                        held = time.monotonic() - hold0
+                        paced_total += held
+                        wall0 += held  # do not rush to catch up afterwards
                 if last_clock is not None and ts - last_clock >= clock_period:
                     self.publish_clock(ts)
                     last_clock = ts
@@ -157,16 +222,19 @@ class Player:
                 if now - last_progress >= a.progress_interval:
                     last_progress = now
                     done = (ts - self.start_ns) / max(self.span_ns, 1)
+                    lead = "" if self.mapper_progress is None else f" mapper_lead={ts / 1e9 - self.mapper_progress:.1f} s"
                     log(f"t={(ts - self.start_ns) / 1e9:.1f}/{self.span_ns / 1e9:.1f} s {done * 100:.0f}% "
-                        f"msgs={msgs} lag={max(0.0, now - target) * 1000:.0f} ms")
+                        f"msgs={msgs} lag={max(0.0, now - target) * 1000:.0f} ms{lead}")
             if first_ts is not None and self.clock_pub is not None and not self.stop_requested:
                 self.publish_clock(ts)
         finally:
             status = "interrupted" if self.stop_requested else "completed"
             elapsed = time.monotonic() - t_begin
             summary = {"status": status, "messages": msgs, "per_topic": per_topic, "elapsed_s": round(elapsed, 2),
-                       "max_lag_ms": round(max_lag * 1000, 1), **{k: v for k, v in stats.items()}}
+                       "max_lag_ms": round(max_lag * 1000, 1), "paced_s": round(paced_total, 1),
+                       **{k: v for k, v in stats.items()}}
             log(f"{status}: {msgs} messages in {elapsed:.1f} s (max lag {max_lag * 1000:.0f} ms, "
+                f"held for the mapper {paced_total:.1f} s, "
                 f"dropped duplicate {stats.get('dropped_duplicate', 0)}, backwards {stats.get('dropped_backwards', 0)})")
             print("[player] summary " + json.dumps(summary), flush=True)
             if a.hold > 0 and not self.stop_requested:
@@ -198,6 +266,12 @@ def build_parser():
     ap.add_argument("--delay", type=float, default=1.0, help="extra settle time before the first message")
     ap.add_argument("--hold", type=float, default=1.0, help="seconds to keep the node alive after the last message")
     ap.add_argument("--progress-interval", type=float, default=5.0)
+    ap.add_argument("--pace-topic", default="/aft_mapped_to_init",
+                    help="mapper odometry topic used for flow control ('' = free-running playback)")
+    ap.add_argument("--max-lead", type=float, default=3.0,
+                    help="hold the playback when the data time is more than this many seconds ahead of the mapper")
+    ap.add_argument("--hold-timeout", type=float, default=20.0,
+                    help="release a hold when the mapper has made no progress for this long (deadlock guard)")
     ap.add_argument("--dry-run", action="store_true", help="describe what would be played and exit")
     return ap
 

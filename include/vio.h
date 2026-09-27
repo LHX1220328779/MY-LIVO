@@ -99,6 +99,13 @@ public:
   vector<float> patch_buffer;
   bool normal_en, inverse_composition_en, exposure_estimate_en, raycast_en, has_ref_patch_cache;
   bool ncc_en = false, colmap_output_en = false;
+  // Colour-only camera use (vio.ekf_update_en=false): keep the per-image
+  // frame/pose bookkeeping that the RGB projection needs and skip the visual
+  // sparse map and the photometric ESIKF update, so the estimator state is
+  // exactly the LIO one.
+  bool ekf_update_en = true;
+  // Per-frame timing table on stdout (debug.print_frame_timing).
+  bool print_frame_timing = false;
 
   int width, height, grid_n_width, grid_n_height, length;
   double image_resize_factor;

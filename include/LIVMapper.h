@@ -22,6 +22,8 @@ which is included as part of this source code package.
 #include <tf2_ros/static_transform_broadcaster.h>
 #include <filesystem>
 #include <csignal>
+#include <limits>
+#include <sstream>
 #include <memory>
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include "extrinsic_precheck.h"
@@ -147,6 +149,18 @@ public:
   int frame_cnt;
   double img_time_offset = 0.0;
   double rtk_reference_time_shift_ = 0.0;
+  // Calibration-file copies used only for the console summary / overrides.
+  double calib_lidar_frontend_offset_ = std::numeric_limits<double>::quiet_NaN();
+  double calib_lidar_ins_offset_ = std::numeric_limits<double>::quiet_NaN();
+  double calib_rtk_position_offset_ = std::numeric_limits<double>::quiet_NaN();
+  double calib_ins_attitude_offset_ = std::numeric_limits<double>::quiet_NaN();
+  string calibration_identity_, calibration_type_, calibration_file_;
+  Eigen::Matrix4d rear_from_camera_ = Eigen::Matrix4d::Identity();
+  bool vio_ekf_update_en = true;
+  bool print_frame_timing = false;
+  double status_interval_sec = 10.0;
+  double last_status_print_time_ = -1.0;
+  void printCalibrationSummary(const char *stage) const;
   deque<PointCloudXYZI::Ptr> lid_raw_data_buffer;
   deque<double> lid_header_time_buffer;
 
