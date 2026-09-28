@@ -18,6 +18,19 @@ Two passes, two pose sources:
         reference points exceeds --cross-time-s (default 2 s). Yaw/x/y stay from pass 1 (the
         few-cm RTK/INS jitter of the optimized poses would only add noise there).
   --ground-poses native disables pass 2 (previous behaviour).
+  Matches are viewing-side consistent (default, --no-same-side disables): the target normals are
+        oriented towards the reference LiDAR that observed them and a source point is matched only
+        when its own LiDAR saw the plane from the same side. Without this, a LiDAR that looks the
+        other way (the back LiDAR sees the rear faces of poles, sign posts, blocks and wall ends that
+        the front LiDAR saw from the front) is pulled onto the opposite face: truck29 v064 solved
+        the back LiDAR 4.3 cm further BACK although fit-free tests (facing planes, pole axes) put
+        its returns 4-10 cm behind the front LiDARs already.
+  --pass1-poses optimized   registers pass 1 (yaw/x/y, or all 6 DoF) with the RTK-optimized poses.
+        Use it when the window is long or the LiDAR overlaps the reference only cross-time: the
+        native along-track drift (truck29: 26-33 cm median xy error, ~1 cm/s) enters the x/y of a
+        LiDAR whose matches are 3-10 s apart as a direct bias (v058: +6..+8 cm y for the side
+        LiDARs), while the optimized poses are locally smooth (fused-native relative motion
+        <=0.6 cm per second) and drift-free at the cm level.
 
 A per-LiDAR quality verdict (convergence, vertical-structure support, residual regression,
 correction magnitude) is written to the report/JSON; a `fail` verdict aborts the stage (exit 3)
@@ -64,17 +77,27 @@ def voxel_down(P, size):
 
 
 class Target:
-    def __init__(self, A, times, k=12):
+    def __init__(self, A, times, k=12, sensors=None):
         self.A = A; self.times = times; self.tree = cKDTree(A)
         d, idx = self.tree.query(A, k=k); nbr = A[idx]; c = nbr.mean(1)
         cov = np.einsum("nki,nkj->nij", nbr - c[:, None], nbr - c[:, None]) / k
         w, v = np.linalg.eigh(cov)
         self.normals = v[:, :, 0]
+        if sensors is not None:   # orient every normal towards the reference LiDAR that observed the point
+            flip = np.einsum("ni,ni->n", sensors - A, self.normals) < 0
+            self.normals[flip] *= -1
+        self.oriented = sensors is not None
         self.planar = (w[:, 0] < 0.0025) & (w[:, 1] > 4 * w[:, 0] + 1e-9)
 
-    def match(self, B, max_dist):
+    def match(self, B, max_dist, sensors=None):
+        """sensors: world position of the LiDAR that produced each B point; with oriented normals a match is
+        kept only when that LiDAR saw the plane from the same side as the reference (no opposite-face pulls)."""
         dist, j = self.tree.query(B, distance_upper_bound=max_dist)
         ok = np.isfinite(dist); ok[ok] &= self.planar[j[ok]]
+        if sensors is not None and self.oriented:
+            idx = np.flatnonzero(ok)
+            same = np.einsum("ni,ni->n", sensors[idx] - self.A[j[idx]], self.normals[j[idx]]) > 0
+            ok[idx[~same]] = False
         return ok, self.normals[j[ok]], self.A[j[ok]], self.times[j[ok]]
 
 
@@ -116,27 +139,30 @@ def world_points(scans, M_t, lr, lt, poses):
     return Q[sub], Rm[sub], Pw[sub], T[sub]
 
 
-def build_target(scans, M_ref, lr, lt, poses, voxel):
-    """Reference LiDAR accumulated in the world frame (per-point deskew), voxelised at `voxel`."""
-    Ws, Ts = [], []
+def build_target(scans, M_ref, lr, lt, poses, voxel, same_side=True):
+    """Reference LiDAR accumulated in the world frame (per-point deskew), voxelised at `voxel`.
+    With same_side the normals are oriented towards the reference LiDAR position at the observation time."""
+    Ws, Ts, Ss = [], [], []
+    sensor_imu = lr @ M_ref[:3, 3] + lt
     for P, ts, h in scans:
         B = (P @ M_ref[:3, :3].T + M_ref[:3, 3]) @ lr.T + lt
         rr, pp = poses.at(h + ts)
-        Ws.append(rr.apply(B) + pp); Ts.append(h + ts)
-    W = np.vstack(Ws); T = np.concatenate(Ts)
+        Ws.append(rr.apply(B) + pp); Ts.append(h + ts); Ss.append(rr.apply(np.tile(sensor_imu, (len(B), 1))) + pp)
+    W = np.vstack(Ws); T = np.concatenate(Ts); S = np.vstack(Ss)
     sub = voxel_down(W, voxel)
-    return Target(W[sub], T[sub])
+    return Target(W[sub], T[sub], sensors=S[sub] if same_side else None)
 
 
 def icp(Q, Rm, Pw, T, center, lr, lt, target, active, x0, prior, normal_filter=None):
     """Robust point-to-plane ICP of one LiDAR against the reference target.
     Correction x = (rotvec about the LiDAR position, translation) in the vehicle frame."""
     x = x0.copy(); stats = first = None; dt_med = np.nan
+    sensors = np.einsum("nij,j->ni", Rm, lr @ center + lt) + Pw   # this LiDAR's world position per point
     for it in range(MAX_ITERS):
         Rc = R.from_rotvec(x[:3]).as_matrix()
         Qc = (Q - center) @ Rc.T + center + x[3:]
         W = np.einsum("nij,nj->ni", Rm, Qc @ lr.T + lt) + Pw
-        ok, n, q, tq = target.match(W, 0.6)
+        ok, n, q, tq = target.match(W, 0.6, sensors)
         if normal_filter is not None:
             keep = normal_filter(n)
             idx_ok = np.flatnonzero(ok); ok = np.zeros_like(ok); ok[idx_ok[keep]] = True; n, q, tq = n[keep], q[keep], tq[keep]
@@ -219,6 +245,10 @@ def main():
                     help="pose source of pass 2 (tilt/z of cross-time LiDARs); native = single pass, previous behaviour")
     ap.add_argument("--cross-time-s", type=float, default=2.0,
                     help="a LiDAR whose median match time gap exceeds this gets pass 2")
+    ap.add_argument("--no-same-side", action="store_true",
+                    help="allow matches where the source LiDAR saw the plane from the opposite side (previous behaviour)")
+    ap.add_argument("--pass1-poses", choices=("native", "optimized"), default="native",
+                    help="pose source of pass 1 (yaw/x/y or 6 DoF): native frames.csv (default) or the RTK-optimized trajectory")
     ap.add_argument("--no-gate", action="store_true", help="write the output even when a LiDAR fails the quality gate")
     a = ap.parse_args()
     calib = json.load(open(a.calibration))
@@ -232,7 +262,16 @@ def main():
     rows = np.array([[float(v) for v in l.split(",")] for l in lines[4:]])
     stamps = rows[:, 0]; t0 = stamps[0]
     native = Poses(stamps, R.from_quat(rows[:, 7:11]), rows[:, 4:7], "native frames.csv")
-    optimized = load_optimized(run, stamps) if a.ground_poses == "optimized" and not a.vertical_only else None
+    want_optimized = (a.ground_poses == "optimized" and not a.vertical_only) or a.pass1_poses == "optimized"
+    optimized = load_optimized(run, stamps) if want_optimized else None
+    pose1 = native
+    if a.pass1_poses == "optimized":
+        if optimized is None:
+            print("warning: --pass1-poses optimized requested but the run has no usable trajectory_optimized.txt; pass 1 uses native poses", flush=True)
+        else:
+            pose1 = optimized
+    if a.vertical_only and a.ground_poses == "optimized" and a.pass1_poses != "optimized":
+        optimized = None
     if a.ground_poses == "optimized" and optimized is None and not a.vertical_only:
         print("warning: no usable trajectory_optimized.txt in the run (LIO round without RTK fusion?); "
               "pass 2 disabled, cross-time LiDARs keep the native-pose tilt/z", flush=True)
@@ -270,13 +309,14 @@ def main():
     pass2_label = optimized.label if optimized is not None else "disabled"
     report = [f"calibration={a.calibration}", f"run={run}",
               f"window {a.window[0]}..{a.window[1]} s, lidar_time_offset {a.lidar_time_offset}",
-              f"pass 1 poses: {native.label} (6 DoF); pass 2 poses: {pass2_label} (tilt about x/y and z of LiDARs with median match time gap > {a.cross_time_s:.1f} s)",
+              f"pass 1 poses: {pose1.label} ({'yaw/x/y, vertical matches only' if a.vertical_only else '6 DoF'}); pass 2 poses: {pass2_label} (tilt about x/y and z of LiDARs with median match time gap > {a.cross_time_s:.1f} s)",
               "scans used: " + ", ".join(f"{t}:{n_used[t]}" for t in topics)]
     if not scans[REFERENCE]:
         pathlib.Path(a.report).parent.mkdir(parents=True, exist_ok=True)
         report.append("no reference scans in the window"); pathlib.Path(a.report).write_text("\n".join(report) + "\n")
         print("\n".join(report)); sys.exit(3)
-    target1 = build_target(scans[REFERENCE], M[REFERENCE], lr, lt, native, a.voxel)
+    target1 = build_target(scans[REFERENCE], M[REFERENCE], lr, lt, pose1, a.voxel, same_side=not a.no_same_side)
+    report.append(f"matching: {'viewing-side consistent (oriented normals)' if not a.no_same_side else 'any side (legacy)'}")
     target2 = None
     report.append(f"reference {REFERENCE}: {len(target1.A)} world points")
     prior = np.diag([1 / np.radians(a.prior_rot_deg) ** 2] * 3 + [1 / a.prior_trans_m ** 2] * 3)
@@ -288,7 +328,7 @@ def main():
             refined[t] = M[t].copy(); report.append(f"{t}: no scans  [quality: warn]")
             quality[t] = {"level": "warn", "reasons": ["no scans in window"]}; continue
         center = M[t][:3, 3]
-        Q, Rm, Pw, T = world_points(scans[t], M[t], lr, lt, native)
+        Q, Rm, Pw, T = world_points(scans[t], M[t], lr, lt, pose1)
         x, first, stats, dt_med = icp(Q, Rm, Pw, T, center, lr, lt, target1, active1, np.zeros(6), prior, filt1)
         if stats is None:
             refined[t] = M[t].copy(); report.append(f"{t}: insufficient matches; manual matrix kept  [quality: warn]")
@@ -298,7 +338,7 @@ def main():
         pass2 = None
         if optimized is not None and dt_med > a.cross_time_s and q1["level"] != "fail":
             if target2 is None:
-                target2 = build_target(scans[REFERENCE], M[REFERENCE], lr, lt, optimized, a.voxel)
+                target2 = build_target(scans[REFERENCE], M[REFERENCE], lr, lt, optimized, a.voxel, same_side=not a.no_same_side)
             Q2, Rm2, Pw2, T2 = world_points(scans[t], M[t], lr, lt, optimized)
             active2 = np.array([True, True, False, False, False, True])
             x2, first2, stats2, dt2 = icp(Q2, Rm2, Pw2, T2, center, lr, lt, target2, active2, x, prior,
@@ -343,7 +383,7 @@ def main():
     out["calibration_type"] = calib.get("calibration_type", "") + tag
     out.setdefault("refinement", {})["stage3_vertical" if a.vertical_only else "stage2_6dof"] = dict(
         reference=REFERENCE, corrections=corrections, run=str(run), window=list(a.window), prior=[a.prior_rot_deg, a.prior_trans_m],
-        poses={"pass1": native.label, "pass2": pass2_label, "cross_time_s": a.cross_time_s}, quality=overall)
+        poses={"pass1": pose1.label, "pass2": pass2_label, "cross_time_s": a.cross_time_s}, quality=overall)
     pathlib.Path(a.output).parent.mkdir(parents=True, exist_ok=True); json.dump(out, open(a.output, "w"), indent=2)
     print("written", a.output)
 

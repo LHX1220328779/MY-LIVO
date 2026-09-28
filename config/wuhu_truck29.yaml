@@ -74,7 +74,8 @@ laser_mapping:
       # 10 Hz merged scan is registered as 33 ms slices of 1/3 of the returns covering only
       # part of the field of view. Measured on truck29 (v063, 30 Hz slices vs 10 Hz full
       # scans): native xy drift over the first 40 s 73-87 cm vs 21-25 cm, start-segment lamp
-      # pole smear 13.6 cm vs 3.9-5.2 cm, multi-epoch pole axis separation 12 vs 7 cm. With 3
+      # pole centre spread 13.6 cm vs 3.9-5.2 cm (a spread statistic, NOT the pole thickness;
+      # the physical pole is ~20 cm in diameter), multi-epoch pole axis separation 12 vs 7 cm. With 3
       # the LIO keeps full scans and the photometric update + colouring run at 10 Hz (VIO is
       # still in the front-end ESIKF). 30 Hz 1080p VIO was also not real-time online.
       frame_divider: 3
@@ -260,6 +261,21 @@ laser_mapping:
       output_directory: ""
       save_map: false
       export_chunk_points: 1000000
+      # Saved-map PRODUCT filter (map_N.pcd and rgb_map_N.pcd only; the archive, the estimator and the
+      # evaluation are untouched): drop returns farther than this from the virtual LiDAR origin. Far
+      # returns carry the sensor's range/angular footprint (measured on truck29: lamp-pole shell
+      # residual P90 ~8 cm for all returns vs ~5 cm at <=25 m; front AT128 returns at 35-40 m bloom to
+      # 8-13 cm), which reads as "thick poles / blurred edges" in the merged map. 0 = keep everything.
+      # 30 m (truck29 LIO, saved PCDs): pole shell |r-R| P50/P90 3.6-3.9/7.0-7.7 -> 1.6-1.8/4.7-5.0 cm,
+      # share >6 cm 17-24 % -> 3-5 %; map 50.2 M -> 40.0 M points (only returns >30 m from the truck);
+      # trajectory metrics identical (the cap never touches the estimator or the archive).
+      save_map_max_range: 30.0
+      # Same cap for rgb_map_N.pcd only (-1 = same as save_map_max_range, 0 = none). The camera looks
+      # forward (60 x 32 deg): pole tops, trees and anything beside the road are coloured only while
+      # they are still 20-45 m ahead, so a 30 m cap loses them (truck29: rgb 8.3 M -> 4.3 M points,
+      # pole 1 coloured only up to ~6 m height). Nearest-observation selection still keeps the
+      # sharpest colour per voxel; at 45 m one 1080p pixel covers ~2.5 cm.
+      save_rgb_max_range: 45.0
 
     reference_frame_conversion:
       # The Odometry child frame is vehicle_rear_axle_rfu. When enabled,
@@ -377,7 +393,11 @@ laser_mapping:
       gravity_align_en: false
 
     publish:
-      dense_map_en: false
+      # true: the coloured LIVO cloud (colors.bin -> rgb_map_N.pcd) is the FULL undistorted scan.
+      # false colours only the 0.30 m voxel-downsampled registration cloud (feats_down_body), i.e.
+      # ~3.6 k coloured points per frame against ~50 k geometry points: the RGB product is then 13x
+      # sparser than map_N.pcd and looks blurred/coarse however good the camera registration is.
+      dense_map_en: true
       pub_effect_point_en: false
       pub_plane_en: false
       pub_scan_num: 1

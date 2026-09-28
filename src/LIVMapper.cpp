@@ -98,6 +98,13 @@ LIVMapper::LIVMapper(const rclcpp::Node::SharedPtr &node)
                                               calib_ins_attitude_offset_);
     RCLCPP_INFO(node_->get_logger(), "RTK backend enabled for %s frontend",
                 slam_mode_ == LIVO ? "LIVO" : "LIO");
+    if (multi_lidar_enabled)
+    {
+      // readParameters() already loaded the LiDAR sources; tag archived returns per LiDAR.
+      std::vector<V3D> origins;
+      for (const auto &source : lidar_sources) origins.push_back(source->rear_from_lidar_translation);
+      rtk_fusion_->setLidarOrigins(origins);
+    }
     {
       std::ostringstream lever_text;
       lever_text << std::setprecision(17) << imu_to_rear_axle.x() << ' ' << imu_to_rear_axle.y() << ' ' << imu_to_rear_axle.z();

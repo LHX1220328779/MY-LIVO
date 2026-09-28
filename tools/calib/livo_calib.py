@@ -610,13 +610,19 @@ def cmd_driven(a):
         sys.exit(f"driven: {a.run} is not a fusion run directory (frames.csv missing); run a LIO round first")
     out_dir = next_version_dir(mine, truck, "driven")
     out_dir.mkdir(parents=True, exist_ok=True)
-    lidar_offset = parent_calib.get("time_offsets", {}).get("lidar", -0.125)
+    # frames.csv / trajectory_optimized.txt are stamped in the front-end time base (header + lidar_frontend);
+    # time_offsets.lidar is the INS-alignment offset of the fusion and would misplace every scan by the
+    # difference (truck29: 20.9 ms = 13.6 cm at 6.5 m/s) on the pose timeline
+    offsets = parent_calib.get("time_offsets", {})
+    lidar_offset = offsets.get("lidar_frontend", offsets.get("lidar", -0.125))
     cmd = ["/usr/bin/python3", str(SCRIPTS / "refine_multi_lidar_yaw.py"), "--calibration",
            str(pdir / "calibration.json"), "--bag", a.bag, "--run", a.run, "--window", str(a.window[0]),
            str(a.window[1]), "--lidar-time-offset", str(lidar_offset), "--output",
            str(out_dir / "calibration.json"), "--report", str(out_dir / "stage_report.txt")]
     if a.vertical_only:
         cmd.append("--vertical-only")
+    if getattr(a, "pass1_poses", None):
+        cmd += ["--pass1-poses", a.pass1_poses]
     lines = run_script(cmd, out_dir / "stage.log")
     calib = json.loads((out_dir / "calibration.json").read_text())
     metrics = {k: v for k, v in calib.items() if k.startswith("refinement")}
@@ -2147,6 +2153,8 @@ def main():
     p.add_argument("--run", required=True, help="fusion run directory (Log/fusion/<stamp>) of a LIO round")
     p.add_argument("--window", nargs=2, type=float, default=(8.0, 40.0))
     p.add_argument("--vertical-only", action="store_true")
+    p.add_argument("--pass1-poses", choices=("native", "optimized"),
+                   help="pass-1 pose source of the refinement (default native; optimized = RTK-optimized trajectory of the run)")
     common(p)
     p.set_defaults(func=cmd_driven)
 

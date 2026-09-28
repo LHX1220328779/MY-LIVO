@@ -115,6 +115,13 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
     parameters.param<int>(name, *parameter.second, *parameter.second);
     if (*parameter.second <= 0) throw std::runtime_error(name + " must be positive");
   }
+  parameters.param<double>("rtk/save_map_max_range", save_map_max_range, 0.0);
+  if (!std::isfinite(save_map_max_range) || save_map_max_range < 0.0)
+    throw std::runtime_error("rtk/save_map_max_range must be finite and nonnegative (0 disables the cap)");
+  parameters.param<double>("rtk/save_rgb_max_range", save_rgb_max_range, -1.0);
+  if (!std::isfinite(save_rgb_max_range))
+    throw std::runtime_error("rtk/save_rgb_max_range must be finite (<0 = same as save_map_max_range, 0 = no cap)");
+  if (save_rgb_max_range < 0.0) save_rgb_max_range = save_map_max_range;
   if (!require_status || accepted_modes != std::vector<int>{4})
     throw std::runtime_error("RTK fusion requires current quality mode 4; bypassing quality or accepting other modes is forbidden");
   if (!std::isfinite(time_offset) || horizontal_sigma > max_horizontal_sigma ||
@@ -217,6 +224,11 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
     frame_index.exceptions(std::ios::badbit | std::ios::failbit);
     archive.open(directory / "scans.bin", std::ios::binary);
     archive.write("LIVORTK3", 8);
+    // sources.bin LIVOSRC1: one uint8 per scans.bin return, same order; value = index of
+    // the configured LiDAR whose (deskewed) beam origin is nearest, 255 = unknown.
+    source_archive.exceptions(std::ios::badbit | std::ios::failbit);
+    source_archive.open(directory / "sources.bin", std::ios::binary);
+    source_archive.write("LIVOSRC1", 8);
     if (color_enabled)
     {
       color_archive.exceptions(std::ios::badbit | std::ios::failbit);
@@ -230,7 +242,7 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
     frame_index << "# lidar_to_imu_rotation_row_major";
     for (int row = 0; row < 3; ++row)
       for (int column = 0; column < 3; ++column) frame_index << ' ' << lidar_rotation(row, column);
-    frame_index << "\nstamp,begin,offset_bytes,count,tx,ty,tz,qx,qy,qz,qw\n";
+    frame_index << "\nstamp,begin,offset_bytes,count,tx,ty,tz,qx,qy,qz,qw,color_offset_bytes,color_count\n";
   }
   path_publisher = node->create_publisher<nav_msgs::Path>("/rtk/path", rclcpp::QoS(1).transient_local());
   odom_publisher = node->create_publisher<nav_msgs::Odometry>("/rtk/odometry", 10);
@@ -1649,6 +1661,29 @@ void RtkFusion::process(Frame frame)
       packed.insert(packed.end(), {point.x, point.y, point.z, point.intensity, point.curvature});
     }
     archive.write(reinterpret_cast<const char *>(packed.data()), packed.size() * sizeof(float));
+    {
+      // The merger stored each return's physical beam origin in the normal fields and the
+      // deskew moved it with the return, so it stays within the intra-scan motion (<1 m) of
+      // its mount while the mounts are metres apart: nearest mount = source LiDAR.
+      std::vector<std::uint8_t> sources(frame.count, 255);
+      if (!lidar_origins.empty())
+      {
+        std::size_t index = 0;
+        for (const PointType &point : *frame.cloud)
+        {
+          const V3D origin(point.normal_x, point.normal_y, point.normal_z);
+          std::size_t best = 0;
+          double best_distance = std::numeric_limits<double>::infinity();
+          for (std::size_t s = 0; s < lidar_origins.size(); ++s)
+          {
+            const double distance = (lidar_origins[s] - origin).squaredNorm();
+            if (distance < best_distance) { best_distance = distance; best = s; }
+          }
+          sources[index++] = static_cast<std::uint8_t>(best);
+        }
+      }
+      source_archive.write(reinterpret_cast<const char *>(sources.data()), sources.size());
+    }
     if (color_enabled)
     {
       frame.color_offset = static_cast<std::uint64_t>(color_archive.tellp());
@@ -1665,7 +1700,8 @@ void RtkFusion::process(Frame frame)
     const auto p = frame.raw.translation();
     frame_index << std::setprecision(17) << frame.stamp << ',' << frame.begin << ',' << frame.offset << ','
         << frame.count << ',' << p.x() << ',' << p.y() << ',' << p.z() << ','
-        << q.x() << ',' << q.y() << ',' << q.z() << ',' << q.w() << '\n';
+        << q.x() << ',' << q.y() << ',' << q.z() << ',' << q.w() << ','
+        << frame.color_offset << ',' << frame.color_count << '\n';
   }
   recent_frames.push_back(frame);
   while (recent_frames.size() > static_cast<std::size_t>(local_map_frames)) recent_frames.pop_front();
@@ -2055,6 +2091,7 @@ void RtkFusion::exportMap()
   if (save_map)
   {
     archive.flush();
+    source_archive.flush();
     frame_index.flush();
     std::size_t chunk_index = 0;
     // The colored cloud only contains returns inside the camera frustum, so it
@@ -2093,21 +2130,25 @@ void RtkFusion::exportMap()
           point.g = static_cast<std::uint8_t>(packed[6 * i + 4]);
           point.b = static_cast<std::uint8_t>(packed[6 * i + 5]);
         }
-        double omega = 0.0, speed = 0.0;
+        double omega = 0.0;
         if (fi + 1 < frames.size())
         {
           const double dt = std::max(frames[fi + 1].stamp - frames[fi].stamp, 1e-3);
           const auto delta = frames[fi].raw.between(frames[fi + 1].raw);
           omega = gtsam::Rot3::Logmap(delta.rotation()).norm() / dt;
-          speed = delta.translation().norm() / dt;
         }
         const auto correction = correctionAt(frame.stamp);
-        const V3D origin = frame.raw.translation();
+        const V3D origin = frame.raw.transformFrom(lidar_translation);
         for (const PointTypeRGB &point : *cloud)
         {
           const V3D native(point.x, point.y, point.z);
-          const double range = std::max((native - origin).norm(), 3.0);
-          const float score = static_cast<float>(omega + speed / range);
+          const double range = (native - origin).norm();
+          if (save_rgb_max_range > 0.0 && range > save_rgb_max_range) continue;
+          // One colour per 3 cm voxel: the NEAREST observation wins. The pixel footprint grows
+          // linearly with range, while the metric colour displacement from a residual camera time
+          // error (speed * dt) does not shrink with range, so far observations only lose detail.
+          // Fast rotation is penalised (20 m per rad/s): its time sensitivity scales with omega*range.
+          const float score = static_cast<float>(range + 20.0 * omega);
           const V3D p = correction.transformFrom(native);
           PointTypeRGB out = point;
           out.x = static_cast<float>(p.x());
@@ -2159,6 +2200,14 @@ void RtkFusion::exportMap()
           point.x = packed[5 * i]; point.y = packed[5 * i + 1]; point.z = packed[5 * i + 2];
           point.intensity = packed[5 * i + 3]; point.curvature = packed[5 * i + 4];
         }
+        if (save_map_max_range > 0.0)
+        {
+          auto kept = std::make_shared<PointCloudXYZI>();
+          kept->reserve(cloud->size());
+          for (const PointType &point : cloud->points)
+            if (point.getVector3fMap().norm() <= save_map_max_range) kept->push_back(point);
+          cloud = kept;
+        }
         frame.cloud = cloud;
         appendCloud(frame, chunk);
         if (chunk.size() >= static_cast<std::size_t>(export_chunk_points))
@@ -2177,6 +2226,6 @@ void RtkFusion::exportMap()
       }
     }
   }
-  RCLCPP_INFO(node->get_logger(), "RTK finalized %zu frames, %zu keys, %zu position factors: %s",
-      frames.size(), keyframes.size(), accepted_positions, directory.c_str());
+  RCLCPP_INFO(node->get_logger(), "RTK finalized %zu frames, %zu keys, %zu position factors (saved-map range cap %.1f m, rgb %.1f m, 0 = none): %s",
+      frames.size(), keyframes.size(), accepted_positions, save_map_max_range, save_rgb_max_range, directory.c_str());
 }

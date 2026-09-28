@@ -167,6 +167,10 @@ struct RtkFusion
   // Append effective front-end settings to parameters.txt (values the node
   // parameters do not show because the calibration file overrides them).
   void appendParameters(const std::vector<std::pair<std::string, std::string>> &items) const;
+  // Physical LiDAR origins (rear-axle frame, multi_lidar.topics order). With save_map
+  // every archived return is tagged with the index of its nearest origin (sources.bin)
+  // so the map can be split per physical LiDAR offline (extrinsic / timing audits).
+  void setLidarOrigins(const std::vector<V3D> &origins) { lidar_origins = origins; }
   const std::filesystem::path &outputDirectory() const { return directory; }
   double attitudeTimeOffset() const { return attitude_time_offset; }
   Eigen::Vector3d installationMisalignmentDeg() const { return final_misalignment_deg_; }
@@ -204,9 +208,19 @@ struct RtkFusion
   int minimum_satellites = 12, max_planes = 800, max_pair_factors = 120;
   int local_neighbors = 3, local_map_frames = 30, queue_capacity = 8;
   int export_chunk_points = 1000000;
+  // Saved-map product filter only (archive and estimator untouched): returns farther than this many
+  // metres from the virtual LiDAR origin are not written to map_N.pcd / rgb_map_N.pcd. 0 = keep all.
+  double save_map_max_range = 0.0;
+  // Same filter for rgb_map_N.pcd only. The camera looks forward (60 x 32 deg), so tall objects and
+  // anything beside the road are coloured only from far away; a separate (larger) cap keeps that
+  // coverage while nearest-observation selection still picks the sharpest colour. <0 = same as
+  // save_map_max_range, 0 = keep all coloured returns.
+  double save_rgb_max_range = -1.0;
   std::vector<int> accepted_modes;
   std::filesystem::path directory;
   std::ofstream archive, color_archive, frame_index, diagnostics, optimization_log, history_log, association_log, geometry_history, path_log;
+  std::ofstream source_archive;
+  std::vector<V3D> lidar_origins;
   std::vector<gtsam::Pose3> last_logged_poses;
   mutable std::mutex mutex;
   std::condition_variable changed;
