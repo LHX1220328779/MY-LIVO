@@ -122,6 +122,11 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   if (!std::isfinite(save_rgb_max_range))
     throw std::runtime_error("rtk/save_rgb_max_range must be finite (<0 = same as save_map_max_range, 0 = no cap)");
   if (save_rgb_max_range < 0.0) save_rgb_max_range = save_map_max_range;
+  RCLCPP_INFO(node->get_logger(),
+      "Saved-map product range cap: geometry %.1f m, colour %.1f m (0 = keep every return; only map_N.pcd / rgb_map_N.pcd are "
+      "filtered, the archive and the estimator are not). Change with rtk.save_map_max_range / rtk.save_rgb_max_range, "
+      "run_wuhu_round.sh --map-range M --rgb-range M, or launch save_map_max_range:=M save_rgb_max_range:=M",
+      save_map_max_range, save_rgb_max_range);
   if (!require_status || accepted_modes != std::vector<int>{4})
     throw std::runtime_error("RTK fusion requires current quality mode 4; bypassing quality or accepting other modes is forbidden");
   if (!std::isfinite(time_offset) || horizontal_sigma > max_horizontal_sigma ||

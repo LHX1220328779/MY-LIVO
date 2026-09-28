@@ -29,7 +29,13 @@ laser_mapping:
       #                  "transform_matrix_lidar_6"]
       # topics: ["/front_lidar"]
       # transform_keys: ["transform_matrix_lidar_6"]
-      synchronization_tolerance_sec: 0.001
+      # Scan-start span allowed between the configured LiDARs before the earliest frame is
+      # treated as unmatched. Each source's points carry their own header offset into the
+      # merged frame (deskew is per point), so the tolerance only has to reject a whole-frame
+      # misalignment (100 ms). truck29 never exceeds 1 ms; truck05's LiDARs jitter to
+      # 1.02-1.3 ms on 4 % of the frames (287 in 720 s, 120 of them in 360-420 s -> 2 s holes
+      # on the ramp), which the former 1 ms setting dropped. 5 ms = the code default.
+      synchronization_tolerance_sec: 0.005
       queue_size: 5
       # Static-start extrinsic self-check (src/extrinsic_precheck.cpp). While the truck is
       # still (gyro < static_gyro_deg_s) the first merged frames are collected per LiDAR; each
@@ -269,13 +275,16 @@ laser_mapping:
       # 30 m (truck29 LIO, saved PCDs): pole shell |r-R| P50/P90 3.6-3.9/7.0-7.7 -> 1.6-1.8/4.7-5.0 cm,
       # share >6 cm 17-24 % -> 3-5 %; map 50.2 M -> 40.0 M points (only returns >30 m from the truck);
       # trajectory metrics identical (the cap never touches the estimator or the archive).
-      save_map_max_range: 30.0
+      # Production default 45 m (operator asked for more coverage than 30 m): pole shell P90 ~5.5 cm at
+      # <=35 m, ~5.9 cm at <=50 m. Console: run_wuhu_round.sh --map-range M / launch save_map_max_range:=M.
+      save_map_max_range: 45.0
       # Same cap for rgb_map_N.pcd only (-1 = same as save_map_max_range, 0 = none). The camera looks
       # forward (60 x 32 deg): pole tops, trees and anything beside the road are coloured only while
       # they are still 20-45 m ahead, so a 30 m cap loses them (truck29: rgb 8.3 M -> 4.3 M points,
       # pole 1 coloured only up to ~6 m height). Nearest-observation selection still keeps the
-      # sharpest colour per voxel; at 45 m one 1080p pixel covers ~2.5 cm.
-      save_rgb_max_range: 45.0
+      # sharpest colour per voxel; at 45 m one 1080p pixel covers ~2.5 cm, at 60 m ~3.3 cm (= voxel).
+      # Console: run_wuhu_round.sh --rgb-range M / launch save_rgb_max_range:=M.
+      save_rgb_max_range: 60.0
 
     reference_frame_conversion:
       # The Odometry child frame is vehicle_rear_axle_rfu. When enabled,

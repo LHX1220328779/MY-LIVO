@@ -10,6 +10,8 @@
 # Usage (inside container):
 #   bash scripts/run_wuhu_round.sh <round_name> [--mode lio|livo] [--dataset DIR] [--calibration FILE]
 #        [--no-rtk] [--no-save-map] [--rviz] [--rate R] [--start-offset S] [--duration D]
+#        [--map-range M] [--rgb-range M]   (saved-map product caps in metres, 0 = keep every return;
+#                                           defaults come from the yaml: rtk.save_map_max_range / save_rgb_max_range)
 #        [--set laser_mapping.key.subkey=value ...] [--no-eval]
 #   (--bag DIR is an alias of --dataset)
 # Examples:
@@ -30,6 +32,8 @@ while (($#)); do
     --start-offset) start_offset="$2"; shift 2 ;;
     --duration) duration="$2"; shift 2 ;;
     --set) sets+=("$2"); shift 2 ;;
+    --map-range) sets+=("rtk.save_map_max_range=$2"); shift 2 ;;   # geometry product cap [m], 0 = all
+    --rgb-range) sets+=("rtk.save_rgb_max_range=$2"); shift 2 ;;   # colour product cap [m], 0 = all, -1 = same as geometry
     --no-eval) do_eval=0; shift ;;
     --quick-eval) quick_eval=1; shift ;;   # trajectory + summary only (scan rounds of the closed loop)
     --bag|--dataset) dataset="$2"; shift 2 ;;

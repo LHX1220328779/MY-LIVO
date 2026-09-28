@@ -77,26 +77,34 @@ def generate_launch_description():
         output="screen",
     )
 
-    mapping = Node(
-        package="fast_livo",
-        executable="fastlivo_mapping",
-        name="laser_mapping",
-        output="screen",
-        sigterm_timeout=LaunchConfiguration("finalize_timeout_sec"),
-        parameters=[
-            config_file,
-            {
-                "common.img_en": ParameterValue(use_camera, value_type=bool),
-                "rtk.enabled": ParameterValue(use_rtk, value_type=bool),
-                "rtk.save_map": ParameterValue(LaunchConfiguration("save_map"), value_type=bool),
-                "output.directory": LaunchConfiguration("output_directory"),
-                "reference_frame_conversion.enabled": ParameterValue(
-                    rear_axle_to_imu, value_type=bool
-                ),
-                "use_sim_time": True,
-            },
-        ],
-    )
+    def launch_mapping(context):
+        overrides = {
+            "common.img_en": ParameterValue(use_camera, value_type=bool),
+            "rtk.enabled": ParameterValue(use_rtk, value_type=bool),
+            "rtk.save_map": ParameterValue(LaunchConfiguration("save_map"), value_type=bool),
+            "output.directory": LaunchConfiguration("output_directory"),
+            "reference_frame_conversion.enabled": ParameterValue(
+                rear_axle_to_imu, value_type=bool
+            ),
+            "use_sim_time": True,
+        }
+        # Saved-map product caps (metres, 0 = keep every return). Empty = keep the yaml value, so the
+        # production default stays in config/wuhu_truck29.yaml and the console can override per run.
+        for arg, key in (("save_map_max_range", "rtk.save_map_max_range"),
+                         ("save_rgb_max_range", "rtk.save_rgb_max_range")):
+            raw = LaunchConfiguration(arg).perform(context).strip()
+            if raw:
+                overrides[key] = float(raw)
+        return [Node(
+            package="fast_livo",
+            executable="fastlivo_mapping",
+            name="laser_mapping",
+            output="screen",
+            sigterm_timeout=LaunchConfiguration("finalize_timeout_sec"),
+            parameters=[config_file, overrides],
+        )]
+
+    mapping = OpaqueFunction(function=launch_mapping)
 
     rviz = OpaqueFunction(
         function=launch_rviz,
@@ -119,6 +127,10 @@ def generate_launch_description():
         DeclareLaunchArgument("output_directory", default_value=default_output_directory),
         DeclareLaunchArgument("config_file", default_value=default_config),
         DeclareLaunchArgument("rear_axle_to_imu", default_value="true"),
+        DeclareLaunchArgument("save_map_max_range", default_value="",
+                              description="saved geometry map cap [m], 0 = all, empty = yaml"),
+        DeclareLaunchArgument("save_rgb_max_range", default_value="",
+                              description="saved colour map cap [m], 0 = all, -1 = same as geometry, empty = yaml"),
         SetEnvironmentVariable(name="ROS_LOG_DIR", value=os.environ.get(
             "ROS_LOG_DIR") or "/home/project/MY-LIVO/results/roslog"),
         decoder,
