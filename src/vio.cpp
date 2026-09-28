@@ -797,6 +797,8 @@ void VIOManager::computeJacobianAndUpdateEKF(cv::Mat img)
     else
       updateState(img, level);
   }
+  if (lidar_parity_ratio > 0)
+    printf("[ VIO ] LiDAR parity: vision covariance x%.1f (finest level)\n", vision_cov_scale);
   state->cov -= G * state->cov;
   updateFrameState(*state);
 }
@@ -1517,6 +1519,23 @@ void VIOManager::updateStateInverse(cv::Mat img, int level)
   }
 }
 
+double VIOManager::parityCovarianceScale(const MatrixXd &H_sub) const
+{
+  if (lidar_parity_ratio <= 0 || H_sub.rows() == 0) return 1.0;
+  if (!lidar_information.allFinite() || !(lidar_information.trace() > 0)) return 1.0;
+  // Visual pose information [rot(3), trans(3)] in the same ESIKF tangent space as the LiDAR
+  // block; eigenvalue extremes are frame-invariant, so the world/body difference of the
+  // translation columns does not matter for this bound.
+  const Eigen::Matrix<double, 6, 6> Iv = (H_sub.leftCols<6>().transpose() * H_sub.leftCols<6>()) / img_point_cov;
+  const Eigen::SelfAdjointEigenSolver<M3D> vr(Iv.topLeftCorner<3, 3>()), vt(Iv.bottomRightCorner<3, 3>());
+  const Eigen::SelfAdjointEigenSolver<M3D> lr(lidar_information.topLeftCorner<3, 3>()), lt(lidar_information.bottomRightCorner<3, 3>());
+  const double eps = 1e-9;
+  const double ratio = std::max(vr.eigenvalues().maxCoeff() / std::max(lr.eigenvalues().minCoeff(), eps),
+                                vt.eigenvalues().maxCoeff() / std::max(lt.eigenvalues().minCoeff(), eps));
+  if (!std::isfinite(ratio)) return 1.0;
+  return std::max(1.0, ratio / lidar_parity_ratio);
+}
+
 void VIOManager::updateState(cv::Mat img, int level)
 {
   if (total_points == 0) return;
@@ -1636,6 +1655,7 @@ void VIOManager::updateState(cv::Mat img, int level)
     error = error / n_meas;
     
     compute_jacobian_time += omp_get_wtime() - t1;
+    if (iteration == 0) vision_cov_scale = parityCovarianceScale(H_sub);
 
     // printf("\nPYRAMID LEVEL %i\n---------------\n", level);
     // std::cout << "It. " << iteration
@@ -1658,7 +1678,7 @@ void VIOManager::updateState(cv::Mat img, int level)
       H_T_H.setZero();
       G.setZero();
       H_T_H.block<7, 7>(0, 0) = H_sub_T * H_sub;
-      MD(DIM_STATE, DIM_STATE) &&K_1 = (H_T_H + (state->cov / img_point_cov).inverse()).inverse();
+      MD(DIM_STATE, DIM_STATE) &&K_1 = (H_T_H + (state->cov / (img_point_cov * vision_cov_scale)).inverse()).inverse();
       auto &&HTz = H_sub_T * z;
       // K = K_1.block<DIM_STATE,6>(0,0) * H_sub_T;
       auto vec = (*state_propagat) - (*state);

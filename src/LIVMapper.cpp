@@ -109,6 +109,7 @@ LIVMapper::LIVMapper(const rclcpp::Node::SharedPtr &node)
           {"effective.imu_to_rear_axle", lever_text.str()},
           {"effective.camera_mode", img_en ? (vio_ekf_update_en ? "livo" : "colour_only") : "off"},
           {"effective.camera_frame_divider", std::to_string(camera_frame_divider)},
+          {"effective.vio_lidar_parity_ratio", num(vio_lidar_parity_ratio)},
           {"calibration.file", calibration_file_},
           {"calibration.id", calibration_identity_}});
     }
@@ -294,6 +295,9 @@ void LIVMapper::readParameters()
   nh.param<bool>("vio/inverse_composition_en", inverse_composition_en, false);
   nh.param<int>("vio/max_iterations", max_iterations, 5);
   nh.param<double>("vio/img_point_cov", IMG_POINT_COV, 100);
+  // > 0: bound the visual information per frame to this multiple of the LiDAR information
+  // (see VIOManager::parityCovarianceScale); 0 = original fixed-weight LIVO update.
+  nh.param<double>("vio/lidar_parity_ratio", vio_lidar_parity_ratio, 0.0);
   nh.param<bool>("vio/raycast_en", raycast_en, false);
   nh.param<bool>("vio/exposure_estimate_en", exposure_estimate_en, true);
   nh.param<double>("vio/inv_expo_cov", inv_expo_cov, 0.2);
@@ -749,6 +753,7 @@ void LIVMapper::initializeComponents()
   vio_manager->state_propagat = &state_propagat;
   vio_manager->max_iterations = max_iterations;
   vio_manager->img_point_cov = IMG_POINT_COV;
+  vio_manager->lidar_parity_ratio = vio_lidar_parity_ratio;
   vio_manager->normal_en = normal_en;
   vio_manager->inverse_composition_en = inverse_composition_en;
   vio_manager->raycast_en = raycast_en;
@@ -814,6 +819,7 @@ void LIVMapper::initializeFiles()
   // LIO and LIVO.  Keep collecting it whenever the backend is enabled; the
   // CSV itself remains a LIO-only diagnostic to avoid changing file output.
   if (rtk_enabled) voxelmap_manager->collect_geometry_diagnostics_ = true;
+  if (vio_lidar_parity_ratio > 0) voxelmap_manager->collect_geometry_diagnostics_ = true;
   if (!img_en && lidar_en && imu_en)
   {
     voxelmap_manager->collect_geometry_diagnostics_ = true;
@@ -1153,6 +1159,9 @@ void LIVMapper::handleVIO()
     vio_manager->plot_flag = false;
   }
 
+  // LiDAR information of the slice just registered by handleLIO: the parity bound of the
+  // photometric update is evaluated against this frame's own LiDAR conditioning.
+  vio_manager->lidar_information = voxelmap_manager->lidar_information_body_;
   vio_manager->processFrame(LidarMeasures.measures.back().img, _pv_list, voxelmap_manager->voxel_map_, LidarMeasures.last_lio_update_time - _first_lidar_time);
 
   if (imu_prop_enable) 
@@ -1696,7 +1705,8 @@ void LIVMapper::printCalibrationSummary(const char *stage) const
   }
   out << "  camera mode: " << (img_en ? (vio_ekf_update_en ? "LIVO (photometric ESIKF update on)" : "colour-only (vio.ekf_update_en=false, estimator = LIO)")
                                       : "off (LIO)")
-      << (img_en && camera_frame_divider > 1 ? ", frame divider " + std::to_string(camera_frame_divider) : "") << "\n";
+      << (img_en && camera_frame_divider > 1 ? ", frame divider " + std::to_string(camera_frame_divider) : "")
+      << (img_en && vio_ekf_update_en ? (vio_lidar_parity_ratio > 0 ? ", LiDAR-parity bound " + std::to_string(vio_lidar_parity_ratio) : std::string(", fixed visual weight")) : std::string()) << "\n";
   out << line;
   RCLCPP_INFO(node_->get_logger(), "%s", out.str().c_str());
 }

@@ -238,6 +238,7 @@ public:
   int camera_width = 1920;
   int camera_height = 1080;
   double IMG_POINT_COV;
+  double vio_lidar_parity_ratio = 0.0;
 
   bool mine_frame_initialized = false;
   std::string lio_world_frame = "mine";

@@ -69,12 +69,15 @@ laser_mapping:
       intrinsics: [1642.570556640625, 1855.53173828125,
                    971.0083025529602, 534.2602337509306]
       distortion: [0.0, 0.0, 0.0, 0.0, 0.0]
-      # Process every N-th image (1 = all). 30 Hz 1080p VIO is not real-time on the
-      # current machine (~10% behind after 2 min); 2-3 keeps LIVO real-time with a
-      # small loss in native accuracy (run 104: 10 Hz still passes the route budget).
-      # Offline rounds are paced by the player (tools/livo/player.py --max-lead), so
-      # the full image rate is affordable there.
-      frame_divider: 1
+      # Process every N-th image (1 = all). 3 is the production value (2026-09-28): in LIVO
+      # mode the LiDAR scan is cut at the image stamps, and with 30 Hz images the four-LiDAR
+      # 10 Hz merged scan is registered as 33 ms slices of 1/3 of the returns covering only
+      # part of the field of view. Measured on truck29 (v063, 30 Hz slices vs 10 Hz full
+      # scans): native xy drift over the first 40 s 73-87 cm vs 21-25 cm, start-segment lamp
+      # pole smear 13.6 cm vs 3.9-5.2 cm, multi-epoch pole axis separation 12 vs 7 cm. With 3
+      # the LIO keeps full scans and the photometric update + colouring run at 10 Hz (VIO is
+      # still in the front-end ESIKF). 30 Hz 1080p VIO was also not real-time online.
+      frame_divider: 3
 
     mine:
       # rosbag2 publishes this prepared MCAP with RELIABLE QoS. Matching it
@@ -327,6 +330,17 @@ laser_mapping:
       max_iterations: 5
       outlier_threshold: 300.0
       img_point_cov: 100.0
+      # LiDAR-parity bound on the photometric update (0 = original fixed weight). Per frame the
+      # visual information may not exceed this multiple of the same frame's LiDAR information in
+      # any pose direction; the excess inflates img_point_cov for that frame. Measured 2026-09 on
+      # truck29: with the fixed weight one 33 ms LiDAR slice constrains the pose to ~1-2 mm while
+      # 200 patches x 64 px inject ~1000x more information, so the front-end follows photometric
+      # model errors (native xy drift 87 cm / 40 s vs 21 cm for LIO; lamp-pole ghosting 12 vs 5.5 cm).
+      # LiDAR-degenerate frames keep the full-weight update. 1.0 = the visual information may equal
+      # but not exceed the weakest LiDAR direction (truck29: scale x400-600 median, x20-180 in the
+      # 10% weakest-LiDAR frames; truck05 W598: x56 median, LIVO 16.5 -> 6.1 cm, no divergence).
+      # 0.1 was not better (docs/mcp-colour-only-and-time-offset-audit.md section 10).
+      lidar_parity_ratio: 1.0
       patch_size: 8
       patch_pyrimid_level: 4
       grid_size: 20

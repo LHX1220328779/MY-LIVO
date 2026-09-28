@@ -114,6 +114,15 @@ public:
   int max_iterations, total_points;
 
   double img_point_cov, outlier_threshold, ncc_thre;
+  // LiDAR-parity bound for the photometric update (0 disables). The visual information of a frame
+  // may not exceed lidar_parity_ratio x the LiDAR information of the same frame in any pose
+  // direction (strongest visual eigenvalue vs weakest LiDAR eigenvalue, rotation and translation
+  // blocks separately); the excess inflates img_point_cov for that frame/level. LiDAR-degenerate
+  // frames keep the original full-weight LIVO update.
+  double lidar_parity_ratio = 0.0;
+  Eigen::Matrix<double, 6, 6> lidar_information = Eigen::Matrix<double, 6, 6>::Zero();
+  double vision_cov_scale = 1.0;
+  double parityCovarianceScale(const MatrixXd &H_sub) const;
   
   SubSparseMap *visual_submap;
   std::vector<std::vector<V3D>> rays_with_sample_points;
