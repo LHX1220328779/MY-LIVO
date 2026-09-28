@@ -352,7 +352,12 @@ laser_mapping:
       inv_expo_cov: 0.1
 
     lio:
-      max_iterations: 5
+      # ESIKF iterations per scan. 3 measured equal to 5 on truck29 (LIVO xy max 4.87/4.87 cm, pole
+      # smear 4.8/4.8, ground thickness 24.86/24.85 mm; LIO 6.60 vs 7.09) and truck05 720 s (9.97 vs
+      # 9.89 cm) while cutting LIO time 20-25% (truck29 41 -> 30 ms, truck05 66 -> 54 ms per scan);
+      # on this machine that is the difference between losing 12% of the truck05 frames in playback
+      # and losing none (docs/mcp-colour-only-and-time-offset-audit.md section 10.9).
+      max_iterations: 3
       dept_err: 0.02
       beam_err: 0.05
       min_eigen_value: 0.0025
