@@ -2,6 +2,15 @@
 
 范围：`/home/lhx/docker/MY-LIVO`，分支 `fusion/56c6896-ins-attitude`（基线 3dbf7e7）。目标是 29/05 两台车全局误差 ≤ 8.5 cm、彩色点云上色正确、外参与时间偏移在控制台可见、时间偏移逻辑经得起审计、在不牺牲精度前提下删掉多余的流水线步骤。本文只记录实测结论；未经实测的推断都标明"未证实"。
 
+## 决策更新（2026-09-28，用户裁定）
+
+**图像必须参与前端状态估计**：LIVO 引入视觉的目的就是在 LiDAR 退化环境下增强鲁棒性，"图像只上色"违背这一目的。因此：
+
+- `config/wuhu_truck29.yaml` 默认已改回 `vio.ekf_update_en: true`、`camera.frame_divider: 1`（原始 LIVO 行为，`--mode livo` 即全速 VIO 参与 EKF）。`ekf_update_en=false` 仅保留为**诊断开关**，不作为生产模式，也不再是流水线建议。
+- 下文 colour-only 的数字（truck29 5.02 / truck05 4.32、5.65 cm）保留，但定位变为**诊断证据**：同一数据、同一标定，去掉视觉更新后误差降到一半，说明当前 VIO 更新在矿区富纹理/动态场景里注入了误差。结论不是关掉它，而是让视觉更新"该出手时出手"（§8 方案）。
+- §5 中依赖 colour-only 的精简建议（删 `camloop`、`camera-time` 降为可选、LIO/LIVO 合并）**撤回**；视觉参与前端时相机时间与外参直接影响轨迹，这两个阶段保留。
+- 回退验证：`mcp_t29_livo_default`（默认配置、v063、同一二进制）见 §6 末行。
+
 ## 0. 结论速览
 
 | 项 | 结论 |
@@ -38,7 +47,7 @@
 - `src/LIVMapper.cpp` / `include/LIVMapper.h`：`printCalibrationSummary()`（启动 + 结束各一次，结束时附后端估计的 INS 安装角）；`vio.ekf_update_en`（false = colour-only）、`debug.print_frame_timing`；`[status]` 行每 10 s 一条（LIO/VIO 均值、点数、模式）。`parameters.txt` 新增 `effective.camera_mode` / `effective.camera_frame_divider`。
 - `src/vio.cpp` / `include/vio.h`：`ekf_update_en=false` 时跳过光度 EKF 更新与视觉子图维护，仅保留图像→点着色。
 - `src/rtk_fusion.cpp`：`appendParameters` 写入 `effective.*`（实际生效的四个时间偏移、杆臂、标定 id）。
-- `config/wuhu_truck29.yaml`：默认 `camera.frame_divider: 3`、`vio.ekf_update_en: false`、`debug.print_frame_timing: false`（注释写明依据；`--set vio.ekf_update_en=true` 可回到旧 LIVO）。
+- `config/wuhu_truck29.yaml`：新增 `vio.ekf_update_en`（默认 **true**，见"决策更新"）、`debug.print_frame_timing: false`；`camera.frame_divider` 保持 1。
 - `scripts/analysis/round_summary.py`、`round_metrics.py`：**修复** `parameters.txt` 键取"最后一次出现"（yaml 转储值 `rtk.time_offset_sec=0.025`）而不是首行的生效值 → `summary.txt`/`error_series.csv` 误差此前被高估（truck29 优化后中位 11 cm vs 真实 0.9 cm）。杆臂改读 `effective.imu_to_rear_axle`。修复后三轮重评估，`summary.txt` 与 `metrics.json["trajectory"]` 一致。
 - `tools/calib/livo_calib.py`：`set` 新增 `--rtk-position-offset/--ins-attitude-offset`（做关联时间试验用）；`decode_hevc` 加 `-nostdin`（ffmpeg 曾吞掉通过 stdin 传入的脚本剩余部分）。
 - 新脚本 `scripts/analysis/time_sync_check.py`、`camera_sync_check.py`、`camera_overlay_check.py`（§3.2、§4）。
@@ -100,7 +109,7 @@ truck29 的三项偏移由此得到独立证实（[2]、[3] 与相机边缘法 �
 
 `scripts/analysis/camera_overlay_check.py` 把 LiDAR 点按深度着色投到原图（`results/.cache/mcp_camsync/t05w40_overlay/`）：t+5 s（洒水车横穿）、t+25 s（近处停放矿卡）两帧中，矿卡轮廓、路缘、远处建筑与点云对齐在 ~10 px（640 宽）以内，即外参无度级错误，彩色地图不会出现"颜色贴到别的物体上"。但 truck05 相机外参仍是供应商标称（`camera-lidar` 阶段因无灯杆未跑过），内参 [1849.37 1849.37 1003.31 502.72]、畸变全零，边缘法要求亚像素级对齐才能出峰；加上 W40 转弯段视野里多是开阔路面，深度边缘主要来自地面起伏噪声。要在 truck05 上定相机时间，先要有一次相机→LiDAR 旋转细调（用停放矿卡/路缘做目标，`livo_calib.py camera-lidar` 的目标检测需要放宽到非杆状结构），列为后续项。
 
-## 5. 流水线精简建议（精度不降的前提下）
+## 5. 流水线精简建议（精度不降的前提下）— 部分撤回，见"决策更新"
 
 当前：`import → windows → axle → ground → LIO round → driven → camera-time → LIVO round → camera-lidar → camloop → validate/activate`。
 
@@ -136,6 +145,7 @@ truck29 的三项偏移由此得到独立证实（[2]、[3] 与相机边缘法 �
 | `mcp_t05_v022_livo_w598_r2` | 同上 | v022 | 全速 LIVO | — / — / 11.3 | 14.2 | — | — |
 | `mcp_t05_colour_full` | truck05 全程 717.5 s / 1538 m | v024 | colour-only（回放节流 3 s；仍有 32 个帧空洞） | 0.72 / 2.69 / **13.47** | 44.7 | 6.75 m（z 0.2 m） | 38.7→55.0 mm |
 | `mcp_t05_colour_full_r2_merger_deadlock` | 同上 | v024 | 点云历史 60、max-lead 1.5 s | 未完成（§5.1 第 4 行） | | | |
+| `mcp_t29_livo_default` | truck29 全程 117.7 s | v063 | **默认配置（VIO 参与 EKF，30 Hz）**，回退验证 | 0.97 / 2.67 / **5.86**（= 历史 v063 LIVO 5.92，二进制改动未改变 LIVO 行为）| 6.93 | 2.72 m | — | | | |
 
 全程的分段 xy/z 最大误差（cm，每 30 s）：0–180 s xy ≤ 8.3（30–60 s 洒水车横穿段 8.3）、180–210 s xy 13.5（帧空洞）、240–300 s z 16–23、330–390 s z 42–44（帧空洞 0.5/0.5/2.0/0.8 s，帧内点数最低 7–9 k，即用户所说其他矿卡经过/扬尘段）、420–720 s xy ≤ 4.2 / z ≤ 6.4。此前 v019 LIO 模式全程 xy max 7.25 cm。
 
@@ -144,6 +154,15 @@ truck29 的三项偏移由此得到独立证实（[2]、[3] 与相机边缘法 �
 ## 7. 提交与后续
 
 提交：见 `git log`（本轮一次提交，含上述代码、v024 标定与激活、本文档、开发计划记录）。未提交：工作树中 `config/perception_truck29*.json`、`config/carlibration/perception_truck29.json`、`pics/Framework.png` 的删除与 `3rdparty/gtsam` 子模块状态不是本轮改动，保持原样——注意 `config/wuhu_truck29.yaml` 的默认 `multi_lidar.calibration_file` 仍指向已删除的 `config/perception_truck29_refined_v2.json`，不带 `--calibration` 直接 launch 会失败（`run_wuhu_round.sh` 总是显式传标定，不受影响）。
+
+## 8. 视觉更新的下一步（按用户裁定：参与前端，但要鲁棒）
+
+诊断证据：截掉视觉 EKF 更新后 truck05 W598 xy max 11.3 → 5.65 cm、truck29 5.92 → 5.02 cm，而 LIO 本身在这两段并不退化（有效特征 1.5–1.8 万/帧，配准残差 ~2 cm）。也就是说当前 VIO 在 **LiDAR 不退化** 的场景里仍以固定权重（`img_point_cov: 100`）修正状态，把光度噪声（曝光、动态车辆、弱纹理、相机外参/时间的残余误差）带进了轨迹。符合原始 LIVO 思路的修法是让视觉权重随 LiDAR 可观测性自适应，而不是恒定：
+
+1. **按 LiDAR 退化程度加权视觉更新**：用 LIO 迭代更新里已有的 Hessian 最小特征值（`lio.min_eigen_value` 同源量）或有效特征数/方向分布，构造 0–1 的退化因子 d；视觉测量协方差取 `img_point_cov / max(d, d_min)`。LiDAR 富约束时视觉只起微弱先验作用，退化时（长直巷道、扬尘、近距大车遮挡）恢复全权重——这正是 LIVO 想要的"退化时视觉兜底"。
+2. **视觉更新质量门**：光度残差中位数/内点率低于阈值（曝光突变、动态物体占比高）时跳过该帧视觉更新，仍上色。
+3. **验证口径**：在 truck05 W598（富约束）要求接近 colour-only 的 5.65 cm，在 truck05 240–390 s（扬尘/大车遮挡，帧内点数 7–9 k）要求优于纯 LIO；两者同时满足才算"视觉增强而非拖累"。
+4. 前提修正：truck05 相机→LiDAR 旋转仍是供应商标称（§4.3），视觉权重再自适应也修不了外参错——应先做相机→LiDAR 细调。
 
 后续（按优先级）：
 0. **多雷达合帧器失配恢复**（C++）：某路扫描丢失/迟到后按时间戳丢弃最旧一路的旧帧立即重新对齐，而不是逐帧丢弃直到偶然对齐；同时 colour-only 模式下 LIO 不应因图像缺失断更。这是 truck05 全程 720 s 达标（≤ 8.5 cm）唯一剩余的障碍：去掉 5 处帧空洞后其余 700 s 的 xy ≤ 8.3 cm、z ≤ 9.7 cm。复现：`bash scripts/run_wuhu_round.sh <name> --mode livo --dataset …/05/20260914/ros2bag --calibration config/carlibration/wuhu/truck05/v024_precheck/calibration.json --start-offset 320 --duration 70`。
