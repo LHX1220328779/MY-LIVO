@@ -553,6 +553,16 @@ def pipeline_steps(kind, body, mapping_cmd):
     stamp = dt.datetime.now().strftime("%m%d_%H%M%S")
     auto_activate = bool(body.get("activate", True))
     steps = []
+    if body.get("dataset") and not body.get("skip_assess"):
+        # data assessment first (cached per recording): warns about defects calibration cannot compensate and stops
+        # the pipeline before any expensive stage when the recording is unusable
+        try:
+            base_file = str(calibration_file(parent))
+        except Exception:  # noqa: BLE001 - parent without a file: assess without the extrinsic checks
+            base_file = None
+        step0 = datasets.assess_pipeline_step(dataset, base_file)
+        if step0:
+            steps.append(step0)
     if kind == "lidar":
         datasets.require(dataset)
         lio_duration = body.get("lidar_round_duration")

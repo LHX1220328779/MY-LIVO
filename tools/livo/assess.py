@@ -41,6 +41,8 @@ import sys
 import tempfile
 import time
 
+for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_v, "1")
 import numpy as np
 
 if __package__ in (None, ""):  # executed as a file: make `livo` importable
@@ -112,6 +114,41 @@ def parse_ffmpeg(data):
     return ts, w, h, pts, flags, data[off + 4:off + 4 + n]
 
 
+def _cdr_string(data, off):
+    off = _align(off, 4)
+    n = _U32.unpack_from(data, off)[0]
+    return bytes(data[off + 4:off + 3 + n]) if n else b"", off + 4 + n
+
+
+def parse_diag(data, keys=(b"ins_pos_mode", b"gps_num_sats")):
+    """(stamp_ns, {key: value}) for diagnostic_msgs/DiagnosticArray, reading only the wanted keys."""
+    ts, off = cdr_header(data)
+    off = _align(off, 4)
+    n_status = _U32.unpack_from(data, off)[0]
+    off += 4
+    found = {}
+    for _ in range(n_status):
+        off += 1  # level (byte)
+        for _ in range(3):  # name, message, hardware_id
+            _, off = _cdr_string(data, off)
+        off = _align(off, 4)
+        n_val = _U32.unpack_from(data, off)[0]
+        off += 4
+        for _ in range(n_val):
+            k, off = _cdr_string(data, off)
+            v, off = _cdr_string(data, off)
+            if k in keys:
+                found[k] = v
+    return ts, found
+
+
+def _diag_int(v):
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return -1
+
+
 def verify_parsers(samples):
     """Compare the byte-level parsers with rclpy on the first message of each type; return the
     set of parsers that agree (the others fall back to deserialize_message)."""
@@ -135,6 +172,10 @@ def verify_parsers(samples):
             elif kind == "camera":
                 ts, w, h, pts, flags, payload = parse_ffmpeg(data)
                 good = ts == st and w == m.width and flags == int(m.flags) and len(payload) == len(m.data)
+            elif kind == "status":
+                ts, found = parse_diag(data)
+                ref = {item.key: item.value for st_ in m.status for item in st_.values}
+                good = ts == st and all(found.get(k.encode(), b"").decode() == ref.get(k, "") for k in ("ins_pos_mode", "gps_num_sats"))
             else:
                 good = False
             if good:
@@ -201,7 +242,9 @@ class Report:
                "status": status, "limits": limits or "", "fix": fixc if status in ("warn", "bad") else None,
                "fix_label": FIX_LABEL.get(fixc, "") if status in ("warn", "bad") else "",
                "alert": status in ("warn", "bad") and fixc in ("procedure", "none"),
-               "note": note, "basis": basis}
+               "note": note, "basis": basis,
+               "thresholds": ({"ok": float(ok), "warn": float(warn if warn is not None else ok), "higher": bool(higher)}
+                              if ok is not None and isinstance(value, (int, float)) and not isinstance(value, bool) else None)}
         if extra:
             rec["extra"] = extra
         self._by_id[gid]["metrics"].append(rec)
@@ -257,19 +300,14 @@ def is_keyframe(payload):
     """HEVC Annex-B packet starts with VPS/SPS/PPS or an IRAP slice (NAL types 32-34 / 16-21)."""
     n = len(payload)
     i = 0
-    checked = 0
-    while i < n - 4 and checked < 6:
-        if payload[i] == 0 and payload[i + 1] == 0 and (payload[i + 2] == 1 or (payload[i + 2] == 0 and payload[i + 3] == 1)):
-            j = i + (3 if payload[i + 2] == 1 else 4)
-            if j >= n:
-                break
-            typ = (payload[j] >> 1) & 0x3F
-            if 16 <= typ <= 21 or 32 <= typ <= 34:
-                return True
-            checked += 1
-            i = j + 2
-        else:
-            i += 1
+    for _ in range(6):
+        i = payload.find(b"\x00\x00\x01", i)
+        if i < 0 or i + 3 >= n:
+            return False
+        typ = (payload[i + 3] >> 1) & 0x3F
+        if 16 <= typ <= 21 or 32 <= typ <= 34:
+            return True
+        i += 3
     return False
 
 
@@ -415,75 +453,80 @@ def percentile(a, p):
     return float(np.percentile(a, p)) if len(a) else None
 
 
-def run(a):
-    t_wall = time.time()
-    ds = Dataset.open(a.dataset)
-    summary = ds.summary()
-    calib = load_calibration(a.calibration)
-    lidar_topics = [t for t in ds.lidar_topics]
+def plan_chunks(ds, jobs, start_ns=None, end_ns=None):
+    """Split the recording into time-contiguous groups of whole segments (one streaming pass each).
+
+    Raw split recordings interleave Perception_* and Camera_* segments of the same 30 s; a chunk holds all
+    segments whose start falls into its time bin, so every topic stays time-ordered across chunks and the
+    parent only has to de-duplicate the segment borders (same rule as Dataset.iter_messages)."""
+    segs = [x for x in ds.segments if (end_ns is None or x.start_ns <= end_ns) and (start_ns is None or x.end_ns >= start_ns)]
+    segs.sort(key=lambda x: (x.start_ns, x.name))
+    if jobs <= 1 or len(segs) < 2:
+        return [segs]
+    t_lo, t_hi = min(x.start_ns for x in segs), max(x.end_ns for x in segs)
+    n = max(1, min(jobs, len(segs)))
+    edges = [t_lo + (t_hi - t_lo) * k // n for k in range(1, n)]
+    chunks = [[] for _ in range(n)]
+    for x in segs:
+        k = sum(1 for e in edges if x.start_ns >= e)
+        chunks[k].append(x)
+    return [c for c in chunks if c]
+
+
+def scan_chunk(job):
+    """One streaming pass over a chunk of segments; returns raw collectors (picklable)."""
+    t_start = time.time()
+    a = job["args"]
+    ds = Dataset.open(job["dataset"])
+    if job["segments"] is not None:
+        names = set(job["segments"])
+        ds = Dataset(ds.root, [x for x in ds.segments if x.name in names])
+    calib = load_calibration(job["calibration"]) if job["calibration"] else None
+    lidar_topics = job["lidar_topics"]
     short = {t: t.split("/")[-1] for t in lidar_topics}
-    imu_topic = next((t for t in ds.imu_topics), None)
-    odom_topic = next((t for t in ds.topics if t.endswith("imu_data/odometry")), None)
-    status_topic = next((t for t in ds.topics if t.endswith("imu_data/ins_status")), None)
-    cam_topic = next((t for t in ds.camera_topics), None) if not a.no_camera else None
-    wanted = lidar_topics + [t for t in (imu_topic, odom_topic, status_topic, cam_topic) if t]
+    imu_topic, odom_topic, status_topic, cam_topic = job["imu_topic"], job["odom_topic"], job["status_topic"], job["cam_topic"]
+    wanted = [t for t in lidar_topics + [imu_topic, odom_topic, status_topic, cam_topic] if t and t in ds.topics]
+    start_ns, end_ns, t0, span_s = job["start_ns"], job["end_ns"], job["t0"], job["span_s"]
+    first = job["first"]
 
-    start_ns = ds.start_ns + int(a.window[0] * NS) if a.window else None
-    end_ns = (start_ns + int(a.window[1] * NS)) if a.window else None
-    span_s = (a.window[1] if a.window else ds.duration_s) or 1.0
-    t0 = (start_ns if start_ns else ds.start_ns) / NS
-
-    # collectors -------------------------------------------------------------
     lid_ts = {t: [] for t in lidar_topics}
     lid_rec = {t: [] for t in lidar_topics}
     lid_n = {t: [] for t in lidar_topics}
     lid_start = {short[t]: [] for t in lidar_topics}
-    sample_slots = {}          # pending slot -> {short: xyz}
-    slots_eval = []            # per sampled slot: above-ground structure count
-    imu_ts, imu_gyro = [], []
-    imu_rec = []
+    sample_slots = {}
+    slots_eval = []
+    imu_ts, imu_gyro, imu_rec = [], [], []
     odo = {"ts": [], "p": [], "q": [], "vb": [], "cov": []}
     st_mode, st_sats, st_ts = [], [], []
     cam_ts, cam_rec, cam_flags, cam_size = [], [], [], []
-    cam_samples = []           # list of dicts {t, packets}
-    cam_windows = []
-    if cam_topic and a.camera_samples > 0:
-        cam_windows = [t0 + (k + 0.5) / a.camera_samples * span_s for k in range(a.camera_samples)]
+    cam_samples = []
+    cam_windows = list(job["cam_windows"])
     cam_pending = None
-    sample_every_ns = int(a.sample_every * NS)
+    sample_every_ns = int(a["sample_every"] * NS)
     next_sample_ns = None
     verified = None
     samples_for_verify = {}
     counters = {"messages": 0, "bytes": 0}
     dropped = {}
     n_start_frames = 22
-    last_progress = -1
-
-    from rclpy.serialization import deserialize_message
-    from diagnostic_msgs.msg import DiagnosticArray
-
-    def progress(ts):
-        nonlocal last_progress
-        pct = int(100 * (ts / NS - t0) / span_s)
-        if pct // 5 != last_progress // 5:
-            last_progress = pct
-            el = time.time() - t_wall
-            rate = counters["bytes"] / max(el, 1e-6) / 1e9
-            print(f"[assess] {min(pct, 100):3d} %  {ts / NS - t0:6.0f}/{span_s:.0f} s  {rate:.2f} GB/s  {el:.0f} s elapsed", flush=True)
+    if not wanted:
+        return {"empty": True, "counters": counters, "dropped": dropped, "elapsed": 0.0}
 
     for topic, data, rec_ns in ds.iter_messages(wanted, start_ns=start_ns, end_ns=end_ns, stats=dropped):
         counters["messages"] += 1
         counters["bytes"] += len(data)
-        if verified is None:
-            kind = "lidar" if topic in lid_ts else "imu" if topic == imu_topic else "odom" if topic == odom_topic else "camera" if topic == cam_topic else None
+        if first and verified is None:
+            kind = ("lidar" if topic in lid_ts else "imu" if topic == imu_topic else "odom" if topic == odom_topic
+                    else "status" if topic == status_topic else "camera" if topic == cam_topic else None)
             if kind and kind not in samples_for_verify:
                 samples_for_verify[kind] = (ds.topics[topic], bytes(data))
-            need = {k for k, t in (("lidar", lidar_topics[0] if lidar_topics else None), ("imu", imu_topic), ("odom", odom_topic), ("camera", cam_topic)) if t}
+            need = {k for k, t in (("lidar", lidar_topics[0] if lidar_topics else None), ("imu", imu_topic), ("odom", odom_topic),
+                                   ("status", status_topic), ("camera", cam_topic)) if t and t in ds.topics}
             if need <= set(samples_for_verify):
                 verified = verify_parsers(samples_for_verify)
                 missing = need - verified
                 if missing:
-                    print(f"[assess] byte-level parser mismatch for {sorted(missing)}: falling back to rclpy deserialisation", flush=True)
+                    print(f"[assess] byte-level parser mismatch for {sorted(missing)} — check message definitions", flush=True)
         if topic in lid_ts:
             try:
                 ts, n = parse_pointcloud(data)
@@ -492,22 +535,20 @@ def run(a):
             lid_ts[topic].append(ts)
             lid_rec[topic].append(rec_ns - ts)
             lid_n[topic].append(n)
-            s = short[topic]
-            if len(lid_start[s]) < n_start_frames and len(lid_ts[topic]) > 2:
-                lid_start[s].append(cloud_xyz(data))
+            sname = short[topic]
+            if first and len(lid_start[sname]) < n_start_frames and len(lid_ts[topic]) > 2:
+                lid_start[sname].append(cloud_xyz(data))
             if next_sample_ns is None:
                 next_sample_ns = ts + 3 * NS
             if calib and ts >= next_sample_ns - 60_000_000:
                 d = sample_slots.setdefault(next_sample_ns, {})
-                if s not in d:
-                    d[s] = cloud_xyz(data)
+                if sname not in d:
+                    d[sname] = cloud_xyz(data)
                 if len(d) == len(lidar_topics) or ts >= next_sample_ns + NS:
                     above, total = slot_structure(d, calib["matrices"])
                     slots_eval.append({"t_s": round(next_sample_ns / NS - t0, 1), "above_ground": above, "points": total})
                     del sample_slots[next_sample_ns]
                     next_sample_ns += sample_every_ns
-            if s == short[lidar_topics[0]]:
-                progress(ts)
         elif topic == imu_topic:
             ts, g, _acc = parse_imu(data)
             imu_ts.append(ts)
@@ -522,13 +563,12 @@ def run(a):
             odo["cov"].append(cov)
         elif topic == status_topic:
             try:
-                m = deserialize_message(data, DiagnosticArray)
-                values = {item.key: item.value for st in m.status for item in st.values}
-                st_ts.append(m.header.stamp.sec * NS + m.header.stamp.nanosec)
-                st_mode.append(int(float(values.get("ins_pos_mode", "nan"))) if values.get("ins_pos_mode") not in (None, "") else -1)
-                st_sats.append(int(float(values.get("gps_num_sats", "nan"))) if values.get("gps_num_sats") not in (None, "") else -1)
-            except Exception:  # noqa: BLE001
+                ts, found = parse_diag(data)
+            except (struct.error, IndexError):
                 continue
+            st_ts.append(ts)
+            st_mode.append(_diag_int(found.get(b"ins_pos_mode")))
+            st_sats.append(_diag_int(found.get(b"gps_num_sats")))
         elif topic == cam_topic:
             ts, w, h, pts, flags, payload = parse_ffmpeg(data)
             cam_ts.append(ts)
@@ -546,8 +586,139 @@ def run(a):
                     cam_windows.pop(0)
     if cam_pending and len(cam_pending["packets"]) >= 2:
         cam_samples.append(cam_pending)
+
+    # camera samples are decoded here so the ffmpeg work runs inside the parallel workers
+    cam_eval = []
+    for smp in cam_samples:
+        img = decode_gray(smp["packets"])
+        if img is None:
+            cam_eval.append({"t_s": round(smp["t"], 1), "decoded": False})
+            continue
+        m = image_metrics(img)
+        m.update({"t_s": round(smp["t"], 1), "decoded": True})
+        cam_eval.append(m)
+
+    return {"empty": False, "lid_ts": lid_ts, "lid_rec": lid_rec, "lid_n": lid_n, "lid_start": lid_start if first else None,
+            "slots_eval": slots_eval, "imu_ts": imu_ts, "imu_gyro": imu_gyro, "imu_rec": imu_rec, "odo": odo,
+            "st_mode": st_mode, "st_sats": st_sats, "st_ts": st_ts, "cam_ts": cam_ts, "cam_rec": cam_rec,
+            "cam_flags": cam_flags, "cam_size": cam_size, "cam_eval": cam_eval, "counters": counters, "dropped": dropped,
+            "elapsed": time.time() - t_start}
+
+
+def _dedup(chunks, key, *companions):
+    """Concatenate per-chunk time-ordered lists; drop border repeats / backwards samples like iter_messages does.
+
+    chunks: list of dicts; key: name of the timestamp list; companions: names of parallel lists.
+    Returns (merged dict of lists, n_duplicate, n_backwards)."""
+    out = {k: [] for k in (key,) + companions}
+    dup = back = 0
+    last = None
+    for c in chunks:
+        ts = c[key]
+        if not ts:
+            continue
+        keep_from = 0
+        if last is not None:
+            while keep_from < len(ts) and ts[keep_from] <= last:
+                if ts[keep_from] == last:
+                    dup += 1
+                else:
+                    back += 1
+                keep_from += 1
+        if keep_from:
+            out[key].extend(ts[keep_from:])
+            for k in companions:
+                out[k].extend(c[k][keep_from:])
+        else:
+            out[key].extend(ts)
+            for k in companions:
+                out[k].extend(c[k])
+        if out[key]:
+            last = out[key][-1]
+    return out, dup, back
+
+
+def run(a):
+    t_wall = time.time()
+    ds = Dataset.open(a.dataset)
+    summary = ds.summary()
+    calib = load_calibration(a.calibration)
+    lidar_topics = [t for t in ds.lidar_topics]
+    short = {t: t.split("/")[-1] for t in lidar_topics}
+    imu_topic = next((t for t in ds.imu_topics), None)
+    odom_topic = next((t for t in ds.topics if t.endswith("imu_data/odometry")), None)
+    status_topic = next((t for t in ds.topics if t.endswith("imu_data/ins_status")), None)
+    cam_topic = next((t for t in ds.camera_topics), None) if not a.no_camera else None
+
+    start_ns = ds.start_ns + int(a.window[0] * NS) if a.window else None
+    end_ns = (start_ns + int(a.window[1] * NS)) if a.window else None
+    span_s = (a.window[1] if a.window else ds.duration_s) or 1.0
+    t0 = (start_ns if start_ns else ds.start_ns) / NS
+    cam_windows = []
+    if cam_topic and a.camera_samples > 0:
+        cam_windows = [t0 + (k + 0.5) / a.camera_samples * span_s for k in range(a.camera_samples)]
+
+    # ------------------------------------------------------------------ streaming pass (parallel over segment chunks)
+    jobs = a.jobs if a.jobs and a.jobs > 0 else max(1, min(8, (os.cpu_count() or 2) // 2))
+    chunks = plan_chunks(ds, jobs, start_ns, end_ns)
+    specs = []
+    for i, chunk in enumerate(chunks):
+        c_lo = min(x.start_ns for x in chunk) / NS
+        c_hi = max(x.end_ns for x in chunk) / NS
+        specs.append({"dataset": str(ds.root), "segments": None if len(chunks) == 1 else [x.name for x in chunk], "first": i == 0,
+                      "calibration": a.calibration, "lidar_topics": lidar_topics, "imu_topic": imu_topic, "odom_topic": odom_topic,
+                      "status_topic": status_topic, "cam_topic": cam_topic, "start_ns": start_ns, "end_ns": end_ns, "t0": t0,
+                      "span_s": span_s, "cam_windows": [w for w in cam_windows if c_lo <= w <= c_hi or (i == 0 and w < c_lo)
+                                                        or (i == len(chunks) - 1 and w > c_hi)],
+                      "args": {"sample_every": a.sample_every}})
+    print(f"[assess] {len(ds.segments)} segments → {len(specs)} parallel pass(es)", flush=True)
+    if len(specs) == 1:
+        results = [scan_chunk(specs[0])]
+    else:
+        import multiprocessing as mp
+        with mp.get_context("fork").Pool(len(specs)) as pool:
+            results = []
+            for i, r in enumerate(pool.imap(scan_chunk, specs)):
+                results.append(r)
+                print(f"[assess] chunk {i + 1}/{len(specs)} done: {r['counters']['messages']} messages, "
+                      f"{r['counters']['bytes'] / 1e9:.2f} GB, {r['elapsed']:.1f} s", flush=True)
+    results = [r for r in results if not r.get("empty")]
+    if not results:
+        raise SystemExit("[assess] no messages of the required topics in the requested range")
+
+    counters = {"messages": sum(r["counters"]["messages"] for r in results), "bytes": sum(r["counters"]["bytes"] for r in results)}
+    dropped = {"dropped_duplicate": sum(r["dropped"].get("dropped_duplicate", 0) for r in results),
+               "dropped_backwards": sum(r["dropped"].get("dropped_backwards", 0) for r in results)}
+    lid_ts, lid_rec, lid_n = {}, {}, {}
+    for t in lidar_topics:
+        m, d1, b1 = _dedup([{"ts": r["lid_ts"][t], "rec": r["lid_rec"][t], "n": r["lid_n"][t]} for r in results], "ts", "rec", "n")
+        lid_ts[t], lid_rec[t], lid_n[t] = m["ts"], m["rec"], m["n"]
+        dropped["dropped_duplicate"] += d1
+        dropped["dropped_backwards"] += b1
+    m, d1, b1 = _dedup([{"ts": r["imu_ts"], "g": r["imu_gyro"], "rec": r["imu_rec"]} for r in results], "ts", "g", "rec")
+    imu_ts, imu_gyro, imu_rec = m["ts"], m["g"], m["rec"]
+    dropped["dropped_duplicate"] += d1
+    dropped["dropped_backwards"] += b1
+    m, d1, b1 = _dedup([r["odo"] for r in results], "ts", "p", "q", "vb", "cov")
+    odo = m
+    dropped["dropped_duplicate"] += d1
+    dropped["dropped_backwards"] += b1
+    m, d1, b1 = _dedup([{"ts": r["st_ts"], "mode": r["st_mode"], "sats": r["st_sats"]} for r in results], "ts", "mode", "sats")
+    st_ts, st_mode, st_sats = m["ts"], m["mode"], m["sats"]
+    dropped["dropped_duplicate"] += d1
+    dropped["dropped_backwards"] += b1
+    m, d1, b1 = _dedup([{"ts": r["cam_ts"], "rec": r["cam_rec"], "flags": r["cam_flags"], "size": r["cam_size"]} for r in results],
+                       "ts", "rec", "flags", "size")
+    cam_ts, cam_rec, cam_flags, cam_size = m["ts"], m["rec"], m["flags"], m["size"]
+    dropped["dropped_duplicate"] += d1
+    dropped["dropped_backwards"] += b1
+    lid_start = next((r["lid_start"] for r in results if r.get("lid_start") is not None), {short[t]: [] for t in lidar_topics})
+    slots_eval = sorted((x for r in results for x in r["slots_eval"]), key=lambda x: x["t_s"])
+    cam_eval = sorted((x for r in results for x in r["cam_eval"]), key=lambda x: x["t_s"])
+    cam_samples = cam_eval  # evaluation only needs the decoded samples
     elapsed_pass = time.time() - t_wall
-    print(f"[assess] pass finished: {counters['messages']} messages, {counters['bytes'] / 1e9:.2f} GB in {elapsed_pass:.1f} s", flush=True)
+    print(f"[assess] pass finished: {counters['messages']} messages, {counters['bytes'] / 1e9:.2f} GB in {elapsed_pass:.1f} s "
+          f"({len(specs)} worker(s))", flush=True)
 
     # ------------------------------------------------------------------ evaluation
     R = Report()
@@ -935,16 +1106,7 @@ def run(a):
               note="没有静止段时建图自检与 ground 阶段无法运行；外参只能由行驶段 driven 阶段求解。")
 
     # --- camera content
-    cam_eval = []
-    if cam_topic and cam_samples:
-        for s in cam_samples:
-            img = decode_gray(s["packets"])
-            if img is None:
-                cam_eval.append({"t_s": round(s["t"], 1), "decoded": False})
-                continue
-            m = image_metrics(img)
-            m.update({"t_s": round(s["t"], 1), "decoded": True})
-            cam_eval.append(m)
+    if cam_topic and cam_eval:
         dec = [c for c in cam_eval if c["decoded"]]
         R.add(g_cam, "camera_decode", "HEVC 样例解码", len(dec), "帧", status="ok" if len(dec) == len(cam_eval) and dec else ("warn" if dec else "bad"),
               display=f"{len(dec)} / {len(cam_eval)} 个样例可解码", fix="none",
@@ -1042,7 +1204,7 @@ def run(a):
            "window": list(a.window) if a.window else None, "calibration": calib["path"] if calib else None,
            "verdict": verdict, "counts": counts, "alerts": alerts, "fixable": fixable, "outlook": outlook,
            "groups": R.groups, "reference": ref_stats, "camera_samples": cam_eval,
-           "messages": counters["messages"], "bytes": counters["bytes"]}
+           "messages": counters["messages"], "bytes": counters["bytes"], "workers": len(specs), "pass_s": round(elapsed_pass, 1)}
     return doc
 
 
@@ -1093,6 +1255,7 @@ def main(argv=None):
     ap.add_argument("--camera-samples", type=int, default=8)
     ap.add_argument("--no-camera", action="store_true")
     ap.add_argument("--quiet", action="store_true", help="不打印表格（只写 JSON）")
+    ap.add_argument("--jobs", type=int, default=0, help="并行读取的进程数（0 = 自动：min(8, CPU/2)，1 = 串行）")
     a = ap.parse_args(argv)
     doc = run(a)
     if a.json:

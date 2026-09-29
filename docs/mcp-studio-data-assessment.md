@@ -1,11 +1,13 @@
 # MCP 专题：控制台数据准备阶段的综合数据评估（LIVO Studio · 数据源页）
 
-日期：2026-09-29 · 分支 `fusion/56c6896-ins-attitude` · 前置文档：`docs/mcp-colour-only-and-time-offset-audit.md`（§12 truck05 数据裁定）、`docs/mcp-studio-v2-workflow.md`
+日期：2026-09-29（第 2 版：并入标定流水线、并行读取、页面重排）· 分支 `fusion/56c6896-ins-attitude` · 前置文档：`docs/mcp-colour-only-and-time-offset-audit.md`（§12 truck05 数据裁定）、`docs/mcp-studio-v2-workflow.md`
 
 ## 1. 结论
 
 1. LIVO Studio「数据源」页新增 **数据评估** 卡片：一次流式读取录制数据，按 7 组 42 项指标给出 正常 / 关注 / 异常 三级判定，每项标明补救类别；**凡是标定自动微调无法补偿的问题，单独列入页首的橙/红色「警示」区**。指标与阈值全部来自本项目在 truck29 / truck05 上真实踩过的坑（§3 逐项给出依据）。
-2. 两车实测：**truck29 → 全部 42 项正常，结论「数据质量达到 truck29 参照水平」，7.0 s**；**truck05 → 10 项关注、0 项异常，其中 5 项「标定无法补救」（全部来自 RTK/INS 参考系统），36 s**。这与 §12 的裁定一致：truck05 精度上限由数据决定，不是标定或算法问题。
+2. 两车实测：**truck29 → 全部 42 项正常，结论「数据质量达到 truck29 参照水平」，1.9 s**；**truck05 → 10 项关注、0 项异常，其中 5 项「标定无法补救」（全部来自 RTK/INS 参考系统），10.5 s**。这与 §12 的裁定一致：truck05 精度上限由数据决定，不是标定或算法问题。
+   评估器第 2 版按分段并行读取（8 进程），与串行结果逐项一致（42/42），耗时 truck29 7.0 → 1.9 s、truck05 36 → 10.5 s。
+2a. **评估并入标定流水线的第 0 步**（LiDAR / 相机 / 相机闭环三条流水线相同）：同一录制只评估一次（报告按 路径+起止时间戳 缓存，命中即跳过、零成本）；出现异常级且标定无法补救的问题时在任何昂贵阶段开始之前中止流水线并给出原因；关注级只做标注。数据源页保留手动「开始/重新评估」，工作台与建图页显示评估徽标。为什么不"顺带"塞进某个标定阶段的读取里，见 §2.1。
 3. 地面阶段「行驶段地面修正后雷达残余俯仰」：**不改代码**。理由见 §6——现有 driven 第 2 遍已经在行驶段用地面约束求解后雷达俯仰（v066：后雷达地面厚度 4.00 → 3.12 cm），再加一个阶段只会增加标定时间而不会提高 truck29 精度；用户前提是"不影响效率才做"。
 4. 评估通过 Studio 的作业系统运行（进度抽屉、日志、结果归档），报告以数据身份（路径 + 起止时间戳）为键缓存在 `results/.studio/assess/`，换数据或数据变化即自动失效；工作台数据源卡片显示评估徽标。
 
@@ -13,12 +15,21 @@
 
 | 入口 | 说明 |
 |---|---|
+| 标定流水线（默认） | 标定页「运行流水线」→ 作业第 0 步 `数据评估 · <数据名>（并行流式读取；已有报告时自动跳过）`。缓存命中时该步根本不出现在步骤列表里。异常级不可补救 → 流水线中止并提示"请在数据源页查看评估报告，更换或重新采集数据"；关注级 → 结果写入作业 `results.assessment`，流水线继续。`POST /api/calibrations/pipeline` 传 `skip_assess: true` 可跳过。 |
 | 控制台 | 数据源页 → 「数据评估」卡片 → **开始评估**（已有报告时为「重新评估」）。评估作为作业运行，进度在右侧抽屉；结束后卡片自动刷新。任一作业运行时按钮禁用（避免与建图/标定争抢 I/O）。 |
 | 工作台 | 数据源卡片徽标：`评估 · 正常 / 关注 / 异常 · N 项不可标定补救`；未评估显示「未评估」。 |
 | API | `GET /api/datasets/assessment?path=` → `{path, file, result|null}`；`POST /api/datasets/assess {path, mine, truck}` → 作业文档（同一时刻只允许一个评估作业）；`/api/overview.assessment` 为摘要。 |
 | 命令行 | `/usr/bin/python3 tools/livo/assess.py <数据目录> [--calibration <calibration.json>] [--json out.json] [--window 起点 s 时长 s] [--sample-every 6] [--camera-samples 8] [--no-camera] [--quiet]`，终端打印同一张表。 |
 
-传入 `mine/truck` 时使用该车当前激活标定（`calibration.vehicle_status(...).calibration_file`）做静止段雷达间外参一致性检查；没有标定文件时该两项显示「未提供标定文件」，其余不受影响。
+传入 `mine/truck` 时使用该车当前激活标定（`calibration.vehicle_status(...).calibration_file`）做静止段雷达间外参一致性检查；没有标定文件时该两项显示「未提供标定文件」，其余不受影响。流水线内的第 0 步用父版本的标定文件；若缓存的报告是在没有标定文件时生成的，而现在有了，会重做一次（2–11 s）以补上外参检查。
+
+### 2.1 放在哪一步：效率分析与决策
+
+问题：评估能否"顺带"在标定流程的某次数据读取里完成，从而省掉一次读取？
+
+1. **标定流水线里没有可搭车的全量读取。** LiDAR 流水线各阶段的输入：运动分析只读 INS；后轴对齐 / 静止地面精修只读起步静止段与一个行驶窗口；LIO 轮次默认只回放 48 s；行驶段精修读的是 LIO 轮次导出的 `scans.bin`。唯一读完整录制的是最终建图的**实时**回放，它的耗时由实时节拍决定（120 s / 720 s），把评估计算塞进回放进程只会增加机器负载——回放丢帧是本项目 truck05 末段 13.47 cm 的直接来源，这是不能碰的。
+2. **评估本身的成本已经压到 I/O 极限附近。** 第 1 版 7 s / 36 s 的瓶颈不是磁盘（顺序冷读实测 1.44 GB/s）而是单进程 Python：rosbag2 读取 + `ins_status` 的 rclpy 反序列化（12 k 条 1.3 s）+ 24 核机器上 BLAS 线程空转（1.3 s）。第 2 版：按分段分块并行读取（每块整段、父进程按 `iter_messages` 同一规则去重分段边界）、`DiagnosticArray` 字节级解析、相机样例在工作进程内解码、`OMP/OPENBLAS_NUM_THREADS=1`、关键帧探测用 `find`。truck29 7.0 → **1.9 s**，truck05 36 → **10.5 s**（聚合读取 2.2–2.6 GB/s），串行与并行报告逐项一致。
+3. **结论：** 评估作为流水线第 0 步、按录制身份缓存。对已评估过的数据成本为零；新数据只多 2–11 s（占流水线 <3 %），换来在任何昂贵阶段之前拦下不可用数据，以及在数据准备阶段就看到精度下限。
 
 ## 3. 指标体系、阈值与依据
 
@@ -115,15 +126,23 @@
 ## 4. 判定与页面
 
 - 组状态 = 组内最差指标；总结论 = 所有组最差；`outlook` 文案三档：全部正常 →「数据质量达到 truck29 参照水平（预期 xy 最大误差 ≤ 8.5 cm）」；有关注级警示 →「N 项关注级问题无法通过标定补救……误差预期高于 truck29」；有异常级警示 →「存在不可补救的异常，需重新采集」。
-- 页面结构（保持控制台既有风格：卡片、`.callout`、`.badge`、`<details>`）：标题 + 结论徽标 + 生成时间 / 用时 / 所用标定 + 按钮 → 结论横幅（正常/关注/异常/不可补救 四个计数）→ **⚠ 警示区**（每条：组 · 指标 · 数值 · 一句话原因 · 「标定无法补救」标签）→ 可补偿区（蓝色，说明跑哪一步流水线）→ 7 个分组卡片（每行：状态点 / 指标 / 等宽数值 / 阈值 + 补救标签；卡片底部「说明与依据」折叠）→ 相机样例缩略图条（时刻 · 亮度均值 · 过曝 % · 纹理）→ 评估范围 / 消息数 / 报告路径。
+- 页面结构（第 2 版，沿用控制台的色彩变量、圆角、`.callout` / `.badge` / `<details>`，新增样式全部以 `.ax-` 前缀隔离）：
+  1. **结论横幅**：左侧环形量表（按 正常/关注/异常/参考 的项数比例着色，中心为结论与总项数）；中间 outlook 标题 + 说明 + 图例计数（含「⚠ 不可标定补救 N」）；右侧事实栏（时长 · 行驶 · 消息 · 数据量 · 用时/进程数 · 外参检查所用版本 · 生成时间）。
+  2. **检查组导航条**：7 个胶囊（状态点 + 组名 + `✓` 或 `n 项`），点击平滑滚动到对应分组。
+  3. **⚠ 标定无法补救区**（橙/红 callout）：编号 01…，指标名 + 所属组标签 + 等宽数值 + 一句话原因 + 补救标签。
+  4. **可补偿区**（蓝 callout）：一行一项，说明跑哪一步流水线。
+  5. **7 个分组卡片**，统一四列表格：指标 ｜ 数值（主值 + 次行明细 + **阈值微条**：绿/橙/红三段刻度与当前值游标）｜ 阈值（正常 / 关注 两枚色片）｜ 判定（徽标 + 补救短标签）；卡片头部为 `n 项 · k 项需关注` 与组徽标；底部「说明与依据」折叠。
+  6. **相机样例**：缩略图网格，图上叠加 `时刻 · 亮度 · 纹理`（过曝 >0.5 % 时标注）。
+  7. 页脚：评估范围 / 静止起步 / 行驶时长 / 报告路径。
+- 未评估状态：同一横幅骨架（灰环 + 说明 + 「开始评估」主按钮），并注明"标定流水线起步时自动执行，已有报告则跳过"。
 - 分段明细表改为折叠（>10 段默认收起），避免 truck05 的 48 段把评估卡片顶到页面底部；≤10 段保持展开。
-- 页面在无头浏览器中以三种状态（未评估 / truck29 正常 / truck05 关注）实际渲染检查，无 JS 错误。
+- 页面在无头浏览器中以三种状态（未评估 / truck29 正常 / truck05 关注）加 工作台 / 标定 / 建图 / 结果 / 系统 五页实际渲染检查，无 JS 错误；建图页参数卡与工作台数据源卡显示评估徽标。
 
 ## 5. 两车实测（Studio 作业 `assess`，2026-09-29）
 
 | 指标 | truck29（120 s，3.7 GB） | truck05（720 s，24.7 GB） |
 |---|---|---|
-| 结论 / 用时 | **正常**（40 ok · 2 信息）/ 7.0 s | **关注**（30 ok · 10 关注 · 0 异常，5 项警示）/ 36 s |
+| 结论 / 用时（第 2 版并行） | **正常**（40 ok · 2 信息）/ **1.9 s**（7 进程；第 1 版 7.0 s） | **关注**（30 ok · 10 关注 · 0 异常，5 项警示）/ **10.5 s**（8 进程；第 1 版 36 s） |
 | 重复消息 | 0 | 621（0.23 %，分段边界）→ 正常 |
 | IMU 最大断点 / 断点数 | 10 ms / 0 | 60 ms / 3（首个 77.2 s）→ 关注，自动补偿 |
 | 多雷达起始离散 P99 | 0.71 ms（0 帧 >1 ms） | 1.14 ms（287 帧 >1 ms，0 帧 >5 ms）→ 关注，合帧容差吸收 |
@@ -136,7 +155,7 @@
 | 静止段地面倾角差 / 高度差 | 0.16° / 0.9 cm（front_right） | 0.28°（front_left 左右向）/ 0.3 cm → 关注，自检自动修正（建图自检实测 0.22°） |
 | 相机 | 30 fps，抖动 0，纹理最弱 430，过曝 0 % | 30 fps，抖动 0.02 ms，纹理最弱 2194，过曝 0 % |
 | 路线 | 585 m，2 转弯，16 直线窗，≈231 关键帧，静止 4.5 s | 1542 m，9 转弯，46 直线窗，≈866 关键帧，静止 47.7 s |
-| 资源 | 120 GB 可用，读取 661 MB/s（21×码率） | 120 GB，711 MB/s（21×） |
+| 资源 | 120 GB 可用，聚合读取 2.6 GB/s（83×码率） | 120 GB，2.2 GB/s（65×） |
 
 解读：
 
@@ -154,13 +173,14 @@
 
 | 文件 | 变更 |
 |---|---|
-| `tools/livo/assess.py`（新，≈1100 行） | 评估器。`livo.dataset.Dataset.iter_messages` 一遍流式读取；LiDAR / IMU / INS / NavSat / 相机消息只解析 CDR 头部字段（时间戳、点数、模式、卫星数、位置/速度/四元数），不做完整反序列化，I/O 受限；每 `--sample-every` 6 s 解一帧点云做点数 / 结构检查，起步静止段解全部点云做地面一致性，抽 8 个关键帧窗解 HEVC 样例（缩略图内嵌 JSON）。`Report.add(...)` 统一登记阈值 / 类别 / 依据；`alerts` / `fixable` / `outlook` 由报告派生。 |
-| `tools/studio/app/datasets.py` | `assess_key`（sha1(path│start_ns│end_ns)[:16]）、`assessment_file / assessment / assessment_summary / assess_cmd / assess_result_ctx`；报告存 `results/.studio/assess/<key>.json`。 |
+| `tools/livo/assess.py`（≈1270 行） | 评估器。`plan_chunks` 把分段按时间箱分成 ≤8 块（每块整段），`scan_chunk` 在 fork 出的工作进程里各跑一遍 `Dataset.iter_messages` 流式读取，父进程 `_dedup` 按主题拼接并按 `iter_messages` 同一规则丢弃分段边界的重复/倒退样本（truck05 621 条重复与串行一致）。LiDAR / IMU / INS / `ins_status`（新增 `parse_diag`）/ 相机消息只解析 CDR 字段；每 `--sample-every` 6 s 解一帧点云做点数 / 结构检查，起步静止段（仅第 1 块）解全部点云做地面一致性，相机样例窗按时间分配给各块并在块内解码。`Report.add(...)` 统一登记阈值 / 类别 / 依据并输出 `thresholds{ok,warn,higher}` 供页面画刻度；`--jobs 1` 为串行。 |
+| `tools/studio/app/datasets.py` | `assess_key`（sha1(path│start_ns│end_ns)[:16]）、`assessment_file / assessment / assessment_summary / assess_cmd / assess_result_ctx`、**`assess_pipeline_step`**（缓存判断 + `after` 钩子：异常级不可补救 → `StudioError` 中止流水线）；报告存 `results/.studio/assess/<key>.json`。 |
+| `tools/studio/app/calibration.py` | `pipeline_steps`：三条流水线在 `steps` 开头插入第 0 步（`skip_assess` 可跳过）。 |
 | `tools/studio/server.py` | `GET /api/datasets/assessment`、`POST /api/datasets/assess`（复用 `jobs.start("assess", …)`，单实例锁），`/api/overview` 增加 `assessment` 摘要。 |
-| `tools/studio/web/app.js` | `loadAssessment / assessmentCard / metricRow / verdictBadge / assessBadgeHome`、动作 `assess`、作业结束钩子、数据页懒加载；分段明细折叠。 |
-| `tools/studio/web/style.css` | `.ahero .acounts .agrid .agroup .am .alist .thumbs .badge.sm`（沿用既有色彩变量与圆角）。 |
+| `tools/studio/web/app.js` | `loadAssessment / assessmentCard / axGauge / axGroup / axMetricRow / axBar / axThresholds / verdictBadge / assessBadgeHome`、动作 `assess` / `ax-jump`、作业结束钩子（`assess` 与 `pipeline` 作业都刷新报告）、数据页懒加载；分段明细折叠；建图页徽标。 |
+| `tools/studio/web/style.css` | `.ax-*`（横幅、量表、导航胶囊、警示/可补偿列表、四列表格、阈值微条、缩略图），只使用既有色彩变量与圆角。 |
 
-性能：truck29 7.0 s（44 397 条消息，3.7 GB，≈530 MB/s）；truck05 36 s（266 170 条，24.7 GB，≈680 MB/s）；点云与图像只在抽样时刻解码、不缓存，内存与数据时长无关。
+性能（Studio 作业实测）：truck29 1.9 s（44 397 条消息，3.7 GB，7 进程）；truck05 10.5 s（266 170 条，24.7 GB，8 进程，冷读 11.5 s）；点云与图像只在抽样时刻解码、不缓存，内存与数据时长无关。
 
 ## 8. 局限与后续
 
@@ -171,8 +191,10 @@
 
 ## 9. 验收记录
 
-- Studio 作业：`1a0eaf6af3c`（truck29，7 s，`verdict ok`）、`1a0eaf6ff00`（truck05，36 s，`verdict warn, alerts 5`）；并发第二个 `POST /api/datasets/assess` 被拒绝（"已有一个数据评估在运行"）；`/api/overview.assessment` 返回摘要；重跑后报告覆盖同一键文件。
+- Studio 作业：第 1 版 `1a0eaf6af3c`（truck29，7 s）、`1a0eaf6ff00`（truck05，36 s）；第 2 版通过同一接口重跑：truck29 1.9 s `verdict ok`，truck05 10.5 s `verdict warn, alerts 5, bad_alerts 0`；并发第二个 `POST /api/datasets/assess` 被拒绝（"已有一个数据评估在运行"）；`/api/overview.assessment` 返回摘要；重跑后报告覆盖同一键文件。
+- 并行正确性：`--jobs 1` 与默认并行的报告逐项比对，truck29 42/42、truck05 42/42 一致（仅"读取带宽"这一项按定义不同：单进程 0.8–1.0 GB/s vs 聚合 2.2–2.6 GB/s），相机样例时刻一致。
+- 流水线接线（干跑，不产生标定版本）：`pipeline_steps("lidar")` 缓存命中 6 步 / 缓存缺失 7 步（第 0 步 = 数据评估，实际执行 2.7 s，`ctx.assessment` 写入 verdict/alerts/bad_alerts/report）；伪造含异常级警示的报告 → `after` 钩子抛出 `StudioError`（流水线中止文案）；无标定文件生成的报告在有标定时重做、无标定时命中缓存；相机流水线在报告存在时不插第 0 步。
 - 报告：`results/.studio/assess/312d136b6d4e2e9f.json`（truck29）、`edc74bc08b3b5f44.json`（truck05）。
 - 前端：`node --check` 通过；无头 Chromium 渲染三种状态、7 组 42 项、警示 5 + 可补偿 5 行、8 张缩略图，无控制台错误。
-- 服务：`tools/studio/server.py` 已重启（新路由需要；`app/*` 热加载不覆盖 `server.py`）。
+- 服务：`tools/studio/server.py` 已重启两次（新路由 / 第 2 版），当前以 `nohup` 运行，日志 `results/.studio/server.log`。
 - truck29 标定（v066）与算法未触碰；本轮无建图代码变更，guard 结论沿用 `guard_t29_{lio,livo}_20260929_023019`。

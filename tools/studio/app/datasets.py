@@ -133,8 +133,10 @@ def assessment_summary(raw_path):
     doc = read_json(f) if f.exists() else None
     if not doc:
         return None
-    return {"verdict": doc.get("verdict"), "generated": doc.get("generated"), "alerts": len(doc.get("alerts") or []),
-            "counts": doc.get("counts"), "title": (doc.get("outlook") or {}).get("title")}
+    alerts = doc.get("alerts") or []
+    return {"verdict": doc.get("verdict"), "generated": doc.get("generated"), "alerts": len(alerts),
+            "bad_alerts": sum(1 for x in alerts if x.get("status") == "bad"), "counts": doc.get("counts"),
+            "title": (doc.get("outlook") or {}).get("title"), "elapsed_s": doc.get("elapsed_s")}
 
 
 def assess_cmd(raw_path, calibration_file=None):
@@ -149,7 +151,32 @@ def assess_cmd(raw_path, calibration_file=None):
 
 def assess_result_ctx(report):
     doc = read_json(report) or {}
-    return {"verdict": doc.get("verdict", "?"), "alerts": len(doc.get("alerts") or []), "report": str(report)}
+    alerts = doc.get("alerts") or []
+    return {"verdict": doc.get("verdict", "?"), "alerts": len(alerts), "bad_alerts": sum(1 for x in alerts if x.get("status") == "bad"),
+            "title": (doc.get("outlook") or {}).get("title", ""), "report": str(report), "elapsed_s": doc.get("elapsed_s")}
+
+
+def assess_pipeline_step(raw_path, calibration_file=None, force=False):
+    """Step 0 of a calibration pipeline: assess the recording unless a report for this exact recording exists.
+
+    The report key is derived from path + first/last timestamp, so an unchanged recording is never read twice;
+    a report made without a calibration file is redone once one is available (static extrinsic checks).
+    Returns a job step spec or None (cache hit). The step aborts the pipeline when an *异常*-level metric that
+    calibration cannot compensate is found (warn-level alerts only annotate the job)."""
+    report, _info = assessment_file(raw_path)
+    doc = read_json(report) if report.exists() else None
+    if doc and not force and (doc.get("calibration") or not calibration_file):
+        return None
+    cmd, report, info = assess_cmd(raw_path, calibration_file)
+
+    def after(ctx, lines, _r=report):
+        res = assess_result_ctx(_r)
+        ctx["assessment"] = res
+        if res.get("bad_alerts"):
+            raise StudioError(f"数据评估：{res['bad_alerts']} 项异常级问题无法通过标定补救（{res.get('title', '')}），已中止流水线；"
+                              f"请在「数据源」页查看评估报告，更换或重新采集数据")
+
+    return {"title": f"数据评估 · {info.get('name')}（并行流式读取；已有报告时自动跳过）", "cmd": cmd, "after": after}
 
 
 def recording_kind(path):

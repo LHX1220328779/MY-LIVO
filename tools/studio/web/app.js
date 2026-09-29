@@ -82,7 +82,7 @@ async function pollJob() {
   if (finished) {
     toast(doc.status === "done" ? `✓ ${doc.title} 完成` : `${doc.title}：${doc.error || doc.status}`, doc.status === "done" ? "ok" : "bad");
     await Promise.all([loadOverview(), loadCatalogue(true), loadRuns()]);
-    if (doc.kind === "assess") await loadAssessment(true);
+    if (doc.kind === "assess" || doc.kind === "pipeline") await loadAssessment(true);
     render();
     return;
   }
@@ -356,6 +356,7 @@ function pageData() {
   </div>${assessmentCard()}`;
 }
 // ------------------------------------------------------------------ data assessment (数据评估)
+const AX_STATUS = { ok: "正常", warn: "关注", bad: "异常", info: "参考", na: "未检" };
 async function loadAssessment(force = false) {
   const d = S.dataset;
   if (!d || d.error) { S.assess = null; return; }
@@ -369,14 +370,66 @@ function verdictBadge(v, prefix = "评估") {
 }
 function assessBadgeHome() {
   const s = S.assessSummary;
-  if (!s || !s.verdict) return `<span class="badge" title="在“数据源”页运行数据评估">未评估</span>`;
+  if (!s || !s.verdict) return `<span class="badge" title="在“数据源”页运行数据评估，或由标定流水线自动完成">未评估</span>`;
   const n = s.alerts || 0;
-  return `<span class="badge ${s.verdict}" title="${esc(s.title || "")}">评估 · ${{ ok: "正常", warn: "关注", bad: "异常" }[s.verdict]}${n ? ` · ${n} 项不可标定补救` : ""}</span>`;
+  return `<span class="badge ${s.verdict}" title="${esc(s.title || "")}">评估 · ${AX_STATUS[s.verdict]}${n ? ` · ${n} 项不可标定补救` : ""}</span>`;
 }
-function metricRow(m) {
-  const tip = [m.note, m.basis ? `依据：${m.basis}` : "", m.limits ? `阈值：${m.limits}` : ""].filter(Boolean).join("\n");
-  const fix = m.fix_label ? `<span class="badge sm ${m.alert ? (m.status === "bad" ? "bad" : "warn") : "accent"}">${m.alert ? "⚠ " : ""}${esc(m.fix_label)}</span>` : "";
-  return `<div class="am ${m.status}" title="${esc(tip)}"><span class="dot ${m.status}"></span><span class="am-l">${esc(m.label)}</span><span class="am-v mono">${esc(m.display)}</span><span class="am-x"><span class="ellipsis" title="${esc(m.limits || "")}">${esc(m.limits || (m.status === "info" ? "参考信息" : ""))}</span>${fix}</span></div>`;
+function axNum(x, unit) {
+  if (x == null || Number.isNaN(x)) return "—";
+  const a = Math.abs(x);
+  const s = (a >= 100 ? x.toFixed(0) : a >= 10 ? x.toFixed(1) : x.toFixed(2)).replace(/\.0+$/, "").replace(/(\.\d*[1-9])0+$/, "$1");
+  return unit ? `${s} ${unit}` : s;
+}
+function axThresholds(m) {
+  const t = m.thresholds;
+  if (!t) return m.limits ? `<span class="ax-lim" title="${esc(m.limits)}">${esc(m.limits)}</span>` : `<span class="ax-lim muted">—</span>`;
+  const c = t.higher ? "≥" : "≤";
+  const same = t.warn === t.ok;
+  return `<span class="ax-tk ok" title="正常">${c} ${axNum(t.ok, m.unit)}</span>${same ? "" : `<span class="ax-tk warn" title="关注">${c} ${axNum(t.warn, m.unit)}</span>`}`;
+}
+function axBar(m) {
+  const t = m.thresholds;
+  if (!t || typeof m.value !== "number" || !Number.isFinite(m.value)) return "";
+  const lo = Math.min(t.ok, t.warn), hi = Math.max(t.ok, t.warn);
+  if (hi <= 0) return "";
+  const span = Math.max(hi * 1.6, m.value * 1.15, 1e-9);
+  const pct = (x) => Math.max(0, Math.min(100, (100 * x) / span));
+  const segs = t.higher ? [["bad", 0, pct(lo)], ["warn", pct(lo), pct(hi)], ["ok", pct(hi), 100]] : [["ok", 0, pct(lo)], ["warn", pct(lo), pct(hi)], ["bad", pct(hi), 100]];
+  return `<div class="ax-bar" aria-hidden="true">${segs.map(([k, a, b]) => `<i class="${k}" style="left:${a}%;width:${Math.max(0, b - a)}%"></i>`).join("")}<b style="left:${pct(m.value)}%"></b></div>`;
+}
+function axGauge(counts, verdict, total) {
+  const parts = [["ok", counts.ok || 0], ["warn", counts.warn || 0], ["bad", counts.bad || 0], ["info", (counts.info || 0) + (counts.na || 0)]];
+  const n = Math.max(1, parts.reduce((a, [, v]) => a + v, 0));
+  const r = 40, C = 2 * Math.PI * r;
+  let off = 0;
+  const arcs = parts.filter(([, v]) => v > 0).map(([k, v]) => {
+    const len = (C * v) / n;
+    const s = `<circle class="${k}" r="${r}" cx="50" cy="50" stroke-dasharray="${len - 2} ${C - len + 2}" stroke-dashoffset="${-off}"/>`;
+    off += len; return s;
+  }).join("");
+  return `<svg class="ax-gauge ${verdict || ""}" viewBox="0 0 100 100"><circle class="track" r="${r}" cx="50" cy="50"/>${arcs}<text x="50" y="47" class="v">${AX_STATUS[verdict] || "—"}</text><text x="50" y="63" class="n">${total} 项</text></svg>`;
+}
+function axValue(display) {
+  const d = String(display ?? "");
+  const i = d.indexOf("（");
+  if (d.length > 26 && i > 0 && d.endsWith("）")) return `<span class="mono">${esc(d.slice(0, i))}</span><div class="ax-vd">${esc(d.slice(i + 1, -1))}</div>`;
+  if (d.length > 40 && d.includes(" · ")) { const parts = d.split(" · "); return `<span class="mono">${esc(parts[0])}</span><div class="ax-vd">${esc(parts.slice(1).join(" · "))}</div>`; }
+  return `<span class="mono">${esc(d)}</span>`;
+}
+const AX_FIX_SHORT = { "标定/建图自动补偿": "自动补偿", "需运行离线标定阶段": "离线标定阶段", "需调整采集或回放流程": "采集/回放流程", "标定无法补救": "标定无法补救" };
+function axMetricRow(m) {
+  const tip = [m.note, m.basis ? `依据：${m.basis}` : ""].filter(Boolean).join("\n");
+  const fix = m.fix_label ? `<div class="ax-fix ${m.alert ? "alert" : ""}" title="${esc(m.fix_label)}">${m.alert ? "⚠ " : ""}${esc(AX_FIX_SHORT[m.fix_label] || m.fix_label)}</div>` : "";
+  return `<tr class="ax-r ${m.status}" title="${esc(tip)}"><td class="ax-l"><span class="dot ${m.status}"></span>${esc(m.label)}</td><td class="ax-v">${axValue(m.display)}${axBar(m)}</td><td class="ax-th">${axThresholds(m)}</td><td class="ax-s"><span class="badge sm ${m.status === "info" || m.status === "na" ? "" : m.status}">${AX_STATUS[m.status] || m.status}</span>${fix}</td></tr>`;
+}
+function axGroup(g) {
+  const c = { ok: 0, warn: 0, bad: 0, other: 0 };
+  g.metrics.forEach((m) => { if (m.status in c) c[m.status] += 1; else c.other += 1; });
+  const n = g.metrics.length, w = c.warn + c.bad;
+  const sub = w ? `${n} 项 · ${w} 项需关注` : `${n} 项`;
+  return `<section class="ax-group" id="ag-${g.id}"><header class="ax-gh"><span class="dot ${g.status}"></span><h3>${esc(g.label)}</h3><span class="ax-gc">${sub}</span><span class="badge sm ${g.status === "ok" ? "ok" : g.status}">${AX_STATUS[g.status] || "—"}</span></header><p class="ax-blurb">${esc(g.blurb || "")}</p>
+    <table class="ax-t"><thead><tr><th>指标</th><th>数值</th><th title="正常 / 关注 的判定边界；其余为异常">阈值</th><th>判定</th></tr></thead><tbody>${g.metrics.map(axMetricRow).join("")}</tbody></table>
+    <details class="ax-more"><summary>说明与依据</summary><dl>${g.metrics.map((m) => `<dt>${esc(m.label)}</dt><dd>${esc(m.note || "")}${m.basis ? `<span class="muted"> 依据：${esc(m.basis)}</span>` : ""}</dd>`).join("")}</dl></details></section>`;
 }
 function assessmentCard() {
   const d = S.dataset;
@@ -384,34 +437,39 @@ function assessmentCard() {
   const a = S.assess && S.assess.path === d.path ? S.assess : null;
   const r = a && a.result;
   const running = S.job && S.job.status === "running";
-  const mine = running && S.job.kind === "assess";
-  const btn = mine ? `<button class="btn sm" data-act="drawer-job">评估进行中 · 查看进度</button>`
+  const mine = running && (S.job.kind === "assess" || (S.job.kind === "pipeline" && /数据评估/.test(S.job.steps?.[S.job.current]?.title || "")));
+  const btn = mine ? `<button class="btn sm" data-act="drawer-job"><span class="dot run"></span>&nbsp;评估进行中 · 查看进度</button>`
     : `<button class="btn sm ${r ? "" : "primary"}" data-act="assess" ${running ? "disabled" : ""}>${r ? "重新评估" : "开始评估"}</button>`;
-  const meta = r ? `<span class="small muted">${fmtT(r.generated)} · 用时 ${r.elapsed_s} s · ${r.calibration ? `外参检查基于 ${esc(r.calibration.split("/").slice(-2, -1)[0] || "")}` : "未提供标定文件（跳过外参检查）"}</span>` : "";
-  const head = `<div class="card-h"><h2>数据评估 ${r ? verdictBadge(r.verdict, "") : ""}</h2><div class="row">${meta}${btn}</div></div>`;
+  const head = `<div class="card-h"><h2>数据评估 ${r ? verdictBadge(r.verdict, "") : ""}</h2><div class="row">${btn}</div></div>`;
   if (!r) {
-    return `<div class="card" style="margin-top:16px">${head}
-      <div class="ahero"><div><div class="t">一次流式读取，给出这份录制能达到的精度上限</div><div class="d">按本项目在 truck29 / truck05 上遇到的全部数据问题逐项检查：完整性、时间同步、RTK/INS 参考自洽性、雷达几何与静止段外参、相机时间戳与图像内容、行驶工况与资源。每项都有阈值，并标明是标定/建图流程能自动补偿，还是<b>标定无法补救</b>的数据源缺陷。truck29（120 s）约 8 s，truck05（720 s，25 GB）约 40 s。</div></div>
-        <div class="acounts"><div class="acount"><div class="n">7</div><div class="k">检查组</div></div><div class="acount"><div class="n">40+</div><div class="k">指标</div></div></div></div>
+    return `<div class="card ax" style="margin-top:16px">${head}
+      <div class="ax-hero ax-idle">${axGauge({}, null, 42)}<div class="ax-sum"><div class="ax-title">一次并行流式读取，给出这份录制能达到的精度上限</div>
+        <div class="ax-text">按本项目在 truck29 / truck05 上遇到的全部数据问题逐项检查：完整性、时间同步、RTK/INS 参考自洽性、雷达几何与静止段外参、相机时间戳与图像内容、行驶工况与资源。每项都有阈值，并标明是标定/建图流程能自动补偿，还是<b>标定无法补救</b>。</div>
+        <div class="ax-legend"><span><i class="dot ok"></i>7 个检查组 · 42 项指标</span><span><i class="dot"></i>truck29（120 s）≈ 2 s · truck05（720 s，25 GB）≈ 11 s</span><span><i class="dot accent"></i>标定流水线起步时自动执行，已有报告则跳过</span></div></div></div>
       ${a && a.error ? `<div class="callout bad">${esc(a.error)}</div>` : ""}</div>`;
   }
   const c = r.counts || {};
   const o = r.outlook || {};
-  const hero = `<div class="ahero ${r.verdict}"><div><div class="t">${esc(o.title || "")}</div><div class="d">${esc(o.text || "")}</div></div>
-    <div class="acounts"><div class="acount"><div class="n ok">${c.ok || 0}</div><div class="k">正常</div></div><div class="acount"><div class="n warn">${c.warn || 0}</div><div class="k">关注</div></div><div class="acount"><div class="n bad">${c.bad || 0}</div><div class="k">异常</div></div><div class="acount"><div class="n">${(r.alerts || []).length}</div><div class="k">不可标定补救</div></div></div></div>`;
-  const alertRows = (r.alerts || []).map((x) => `<div class="ai"><span class="dot ${x.status}"></span><span><b>${esc(x.group)}</b> · ${esc(x.label)}：<span class="mono">${esc(x.display)}</span><div class="small" style="opacity:.85">${esc(x.note || "")}</div></span><span class="badge sm ${x.status === "bad" ? "bad" : "warn"}">${esc(x.fix_label)}</span></div>`).join("");
-  const alerts = alertRows ? `<div class="callout ${r.alerts.some((x) => x.status === "bad") ? "bad" : "warn"}" style="margin-bottom:10px"><b>⚠ 警示：以下 ${r.alerts.length} 项无法通过标定自动微调补救</b>（来自参考系统、传感器同步、录制流程或场景本身；会直接决定精度下限）<div class="alist">${alertRows}</div></div>` : "";
-  const fixRows = (r.fixable || []).map((x) => `<div class="ai"><span class="dot ${x.status}"></span><span><b>${esc(x.group)}</b> · ${esc(x.label)}：<span class="mono">${esc(x.display)}</span></span><span class="badge sm accent">${esc(x.fix_label)}</span></div>`).join("");
-  const fixable = fixRows ? `<div class="callout" style="margin-bottom:10px"><b>可由标定流程 / 建图自检补偿（${r.fixable.length} 项）</b>：运行 LiDAR 标定流水线（后轴对齐 → 地面精修 → LIO → 行驶段精修）或依赖建图起步自检 / 合并容差即可，不需要重新采集。<div class="alist">${fixRows}</div></div>` : "";
-  const groups = (r.groups || []).map((g) => `<div class="agroup"><div class="agh"><span class="dot ${g.status}"></span><b>${esc(g.label)}</b><span class="badge sm ${g.status === "ok" ? "ok" : g.status}">${{ ok: "正常", warn: "关注", bad: "异常" }[g.status] || "—"}</span></div><div class="blurb">${esc(g.blurb || "")}</div>${g.metrics.map(metricRow).join("")}
-    <details style="margin-top:6px"><summary class="small">说明与依据（${g.metrics.length}）</summary><div class="stack small" style="gap:6px">${g.metrics.map((m) => `<div><b>${esc(m.label)}</b>：${esc(m.note || "")}${m.basis ? `<div class="muted">依据：${esc(m.basis)}</div>` : ""}${m.limits ? `<div class="muted">阈值：${esc(m.limits)}</div>` : ""}</div>`).join("")}</div></details></div>`).join("");
-  const cams = (r.camera_samples || []).filter((s) => s.decoded && s.thumb);
-  const strip = cams.length ? `<div style="margin-top:14px"><div class="small muted" style="margin-bottom:4px">相机样例（均匀抽取 ${cams.length} 个时刻：亮度均值 · 过曝 % · 纹理）</div><div class="thumbs">${cams.map((s) => `<div class="thumb"><img src="${s.thumb}" alt=""><div class="c">${s.t_s} s · ${Math.round(s.mean)} · ${s.clipped_pct.toFixed(1)} % · ${Math.round(s.texture)}</div></div>`).join("")}</div></div>` : "";
+  const total = (r.groups || []).reduce((n, g) => n + g.metrics.length, 0);
   const ref = r.reference || {};
-  const foot = `<div class="small muted" style="margin-top:12px">评估范围：${r.window ? `${r.window[0]}–${r.window[0] + r.window[1]} s` : "全程"} · ${(r.messages || 0).toLocaleString()} 条消息 · ${((r.bytes || 0) / 1e9).toFixed(1)} GB · 行驶 ${Math.round(ref.moving_s || 0)} s / ${Math.round(ref.path_m || 0)} m · 静止起步 ${ref.static_start_s != null ? ref.static_start_s.toFixed(1) : "—"} s · 报告 <span class="mono">${esc(a.file || "")}</span></div>`;
-  return `<div class="card" style="margin-top:16px">${head}${hero}${alerts}${fixable}<div class="agrid">${groups}</div>${strip}${foot}</div>`;
+  const calName = r.calibration ? r.calibration.split("/").slice(-2, -1)[0] : "";
+  const facts = [["时长", fmtDur(r.dataset?.duration_s || 0)], ["行驶", `${Math.round(ref.path_m || 0)} m`], ["消息", (r.messages || 0).toLocaleString()], ["数据量", `${((r.bytes || 0) / 1e9).toFixed(1)} GB`],
+    ["用时", `${r.elapsed_s} s${r.workers > 1 ? ` · ${r.workers} 进程` : ""}`], ["外参检查", calName || "未提供标定"], ["生成", fmtT(r.generated)]];
+  const hero = `<div class="ax-hero ${r.verdict}">${axGauge(c, r.verdict, total)}
+    <div class="ax-sum"><div class="ax-title">${esc(o.title || "")}</div><div class="ax-text">${esc(o.text || "")}</div>
+      <div class="ax-legend"><span><i class="dot ok"></i>正常 <b>${c.ok || 0}</b></span><span><i class="dot warn"></i>关注 <b>${c.warn || 0}</b></span><span><i class="dot bad"></i>异常 <b>${c.bad || 0}</b></span><span><i class="dot"></i>参考 <b>${(c.info || 0) + (c.na || 0)}</b></span><span class="ax-alertn ${(r.alerts || []).length ? "on" : ""}">⚠ 不可标定补救 <b>${(r.alerts || []).length}</b></span></div></div>
+    <dl class="ax-facts">${facts.map(([k, v]) => `<dt>${k}</dt><dd>${esc(String(v))}</dd>`).join("")}</dl></div>`;
+  const strip = `<nav class="ax-strip">${(r.groups || []).map((g) => { const w = g.metrics.filter((m) => m.status === "warn" || m.status === "bad").length; return `<button class="ax-chip ${g.status}" data-act="ax-jump" data-target="ag-${g.id}"><span class="dot ${g.status}"></span>${esc(g.label)}<em>${w ? `${w} 项` : "✓"}</em></button>`; }).join("")}</nav>`;
+  const alerts = (r.alerts || []).length ? `<div class="callout ${r.alerts.some((x) => x.status === "bad") ? "bad" : "warn"} ax-alerts"><div class="ax-ah"><b>⚠ 标定无法补救 · ${r.alerts.length} 项</b><span>来自参考系统、传感器同步、录制流程或场景本身；外参 / 时间偏移微调不改变这些数值，它们直接决定精度下限</span></div>
+    ${r.alerts.map((x, i) => `<div class="ax-ai"><span class="ax-no">${String(i + 1).padStart(2, "0")}</span><div class="ax-ab"><div class="ax-at"><b>${esc(x.label)}</b><span class="ax-ag">${esc(x.group)}</span><span class="mono ax-av">${esc(x.display)}</span></div><div class="ax-ar">${esc(x.note || "")}</div></div><span class="badge sm ${x.status === "bad" ? "bad" : "warn"}">${esc(x.fix_label)}</span></div>`).join("")}</div>` : "";
+  const fixable = (r.fixable || []).length ? `<div class="callout ax-fixable"><div class="ax-ah"><b>可由标定流程 / 建图自检补偿 · ${r.fixable.length} 项</b><span>运行 LiDAR 标定流水线（后轴对齐 → 地面精修 → LIO → 行驶段精修）或依赖建图起步自检 / 合帧容差即可，不需要重新采集</span></div>
+    ${r.fixable.map((x) => `<div class="ax-fi"><span class="dot ${x.status}"></span><span><b>${esc(x.label)}</b><span class="ax-ag">${esc(x.group)}</span></span><span class="mono ax-av">${esc(x.display)}</span><span class="badge sm accent">${esc(x.fix_label)}</span></div>`).join("")}</div>` : "";
+  const groups = `<div class="ax-grid">${(r.groups || []).map(axGroup).join("")}</div>`;
+  const cams = (r.camera_samples || []).filter((s) => s.decoded && s.thumb);
+  const thumbs = cams.length ? `<section class="ax-cams"><header class="ax-gh"><span class="dot ok"></span><h3>相机样例</h3><span class="ax-gc">均匀抽取 ${cams.length} 个时刻 · 时刻 / 亮度均值 / 纹理（过曝 >0.5 % 时标注）</span></header><div class="ax-thumbs">${cams.map((s) => `<figure class="ax-thumb"><img src="${s.thumb}" alt=""><figcaption class="mono" title="时刻 ${s.t_s} s · 亮度均值 ${Math.round(s.mean)} · 过曝 ${s.clipped_pct.toFixed(1)} % · 纹理 ${Math.round(s.texture)}">${Math.round(s.t_s)} s · ${Math.round(s.mean)}${s.clipped_pct > 0.5 ? ` · ${s.clipped_pct.toFixed(1)} %` : ""} · ${Math.round(s.texture)}</figcaption></figure>`).join("")}</div></section>` : "";
+  const foot = `<div class="ax-foot small muted">评估范围 ${r.window ? `${r.window[0]}–${r.window[0] + r.window[1]} s` : "全程"} · 静止起步 ${ref.static_start_s != null ? ref.static_start_s.toFixed(1) : "—"} s · 行驶 ${Math.round(ref.moving_s || 0)} s · 报告 <span class="mono">${esc(a.file || "")}</span></div>`;
+  return `<div class="card ax" style="margin-top:16px">${head}${hero}${strip}${alerts}${fixable}${groups}${thumbs}${foot}</div>`;
 }
-
 function fsHtml() {
   const f = S.fs; if (!f) return `<div class="e dim">输入路径后点击“打开”</div>`;
   const up = `<div class="e" data-act="fs-open" data-path="${esc(f.parent)}"><span>↰</span><span class="n muted">上一级</span></div>`;
@@ -482,7 +540,7 @@ function pageMap() {
   const mode = m.mode === "livo" && !canLIVO ? "lio" : m.mode;
   return `<h1 style="margin-bottom:6px">建图</h1><div class="muted" style="margin-bottom:18px">一次建图 = 启动 fastlivo_mapping → 按时间戳实时回放原始录制 → 收尾优化导出轨迹/地图 → 自动精度评估。所有输出在 <code>results/&lt;轮次&gt;/</code>（round.json 记录完整参数与阶段）。</div>
   ${liveMonitor()}
-  <div class="card" style="margin-top:16px"><div class="card-h"><h2>参数</h2><div class="row"><span class="small muted">数据源</span><b>${esc(d?.name || "未选择")}</b>${datasetBadges(d)}<button class="btn sm" data-act="go" data-page="data">更换</button></div></div>
+  <div class="card" style="margin-top:16px"><div class="card-h"><h2>参数</h2><div class="row"><span class="small muted">数据源</span><b>${esc(d?.name || "未选择")}</b>${datasetBadges(d)}${assessBadgeHome()}<button class="btn sm" data-act="go" data-page="data">更换</button></div></div>
     <div class="form">
       <div class="field"><label>模式</label><div class="seg"><button class="${mode === "lio" ? "active" : ""}" data-act="mode" data-mode="lio" ${canLIO ? "" : "disabled"}>LIO</button><button class="${mode === "livo" ? "active" : ""}" data-act="mode" data-mode="livo" ${canLIVO ? "" : "disabled"}>LIVO</button></div></div>
       <div class="field"><label>标定版本</label><select data-act="field" data-section="mapping" data-key="calibration_id"><option value="" ${!m.calibration_id ? "selected" : ""}>激活版本（${esc(v?.active ? v.active.split("/").pop() : "无")}）</option>${versions.map((x) => `<option value="${esc(x.id)}" ${m.calibration_id === x.id ? "selected" : ""}>${esc(x.version)} · ${esc(x.stage_label)}</option>`).join("")}</select></div>
@@ -778,6 +836,7 @@ const A = {
   async "fs-open"(el) { await act(async () => { S.fs = await api(`/api/fs?path=${encodeURIComponent(el.dataset.path)}`); const box = $(".fsb"); if (box) box.innerHTML = fsHtml(); const inp = $("#fs-path"); if (inp) inp.value = S.fs.path; }); },
   async "select-dataset"(el) { await act(async () => { const r = await api("/api/datasets/select", "POST", { path: el.dataset.path }); S.state = r.state; S.dataset = r.dataset; await loadOverview(); render(); }, "已选择数据源"); },
   async "forget-dataset"(el) { await act(async () => { S.state = await api("/api/datasets/forget", "POST", { path: el.dataset.path }); render(); }); },
+  "ax-jump"(el) { const t = document.getElementById(el.dataset.target); if (t) t.scrollIntoView({ behavior: "smooth", block: "start" }); },
   async assess() {
     const d = S.dataset; const v = vehicle();
     if (!d || d.error) return toast("请先选择可用的数据源", "bad");

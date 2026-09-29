@@ -643,3 +643,4 @@ driven 阶段（`tools/calib/livo_calib.py driven --id wuhu/truck05/v024_prechec
 ### 12.10 数据准备阶段的综合数据评估（2026-09-29，已实现）
 
 §12.3–12.7 的结论已经产品化为 Studio「数据源」页的 **数据评估**（`tools/livo/assess.py` + 控制台卡片）：7 组 42 项指标、逐项阈值与补救类别，标定自动微调无法补偿的项在页首单独警示。truck29 全部正常（7 s）；truck05 5 项警示全部来自 RTK/INS 参考系统（36 s）。地面阶段不再新增行驶段后雷达俯仰步骤（driven 第 2 遍已覆盖）。详见 `docs/mcp-studio-data-assessment.md`。
+第 2 版（同日）：评估并入标定流水线第 0 步并按录制缓存；并行读取后 truck29 1.9 s、truck05 10.5 s；页面重排（环形量表、导航胶囊、四列表格 + 阈值微条）。放置位置的效率分析见该文档 §2.1。
