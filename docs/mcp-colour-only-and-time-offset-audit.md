@@ -639,3 +639,7 @@ driven 阶段（`tools/calib/livo_calib.py driven --id wuhu/truck05/v024_prechec
 1. 后端可扩展性：iSAM2 更新耗时随关键帧线性增长（1286 关键帧时 solve 中位 298 ms、总 P95 1.0 s），720 s 以上的包在最后几分钟出现传输丢帧。方向：限制重线性化范围/把无平面关联的旧关键帧边缘化；任何改动都必须过 `check_truck29_guard.sh`。
 2. 长直坡道沿向弱可观（truck05 395–398 s ±5–10 cm）：可加 INS 速度因子，属融合算法改动，需 guard。
 3. 后雷达剩余俯仰当量 −0.15…−0.3°（`along_track.py` 高度斜率）：ground 阶段改用行驶段地面（§11.9 遗留 1 未变）。
+
+### 12.10 数据准备阶段的综合数据评估（2026-09-29，已实现）
+
+§12.3–12.7 的结论已经产品化为 Studio「数据源」页的 **数据评估**（`tools/livo/assess.py` + 控制台卡片）：7 组 42 项指标、逐项阈值与补救类别，标定自动微调无法补偿的项在页首单独警示。truck29 全部正常（7 s）；truck05 5 项警示全部来自 RTK/INS 参考系统（36 s）。地面阶段不再新增行驶段后雷达俯仰步骤（driven 第 2 遍已覆盖）。详见 `docs/mcp-studio-data-assessment.md`。

@@ -173,12 +173,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"state": state, "system": system_info(), "vehicles": calibration.vehicles(cat),
                                     "stages": cat["stages"], "runs": mapping.list_runs(limit=8),
                                     "jobs": jobs.list_jobs(limit=8),
-                                    "dataset": datasets.describe(state["data"]["dataset"]) if state["data"].get("dataset") else None})
+                                    "dataset": datasets.describe(state["data"]["dataset"]) if state["data"].get("dataset") else None,
+                                    "assessment": datasets.assessment_summary(state["data"]["dataset"]) if state["data"].get("dataset") else None})
         if path == "/api/fs":
             return self._send(200, datasets.browse(q.get("path") or "/home/project"))
         if path == "/api/datasets":
             info = datasets.describe(q["path"], refresh=q.get("refresh") == "1")
             return self._send(200, info)
+        if path == "/api/datasets/assessment":
+            return self._send(200, datasets.assessment(q["path"]))
         if path == "/api/vehicles":
             cat = calibration.catalogue(refresh=q.get("refresh") == "1")
             return self._send(200, {"vehicles": calibration.vehicles(cat), "stages": cat["stages"], "sources": cat["sources"]})
@@ -222,6 +225,20 @@ class Handler(BaseHTTPRequestHandler):
             if info.get("error"):
                 raise StudioError(f"数据源不可用：{info['error']}")
             return self._send(200, {"state": remember_dataset(p), "dataset": info})
+        if path == "/api/datasets/assess":
+            p = str(common.safe_path(body["path"]))
+            if jobs.active("assess"):
+                raise StudioError("已有一个数据评估在运行，请等待其结束")
+            calib_file = None
+            mine, truck = body.get("mine"), body.get("truck")
+            if mine and truck:
+                calib_file = calibration.vehicle_status(calibration.catalogue(), mine, truck).get("calibration_file")
+            cmd, report, info = datasets.assess_cmd(p, calib_file)
+            job = jobs.start("assess", f"数据评估 · {info.get('name')}",
+                             [{"title": "数据评估（一次流式读取 + 抽样点云/图像）", "cmd": cmd,
+                               "after": lambda ctx, lines, _r=report: ctx.update(datasets.assess_result_ctx(_r))}],
+                             meta={"path": p, "calibration": calib_file})
+            return self._send(200, job.to_json())
         if path == "/api/datasets/forget":
             state = load_state()
             state["data"]["recent"] = [x for x in state["data"].get("recent", []) if x != body.get("path")]

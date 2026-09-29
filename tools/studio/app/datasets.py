@@ -4,7 +4,10 @@ import pathlib
 import subprocess
 import threading
 
-from .common import DATASET_TOOL, PY, REPO, StudioError, now, safe_path
+from .common import DATASET_TOOL, PY, REPO, STUDIO_DIR, TOOLS, StudioError, now, read_json, safe_path
+
+ASSESS_TOOL = TOOLS / "livo" / "assess.py"
+ASSESS_DIR = STUDIO_DIR / "assess"
 
 _cache = {}
 _cache_lock = threading.Lock()
@@ -99,6 +102,54 @@ def browse(raw_path):
     elif any(e["kind"] == "bag" for e in entries):
         here = "recording"
     return {"path": str(p), "parent": str(p.parent), "kind": here, "entries": entries[:500]}
+
+
+def assess_key(info):
+    import hashlib
+    return hashlib.sha1(f"{info['path']}|{info.get('start_ns')}|{info.get('end_ns')}".encode()).hexdigest()[:16]
+
+
+def assessment_file(raw_path):
+    """(report path, describe() info) of a recording; the key changes when the recording changes."""
+    info = describe(raw_path)
+    if info.get("error"):
+        raise StudioError(f"数据源不可用：{info['error']}")
+    return ASSESS_DIR / f"{assess_key(info)}.json", info
+
+
+def assessment(raw_path):
+    """Stored data-assessment report of a recording (result=None when it was never run)."""
+    f, info = assessment_file(raw_path)
+    doc = read_json(f) if f.exists() else None
+    return {"path": info["path"], "file": str(f), "result": doc}
+
+
+def assessment_summary(raw_path):
+    """Small verdict record for the overview / home page (None when not assessed)."""
+    try:
+        f, _ = assessment_file(raw_path)
+    except StudioError:
+        return None
+    doc = read_json(f) if f.exists() else None
+    if not doc:
+        return None
+    return {"verdict": doc.get("verdict"), "generated": doc.get("generated"), "alerts": len(doc.get("alerts") or []),
+            "counts": doc.get("counts"), "title": (doc.get("outlook") or {}).get("title")}
+
+
+def assess_cmd(raw_path, calibration_file=None):
+    """Command line of the assessment job + report path + describe() info."""
+    f, info = assessment_file(raw_path)
+    ASSESS_DIR.mkdir(parents=True, exist_ok=True)
+    cmd = [PY, str(ASSESS_TOOL), info["path"], "--json", str(f)]
+    if calibration_file and pathlib.Path(calibration_file).exists():
+        cmd += ["--calibration", str(calibration_file)]
+    return cmd, f, info
+
+
+def assess_result_ctx(report):
+    doc = read_json(report) or {}
+    return {"verdict": doc.get("verdict", "?"), "alerts": len(doc.get("alerts") or []), "report": str(report)}
 
 
 def recording_kind(path):

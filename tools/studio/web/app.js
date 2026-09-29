@@ -6,6 +6,7 @@ const S = {
   cal: null, versionDetail: null, runDetail: null, live: null, job: null, jobLog: [], jobLogNext: 0,
   fs: null, drawer: null, fsTarget: null, busy: false, calibForm: { stage: "ground" }, timers: {},
   overlayForm: { times: "20,60,100", delta: "0 0 0", run: "" }, overlay: null, overlayBusy: false,
+  assess: null, assessSummary: null, assessLoading: false,
 };
 const $ = (sel, root = document) => root.querySelector(sel);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -58,7 +59,7 @@ const saveState = debounce((patch) => api("/api/state", "POST", patch).then((s) 
 // ------------------------------------------------------------------ data loading
 async function loadOverview() {
   const o = await api("/api/overview");
-  Object.assign(S, { state: o.state, system: o.system, vehicles: o.vehicles, stages: o.stages, runs: o.runs, jobs: o.jobs, dataset: o.dataset });
+  Object.assign(S, { state: o.state, system: o.system, vehicles: o.vehicles, stages: o.stages, runs: o.runs, jobs: o.jobs, dataset: o.dataset, assessSummary: o.assessment || null });
   const active = o.system.active_job;
   if (active && (!S.job || S.job.id !== active.id)) { S.job = active; S.jobLog = []; S.jobLogNext = 0; }
   if (!active && S.job && S.job.status === "running") { S.job = null; }
@@ -81,6 +82,7 @@ async function pollJob() {
   if (finished) {
     toast(doc.status === "done" ? `✓ ${doc.title} 完成` : `${doc.title}：${doc.error || doc.status}`, doc.status === "done" ? "ok" : "bad");
     await Promise.all([loadOverview(), loadCatalogue(true), loadRuns()]);
+    if (doc.kind === "assess") await loadAssessment(true);
     render();
     return;
   }
@@ -162,9 +164,10 @@ function datasetSummary(d, compact = false) {
     <div class="stat"><div class="k">采集时间</div><div class="v" style="font-size:13px">${esc(d.start_iso)}</div></div></div>`;
   if (compact) return stats;
   const gaps = (d.coverage_gaps || []).length ? `<div class="callout warn" style="margin-top:10px">分段之间存在 ${d.coverage_gaps.length} 处 >0.5 s 的间隙：${d.coverage_gaps.map((g) => `${esc(g.after)} → ${esc(g.before)} (${g.gap_s}s)`).join("；")}</div>` : "";
-  const segs = `<table style="margin-top:12px"><thead><tr><th>分段</th><th class=num>时长</th><th class=num>消息</th><th>话题</th></tr></thead><tbody>${(d.segments || []).map((s) => `<tr><td class="mono small">${esc(s.name)}</td><td class=num>${fmtDur(s.duration_s)}</td><td class=num>${s.messages}</td><td class="small muted">${Object.keys(s.topics).map((t) => t.replace(/^\//, "")).join(", ")}</td></tr>`).join("")}</tbody></table>`;
+  const segs = `<table><thead><tr><th>分段</th><th class=num>时长</th><th class=num>消息</th><th>话题</th></tr></thead><tbody>${(d.segments || []).map((s) => `<tr><td class="mono small">${esc(s.name)}</td><td class=num>${fmtDur(s.duration_s)}</td><td class=num>${s.messages}</td><td class="small muted">${Object.keys(s.topics).map((t) => t.replace(/^\//, "")).join(", ")}</td></tr>`).join("")}</tbody></table>`;
   const topics = `<details style="margin-top:10px"><summary>话题清单（${Object.keys(d.topics || {}).length}）</summary><table><tbody>${Object.entries(d.topics || {}).map(([n, t]) => `<tr><td class="mono small">${esc(n)}</td><td class="small muted">${esc(t.type)}</td><td class="num small">${t.messages}</td></tr>`).join("")}</tbody></table></details>`;
-  return stats + gaps + segs + topics;
+  const segCount = (d.segments || []).length;
+  return stats + gaps + `<details style="margin-top:10px" ${segCount <= 10 ? "open" : ""}><summary>分段明细（${segCount}）</summary>${segs}</details>` + topics;
 }
 function checksHtml(v) {
   if (!v) return `<div class="empty">没有车辆</div>`;
@@ -266,6 +269,10 @@ function render() {
   const page = { home: pageHome, data: pageData, calib: pageCalib, map: pageMap, results: pageResults, system: pageSystem }[S.page];
   $("#page").innerHTML = page();
   renderDrawer();
+  if (S.page === "data" && S.dataset && !S.dataset.error && (!S.assess || S.assess.path !== S.dataset.path) && !S.assessLoading) {
+    S.assessLoading = true;
+    loadAssessment(true).then(() => { S.assessLoading = false; render(); }).catch(() => { S.assessLoading = false; });
+  }
 }
 
 function pageHome() {
@@ -282,7 +289,7 @@ function pageHome() {
   <div class="grid g3" style="margin-top:${running || S.live ? 16 : 0}px">
     <div class="card"><div class="card-h"><h2><span class="stepnum ${canLIO ? "done" : ""}">1</span>数据源</h2><button class="btn sm" data-act="go" data-page="data">更换</button></div>
       <div class="t" style="font-weight:600">${esc(d?.name || "未选择")}</div><div class="small muted ellipsis" title="${esc(d?.path || "")}">${esc(d?.path || "")}</div>
-      <div class="row" style="margin:8px 0 12px">${datasetBadges(d)}</div>${datasetSummary(d, true)}</div>
+      <div class="row" style="margin:8px 0 12px">${datasetBadges(d)}${assessBadgeHome()}</div>${datasetSummary(d, true)}</div>
     <div class="card"><div class="card-h"><h2><span class="stepnum ${v?.ready_level === "livo" ? "done" : v?.active ? "warn" : ""}">2</span>车辆与标定</h2><button class="btn sm" data-act="go" data-page="calib">管理</button></div>
       <div class="row" style="margin-bottom:8px"><select data-act="set-vehicle" style="max-width:220px">${S.vehicles.map((x) => `<option value="${x.id}" ${v && x.id === v.id ? "selected" : ""}>${esc(x.mine)} / ${esc(x.truck)}</option>`).join("")}${S.vehicles.length ? "" : "<option>（无车辆）</option>"}</select>
         ${v?.active ? `<span class="badge dark" title="${esc(v.active)}">${esc(v.active.split("/").pop())}</span>` : '<span class="badge bad">无激活版本</span>'}</div>
@@ -346,8 +353,65 @@ function pageData() {
     </div>
     <div class="card"><div class="card-h"><h2>${esc(d?.name || "未选择")}</h2><div class="row">${datasetBadges(d)}${d && !d.error ? `<button class="btn sm" data-act="refresh-dataset">重新读取</button>` : ""}</div></div>
       <div class="small muted mono" style="margin-bottom:10px">${esc(d?.path || "")}</div>${datasetSummary(d)}</div>
-  </div>`;
+  </div>${assessmentCard()}`;
 }
+// ------------------------------------------------------------------ data assessment (数据评估)
+async function loadAssessment(force = false) {
+  const d = S.dataset;
+  if (!d || d.error) { S.assess = null; return; }
+  if (!force && S.assess && S.assess.path === d.path) return;
+  try { const res = await api(`/api/datasets/assessment?path=${encodeURIComponent(d.path)}`); S.assess = { ...res, path: d.path }; }
+  catch (e) { S.assess = { path: d.path, result: null, error: e.message || String(e) }; }
+}
+function verdictBadge(v, prefix = "评估") {
+  const m = { ok: ["ok", "正常"], warn: ["warn", "关注"], bad: ["bad", "异常"] }[v] || ["", "未评估"];
+  return `<span class="badge ${m[0]}">${prefix ? prefix + " · " : ""}${m[1]}</span>`;
+}
+function assessBadgeHome() {
+  const s = S.assessSummary;
+  if (!s || !s.verdict) return `<span class="badge" title="在“数据源”页运行数据评估">未评估</span>`;
+  const n = s.alerts || 0;
+  return `<span class="badge ${s.verdict}" title="${esc(s.title || "")}">评估 · ${{ ok: "正常", warn: "关注", bad: "异常" }[s.verdict]}${n ? ` · ${n} 项不可标定补救` : ""}</span>`;
+}
+function metricRow(m) {
+  const tip = [m.note, m.basis ? `依据：${m.basis}` : "", m.limits ? `阈值：${m.limits}` : ""].filter(Boolean).join("\n");
+  const fix = m.fix_label ? `<span class="badge sm ${m.alert ? (m.status === "bad" ? "bad" : "warn") : "accent"}">${m.alert ? "⚠ " : ""}${esc(m.fix_label)}</span>` : "";
+  return `<div class="am ${m.status}" title="${esc(tip)}"><span class="dot ${m.status}"></span><span class="am-l">${esc(m.label)}</span><span class="am-v mono">${esc(m.display)}</span><span class="am-x"><span class="ellipsis" title="${esc(m.limits || "")}">${esc(m.limits || (m.status === "info" ? "参考信息" : ""))}</span>${fix}</span></div>`;
+}
+function assessmentCard() {
+  const d = S.dataset;
+  if (!d || d.error) return "";
+  const a = S.assess && S.assess.path === d.path ? S.assess : null;
+  const r = a && a.result;
+  const running = S.job && S.job.status === "running";
+  const mine = running && S.job.kind === "assess";
+  const btn = mine ? `<button class="btn sm" data-act="drawer-job">评估进行中 · 查看进度</button>`
+    : `<button class="btn sm ${r ? "" : "primary"}" data-act="assess" ${running ? "disabled" : ""}>${r ? "重新评估" : "开始评估"}</button>`;
+  const meta = r ? `<span class="small muted">${fmtT(r.generated)} · 用时 ${r.elapsed_s} s · ${r.calibration ? `外参检查基于 ${esc(r.calibration.split("/").slice(-2, -1)[0] || "")}` : "未提供标定文件（跳过外参检查）"}</span>` : "";
+  const head = `<div class="card-h"><h2>数据评估 ${r ? verdictBadge(r.verdict, "") : ""}</h2><div class="row">${meta}${btn}</div></div>`;
+  if (!r) {
+    return `<div class="card" style="margin-top:16px">${head}
+      <div class="ahero"><div><div class="t">一次流式读取，给出这份录制能达到的精度上限</div><div class="d">按本项目在 truck29 / truck05 上遇到的全部数据问题逐项检查：完整性、时间同步、RTK/INS 参考自洽性、雷达几何与静止段外参、相机时间戳与图像内容、行驶工况与资源。每项都有阈值，并标明是标定/建图流程能自动补偿，还是<b>标定无法补救</b>的数据源缺陷。truck29（120 s）约 8 s，truck05（720 s，25 GB）约 40 s。</div></div>
+        <div class="acounts"><div class="acount"><div class="n">7</div><div class="k">检查组</div></div><div class="acount"><div class="n">40+</div><div class="k">指标</div></div></div></div>
+      ${a && a.error ? `<div class="callout bad">${esc(a.error)}</div>` : ""}</div>`;
+  }
+  const c = r.counts || {};
+  const o = r.outlook || {};
+  const hero = `<div class="ahero ${r.verdict}"><div><div class="t">${esc(o.title || "")}</div><div class="d">${esc(o.text || "")}</div></div>
+    <div class="acounts"><div class="acount"><div class="n ok">${c.ok || 0}</div><div class="k">正常</div></div><div class="acount"><div class="n warn">${c.warn || 0}</div><div class="k">关注</div></div><div class="acount"><div class="n bad">${c.bad || 0}</div><div class="k">异常</div></div><div class="acount"><div class="n">${(r.alerts || []).length}</div><div class="k">不可标定补救</div></div></div></div>`;
+  const alertRows = (r.alerts || []).map((x) => `<div class="ai"><span class="dot ${x.status}"></span><span><b>${esc(x.group)}</b> · ${esc(x.label)}：<span class="mono">${esc(x.display)}</span><div class="small" style="opacity:.85">${esc(x.note || "")}</div></span><span class="badge sm ${x.status === "bad" ? "bad" : "warn"}">${esc(x.fix_label)}</span></div>`).join("");
+  const alerts = alertRows ? `<div class="callout ${r.alerts.some((x) => x.status === "bad") ? "bad" : "warn"}" style="margin-bottom:10px"><b>⚠ 警示：以下 ${r.alerts.length} 项无法通过标定自动微调补救</b>（来自参考系统、传感器同步、录制流程或场景本身；会直接决定精度下限）<div class="alist">${alertRows}</div></div>` : "";
+  const fixRows = (r.fixable || []).map((x) => `<div class="ai"><span class="dot ${x.status}"></span><span><b>${esc(x.group)}</b> · ${esc(x.label)}：<span class="mono">${esc(x.display)}</span></span><span class="badge sm accent">${esc(x.fix_label)}</span></div>`).join("");
+  const fixable = fixRows ? `<div class="callout" style="margin-bottom:10px"><b>可由标定流程 / 建图自检补偿（${r.fixable.length} 项）</b>：运行 LiDAR 标定流水线（后轴对齐 → 地面精修 → LIO → 行驶段精修）或依赖建图起步自检 / 合并容差即可，不需要重新采集。<div class="alist">${fixRows}</div></div>` : "";
+  const groups = (r.groups || []).map((g) => `<div class="agroup"><div class="agh"><span class="dot ${g.status}"></span><b>${esc(g.label)}</b><span class="badge sm ${g.status === "ok" ? "ok" : g.status}">${{ ok: "正常", warn: "关注", bad: "异常" }[g.status] || "—"}</span></div><div class="blurb">${esc(g.blurb || "")}</div>${g.metrics.map(metricRow).join("")}
+    <details style="margin-top:6px"><summary class="small">说明与依据（${g.metrics.length}）</summary><div class="stack small" style="gap:6px">${g.metrics.map((m) => `<div><b>${esc(m.label)}</b>：${esc(m.note || "")}${m.basis ? `<div class="muted">依据：${esc(m.basis)}</div>` : ""}${m.limits ? `<div class="muted">阈值：${esc(m.limits)}</div>` : ""}</div>`).join("")}</div></details></div>`).join("");
+  const cams = (r.camera_samples || []).filter((s) => s.decoded && s.thumb);
+  const strip = cams.length ? `<div style="margin-top:14px"><div class="small muted" style="margin-bottom:4px">相机样例（均匀抽取 ${cams.length} 个时刻：亮度均值 · 过曝 % · 纹理）</div><div class="thumbs">${cams.map((s) => `<div class="thumb"><img src="${s.thumb}" alt=""><div class="c">${s.t_s} s · ${Math.round(s.mean)} · ${s.clipped_pct.toFixed(1)} % · ${Math.round(s.texture)}</div></div>`).join("")}</div></div>` : "";
+  const ref = r.reference || {};
+  const foot = `<div class="small muted" style="margin-top:12px">评估范围：${r.window ? `${r.window[0]}–${r.window[0] + r.window[1]} s` : "全程"} · ${(r.messages || 0).toLocaleString()} 条消息 · ${((r.bytes || 0) / 1e9).toFixed(1)} GB · 行驶 ${Math.round(ref.moving_s || 0)} s / ${Math.round(ref.path_m || 0)} m · 静止起步 ${ref.static_start_s != null ? ref.static_start_s.toFixed(1) : "—"} s · 报告 <span class="mono">${esc(a.file || "")}</span></div>`;
+  return `<div class="card" style="margin-top:16px">${head}${hero}${alerts}${fixable}<div class="agrid">${groups}</div>${strip}${foot}</div>`;
+}
+
 function fsHtml() {
   const f = S.fs; if (!f) return `<div class="e dim">输入路径后点击“打开”</div>`;
   const up = `<div class="e" data-act="fs-open" data-path="${esc(f.parent)}"><span>↰</span><span class="n muted">上一级</span></div>`;
@@ -714,6 +778,11 @@ const A = {
   async "fs-open"(el) { await act(async () => { S.fs = await api(`/api/fs?path=${encodeURIComponent(el.dataset.path)}`); const box = $(".fsb"); if (box) box.innerHTML = fsHtml(); const inp = $("#fs-path"); if (inp) inp.value = S.fs.path; }); },
   async "select-dataset"(el) { await act(async () => { const r = await api("/api/datasets/select", "POST", { path: el.dataset.path }); S.state = r.state; S.dataset = r.dataset; await loadOverview(); render(); }, "已选择数据源"); },
   async "forget-dataset"(el) { await act(async () => { S.state = await api("/api/datasets/forget", "POST", { path: el.dataset.path }); render(); }); },
+  async assess() {
+    const d = S.dataset; const v = vehicle();
+    if (!d || d.error) return toast("请先选择可用的数据源", "bad");
+    await act(async () => { const job = await api("/api/datasets/assess", "POST", { path: d.path, mine: v?.mine, truck: v?.truck }); S.job = job; S.jobLog = []; S.jobLogNext = 0; S.drawer = "job"; render(); }, "数据评估已启动");
+  },
   async "refresh-dataset"() { await act(async () => { S.dataset = await api(`/api/datasets?path=${encodeURIComponent(S.dataset.path)}&refresh=1`); render(); }, "已重新读取"); },
 };
 document.addEventListener("click", (ev) => {
