@@ -147,6 +147,10 @@ struct RtkFusion
   // A non-fixed startup keeps the frontend in its original local frame.
   // A single fixed frame transform later anchors it; its voxel map never jumps.
   bool local_frontend = false, frontend_alignment_known = true, graph_in_enu = true;
+  // false (no-RTK rounds): maintain the graph/exports but ADOPT the raw frontend poses -- without
+  // RTK anchoring the lidar-geometry/motion-prior graph distorts instead of refining (measured:
+  // optimized drift 2x native on wuhu 120 s), so the honest product is the native trajectory.
+  bool observations_enabled = true;
   gtsam::Pose3 frontend_to_enu;
   V3D local_gravity = V3D(0, 0, -G_m_s2);
   // Captured before the first submitted scan. The stationary gravity datum

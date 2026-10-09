@@ -165,7 +165,8 @@ def assess_pipeline_step(raw_path, calibration_file=None, force=False):
     calibration cannot compensate is found (warn-level alerts only annotate the job)."""
     report, _info = assessment_file(raw_path)
     doc = read_json(report) if report.exists() else None
-    if doc and not force and (doc.get("calibration") or not calibration_file):
+    # Recompute reports made with the former 5 ms merge limit.
+    if doc and doc.get("schema") == 2 and not force and (doc.get("calibration") or not calibration_file):
         return None
     cmd, report, info = assess_cmd(raw_path, calibration_file)
 

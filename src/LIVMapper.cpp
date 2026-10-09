@@ -103,6 +103,10 @@ LIVMapper::LIVMapper(const rclcpp::Node::SharedPtr &node)
       // readParameters() already loaded the LiDAR sources; tag archived returns per LiDAR.
       std::vector<V3D> origins;
       for (const auto &source : lidar_sources) origins.push_back(source->rear_from_lidar_translation);
+      if (!rtk_observations_enabled)
+        RCLCPP_WARN(node_->get_logger(),
+            "rtk.observations_enabled=false: no INS/RTK observations will be fused; the backend runs as a "
+            "pure-odometry smoother/exporter and all products stay in the INS-anchored mine frame");
       rtk_fusion_->setLidarOrigins(origins);
     }
     {
@@ -140,6 +144,7 @@ void LIVMapper::readParameters()
   nh.param<string>("common/imu_topic", imu_topic, "/livox/imu");
   nh.param<string>("common/ins_odom_topic", ins_odom_topic, "/imu_data/odometry");
   nh.param<bool>("rtk/enabled", rtk_enabled, false);
+  nh.param<bool>("rtk/observations_enabled", rtk_observations_enabled, true);
   nh.param<bool>("rtk/frontend_attitude_aiding", frontend_attitude_aiding, false);
   nh.param<double>("rtk/frontend_attitude_sigma_deg", frontend_attitude_sigma_deg, 0.3);
   nh.param<double>("rtk/frontend_attitude_huber_deg", frontend_attitude_huber_deg, 1.0);
@@ -1003,7 +1008,7 @@ void LIVMapper::initializeMineFrame(double initialization_time)
   for (const MinePose &sample : mine_pose_samples)
   {
     if (sample.stamp > initialization_time) break;
-    if (rtk_fusion_)
+    if (rtk_fusion_ && rtk_observations_enabled)
     {
       RtkFusion::Observation quality_checked;
       const double time = sample.stamp + imu_time_offset - rtk_fusion_->time_offset;
@@ -1310,7 +1315,7 @@ void LIVMapper::handleLIO()
   // It never touches position/velocity; without it, scan-to-map registration
   // on this multi-LiDAR rig drifted native pitch ~0.01 deg per metre.
   voxelmap_manager->attitude_aiding_ = false;
-  if (rtk_fusion_ && frontend_attitude_aiding)
+  if (rtk_fusion_ && frontend_attitude_aiding && rtk_observations_enabled)
   {
     RtkFusion::Observation reference;
     gtsam::Pose3 alignment;
@@ -2326,7 +2331,7 @@ void LIVMapper::ins_odom_cbk(const nav_msgs::Odometry::ConstSharedPtr &msg_in)
 
   // Position fusion does not require a valid INS attitude. Only reference
   // visualization and initial alignment below require the full quaternion.
-  if (rtk_fusion_) rtk_fusion_->observe(*msg_in);
+  if (rtk_fusion_) rtk_fusion_->observe(*msg_in);  // reference always flows; factor creation is gated on observations_enabled
 
   MinePose mine_pose;
   mine_pose.stamp = stampToSec(msg_in->header.stamp) - imu_time_offset;

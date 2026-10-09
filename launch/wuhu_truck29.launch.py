@@ -51,6 +51,10 @@ def generate_launch_description():
     use_camera = LaunchConfiguration("use_camera")
     use_rviz = LaunchConfiguration("use_rviz")
     use_rtk = LaunchConfiguration("use_rtk")
+    # "" = follow use_rtk. --no-rtk rounds pass use_rtk:=false (native RViz layout, honest
+    # display) together with rtk_backend:=true (exporter backend stays alive, observations
+    # starved via rtk.observations_enabled=false in the config overrides).
+    rtk_backend = LaunchConfiguration("rtk_backend")
     rear_axle_to_imu = LaunchConfiguration("rear_axle_to_imu")
     rviz_current_cloud = PythonExpression([
         "'/rtk/cloud_current' if '", use_rtk,
@@ -80,7 +84,9 @@ def generate_launch_description():
     def launch_mapping(context):
         overrides = {
             "common.img_en": ParameterValue(use_camera, value_type=bool),
-            "rtk.enabled": ParameterValue(use_rtk, value_type=bool),
+            "rtk.enabled": ParameterValue(PythonExpression([
+                "'", use_rtk, "'.lower() == 'true' or '", rtk_backend, "'.lower() == 'true'",
+            ]), value_type=bool),
             "rtk.save_map": ParameterValue(LaunchConfiguration("save_map"), value_type=bool),
             "output.directory": LaunchConfiguration("output_directory"),
             "reference_frame_conversion.enabled": ParameterValue(
@@ -122,6 +128,7 @@ def generate_launch_description():
         DeclareLaunchArgument("use_camera", default_value="false"),
         DeclareLaunchArgument("use_rviz", default_value="false"),
         DeclareLaunchArgument("use_rtk", default_value="true"),
+        DeclareLaunchArgument("rtk_backend", default_value=""),
         DeclareLaunchArgument("save_map", default_value="false"),
         DeclareLaunchArgument("finalize_timeout_sec", default_value="600.0"),
         DeclareLaunchArgument("output_directory", default_value=default_output_directory),

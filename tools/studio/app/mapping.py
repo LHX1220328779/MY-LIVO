@@ -1,6 +1,7 @@
 """Mapping rounds (scripts/run_wuhu_round.sh): start / stop, round listing, live monitoring."""
 import datetime as dt
 import json
+import math
 import re
 import subprocess
 
@@ -34,6 +35,15 @@ def round_cmd(round_name, mode, calibration_file, body, *, force_save_map=False,
         cmd += ["--duration", str(float(body["duration"]))]
     if calibration_file:
         cmd += ["--calibration", str(calibration_file)]
+    for key, flag in (("map_range", "--map-range"), ("rgb_range", "--rgb-range")):
+        if body.get(key) not in (None, ""):
+            try:
+                distance = float(body[key])
+            except (TypeError, ValueError):
+                raise StudioError("点云截取距离必须是非负数（0 表示不限距离）") from None
+            if not math.isfinite(distance) or distance < 0:
+                raise StudioError("点云截取距离必须是有限非负数（0 表示不限距离）")
+            cmd += [flag, str(distance)]
     cmd += ["--set", f"multi_lidar.precheck.enabled={'true' if body.get('precheck', True) else 'false'}"]
     if int(body.get("frame_divider") or 1) > 1:
         cmd += ["--set", f"camera.frame_divider={int(body['frame_divider'])}"]
@@ -80,16 +90,53 @@ def start(body):
         raise StudioError("模式必须是 lio 或 livo")
     dataset = str(safe_path(body.get("dataset") or ""))
     datasets.require(dataset, camera=(mode == "livo"))
-    prefix = re.sub(r"[^A-Za-z0-9_\-]", "_", body.get("round_prefix") or "studio")
-    round_name = f"{prefix}_{mode}_{dt.datetime.now().strftime('%m%d_%H%M%S')}"
+    # 轮次命名规范：<矿区>_<车号>_<模式>_<序号>，序号从 1 起；名称不含日期
+    # （开始时间已记录在轮次元数据中）。开发测试轮由脚本手工命名并加 _test 后缀。
+    mine_part = re.sub(r"[^A-Za-z0-9]", "", str(body.get("mine") or "")).lower() or "site"
+    truck_raw = str(body.get("truck") or "")
+    truck_part = re.sub(r"[^0-9]", "", truck_raw) or re.sub(r"[^A-Za-z0-9]", "", truck_raw) or "truck"
+    base = f"{mine_part}_{truck_part}_{mode}"
+    number = 1
+    for existing in RESULTS.glob(f"{base}_*"):
+        match = re.match(re.escape(base) + r"_(\d+)", existing.name)
+        if match:
+            number = max(number, int(match.group(1)) + 1)
+    round_name = f"{base}_{number}"
     cid = body.get("calibration_id") or ""
     if cid == "active" or not cid:
         cid = calibration.active_id(body.get("mine") or "", body.get("truck") or "") or ""
+    # A stale UI draft can carry another vehicle's calibration id (the dropdown then shows
+    # "active version" because the id is missing from the current vehicle's list, but the
+    # submit still sends the stale id). Mapping with another truck's extrinsics/time offsets
+    # yields metre-level native drift from the first frame, so refuse instead of running it
+    # (observed: wuhu bag + zongyang/truck07 calibration -> native median 1.83 m, pitch 2.9 deg).
+    mine, truck = body.get("mine") or "", body.get("truck") or ""
+    if cid and mine and truck and not cid.startswith(f"{mine}/{truck}/"):
+        raise StudioError(
+            f"标定 {cid} 不属于当前车辆 {mine}/{truck}：请在建图页重新选择标定版本"
+            f"（该选项可能是切换车辆前残留的表单草稿）")
+    # The recording path names its mine (…/data/haibo/<mine…>/…). Mapping a recording with
+    # another mine's vehicle calibration is always a mistake: the extrinsics / lever arms and
+    # the per-truck time offsets belong to that other machine (observed 2026-10-09: six wuhu
+    # rounds ran with zongyang/truck07 -> the red native path sat metres away from RTK from
+    # the first metres, startup included). The cid<->vehicle check above cannot catch this
+    # case because the whole vehicle selector was on the other truck; refuse on the dataset.
+    if cid:
+        from .common import CAL_ROOT
+        known_mines = sorted({d.name for d in CAL_ROOT.iterdir()
+                              if d.is_dir() and not d.name.startswith(".")})
+        ds_l = dataset.lower()
+        mines_in_path = [m for m in known_mines if m.lower() in ds_l]
+        if mines_in_path and not any(cid.startswith(m + "/") for m in mines_in_path):
+            raise StudioError(
+                f"数据 {dataset} 按路径属于矿区 {'、'.join(mines_in_path)}，而标定 {cid} "
+                f"来自其他矿区的车辆：请先切换到该矿区的车辆（或为当前数据选择正确的标定版本）。"
+                f"跨车标定会让原生轨迹从起步就偏离 RTK 米级")
     calib_file = str(calibration.calibration_file(cid)) if cid else None
     cmd = round_cmd(round_name, mode, calib_file, body)
     meta = {"round": round_name, "mode": mode, "dataset": dataset, "calibration_id": cid,
             "options": {k: body.get(k) for k in ("use_rtk", "save_map", "rviz", "rate", "precheck", "frame_divider",
-                                                  "evaluate", "extra_sets", "start_offset", "duration")}}
+                                                  "evaluate", "extra_sets", "start_offset", "duration", "map_range", "rgb_range")}}
     title = f"{'LIVO' if mode == 'livo' else 'LIO'} 建图 · {round_name}"
     return jobs.start("mapping", title, [{"title": title, "cmd": cmd}], meta=meta)
 

@@ -435,19 +435,35 @@ def read_pcd(path, with_header=False):
     return (cloud, header) if with_header else cloud
 
 
+def saved_map_range(directory):
+    parameters = directory / "parameters.txt"
+    if parameters.exists():
+        for line in parameters.read_text().splitlines():
+            if line.startswith("rtk.save_map_max_range="):
+                return float(line.split("=", 1)[1])
+    return 0.0
+
+
 def actual_pcd_frames(directory, index, archive):
     """Stream unchanged saved returns, paired by archive order, one chunk at a time."""
     files = sorted(directory.glob("map_*.pcd"), key=lambda path: int(path.stem.split("_")[-1]))
     if not files or [int(p.stem.split("_")[-1]) for p in files] != list(range(len(files))):
         raise ValueError("Actual map PCD chunks must start at zero and be contiguous")
     file_number, row, cloud = 0, 0, read_pcd(files[0])
+    max_range = saved_map_range(directory)
     expected_start = 0
     for record in index:
         count = int(record["count"])
         offset = int(record["offset_bytes"]) - 8
         if count < 0 or offset != expected_start * 20 or expected_start + count > len(archive):
             raise ValueError("Frame archive offsets/counts are not contiguous source returns")
-        parts, remaining = [], count
+        source = archive[expected_start:expected_start + count]
+        source_ids = np.arange(count)
+        if max_range > 0:
+            # Match the exporter's float32 norm in the archived virtual-LiDAR frame.
+            keep = np.linalg.norm(source[:, :3], axis=1) <= max_range
+            source, source_ids = source[keep], source_ids[keep]
+        parts, remaining = [], len(source)
         while remaining:
             if row == len(cloud):
                 file_number += 1
@@ -460,10 +476,9 @@ def actual_pcd_frames(directory, index, archive):
                 row += take
                 remaining -= take
         saved = (parts[0] if len(parts) == 1 else np.concatenate(parts)) if parts else np.empty((0, 4), dtype="<f4")
-        source = archive[expected_start:expected_start + count]
         if not np.array_equal(saved[:, 3], source[:, 3], equal_nan=True):
             raise ValueError(f"Actual PCD/source-return intensity order differs at {record['stamp']:.9f}")
-        yield saved
+        yield saved, source, source_ids
         expected_start += count
     if expected_start != len(archive) or row != len(cloud) or file_number + 1 != len(files):
         raise ValueError("Actual PCD/archive contains returns outside the frame index")
@@ -1125,11 +1140,8 @@ def compare_native_windows(native, run, output, cutoff_ns, window_length, deskew
         start = end + 1
     frames = np.genfromtxt(run / "frames.csv", delimiter=",", names=True, skip_header=3)
     fused_poses = np.loadtxt(run / "trajectory_optimized.txt") if deskew_ablation else None
-    offsets = np.r_[0, np.cumsum(frames["count"].astype(np.int64))]
-    chunks = [read_pcd(p) for p in sorted(run.glob("map_*.pcd"), key=lambda p: int(p.stem.split("_")[-1]))]
-    chunk_ends = np.cumsum([len(c) for c in chunks])
-    if not len(chunks) or chunk_ends[-1] != offsets[-1]:
-        raise ValueError("Actual saved PCD point count does not match the raw frame index")
+    archive = np.memmap(run / "scans.bin", dtype="<f4", mode="r", offset=8).reshape(-1, 5)
+    paired = [(saved, ids) for saved, _source, ids in actual_pcd_frames(run, frames, archive)]
     with (output / "windows.csv").open("w") as stream, (output / "sections.csv").open("w") as metrics:
         rows, scores = csv.writer(stream), csv.writer(metrics)
         rows.writerow(("window", "begin", "end", "native_arc_m", "matched_frames", "expected_frames", "status"))
@@ -1146,16 +1158,16 @@ def compare_native_windows(native, run, output, cutoff_ns, window_length, deskew
                 cloud = read_pcd(native / "Log/pcd" / f"{stamp:.6f}.pcd")
                 # Native IMU deskew removes ONLY the already-consumed prefix
                 # of overlapping scan envelopes; point order is retained.
-                stop, count = offsets[i + 1], len(cloud)
-                first = stop - count
-                if first < offsets[i]:
+                prefix = int(frames[i]["count"]) - len(cloud)
+                if prefix < 0:
                     print(f"native window {number}: source count differs at {stamp:.9f}; whole window will be unscored")
                     unpaired_returns += 1
                     continue
-                c = int(np.searchsorted(chunk_ends, first, side="right"))
-                previous = chunk_ends[c - 1] if c else 0
-                fused = chunks[c][first - previous:min(stop, chunk_ends[c]) - previous]
-                if stop > chunk_ends[c]: fused = np.concatenate((fused, chunks[c + 1][:stop - chunk_ends[c]]))
+                saved, ids = paired[i]
+                keep = ids >= prefix
+                fused = saved[keep]
+                cloud = cloud[ids[keep] - prefix]
+                count = len(cloud)
                 if not np.array_equal(cloud[:, 3], fused[:, 3]):
                     print(f"native window {number}: source-return order differs at {stamp:.9f}; whole window will be unscored")
                     unpaired_returns += 1
@@ -1313,17 +1325,14 @@ def compare_map(directory, frame_stride, point_stride, reference, lever):
         cache[i] = tuple((centers[planar], normals[planar]) for centers, normals, _ in summaries)
 
     before, after, stamps, ranges = [], [], [], []
-    for i, saved in enumerate(actual_pcd_frames(directory, index, points)):
+    for i, (saved, scan, _source_ids) in enumerate(actual_pcd_frames(directory, index, points)):
         record = index[i]
-        start = (int(record["offset_bytes"]) - 8) // 20
         if i in candidate_set:
-            scan = points[start:start + int(record["count"])]
             local, world = native_points(i, record, scan)
             retain_surface_summary(i, local, world, np.asarray(saved[:, :3], dtype=float))
         if i % frame_stride:
             continue
-        scan = points[start:start + int(record["count"]):point_stride]
-        local, world = native_points(i, record, scan)
+        local, world = native_points(i, record, scan[::point_stride])
         refined = np.asarray(saved[::point_stride, :3], dtype=float)
         distance = np.linalg.norm(local, axis=1)
         valid = np.isfinite(world).all(axis=1) & np.isfinite(refined).all(axis=1) & (distance >= 5) & (distance <= 70)

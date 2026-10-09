@@ -292,6 +292,9 @@ public:
   std::unique_ptr<tf2_ros::StaticTransformBroadcaster> alignment_broadcaster_;
   std::unique_ptr<RtkFusion> rtk_fusion_;
   bool rtk_enabled = false;
+  // false = run the fusion backend purely as exporter/smoother: no INS/RTK observations are fed,
+  // the graph stays pure odometry, products stay in the INS-anchored mine frame (--no-rtk rounds).
+  bool rtk_observations_enabled = true;
   // Qualified INS attitude as a bounded absolute attitude measurement in the
   // LIO update (positions/velocities stay unaided).
   bool frontend_attitude_aiding = false;

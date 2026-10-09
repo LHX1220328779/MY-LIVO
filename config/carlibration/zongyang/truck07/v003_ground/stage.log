@@ -1,0 +1,13 @@
+calibration=/home/project/MY-LIVO/config/carlibration/zongyang/truck07/v002_axle/calibration.json
+bag=/home/project/data/haibo/zongyang/07/20261007/ros2bag
+reference=front_lidar
+stationary frames 2..22 (aggregated) for side LiDARs; moving frames 2750..2790 (per frame) for back LiDAR
+stationary check (front_lidar, first vs last frame of 20): scan displacement median 11.1 cm / P90 53.2 cm (limit 30 cm) -> stationary
+front_right_lidar: stationary aggregated points 17925
+back_lidar: stationary aggregated points 31954
+front_left_lidar: stationary aggregated points 16708
+front_lidar: stationary aggregated points 21589
+front_right_lidar: yaw/xy solved=False; matches 2397->2405; |res| median 9.60->6.16 cm; ground 9.60->6.16 cm (n=2405); vertical nan->nan cm (n=0); correction rot deg (x,y,z)=(+0.236,+0.041,+0.000) trans cm=(+0.0,+0.0,-0.1); iters 13
+front_left_lidar: yaw/xy solved=False; matches 2556->2565; |res| median 6.44->5.94 cm; ground 6.44->5.94 cm (n=2565); vertical nan->nan cm (n=0); correction rot deg (x,y,z)=(+0.011,-0.226,+0.000) trans cm=(+0.0,+0.0,+1.4); iters 11
+back_lidar: (moving, per-frame vs refined sides) yaw/xy solved=False; matches 28116->28084; |res| median 7.08->5.67 cm; ground 7.07->5.66 cm (n=28025); vertical n=22; correction rot deg (x,y,z)=(-0.403,+0.492,+0.000) trans cm=(+0.0,+0.0,-1.8); iters 11
+written /home/project/MY-LIVO/config/carlibration/zongyang/truck07/v003_ground/calibration.json

@@ -208,16 +208,15 @@ function multiChart(lines, ymaxHint) {
 }
 // Trajectory-vs-RTK panel: the optimized (delivered map) trajectory is the primary solid line; the online
 // published pose is the dashed secondary. Before evaluation the backend keyframe residual stands in.
-function trajectoryChart(live) {
+function trajectoryChart(live, noRtk) {
   const es = live?.error_series;
   if (es && es.length >= 2) {
-    return multiChart([
-      { series: es, key: "opt_rear", color: "#0071e3", label: "优化后轨迹 vs RTK（后轴，评估）" },
-      { series: live.online_series, key: "latest", color: "#5e5ce6", dash: "5 4", label: "在线轨迹 vs INS（实时）" },
-    ], 0.1);
+    const lines = noRtk ? [] : [{ series: es, key: "opt_rear", color: "#0071e3", label: "优化后轨迹 vs RTK（后轴，评估）" }];
+    lines.push({ series: live.online_series, key: "latest", color: "#5e5ce6", dash: "5 4", label: "在线轨迹 vs INS（实时）" });
+    return multiChart(lines, 0.1);
   }
   return multiChart([
-    { series: live?.diagnostics, key: "rtk_residual_m", color: "#0071e3", label: "优化后关键帧 RTK 残差（实时）" },
+    ...(noRtk ? [] : [{ series: live?.diagnostics, key: "rtk_residual_m", color: "#0071e3", label: "优化后关键帧 RTK 残差（实时）" }]),
     { series: live?.online_series, key: "latest", color: "#5e5ce6", dash: "5 4", label: "在线轨迹 vs INS（实时）" },
   ], 0.1);
 }
@@ -251,7 +250,7 @@ function liveMonitor() {
     </div>
     <div class="grid g2" style="margin-top:12px">
       <div><h4>前端 RTK 残差 (m)</h4>${chart(live?.diagnostics, "frontend_rtk_residual_m", "#0071e3", 0.1)}</div>
-      <div><h4>优化后轨迹 vs RTK (m)　<span class="small muted">虚线：在线轨迹 vs INS</span></h4>${trajectoryChart(live)}</div>
+      <div><h4>${live?.record?.options?.use_rtk === false ? `在线轨迹 vs INS (m)　<span class="small muted">无 RTK/INS 融合</span>` : `优化后轨迹 vs RTK (m)　<span class="small muted">虚线：在线轨迹 vs INS</span>`}</h4>${trajectoryChart(live, live?.record?.options?.use_rtk === false)}</div>
     </div>
     ${live?.launch_events?.length ? `<details style="margin-top:10px"><summary>算法事件（${live.launch_events.length}）</summary><div class="events">${live.launch_events.slice(-40).map((e) => `<div class="${/WARN/.test(e) ? "warn" : /ERROR|FATAL|died/.test(e) ? "bad" : ""}">${esc(e)}</div>`).join("")}</div></details>` : ""}
   </div>`;
@@ -263,7 +262,7 @@ function render() {
   document.querySelectorAll("#nav a").forEach((a) => a.classList.toggle("active", a.dataset.page === S.page));
   $("#crumbs").innerHTML = `LIVO Studio <span>/ ${PAGES[S.page]}</span>`;
   const v = vehicle(); const d = S.dataset;
-  $("#context").innerHTML = `<span class="ctx">车辆 <b>${esc(v ? `${v.mine}/${v.truck}` : "—")}</b></span><span class="ctx">数据源 <b title="${esc(d?.path || "")}">${esc(d ? d.name : "—")}</b></span><span class="ctx">标定 <b>${esc(v?.active ? v.active.split("/").pop() : "无")}</b></span>`;
+  $("#context").innerHTML = `<span class="ctx">车辆 <b>${esc(v ? `${v.mine}/${v.truck}` : "—")}</b></span><span class="ctx">数据源 <b title="${esc(d?.path || "")}">${esc(d ? ((d.path || "").split("/").filter(Boolean).slice(-2).join("/") || d.name) : "—")}</b></span><span class="ctx">标定 <b title="${S.state?.mapping?.calibration_id ? "本轮指定版本" : "激活版本"}">${esc(((S.state?.mapping?.calibration_id || v?.active) || "").split("/").pop() || "无")}</b></span>`;
   $("#jobpill").outerHTML = jobPill();
   $("#sidebar-foot").innerHTML = footHtml();
   const page = { home: pageHome, data: pageData, calib: pageCalib, map: pageMap, results: pageResults, system: pageSystem }[S.page];
@@ -318,7 +317,8 @@ function metricCells(r) {
   if (!r.evaluated) return { native: '<span class="muted">未评估</span>', opt: evalBtn("评估"), map: "—", pole: "—" };
   if (!o && !n) return { native: '<span class="badge warn" title="评估输出不完整（summary 解析失败），请重新评估">评估异常</span>', opt: evalBtn("重新评估"), map: "—", pole: "—" };
   const native = n ? `<span title="全程后轴 3D 误差 中位 · 终点（无对齐）">${fm(n.median_m)} · 终点 ${fm(n.final_m)}</span>${n.final_xy_m != null ? `<div class="small muted">终点 XY ${fm(n.final_xy_m)} · Z ${fm(n.final_z_m)}${n.yaw_drift_end_deg != null ? ` · 偏航 ${sdeg(n.yaw_drift_end_deg)}` : ""}${n.path_length_ratio != null ? ` · <span title="原生里程 / RTK 融合里程：偏离 1 即前端存在尺度误差" class="${Math.abs(n.path_length_ratio - 1) > 0.005 ? "warn" : ""}">尺度 ${(n.path_length_ratio * 100).toFixed(2)}%</span>` : ""}</div>` : ""}${h.startup?.native ? `<div class="small muted">起步 30 m 中位 ${cm(h.startup.native.median_m)} · 最大 ${cm(h.startup.native.max_m)}</div>` : ""}` : "—";
-  const opt = o ? `<span title="RTK/INS 融合后 后轴 3D 误差 中位 / P95 / 最大">${cm(o.median_m)} / ${cm(o.p95_m)} / ${cm(o.max_m)}</span> <span class="badge ${o.budget === "PASS" ? "ok" : "warn"}">${esc(o.budget || "—")}</span>${o.route_le10cm_pct != null ? `<div class="small muted">路线 ≤10 cm ${pct(o.route_le10cm_pct)} · >20 cm ${pct(o.route_gt20cm_pct)}</div>` : ""}` : "—";
+  const noRtk = r.options && r.options.use_rtk === false;
+  const opt = noRtk ? `<span class="badge" title="本轮未启用 RTK/INS 融合：交付轨迹即原生轨迹，无优化指标">无融合</span>` : o ? `<span title="RTK/INS 融合后 后轴 3D 误差 中位 / P95 / 最大">${cm(o.median_m)} / ${cm(o.p95_m)} / ${cm(o.max_m)}</span> <span class="badge ${o.budget === "PASS" ? "ok" : "warn"}">${esc(o.budget || "—")}</span>${o.route_le10cm_pct != null ? `<div class="small muted">路线 ≤10 cm ${pct(o.route_le10cm_pct)} · >20 cm ${pct(o.route_gt20cm_pct)}</div>` : ""}` : "—";
   const g = h.ground_5_20;
   const map = g ? `<span title="5–20 m 地面同点平面 RMS 厚度 原生 → 优化后（中位）">${f1(g.median_before_mm)} → <b>${f1(g.median_after_mm)}</b> mm</span><div class="small muted">带内 ${pct(g.within_bound_pct)} · ${g.cells} 格</div>` : "—";
   const pp = h.pole_pair_separation_cm;
@@ -330,7 +330,7 @@ function runsTable(runs, compact = false) {
   const badge = (r) => r.status === "running" ? '<span class="badge accent"><span class="dot run"></span>运行中</span>' : r.status === "done" ? '<span class="badge ok">完成</span>' : r.status === "failed" ? '<span class="badge bad">失败</span>' : r.status === "lost" ? '<span class="badge warn">中断</span>' : r.status === "incomplete" ? `<span class="badge warn" title="${esc(r.error || "")}">不完整</span>` : `<span class="badge">${esc(r.status)}</span>`;
   const head = compact
     ? "<th>原生轨迹 vs RTK</th><th>RTK 优化后</th>"
-    : `<th title="前端里程计（RViz 红线）后轴 3D 误差，全程、无对齐，随里程累积">原生轨迹 vs RTK（全程）</th><th title="RTK/INS 融合结果（蓝线）后轴 3D 误差">RTK 优化后（中位 / P95 / 最大）</th><th title="5–20 m 地面同点平面厚度，原生 → 优化后">地面厚度 5–20 m</th><th title="同一灯柱在不同地图块中的轴线 XY 分离">灯柱多期一致性</th>`;
+    : `<th title="前端里程计（RViz 红线）后轴 3D 误差，全程、无对齐，随里程累积。融合轮的前端启用 INS 姿态辅助（仅横滚/俯仰弱约束，σ0.3°，不碰位置/速度/偏航），无融合轮为纯 LIO——两种模式的原生漂移不可直接对比">原生轨迹 vs RTK（全程）</th><th title="RTK/INS 融合结果（蓝线）后轴 3D 误差">RTK 优化后（中位 / P95 / 最大）</th><th title="5–20 m 地面同点平面厚度，原生 → 优化后">地面厚度 5–20 m</th><th title="同一灯柱在不同地图块中的轴线 XY 分离">灯柱多期一致性</th>`;
   return `<table><thead><tr><th>轮次</th><th>模式</th><th>状态</th>${compact ? "" : "<th>数据源</th><th>标定</th>"}<th>开始</th>${head}</tr></thead><tbody>
   ${runs.map((r) => { const c = metricCells(r); return `<tr class="click ${S.runDetail?.round === r.round ? "sel" : ""}" data-act="open-run" data-round="${esc(r.round)}"><td class="mono">${esc(r.round)}</td><td><span class="badge">${esc((r.mode || "").toUpperCase())}</span></td><td>${badge(r)}</td>${compact ? "" : `<td class="small muted ellipsis" style="max-width:180px" title="${esc(r.dataset)}">${esc(baseName(r.dataset))}</td><td class="small muted">${esc(r.calibration ? baseName(r.calibration.replace(/\/calibration\.json$/, "")) : "yaml")}</td>`}<td class="small nowrap">${fmtT(r.start)}</td><td class="small">${c.native}</td><td class="small">${c.opt}</td>${compact ? "" : `<td class="small">${c.map}</td><td class="small">${c.pole}</td>`}</tr>`; }).join("")}</tbody></table>`;
 }
@@ -536,6 +536,9 @@ function importForm(c) {
 function pageMap() {
   const v = vehicle(); const d = S.dataset; const m = S.state.mapping; const running = S.job && S.job.status === "running";
   const versions = (S.cal?.versions || []).filter((x) => v && x.mine === v.mine && x.truck === v.truck);
+  // A stale calibration_id from another vehicle must never survive: the <select> would silently
+  // display the first option (active version) while submitting the stale id. Reset it.
+  if (m.calibration_id && S.cal && !versions.some((x) => x.id === m.calibration_id)) { m.calibration_id = ""; S.state.mapping.calibration_id = ""; saveState({ mapping: { calibration_id: "" } }); }
   const canLIVO = d && d.livo_ready, canLIO = d && d.lio_ready;
   const mode = m.mode === "livo" && !canLIVO ? "lio" : m.mode;
   return `<h1 style="margin-bottom:6px">建图</h1><div class="muted" style="margin-bottom:18px">一次建图 = 启动 fastlivo_mapping → 按时间戳实时回放原始录制 → 收尾优化导出轨迹/地图 → 自动精度评估。所有输出在 <code>results/&lt;轮次&gt;/</code>（round.json 记录完整参数与阶段）。</div>
@@ -544,13 +547,16 @@ function pageMap() {
     <div class="form">
       <div class="field"><label>模式</label><div class="seg"><button class="${mode === "lio" ? "active" : ""}" data-act="mode" data-mode="lio" ${canLIO ? "" : "disabled"}>LIO</button><button class="${mode === "livo" ? "active" : ""}" data-act="mode" data-mode="livo" ${canLIVO ? "" : "disabled"}>LIVO</button></div></div>
       <div class="field"><label>标定版本</label><select data-act="field" data-section="mapping" data-key="calibration_id"><option value="" ${!m.calibration_id ? "selected" : ""}>激活版本（${esc(v?.active ? v.active.split("/").pop() : "无")}）</option>${versions.map((x) => `<option value="${esc(x.id)}" ${m.calibration_id === x.id ? "selected" : ""}>${esc(x.version)} · ${esc(x.stage_label)}</option>`).join("")}</select></div>
-      <div class="field"><label>轮次前缀</label><input type="text" data-act="field" data-section="mapping" data-key="round_prefix" value="${esc(m.round_prefix)}"></div>
+      
       <div class="field"><label>回放倍速</label><input type="number" step="0.1" min="0.1" max="4" data-act="field" data-section="mapping" data-key="rate" value="${esc(m.rate)}"></div>
       <div class="field"><label>起始偏移 (s)</label><input type="number" step="1" min="0" data-act="field" data-section="mapping" data-key="start_offset" value="${esc(m.start_offset ?? 0)}"></div>
       <div class="field"><label>回放时长 (s，空=全部)</label><input type="number" step="1" min="0" data-act="field" data-section="mapping" data-key="duration" value="${esc(m.duration ?? "")}"></div>
+      <div class="field"><label>几何点云截取距离 (m)</label><input type="number" step="1" min="0" data-act="field" data-section="mapping" data-key="map_range" value="${esc(m.map_range ?? 45)}" ${m.save_map ? "" : "disabled"}></div>
+      <div class="field"><label>彩色点云截取距离 (m)</label><input type="number" step="1" min="0" data-act="field" data-section="mapping" data-key="rgb_range" value="${esc(m.rgb_range ?? 60)}" ${m.save_map && mode === "livo" ? "" : "disabled"}></div>
       <div class="field"><label>相机帧抽稀 (frame_divider)</label><input type="number" step="1" min="1" max="10" data-act="field" data-section="mapping" data-key="frame_divider" value="${esc(m.frame_divider ?? 1)}"></div>
       <div class="field wide"><label>额外参数覆盖（空格分隔 key=value，例如 vio.img_point_cov=100 time_offset.img_time_offset=-0.115）</label><input type="text" class="mono" data-act="field" data-section="mapping" data-key="extra_sets" value="${esc(m.extra_sets || "")}"></div>
     </div>
+    <div class="small muted" style="margin-top:10px">截取距离仅控制导出的 PCD 范围，0 表示不限距离。几何和彩色点云可分别设置。</div>
     <div class="row" style="margin-top:14px;gap:22px">${toggle("use_rtk", "RTK / INS 融合", m.use_rtk)}${toggle("save_map", "保存地图 (PCD/扫描存档)", m.save_map)}${toggle("rviz", "RViz", m.rviz)}${toggle("precheck", "起步静止外参自检", m.precheck)}${toggle("evaluate", "自动评估", m.evaluate)}</div>
     <div class="sep"></div>
     <div class="row" style="justify-content:space-between"><div class="small muted">启动前会校验数据源话题与标定版本；进行中可“提前结束并保存”（停止回放，保留优化/导出/评估）。</div><button class="btn primary big" data-act="start" ${running || !canLIO || !v?.active ? "disabled" : ""}>${running ? "建图进行中…" : `开始 ${mode.toUpperCase()} 建图`}</button></div>
@@ -559,7 +565,7 @@ function pageMap() {
 
 function pageResults() {
   const ev = S.runs.filter((r) => r.evaluated && r.metrics?.optimized);
-  const legend = `<div class="callout" style="margin-bottom:14px"><b>怎么读这张表</b> · <b>原生轨迹</b>＝前端里程计（LIO / LIVO，RViz 红线）与 RTK 后轴位置之差，起点对齐后不做任何轨迹对齐，误差随里程累积，用来比较前端与标定的好坏；<b>RTK 优化后</b>＝融合后输出（蓝线），是交付地图的精度；<b>地面厚度</b>与<b>灯柱一致性</b>反映多期地图的几何一致性。点击行查看完整指标（姿态漂移、分时段、起步段、后端统计）；未评估的轮次可直接点「评估」。</div>`;
+  const legend = `<div class="callout" style="margin-bottom:14px"><b>怎么读这张表</b> · <b>原生轨迹</b>＝前端里程计（LIO / LIVO，RViz 红线）与 RTK 后轴位置之差，起点对齐后不做任何轨迹对齐，误差随里程累积，用来比较前端与标定的好坏（注意：融合轮的前端含 INS 姿态辅助——仅横滚/俯仰弱约束，不注入 RTK 位置——所以其原生漂移通常小于无融合轮的纯 LIO，两种模式之间不可直接对比）；<b>RTK 优化后</b>＝融合后输出（蓝线），是交付地图的精度；<b>地面厚度</b>与<b>灯柱一致性</b>反映多期地图的几何一致性。点击行查看完整指标（姿态漂移、分时段、起步段、后端统计）；未评估的轮次可直接点「评估」。</div>`;
   return `<h1 style="margin-bottom:6px">结果</h1><div class="muted" style="margin-bottom:12px">每个轮次目录包含 run.log / round.json / launch.log / playback.log / Log/fusion/&lt;stamp&gt;/（轨迹、地图、诊断）与 evaluation/（trajectory.log、summary.txt、metrics.json）。</div>${legend}
   <div class="card"><div class="card-h"><h2>建图轮次（${S.runs.length}，已评估 ${ev.length}）</h2><button class="btn sm" data-act="reload-runs">刷新</button></div>${runsTable(S.runs)}</div>`;
 }
@@ -684,7 +690,7 @@ function metricsPanel(l) {
   const trow = (label, e) => e ? `<tr><td>${label}</td><td class=num>${fm(e.median_m)}</td><td class=num>${fm(e.p95_m)}</td><td class=num>${fm(e.max_m)}</td><td class=num>${fm(e.final_m)}</td><td class=num>${fm(e.final_xy_m)}</td><td class=num>${fm(e.final_z_m)}</td><td class=num>${pct(e.route_le10cm_pct)}</td><td class=num>${pct(e.route_gt20cm_pct)}</td><td>${e.budget ? `<span class="badge ${e.budget === "PASS" ? "ok" : "warn"}">${esc(e.budget)}</span>` : "—"}</td></tr>` : "";
   const traj = `<details open><summary>轨迹精度 · 后轴 vs RTK（全程，起点对齐后不做任何轨迹对齐）</summary>
     <table class="small"><thead><tr><th></th><th class=num>中位</th><th class=num>P95</th><th class=num>最大</th><th class=num>终点</th><th class=num>终点 XY</th><th class=num>终点 Z</th><th class=num>路线 ≤10 cm</th><th class=num>>20 cm</th><th>预算</th></tr></thead><tbody>${trow("原生（前端里程计，红线）", n)}${trow("RTK 优化后（蓝线）", o)}</tbody></table>
-    <div class="small muted" style="margin-top:6px">原生误差随里程累积，反映前端（LIO / LIVO）自身的漂移；里程尺度（原生路径长 / 融合路径长）偏离 100% 说明前端存在尺度误差——LIVO 模式下这是相机外参（俯仰）误差最灵敏的指标（约 11%/°）；优化后误差反映 RTK/INS 融合输出的质量。路线百分比按行驶距离加权。${s?.native?.imu ? ` IMU 轨迹 vs INS 推算：原生 ${fm(s.native.imu.median_m)} / 优化后 ${fm(s.optimized?.imu?.median_m)}（中位）。` : ""}</div></details>`;
+    <div class="small muted" style="margin-top:6px">原生误差随里程累积，反映本轮实际运行的前端（LIO / LIVO）自身漂移——融合模式下前端含 INS 姿态辅助（仅横滚/俯仰），无 RTK 模式为纯 LIO；里程尺度（原生路径长 / 融合路径长）偏离 100% 说明前端存在尺度误差——LIVO 模式下这是相机外参（俯仰）误差最灵敏的指标（约 11%/°）；优化后误差反映 RTK/INS 融合输出的质量。路线百分比按行驶距离加权。${s?.native?.imu ? ` IMU 轨迹 vs INS 推算：原生 ${fm(s.native.imu.median_m)} / 优化后 ${fm(s.optimized?.imu?.median_m)}（中位）。` : ""}</div></details>`;
   const sides = (st?.sides || []).map((x) => `${x.length_m} m：对侧 ${x.opposite}/${x.samples}`).join(" · ");
   const startup = st?.native ? `<details><summary>起步段 · 前 ${Math.round(st.length_m || 30)} m（原生 ${cm(st.native.median_m)} / ${cm(st.native.p95_m)} / ${cm(st.native.max_m)}；优化后 ${st.fused ? `${cm(st.fused.median_m)} / ${cm(st.fused.p95_m)} / ${cm(st.fused.max_m)}` : "—"}）</summary>
     <div class="kv small"><div class="k">中位 / P95 / 最大</div><div>原生 ${cm(st.native.median_m)} / ${cm(st.native.p95_m)} / ${cm(st.native.max_m)} · 优化后 ${st.fused ? `${cm(st.fused.median_m)} / ${cm(st.fused.p95_m)} / ${cm(st.fused.max_m)}` : "—"}</div>
@@ -737,7 +743,7 @@ function drawerRun() {
     ${r.error ? `<div class="callout bad">${esc(r.error)}</div>` : ""}
     <div class="kv small" style="margin:10px 0"><div class="k">数据源</div><div class="mono">${esc(r.dataset)}</div><div class="k">标定</div><div class="mono">${esc(r.calibration || "config yaml 内置")}</div><div class="k">参数</div><div class="mono">${esc(JSON.stringify(r.options || {}))} ${esc(Array.isArray(r.overrides) ? r.overrides.join(" ") : r.overrides || "")}</div><div class="k">fusion</div><div class="mono">${esc(l.fusion_dir || "")}</div><div class="k">地图</div><div>${l.map_chunks ?? 0} 块 · ${l.map_size_mb ?? 0} MB${l.rgb_map_chunks ? ` · RGB ${l.rgb_map_chunks} 块` : ""}</div></div>
     ${metricsPanel(l)}
-    <div class="grid g2" style="margin:12px 0"><div><h4>前端 RTK 残差 (m)</h4>${chart(l.diagnostics, "frontend_rtk_residual_m", "#0071e3", 0.1)}</div><div><h4>优化后轨迹 vs RTK (m)　<span class="small muted">虚线：在线轨迹 vs INS</span></h4>${trajectoryChart(l)}</div></div>
+    <div class="grid g2" style="margin:12px 0"><div><h4>前端 RTK 残差 (m)</h4>${chart(l.diagnostics, "frontend_rtk_residual_m", "#0071e3", 0.1)}</div><div><h4>${l.record?.options?.use_rtk === false ? `在线轨迹 vs INS (m)　<span class="small muted">无 RTK/INS 融合</span>` : `优化后轨迹 vs RTK (m)　<span class="small muted">虚线：在线轨迹 vs INS</span>`}</h4>${trajectoryChart(l, l.record?.options?.use_rtk === false)}</div></div>
     ${l.summary ? `<details><summary>评估摘要原文（summary.txt）</summary><pre class="small" style="max-height:320px;overflow:auto">${esc(l.summary.join("\n"))}</pre></details>` : ""}
     ${preHtml}
     <details><summary>算法事件（${(l.launch_events || []).length}）</summary><div class="events">${(l.launch_events || []).map((e) => `<div class="${/WARN/.test(e) ? "warn" : /ERROR|FATAL|died/.test(e) ? "bad" : ""}">${esc(e)}</div>`).join("")}</div></details>
@@ -759,9 +765,9 @@ const A = {
   async "drawer-job"() { S.drawer = "job"; if (!S.job && S.jobs.length) { await A["open-job"]({ dataset: { id: S.jobs[0].id } }); return; } renderDrawer(); if (S.job) { await pollJob(); renderDrawer(); } },
   async "open-job"(el) { const id = el.dataset.id; S.job = { id, status: "loading", steps: [], meta: {}, results: {} }; S.jobLog = []; S.jobLogNext = 0; S.drawer = "job"; renderDrawer(); await pollJob(); renderDrawer(); },
   mode(el) { S.state.mapping.mode = el.dataset.mode; saveState({ mapping: { mode: el.dataset.mode } }); render(); },
-  toggle(el) { const sec = el.dataset.section, key = el.dataset.key; S.state[sec][key] = el.checked; saveState({ [sec]: { [key]: el.checked } }); if (sec === "calibration") render(); },
-  field(el) { const sec = el.dataset.section, key = el.dataset.key; const v = el.type === "number" ? (el.value === "" ? "" : Number(el.value)) : el.value; S.state[sec][key] = v; saveState({ [sec]: { [key]: v } }); },
-  "set-vehicle"(el) { const [mine, truck] = el.value.split("/"); S.state.vehicle = { mine, truck }; S.calibForm.parent = null; saveState({ vehicle: { mine, truck } }); render(); },
+  toggle(el) { const sec = el.dataset.section, key = el.dataset.key; S.state[sec][key] = el.checked; saveState({ [sec]: { [key]: el.checked } }); if (sec === "calibration" || (sec === "mapping" && key === "save_map")) render(); },
+  field(el) { const sec = el.dataset.section, key = el.dataset.key; const v = el.type === "number" ? (el.value === "" ? "" : Number(el.value)) : el.value; S.state[sec][key] = v; saveState({ [sec]: { [key]: v } }); if (el.tagName === "SELECT") render(); },
+  "set-vehicle"(el) { const [mine, truck] = el.value.split("/"); S.state.vehicle = { mine, truck }; S.calibForm.parent = null; S.state.mapping.calibration_id = ""; saveState({ vehicle: { mine, truck }, mapping: { calibration_id: "" } }); render(); },
   async start() {
     const v = vehicle(); const m = S.state.mapping; const d = S.dataset;
     const mode = m.mode === "livo" && !d?.livo_ready ? "lio" : m.mode;

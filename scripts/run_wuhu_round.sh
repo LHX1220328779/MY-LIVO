@@ -107,6 +107,16 @@ doc = {"round": round_name, "mode": mode, "dataset": dataset, "calibration": cal
 json.dump(doc, open(path, "w"), indent=2, ensure_ascii=False)
 PY
 
+# --no-rtk mapping: the exporter (frames.csv/scans.bin/trajectories/map_N.pcd) lives in the RTK
+# backend, so the backend must run; rtk.observations_enabled=false starves it of INS/RTK
+# observations instead -> pure-odometry graph, products in the INS-anchored mine frame,
+# and the standard evaluation keeps working.
+rtk_backend=false   # launch arg must never be empty (name:=<value>); false = follow use_rtk
+if [[ $use_rtk == false ]]; then
+  rtk_backend=true
+  sets+=("rtk.observations_enabled=false")
+fi
+
 # Effective configuration: copy of the production yaml with the requested overrides applied.
 config="$out/config.yaml"
 /usr/bin/python3 - "$repo/config/wuhu_truck29.yaml" "$config" "${sets[@]}" <<'PY'
@@ -155,7 +165,7 @@ git status --short -- src include config launch scripts tools CMakeLists.txt 2>/
 } > "$out/run.log"
 
 use_camera=false; [[ "$mode" == "livo" ]] && use_camera=true
-ros2 launch fast_livo wuhu_truck29.launch.py use_camera:=$use_camera use_rtk:=$use_rtk use_rviz:=$use_rviz \
+ros2 launch fast_livo wuhu_truck29.launch.py use_camera:=$use_camera use_rtk:=$use_rtk rtk_backend:=$rtk_backend use_rviz:=$use_rviz \
   rear_axle_to_imu:=true save_map:=$save_map output_directory:="$out" config_file:="$config" > "$out/launch.log" 2>&1 &
 launch_pid=$!
 for i in $(seq 1 60); do
@@ -163,7 +173,9 @@ for i in $(seq 1 60); do
   sleep 0.5
 done
 sleep 3
-mapper_pid=$(pgrep -f "fastlivo_mapping" | head -1)
+# Use the PID reported by this launcher in its own PID namespace. /proc-based
+# pgrep can return host PIDs inside a sandbox and fail to signal/export the map.
+mapper_pid=$(sed -n 's/.*fastlivo_mapping.*process started with pid \[\([0-9][0-9]*\)\].*/\1/p' "$out/launch.log" | head -1)
 echo "launch_pid=$launch_pid mapper_pid=${mapper_pid:-none}" >> "$out/run.log"
 if [[ -z "${mapper_pid:-}" ]]; then
   echo "mapper did not start" | tee -a "$out/run.log"; phase failed status=failed error='"mapper did not start"'

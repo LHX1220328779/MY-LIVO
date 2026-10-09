@@ -151,6 +151,7 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
     motion_rotation_sigma(axis) = rotation_sigmas[axis] * M_PI / 180;
     motion_translation_sigma(axis) = translation_sigmas[axis];
   }
+  parameters.param<bool>("rtk/observations_enabled", observations_enabled, observations_enabled);
   parameters.param<bool>("rtk/attitude_enabled", attitude_enabled, attitude_enabled);
   parameters.param<double>("rtk/attitude_huber_delta", attitude_huber, attitude_huber);
   parameters.param<double>("rtk/attitude_min_speed_mps", attitude_min_speed, attitude_min_speed);
@@ -359,7 +360,7 @@ void RtkFusion::updatePoses()
   for (std::size_t i = 0; i < keyframes.size(); ++i)
   {
     auto &key = keyframes[i];
-    key.optimized = estimate.at<gtsam::Pose3>(gtsam::Symbol('x', i));
+    key.optimized = observations_enabled ? estimate.at<gtsam::Pose3>(gtsam::Symbol('x', i)) : key.raw;
     if (!key.optimized.matrix().allFinite())
       throw std::runtime_error("Non-finite optimized global pose");
   }
@@ -432,7 +433,7 @@ void RtkFusion::initializePose(const gtsam::NonlinearFactorGraph &graph, gtsam::
     }
     if (!accepted) { values.update(key, previous); break; }
   }
-  current.optimized = values.at<gtsam::Pose3>(key);
+  current.optimized = observations_enabled ? values.at<gtsam::Pose3>(key) : current.raw;
   initial.update(key, current.optimized);
 }
 
@@ -600,6 +601,9 @@ void RtkFusion::finalizeOptimization()
 gtsam::Pose3 RtkFusion::correctionAt(double stamp) const
 {
   if (keyframes.empty()) throw std::runtime_error("Global correction has no pose knots");
+  // observations_enabled=false: the delivered/online trajectory IS the native
+  // trajectory by definition; never apply interim gauge/knot corrections.
+  if (!observations_enabled) return gtsam::Pose3();
   const auto right = std::lower_bound(keyframes.begin(), keyframes.end(), stamp,
       [](const Keyframe &key, double time) { return key.stamp < time; });
   const auto correction = [](const Keyframe &key) { return key.optimized * key.raw.inverse(); };
@@ -1265,7 +1269,7 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
   new_links.clear();
   if (keyframes.empty()) local_gravity = initial_gravity_stamp >= 0 ? initial_gravity : frame.gravity;
   Observation seed;
-  const bool have_seed = referenceAt(frame.stamp, seed);
+  const bool have_seed = observations_enabled && referenceAt(frame.stamp, seed);
   if (local_frontend && have_seed)
   {
     StatesGroup state;
@@ -1379,7 +1383,7 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
   const std::size_t first_pending = index > 100 ? index - 100 : 0;
   for (std::size_t i = first_pending; i <= index; ++i)
   {
-    if (keyframes[i].has_position || !graph_in_enu) continue;
+    if (keyframes[i].has_position || !graph_in_enu || !observations_enabled) continue;
     Observation reference;
     if (!referenceAt(keyframes[i].stamp, reference, &keyframes[i].reference_failure))
     { ++missing_positions; continue; }
@@ -1408,7 +1412,7 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
   // gate, timing and temporal weight as the rear-axle position; one factor per
   // keyframe. The installation misalignment is a single shared variable with
   // a weak prior, so a constant mounting offset never bends the trajectory.
-  if (attitude_enabled)
+  if (attitude_enabled && observations_enabled)
     for (std::size_t i = first_pending; i <= index; ++i)
     {
       if (keyframes[i].has_attitude || !graph_in_enu) continue;
@@ -1805,6 +1809,10 @@ void RtkFusion::process(Frame frame)
 
 void RtkFusion::publishCurrent(const Frame &frame)
 {
+  // No-RTK rounds: the backend only exports; the native displays (/path, frontend clouds)
+  // carry the visualization. Publishing /rtk/* here would light the "optimized" RViz
+  // displays and suggest a fused solution that does not exist.
+  if (!observations_enabled) return;
   if (rclcpp::ok())
   {
     const auto fused = poseAt(frame);
@@ -1855,7 +1863,9 @@ void RtkFusion::publish(double stamp, bool force)
   last_publish = stamp;
   diagnostics.flush();
   if (!rclcpp::ok()) return;
-  if (force && !recent_frames.empty()) publishCurrent(recent_frames.back());
+  // observations_enabled=false: still compute the online-vs-INS assessment and write
+  // online_path.csv (studio live chart), but never publish fused topics (/rtk/*).
+  if (observations_enabled && force && !recent_frames.empty()) publishCurrent(recent_frames.back());
   nav_msgs::Path path;
   path.header.frame_id = graph_in_enu ? "mine" : "lio_local";
   path.header.stamp = stampFromSec(stamp);
@@ -1884,12 +1894,12 @@ void RtkFusion::publish(double stamp, bool force)
     message.pose.orientation.z = q.z(); message.pose.orientation.w = q.w();
     path.poses.push_back(message);
   }
-  path_publisher->publish(path);
+  if (observations_enabled) path_publisher->publish(path);
   path_log << std::setprecision(17) << stamp << ',' << assessed << ',' << latest << ','
       << (assessed ? maximum : std::numeric_limits<double>::quiet_NaN()) << ',' << worst_stamp << ','
       << (assessed ? sum / assessed : std::numeric_limits<double>::quiet_NaN()) << ',' << over10 << ',' << over20 << '\n';
   path_log.flush();
-  if (map_publisher->get_subscription_count() > 0)
+  if (observations_enabled && map_publisher->get_subscription_count() > 0)
   {
     sensor_msgs::PointCloud2 message;
     if (color_enabled)

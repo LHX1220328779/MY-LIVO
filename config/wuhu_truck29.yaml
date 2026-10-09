@@ -34,8 +34,10 @@ laser_mapping:
       # merged frame (deskew is per point), so the tolerance only has to reject a whole-frame
       # misalignment (100 ms). truck29 never exceeds 1 ms; truck05's LiDARs jitter to
       # 1.02-1.3 ms on 4 % of the frames (287 in 720 s, 120 of them in 360-420 s -> 2 s holes
-      # on the ramp), which the former 1 ms setting dropped. 5 ms = the code default.
-      synchronization_tolerance_sec: 0.005
+      # on the ramp), which the former 1 ms setting dropped. zongyang truck07 has a
+      # stable 16.6 ms phase difference: 20 ms accepts it with real point-time deskew,
+      # while rejecting missing/adjacent 100 ms scans. Do not shift sensor stamps.
+      synchronization_tolerance_sec: 0.02
       queue_size: 5
       # Static-start extrinsic self-check (src/extrinsic_precheck.cpp). While the truck is
       # still (gyro < static_gyro_deg_s) the first merged frames are collected per LiDAR; each
@@ -141,7 +143,11 @@ laser_mapping:
       # registration only observes attitude relative to the self-built map;
       # the induced gravity leakage diverged the along-track velocity on the
       # final degenerate straight. Body-axis sigma in degrees; convex Huber.
-      frontend_attitude_aiding: true
+      # 2026-10-09 决定默认关闭：辅助会把不同期间的 INS 横滚/俯仰偏差印进前端，
+      # 起步灯杆多期重影 0.232->0.202 m(中位)/0.296->0.217 m(最大)；守护全项 PASS
+      # 且融合精度略升(LIO 0.75/2.73/6.16 cm, LIVO 0.77/2.14/4.29 cm)。关闭后
+      # 原生轨迹即真实纯 LIO，便于跨模式对比。若弱场景前端发散可重新打开。
+      frontend_attitude_aiding: false
       # sigma is the absolute floor (INS accuracy) that dominates when LiDAR
       # is weak. In rich scenes scan-to-map rows carry ~1e9 rad^-2 of
       # (map-relative) angular information, so the absolute reference also

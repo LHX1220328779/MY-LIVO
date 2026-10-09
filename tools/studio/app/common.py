@@ -31,7 +31,7 @@ DEFAULT_STATE = {
                     "lidar_offset": -0.125, "camera_offset": -0.115, "auto_activate": True, "fast": True},
     "mapping": {"round_prefix": "studio", "mode": "livo", "use_rtk": True, "save_map": True, "rviz": False,
                 "rate": 1.0, "calibration_id": "", "precheck": True, "frame_divider": 1, "evaluate": True,
-                "extra_sets": "", "start_offset": 0, "duration": ""},
+                "extra_sets": "", "start_offset": 0, "duration": "", "map_range": 45.0, "rgb_range": 60.0},
     "ui": {"page": "home"},
 }
 

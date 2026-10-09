@@ -1,0 +1,18 @@
+calibration=/home/project/MY-LIVO/config/carlibration/zongyang/truck07/v003_ground/calibration.json
+run=/home/project/MY-LIVO/results/calib_truck07_lio_1008_172457/Log/fusion/1791451791012357480
+window 8.0..40.0 s, lidar_time_offset -0.125
+pass 1 poses: native frames.csv (6 DoF); pass 2 poses: RTK-optimized trajectory_optimized.txt (tilt about x/y and z of LiDARs with median match time gap > 2.0 s)
+scans used: front_right_lidar:321, back_lidar:321, front_left_lidar:321, front_lidar:320
+matching: viewing-side consistent (oriented normals)
+reference front_lidar: 629204 world points
+front_right_lidar: pass 1 matches 91768->91985 |res| median 4.06->3.92 cm; ground 4.04->3.91 (n=90983); vertical 5.08->4.85 (n=430); match time gap median 4.3 s; correction rot deg (x,y,z)=(+0.033,+0.062,-0.032) trans cm=(-4.1,-0.5,-1.3); iters 19
+    pass 2 (cross-time LiDAR, drift-free poses, ground only): ground 3.93->3.97 cm (n=85083); tilt about x/y adjusted by (+0.027,+0.027) deg, z by -1.4 cm; iters 11
+    final correction rot deg (x,y,z)=(+0.061,+0.089,-0.032) trans cm=(-4.1,-0.5,-2.7)  [quality: warn; only 430 vertical planar matches (yaw/x/y weakly observed)]
+front_left_lidar: pass 1 matches 58631->58113 |res| median 3.82->3.27 cm; ground 3.80->3.25 (n=57393); vertical 5.19->4.90 (n=387); match time gap median 3.2 s; correction rot deg (x,y,z)=(+0.065,-0.070,-0.015) trans cm=(+0.9,+2.2,-0.1); iters 25
+    pass 2 (cross-time LiDAR, drift-free poses, ground only): ground 3.22->3.22 cm (n=55060); tilt about x/y adjusted by (+0.013,+0.016) deg, z by -1.0 cm; iters 11
+    final correction rot deg (x,y,z)=(+0.078,-0.054,-0.015) trans cm=(+0.9,+2.2,-1.1)  [quality: warn; not converged in 25 iterations; only 387 vertical planar matches (yaw/x/y weakly observed)]
+back_lidar: pass 1 matches 9502->9730 |res| median 4.65->3.44 cm; ground 4.62->3.41 (n=9610); vertical 9.01->3.17 (n=4); match time gap median 15.9 s; correction rot deg (x,y,z)=(+0.232,-0.101,+0.051) trans cm=(+0.5,+0.3,+4.0); iters 18
+    pass 2 (cross-time LiDAR, drift-free poses, ground only): ground 3.88->3.52 cm (n=8491); tilt about x/y adjusted by (+0.058,+0.065) deg, z by +0.5 cm; iters 9
+    final correction rot deg (x,y,z)=(+0.290,-0.036,+0.051) trans cm=(+0.5,+0.3,+4.5)  [quality: warn; only 4 vertical planar matches (yaw/x/y weakly observed)]
+quality: warn  (front_right_lidar: only 430 vertical planar matches (yaw/x/y weakly observed); front_left_lidar: not converged in 25 iterations, only 387 vertical planar matches (yaw/x/y weakly observed); back_lidar: only 4 vertical planar matches (yaw/x/y weakly observed))
+written /home/project/MY-LIVO/config/carlibration/zongyang/truck07/v004_driven/calibration.json

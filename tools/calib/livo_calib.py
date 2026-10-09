@@ -576,7 +576,41 @@ def cmd_axle(a):
         cmd.append("--keep-time-offset")
     lines = run_script(cmd, out_dir / "stage.log")
     calib = json.loads((out_dir / "calibration.json").read_text())
-    metrics = {"rear_axle_alignment": calib.get("refinement", {}).get("rear_axle_alignment", {})}
+    # Front-end time base: time_offsets.lidar is the scan<->INS alignment this stage just
+    # solved, but the SLAM front-end deskews against the raw IMU stream. On every truck
+    # measured so far the INS odometry timeline runs 15-21 ms behind the raw IMU for the
+    # same motion, so lidar_frontend = lidar + imu/ins clock lag (truck29 -0.1459 + 0.0209
+    # = -0.125, truck05 -0.0267 + 0.0148 = -0.0119). A lidar_frontend inherited from the
+    # import template of another truck desynchronises deskew by >100 ms on GPS-stamped
+    # LiDARs (zongyang truck07: native LIO yaw drift 1.1 deg / 2.3 m position in 45 s).
+    frontend_sync = {}
+    if not a.keep_time_offset and not getattr(a, "no_frontend_sync", False):
+        offsets = calib.setdefault("time_offsets", dict(DEFAULT_TIME_OFFSETS))
+        solved = offsets.get("lidar")
+        template = offsets.get("lidar_frontend")
+        if isinstance(solved, (int, float)):
+            lag, corr, yaw_rms = measure_imu_ins_clock_lag(a.bag)
+            frontend_sync = {"imu_ins_lag_s": lag, "corr": round(corr, 4),
+                             "yaw_rms_rad_s": round(yaw_rms, 4), "template": template}
+            if lag is None or corr < 0.95 or yaw_rms < 0.02:
+                frontend_sync["decision"] = "kept template (weak yaw excitation or low imu/ins correlation)"
+            else:
+                candidate = round(float(solved) + lag, 4)
+                if template is None or abs(candidate - float(template)) > 0.02:
+                    offsets["lidar_frontend"] = candidate
+                    offsets["lidar_frontend_source"] = (
+                        "axle: lidar %+.4f + imu/ins clock lag %+.4f (corr %.3f); template %s replaced"
+                        % (float(solved), lag, corr, "none" if template is None else "%+.4f" % float(template)))
+                    frontend_sync["decision"] = "replaced template with %+.4f" % candidate
+                    (out_dir / "calibration.json").write_text(json.dumps(calib, indent=1))
+                else:
+                    frontend_sync["decision"] = "template confirmed (candidate %+.4f)" % candidate
+            lines.append("frontend time base: %s; imu/ins lag %s, corr %.3f, yaw rms %.3f rad/s"
+                         % (frontend_sync["decision"],
+                            "n/a" if lag is None else "%+.1f ms" % (lag * 1000.0),
+                            corr, yaw_rms))
+    metrics = {"rear_axle_alignment": calib.get("refinement", {}).get("rear_axle_alignment", {}),
+               "frontend_sync": frontend_sync}
     finalize_version(out_dir, calib, mine=mine, truck=truck, stage="axle", parent=a.id,
                      note=a.note or "reference-LiDAR -> rear-axle alignment from RTK/INS poses (rig correction)",
                      inputs={"bag": a.bag, "dataset": ds_info, "window": list(a.window), "dof": dof,
@@ -670,6 +704,57 @@ def read_bag_topics(bag, wanted):
         sys.exit(f"recording {bag} has none of the topics {list(wanted)} (has {sorted(ds.topics)})")
     for topic, msg, _ts in ds.read_messages(topics):
         yield topic, msg
+
+
+def measure_imu_ins_clock_lag(bag, max_lag=0.30, step=0.0025, max_duration=240.0):
+    """Clock lag of the INS odometry timeline relative to the raw IMU stream (s).
+
+    Correlates body yaw rate (imu_data gyro z) against the yaw rate differentiated from
+    imu_data/odometry orientation. Positive lag means the INS stamps the same physical
+    motion later than the raw IMU (measured: truck29 +21 ms, truck05 +15 ms, truck07 +15 ms).
+    The scan<->IMU front-end offset is therefore time_offsets.lidar (scan<->INS) + lag.
+    Returns (lag_s | None, corr, yaw_rms_rad_s).
+    """
+    imu_t, imu_gz, odo_t, odo_yaw = [], [], [], []
+    t0 = None
+    for topic, msg in read_bag_topics(bag, ("imu_data", "imu_data/odometry")):
+        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        if t0 is None:
+            t0 = stamp
+        elif stamp - t0 > max_duration and len(imu_t) > 500 and len(odo_t) > 500:
+            break
+        if topic.lstrip("/") == "imu_data":
+            imu_t.append(stamp)
+            imu_gz.append(msg.angular_velocity.z)
+        else:
+            q = msg.pose.pose.orientation
+            odo_t.append(stamp)
+            odo_yaw.append(np.arctan2(2.0 * (q.w * q.z + q.x * q.y),
+                                      1.0 - 2.0 * (q.y * q.y + q.z * q.z)))
+    if len(imu_t) < 500 or len(odo_t) < 500:
+        return None, 0.0, 0.0
+    imu_t = np.asarray(imu_t); imu_gz = np.asarray(imu_gz)
+    odo_t = np.asarray(odo_t); odo_yaw = np.unwrap(np.asarray(odo_yaw))
+    odo_rate = np.gradient(odo_yaw, odo_t)
+    lo = max(imu_t[0], odo_t[0]) + 1.0
+    hi = min(imu_t[-1], odo_t[-1]) - 1.0
+    if hi - lo < 20.0:
+        return None, 0.0, 0.0
+    grid = np.arange(lo, hi, 0.01)
+    gi = np.interp(grid, imu_t, imu_gz)
+    yaw_rms = float(np.sqrt(np.mean(gi * gi)))
+    gi_c = gi - gi.mean()
+    best_lag, best_corr = None, -1.0
+    for lag in np.arange(-max_lag, max_lag + step / 2.0, step):
+        go = np.interp(grid, odo_t + lag, odo_rate)
+        go_c = go - go.mean()
+        denom = np.sqrt(float((gi_c * gi_c).sum()) * float((go_c * go_c).sum()))
+        if denom <= 0.0:
+            continue
+        corr = float((gi_c * go_c).sum()) / denom
+        if corr > best_corr:
+            best_lag, best_corr = float(lag), corr
+    return best_lag, best_corr, yaw_rms
 
 
 def decode_hevc(stream_path, scale, keep=None):
@@ -2138,6 +2223,8 @@ def main():
                    help="auto (default): rpy_xy for a raw supplier import, xy (keep rotation, refine lever arm + time) "
                         "for an already aligned parent; rpy_xy / rpy / xy force the solved DoF")
     p.add_argument("--keep-time-offset", action="store_true", help="do not estimate/apply the LiDAR time shift")
+    p.add_argument("--no-frontend-sync", action="store_true",
+                   help="keep time_offsets.lidar_frontend untouched (skip the imu/ins clock-lag check)")
     common(p)
     p.set_defaults(func=cmd_axle)
 

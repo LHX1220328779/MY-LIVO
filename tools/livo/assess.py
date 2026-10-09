@@ -54,7 +54,7 @@ rosenv.ensure()
 
 from livo.dataset import Dataset, norm  # noqa: E402
 
-SCHEMA = 1
+SCHEMA = 2
 LIDAR_KEYS = {"front_right_lidar": "transform_matrix_lidar_1", "back_lidar": "transform_matrix_lidar_2",
               "front_left_lidar": "transform_matrix_lidar_3", "front_lidar": "transform_matrix_lidar_6"}
 REFERENCE_LIDAR = "front_lidar"
@@ -823,14 +823,15 @@ def run(a):
             span_ms = percentile(spans, 99)
     over1 = int((spans > 1.0).sum()) if len(spans) else 0
     over5 = int((spans > 5.0).sum()) if len(spans) else 0
-    status_span = grade(span_ms, 1.0, 5.0)
-    if len(spans) and over5 > 0.001 * len(spans):
+    over20 = int((spans > 20.0).sum()) if len(spans) else 0
+    status_span = grade(span_ms, 1.0, 20.0)
+    if len(spans) and over20 > 0.001 * len(spans):
         status_span = "bad"
-    R.add(g_time, "lidar_span", "多雷达扫描起始离散 P99", span_ms, "ms", ok=1.0, warn=5.0, status=status_span, fix="auto", fix_bad="none",
-          display=(f"{span_ms:.2f} ms（最大 {float(spans.max()):.2f}；>1 ms {over1} 帧，>5 ms {over5} 帧 / {len(spans)}）" if span_ms is not None else "—"),
-          note="同一合并帧内四路雷达 header 时间戳的极差。≤5 ms 在合并容差内被逐点时间戳吸收；超过容差的帧被整帧丢弃（或错拼），只能靠硬件同步解决。",
-          basis="truck29: 0 帧 >1 ms；truck05: 4 % 帧 1.0–1.3 ms 随机抖动 → 合并容差 1→5 ms 后不再丢帧。",
-          extra={"count": int(len(spans)), "over_1ms": over1, "over_5ms": over5, "max_ms": float(spans.max()) if len(spans) else None})
+    R.add(g_time, "lidar_span", "多雷达扫描起始离散 P99", span_ms, "ms", ok=1.0, warn=20.0, status=status_span, fix="auto", fix_bad="none",
+          display=(f"{span_ms:.2f} ms（最大 {float(spans.max()):.2f}；>1 ms {over1} 帧，>20 ms {over20} 帧 / {len(spans)}）" if span_ms is not None else "—"),
+          note="同一合并帧内四路雷达 header 时间戳的极差。默认合帧容差 20 ms，逐点保留真实采样时刻做 IMU 去畸变；超限时丢弃未匹配的旧帧并继续。此补偿不能修复传感器时钟错误。",
+          basis="truck29 <1 ms；truck05 抖动 1.0–1.3 ms；zongyang truck07 稳定相位差 P99 16.58 ms，原 5 ms 容差使建图零帧。",
+          extra={"count": int(len(spans)), "over_1ms": over1, "over_5ms": over5, "over_20ms": over20, "max_ms": float(spans.max()) if len(spans) else None})
     # clock domains: record time - header time
     lat_med = {}
     for t in lidar_topics:
