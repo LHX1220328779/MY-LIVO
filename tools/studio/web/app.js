@@ -256,6 +256,8 @@ function liveMonitor() {
   </div>`;
 }
 
+function modeLabel(r) { const m = (r?.mode || "").toUpperCase(); return r?.options?.use_rtk === false ? m : (m ? m + "+RTK" : m); }
+
 // ------------------------------------------------------------------ pages
 function render() {
   captureForms();
@@ -332,7 +334,7 @@ function runsTable(runs, compact = false) {
     ? "<th>原生轨迹 vs RTK</th><th>RTK 优化后</th>"
     : `<th title="前端里程计（RViz 红线）后轴 3D 误差，全程、无对齐，随里程累积。融合轮的前端启用 INS 姿态辅助（仅横滚/俯仰弱约束，σ0.3°，不碰位置/速度/偏航），无融合轮为纯 LIO——两种模式的原生漂移不可直接对比">原生轨迹 vs RTK（全程）</th><th title="RTK/INS 融合结果（蓝线）后轴 3D 误差">RTK 优化后（中位 / P95 / 最大）</th><th title="5–20 m 地面同点平面厚度，原生 → 优化后">地面厚度 5–20 m</th><th title="同一灯柱在不同地图块中的轴线 XY 分离">灯柱多期一致性</th>`;
   return `<table><thead><tr><th>轮次</th><th>模式</th><th>状态</th>${compact ? "" : "<th>数据源</th><th>标定</th>"}<th>开始</th>${head}</tr></thead><tbody>
-  ${runs.map((r) => { const c = metricCells(r); return `<tr class="click ${S.runDetail?.round === r.round ? "sel" : ""}" data-act="open-run" data-round="${esc(r.round)}"><td class="mono">${esc(r.round)}</td><td><span class="badge">${esc((r.mode || "").toUpperCase())}</span></td><td>${badge(r)}</td>${compact ? "" : `<td class="small muted ellipsis" style="max-width:180px" title="${esc(r.dataset)}">${esc(baseName(r.dataset))}</td><td class="small muted">${esc(r.calibration ? baseName(r.calibration.replace(/\/calibration\.json$/, "")) : "yaml")}</td>`}<td class="small nowrap">${fmtT(r.start)}</td><td class="small">${c.native}</td><td class="small">${c.opt}</td>${compact ? "" : `<td class="small">${c.map}</td><td class="small">${c.pole}</td>`}</tr>`; }).join("")}</tbody></table>`;
+  ${runs.map((r) => { const c = metricCells(r); return `<tr class="click ${S.runDetail?.round === r.round ? "sel" : ""}" data-act="open-run" data-round="${esc(r.round)}"><td class="mono">${esc(r.round)}</td><td><span class="badge">${esc(modeLabel(r))}</span></td><td>${badge(r)}</td>${compact ? "" : `<td class="small muted ellipsis" style="max-width:180px" title="${esc(r.dataset)}">${esc(baseName(r.dataset))}</td><td class="small muted">${esc(r.calibration ? baseName(r.calibration.replace(/\/calibration\.json$/, "")) : "yaml")}</td>`}<td class="small nowrap">${fmtT(r.start)}</td><td class="small">${c.native}</td><td class="small">${c.opt}</td>${compact ? "" : `<td class="small">${c.map}</td><td class="small">${c.pole}</td>`}</tr>`; }).join("")}</tbody></table>`;
 }
 function jobsTable(jobs) {
   if (!jobs.length) return `<div class="empty">暂无任务</div>`;
@@ -738,7 +740,7 @@ function drawerRun() {
   const pre = l.precheck;
   const preHtml = pre ? `<details><summary>起步静止外参自检 ${pre.status ? `· ${esc(pre.status)}` : ""}</summary><pre class="small" style="max-height:260px;overflow:auto">${esc(JSON.stringify(pre, null, 1))}</pre><button class="btn sm" data-act="from-precheck" data-round="${esc(r.round)}">采纳自检修正为新版本</button></details>` : "";
   const files = ["run.log", "round.json", "launch.log", "playback.log", "evaluation/summary.txt", "evaluation/trajectory.log", "evaluation/metrics.json", "config.yaml"].map((n) => `<a class="badge" href="/api/runs/${encodeURIComponent(r.round)}/file?name=${encodeURIComponent(n)}" target="_blank">${n}</a>`).join(" ");
-  return `<div class="drawer-h"><div><h2>${esc(r.round)} <span class="badge">${esc((r.mode || "").toUpperCase())}</span></h2><div class="small muted">${fmtT(r.start)} → ${fmtT(r.end)} · ${esc(r.status)}${r.phase ? ` / ${esc(r.phase)}` : ""} · 提交 ${esc(r.commit || "")}</div></div>
+  return `<div class="drawer-h"><div><h2>${esc(r.round)} <span class="badge">${esc(modeLabel(r))}</span></h2><div class="small muted">${fmtT(r.start)} → ${fmtT(r.end)} · ${esc(r.status)}${r.phase ? ` / ${esc(r.phase)}` : ""} · 提交 ${esc(r.commit || "")}</div></div>
     <div class="row"><button class="btn" data-act="evaluate" data-round="${esc(r.round)}" ${r.status === "running" ? "disabled" : ""}>${l.evaluated ? "重新评估" : "运行评估"}</button><button class="btn sm" data-act="close">关闭</button></div></div>
     ${r.error ? `<div class="callout bad">${esc(r.error)}</div>` : ""}
     <div class="kv small" style="margin:10px 0"><div class="k">数据源</div><div class="mono">${esc(r.dataset)}</div><div class="k">标定</div><div class="mono">${esc(r.calibration || "config yaml 内置")}</div><div class="k">参数</div><div class="mono">${esc(JSON.stringify(r.options || {}))} ${esc(Array.isArray(r.overrides) ? r.overrides.join(" ") : r.overrides || "")}</div><div class="k">fusion</div><div class="mono">${esc(l.fusion_dir || "")}</div><div class="k">地图</div><div>${l.map_chunks ?? 0} 块 · ${l.map_size_mb ?? 0} MB${l.rgb_map_chunks ? ` · RGB ${l.rgb_map_chunks} 块` : ""}</div></div>
