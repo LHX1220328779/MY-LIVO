@@ -324,7 +324,7 @@ function metricCells(r) {
   const g = h.ground_5_20;
   const map = g ? `<span title="5–20 m 地面同点平面 RMS 厚度 原生 → 优化后（中位）">${f1(g.median_before_mm)} → <b>${f1(g.median_after_mm)}</b> mm</span><div class="small muted">带内 ${pct(g.within_bound_pct)} · ${g.cells} 格</div>` : "—";
   const pp = h.pole_pair_separation_cm;
-  const pole = pp ? `<span title="灯柱轴线 XY 多期分离 中位 / P95 / 最大">${f1(pp.median)} / ${f1(pp.p95)} / ${f1(pp.max)} cm</span><div class="small muted">${h.pole_chunks} 期</div>` : "—";
+  const pole = pp ? `<span title="灯柱环拟合中心 多期分离 中位 / P95 / 最大（视角无关）">${f1(pp.median)} / ${f1(pp.p95)} / ${f1(pp.max)} cm</span><div class="small muted">${h.pole_chunks} 期</div>` : "—";
   return { native, opt, map, pole };
 }
 function runsTable(runs, compact = false) {

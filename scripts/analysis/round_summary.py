@@ -63,6 +63,53 @@ def find_reference(out, explicit):
              % (", ".join(str(c) for c in cands), out / "reference_csv"))
 
 
+POLE_RING_RADIUS = 0.12  # m; fixed lamp-pole radius (see docs/mcp-pole-ghost-viewing-geometry.md)
+
+
+def ring_fit(xy, centre, radius, band=0.03, iters=30):
+    """Fixed-radius circle fit on the shaft returns (view-independent centre).
+
+    Single-sided arcs have two near basins (real axis and the diameter-flip centre
+    one radius behind the arc). Seed from centroid + prior + a ring of starts; pick
+    the solution with the most inliers, breaking ties by rms then distance to prior.
+    Returns (centre, n_inliers) or None.
+    """
+    xy = np.asarray(xy, dtype=float)
+    centre = np.asarray(centre, dtype=float)
+    if len(xy) < 20:
+        return None
+
+    def solve(init):
+        c = np.asarray(init, dtype=float).copy()
+        sel = None
+        for _ in range(iters):
+            d = xy - c
+            rr = np.linalg.norm(d, axis=1)
+            sel = np.abs(rr - radius) < band
+            if sel.sum() < 20:
+                return None
+            ds = d[sel] / rr[sel, None]
+            step, *_ = np.linalg.lstsq(-ds, -(rr[sel] - radius), rcond=None)
+            c = c + step
+            if np.linalg.norm(step) < 1e-6:
+                break
+        return c, int(sel.sum())
+
+    c0 = np.median(xy, axis=0)
+    starts = [c0, centre]
+    for ang in range(0, 360, 30):
+        starts.append(c0 + radius * np.array([np.cos(np.radians(ang)), np.sin(np.radians(ang))]))
+    best = None
+    for s0 in starts:
+        r = solve(s0)
+        if r is None:
+            continue
+        score = (-r[1], np.linalg.norm(r[0] - centre))
+        if best is None or score < best[1]:
+            best = (r, score)
+    return best[0] if best else None
+
+
 def main():
     run, out, opts = parse_args(sys.argv[1:]); out.mkdir(parents=True, exist_ok=True)
     ref = find_reference(out, opts["reference"])
@@ -175,7 +222,7 @@ def main():
         ref = mean + axis * (POLE['ref_z'] - mean[2]) / axis[2]
         upper = crop[crop[:, 2] > POLE['shaft'][1]]
         top = np.percentile(upper[:, 2], 99) if len(upper) >= 20 else np.nan
-        epochs[k] = dict(n=len(shaft), xy=ref[:2], top=top, zmax=crop[:, 2].max(), cents=cents, tilt=np.degrees(np.arccos(abs(axis[2]))))
+        epochs[k] = dict(shaft_xy=shaft[:, :2], n=len(shaft), xy=ref[:2], top=top, zmax=crop[:, 2].max(), cents=cents, tilt=np.degrees(np.arccos(abs(axis[2]))))
         print(f"  map_{k:<3d} {len(shaft):6d}  ({ref[0]:8.3f},{ref[1]:8.3f})  {top:7.3f}  {crop[:,2].max():7.3f}  tilt {epochs[k]['tilt']:.2f} deg")
     keys = sorted(epochs)
     if len(keys) >= 2:
@@ -192,7 +239,19 @@ def main():
                 dz = 100 * (a['top'] - b['top']) if np.isfinite(a['top']) and np.isfinite(b['top']) else np.nan
                 seps.append(sep)
                 print(f"  {keys[i]:>3d}v{keys[j]:<3d} {sep:8.2f} {eh:14.2f} {dz:14.2f}")
-        print(f"pole axis XY separation over all epoch pairs (cm): {stats(seps)}")
+        print(f"[view-biased diagnostic] pole axis XY separation over all epoch pairs (cm): {stats(seps)}")
+        # Headline pole consistency: fixed-radius ring centre per epoch. The per-height median above is
+        # pulled toward the sensor side of each one-sided view, so it is not an axis estimate.
+        centre = np.median(np.vstack([epochs[k]["shaft_xy"] for k in keys]), axis=0)
+        rings = {}
+        for k in keys:
+            fit = ring_fit(epochs[k]["shaft_xy"], centre, POLE_RING_RADIUS)
+            if fit is not None:
+                rings[k] = fit[0]
+        ring_seps = [100 * float(np.linalg.norm(rings[a] - rings[b]))
+                     for i, a in enumerate(sorted(rings)) for b in sorted(rings)[i + 1:]]
+        if ring_seps:
+            print(f"pole ring-centre separation over all epoch pairs (cm, radius {POLE_RING_RADIUS*100:.0f} cm fixed): {stats(ring_seps)}")
 
 
 if __name__ == "__main__":

@@ -920,6 +920,63 @@ def audit_deskew_surfaces(run, reference, lever, output, args):
     print(f"Fixed-support velocity diagnostic: {len(audits)} scans, {len(updated)} unchanged correspondences. NOT an optimized map or production calibration.")
 
 
+POLE_RING_RADIUS = 0.12  # m; lamp-pole radius measured from pooled shaft returns (docs/mcp-pole-ghost-viewing-geometry.md)
+
+
+def ring_fit(xy, centre, radius, band=0.03, iters=30):
+    """Fixed-radius circle fit on the surface returns that lie on the pole ring.
+
+    A pole return lies on its circumference, so this centre does not depend on which
+    side of the pole an epoch saw. A median or centroid of a one-sided arc is pulled
+    toward the sensor and must not be used as the pole-axis estimate. Because the
+    solver is a local IRLS step, starting it at the centroid of a single-sided arc
+    can land in the "diameter flip" basin (centre one radius behind the arc on the
+    opposite side from the real axis). Multistart from a circle of candidate
+    displacements around the centroid, plus a prior-favoured centre (the pooled
+    median of all chunks when callers pass it), and pick the candidate with the most
+    inliers and the smallest residual; then report the fit that is closest to the
+    prior when two basins are tied. Returns (centre, rms, count, 30-degree sectors
+    covered) or None.
+    """
+    xy = np.asarray(xy, dtype=float)
+    centre = np.asarray(centre, dtype=float)
+    if len(xy) < 20:
+        return None
+
+    def solve(init):
+        c = np.asarray(init, dtype=float).copy()
+        sel = None
+        for _ in range(iters):
+            d = xy - c
+            rr = np.linalg.norm(d, axis=1)
+            sel = np.abs(rr - radius) < band
+            if sel.sum() < 20:
+                return None
+            ds = d[sel] / rr[sel, None]
+            step, *_ = np.linalg.lstsq(-ds, -(rr[sel] - radius), rcond=None)
+            c = c + step
+            if np.linalg.norm(step) < 1e-6:
+                break
+        d = xy[sel] - c
+        rr = np.linalg.norm(d, axis=1)
+        sectors = len(np.unique(np.floor((np.degrees(np.arctan2(d[:, 1], d[:, 0])) + 180) / 30)))
+        return c, float(np.sqrt(np.mean((rr - radius) ** 2))), int(sel.sum()), int(sectors)
+
+    c0 = np.median(xy, axis=0)
+    starts = [c0, centre]
+    for ang in range(0, 360, 30):
+        starts.append(c0 + radius * np.array([np.cos(np.radians(ang)), np.sin(np.radians(ang))]))
+    best = None
+    for s0 in starts:
+        r = solve(s0)
+        if r is None:
+            continue
+        # score: (more inliers, lower rms, distance to prior centre last)
+        score = (-r[2], r[1], np.linalg.norm(r[0] - centre))
+        if best is None or score < best[1]:
+            best = (r, score)
+    return best[0] if best else None
+
 def compare_pole_chunks(directory, ground_triangle, height, chunks, output, manual_crops=None,
                         cylinder=(-10.75, -274.0, 2.5, 43.0, 54.5), shaft_z=(45.5, 48.5)):
     """Extract the verified pole region from ACTUAL saved chunks.
@@ -1001,6 +1058,43 @@ def compare_pole_chunks(directory, ground_triangle, height, chunks, output, manu
         span = float(np.ptp(patch[:, 2])) if len(patch) else 0.
         summary.append(f"map_{chunk}: selected points={len(crop)}, shaft points={len(patch)}, shaft Z span={span:.6f} m")
 
+    # Ring fit per chunk: the view-independent pole-axis estimate. The radius is FIXED
+    # (POLE_RING_RADIUS). Free-radius fits on one-sided arcs trade radius against centre along
+    # the line of sight, which is the same view bias as the median metric. The 10-14 cm band is
+    # reported so the metric is not presented as more precise than it is.
+    ring = {}
+    shafts = [p[:, :2] for p in patches if len(p) >= 20]
+    if shafts:
+        centre = np.median(np.vstack(shafts), axis=0)
+
+        def ring_pairs(radius):
+            fits = {chunk: ring_fit(patch[:, :2], centre, radius)
+                    for chunk, patch in zip(chunks, patches) if len(patch) >= 20}
+            return {k: v for k, v in fits.items() if v is not None}
+
+        def pair_cm(fits):
+            keys = list(fits)
+            return [100 * float(np.linalg.norm(fits[a][0] - fits[b][0])) for i, a in enumerate(keys) for b in keys[i + 1:]]
+
+        ring = ring_pairs(POLE_RING_RADIUS)
+        for chunk in chunks:
+            if chunk not in ring:
+                summary.append(f"map_{chunk}: ring fit UNASSESSED (too few returns on the pole ring)")
+                continue
+            fit = ring[chunk]
+            summary.append(f"map_{chunk}: ring-fit centre=({fit[0][0]:.4f},{fit[0][1]:.4f}) m, "
+                           f"rms={fit[1]*100:.2f} cm, ring returns={fit[2]}, sectors(30deg)={fit[3]}/12")
+        if len(ring) >= 2:
+            seps = pair_cm(ring)
+            summary.append(f"ring-fit pole radius={POLE_RING_RADIUS*100:.1f} cm (fixed); pairwise ring-centre separation "
+                           f"median/P95/max={np.percentile(seps, [50, 95, 100]).round(2).tolist()} cm over {len(seps)} pairs")
+            for radius in (0.10, 0.14):
+                alt = pair_cm(ring_pairs(radius))
+                if alt:
+                    summary.append(f"  radius sensitivity {radius*100:.0f} cm: pairwise median/max={np.median(alt):.2f}/{max(alt):.2f} cm")
+            summary.append("Ring-fit separation is the view-independent pole-axis consistency metric; "
+                           "the equal-height median below is biased by which side of the pole each epoch saw.")
+
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -1049,7 +1143,7 @@ def compare_pole_chunks(directory, ground_triangle, height, chunks, output, manu
             rows.append((bottom + .125, len(slices[0]), len(slices[1]), *centers[0], *centers[1],
                          np.linalg.norm(centers[0] - centers[1])))
         if rows:
-            summary.append(f"equal-height XY surface separation median/P95/max={np.percentile(np.asarray(rows)[:, -1], [50,95,100]).tolist()} m")
+            summary.append(f"[view-biased diagnostic] equal-height median XY separation median/P95/max={np.percentile(np.asarray(rows)[:, -1], [50,95,100]).tolist()} m")
         else:
             supported = False
             summary.append("No sufficiently populated equal-height slices")

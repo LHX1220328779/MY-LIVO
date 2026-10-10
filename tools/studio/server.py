@@ -162,7 +162,10 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/", "/index.html"):
             return self._file(WEB / "index.html")
         if path.startswith("/static/"):
-            return self._file(WEB / path[len("/static/"):].replace("..", ""))
+            target = (WEB / path[len("/static/"):].lstrip("/")).resolve()
+            if not target.is_relative_to(WEB.resolve()):
+                raise PermissionError("static path outside the web root")
+            return self._file(target)
         if path == "/api/state":
             return self._send(200, load_state())
         if path == "/api/system":

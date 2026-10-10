@@ -336,9 +336,12 @@ def parse_summary(path):
     for m in re.finditer(r"^\s*map_(\d+)\s+(\d+)\s+\(\s*%s,\s*%s\)\s+%s\s+%s\s+tilt %s deg" % ((NUM,) * 5), txt, re.M):
         pole["chunks"].append({"chunk": int(m.group(1)), "shaft_points": int(m.group(2)), "axis_x": float(m.group(3)), "axis_y": float(m.group(4)),
                                "top_z_p99": float(m.group(5)), "z_max": float(m.group(6)), "tilt_deg": float(m.group(7))})
-    g = rx(r"pole axis XY separation over all epoch pairs \(cm\): median %s P95 %s max %s" % (NUM, NUM, NUM), txt)
+    g = rx(r"pole ring-centre separation over all epoch pairs \(cm, radius %s cm fixed\): median %s P95 %s max %s" % (NUM, NUM, NUM, NUM), txt)
     if g:
-        pole["pair_separation_cm"] = {"median": float(g[0]), "p95": float(g[1]), "max": float(g[2])}
+        pole["pair_separation_cm"] = {"median": float(g[1]), "p95": float(g[2]), "max": float(g[3]), "metric": "ring_fit"}
+    g = rx(r"\[view-biased diagnostic\] pole axis XY separation over all epoch pairs \(cm\): median %s P95 %s max %s" % (NUM, NUM, NUM), txt)
+    if g:
+        pole["view_biased_pair_separation_cm"] = {"median": float(g[0]), "p95": float(g[1]), "max": float(g[2])}
     pairwise = []
     for m in re.finditer(r"^\s*(\d+)v(\d+)\s+%s\s+(%s|nan)\s+(%s|nan)\s*$" % (NUM, NUM, NUM), txt, re.M):
         pairwise.append({"a": int(m.group(1)), "b": int(m.group(2)), "axis_sep_cm": float(m.group(3)),
@@ -353,7 +356,7 @@ def parse_summary(path):
                 seps.append(math.hypot(ch[i]["axis_x"] - ch[j]["axis_x"], ch[i]["axis_y"] - ch[j]["axis_y"]) * 100.0)
         s = stats(seps)
         if s:
-            pole["pair_separation_cm"] = {"median": round(s["median"], 2), "p95": round(s["p95"], 2), "max": round(s["max"], 2), "pairs": s["n"]}
+            pole["view_biased_pair_separation_cm"] = {"median": round(s["median"], 2), "p95": round(s["p95"], 2), "max": round(s["max"], 2), "pairs": s["n"]}
     out["pole"] = pole if pole["chunks"] else None
     if "Lamp pole scan skipped" in txt:
         out["pole_skipped"] = True
