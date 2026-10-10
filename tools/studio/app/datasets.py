@@ -104,28 +104,45 @@ def browse(raw_path):
     return {"path": str(p), "parent": str(p.parent), "kind": here, "entries": entries[:500]}
 
 
-def assess_key(info):
+def _win_key(window_start, window_duration):
+    if window_start in (None, "", 0) and window_duration in (None, "", 0):
+        return "full"
+    try:
+        s = float(window_start) if window_start not in (None, "") else 0.0
+        d = float(window_duration) if window_duration not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        return "full"
+    if d <= 0 and s <= 0:
+        return "full"
+    return f"s{s:.2f}_d{d:.2f}" if d > 0 else f"s{s:.2f}_end"
+
+
+def assess_key(info, window_start=None, window_duration=None):
     import hashlib
-    return hashlib.sha1(f"{info['path']}|{info.get('start_ns')}|{info.get('end_ns')}".encode()).hexdigest()[:16]
+    wk = _win_key(window_start, window_duration)
+    return hashlib.sha1(
+        f"{info['path']}|{info.get('start_ns')}|{info.get('end_ns')}|{wk}".encode()
+    ).hexdigest()[:16]
 
 
-def assessment_file(raw_path):
-    """(report path, describe() info) of a recording; the key changes when the recording changes."""
+def assessment_file(raw_path, window_start=None, window_duration=None):
+    """(report path, describe() info) of a recording; the key changes when the recording changes or the time
+    window selection changes, so different windows are cached separately."""
     info = describe(raw_path)
     if info.get("error"):
         raise StudioError(f"数据源不可用：{info['error']}")
-    return ASSESS_DIR / f"{assess_key(info)}.json", info
+    return ASSESS_DIR / f"{assess_key(info, window_start, window_duration)}.json", info
 
 
-def assessment(raw_path):
+def assessment(raw_path, window_start=None, window_duration=None):
     """Stored data-assessment report of a recording (result=None when it was never run)."""
-    f, info = assessment_file(raw_path)
+    f, info = assessment_file(raw_path, window_start, window_duration)
     doc = read_json(f) if f.exists() else None
     return {"path": info["path"], "file": str(f), "result": doc}
 
 
 def assessment_summary(raw_path):
-    """Small verdict record for the overview / home page (None when not assessed)."""
+    """Small verdict record for the overview / home page (uses the full-recording report)."""
     try:
         f, _ = assessment_file(raw_path)
     except StudioError:
@@ -139,11 +156,27 @@ def assessment_summary(raw_path):
             "title": (doc.get("outlook") or {}).get("title"), "elapsed_s": doc.get("elapsed_s")}
 
 
-def assess_cmd(raw_path, calibration_file=None):
+def _win_args(window_start, window_duration):
+    args = []
+    wk = _win_key(window_start, window_duration)
+    if wk == "full":
+        return args
+    s = float(window_start) if window_start not in (None, "") else 0.0
+    d = float(window_duration) if window_duration not in (None, "") else 0.0
+    if d > 0:
+        args += ["--window", f"{s:.3f}", f"{d:.3f}"]
+    else:
+        # assess.py --window expects (start, duration); pass start=0→1e9 as "start to end"
+        args += ["--window", f"{s:.3f}", "1e9"]
+    return args
+
+
+def assess_cmd(raw_path, calibration_file=None, window_start=None, window_duration=None):
     """Command line of the assessment job + report path + describe() info."""
-    f, info = assessment_file(raw_path)
+    f, info = assessment_file(raw_path, window_start, window_duration)
     ASSESS_DIR.mkdir(parents=True, exist_ok=True)
     cmd = [PY, str(ASSESS_TOOL), info["path"], "--json", str(f)]
+    cmd += _win_args(window_start, window_duration)
     if calibration_file and pathlib.Path(calibration_file).exists():
         cmd += ["--calibration", str(calibration_file)]
     return cmd, f, info
@@ -156,19 +189,18 @@ def assess_result_ctx(report):
             "title": (doc.get("outlook") or {}).get("title", ""), "report": str(report), "elapsed_s": doc.get("elapsed_s")}
 
 
-def assess_pipeline_step(raw_path, calibration_file=None, force=False):
-    """Step 0 of a calibration pipeline: assess the recording unless a report for this exact recording exists.
+def assess_pipeline_step(raw_path, calibration_file=None, force=False, window_start=None, window_duration=None):
+    """Step 0 of a calibration pipeline: assess the recording unless a report for this exact recording+window exists.
 
-    The report key is derived from path + first/last timestamp, so an unchanged recording is never read twice;
-    a report made without a calibration file is redone once one is available (static extrinsic checks).
-    Returns a job step spec or None (cache hit). The step aborts the pipeline when an *异常*-level metric that
-    calibration cannot compensate is found (warn-level alerts only annotate the job)."""
-    report, _info = assessment_file(raw_path)
+    The report key is derived from path + first/last timestamp + window, so an unchanged recording/window is
+    never read twice; a report made without a calibration file is redone once one is available (static extrinsic
+    checks). Returns a job step spec or None (cache hit). The step aborts the pipeline when an *异常*-level
+    metric that calibration cannot compensate is found (warn-level alerts only annotate the job)."""
+    report, _info = assessment_file(raw_path, window_start, window_duration)
     doc = read_json(report) if report.exists() else None
-    # Recompute reports made with the former 5 ms merge limit.
     if doc and doc.get("schema") == 2 and not force and (doc.get("calibration") or not calibration_file):
         return None
-    cmd, report, info = assess_cmd(raw_path, calibration_file)
+    cmd, report, info = assess_cmd(raw_path, calibration_file, window_start=window_start, window_duration=window_duration)
 
     def after(ctx, lines, _r=report):
         res = assess_result_ctx(_r)

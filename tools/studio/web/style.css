@@ -211,6 +211,17 @@ details[open] summary { margin-bottom: 8px; }
 .ax-t tbody tr:last-child td { border-bottom: 0; }
 .ax-t th:nth-child(2), .ax-t td.ax-v { text-align: right; }
 .ax-l { font-weight: 500; } .ax-l .dot { margin-right: 7px; vertical-align: 1px; }
+.ax-lb { display: inline-block; vertical-align: middle; }
+.ax-plain { font-weight: 400; font-size: 11.5px; color: var(--muted); line-height: 1.4; margin-top: 2px; max-width: 360px; }
+.ax-win { border: 1px solid var(--line); border-radius: var(--radius-s); padding: 10px 14px; margin: 0 0 12px; background: #fbfbfd; }
+.ax-win header { display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px; }
+.ax-win header b { font-size: 13px; }
+.ax-win-seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+.ax-win-seg button { background: #fff; border: 0; padding: 5px 12px; font: inherit; font-size: 12.5px; color: var(--text); cursor: pointer; border-right: 1px solid var(--line); }
+.ax-win-seg button:last-child { border-right: 0; }
+.ax-win-seg button.active { background: var(--accent); color: #fff; }
+.ax-win-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 220px)); gap: 8px 14px; margin-top: 8px; align-items: end; }
+.ax-win-grid .field { margin: 0; } .ax-win-grid label { font-size: 11.5px; color: var(--muted); display: block; margin-bottom: 3px; }
 .ax-v { font-variant-numeric: tabular-nums; } .ax-v .mono { font-size: 12px; word-break: break-word; }
 .ax-vd { font-size: 11px; color: var(--muted); margin-top: 1px; line-height: 1.35; word-break: break-word; }
 .ax-r.info .ax-v, .ax-r.na .ax-v, .ax-r.na .ax-l { color: var(--muted); }

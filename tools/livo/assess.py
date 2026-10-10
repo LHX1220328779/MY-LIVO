@@ -222,8 +222,16 @@ class Report:
         return gid
 
     def add(self, gid, mid, label, value, unit="", *, ok=None, warn=None, higher=False, status=None,
-            fix="none", fix_bad=None, note="", basis="", display=None, limits=None, extra=None):
-        """Register one metric. `fix` applies to 关注, `fix_bad` (default = fix) to 异常."""
+            fix="none", fix_bad=None, note="", basis="", plain="", display=None, limits=None, extra=None):
+        """Register one metric. `fix` applies to 关注, `fix_bad` (default = fix) to 异常.
+
+        `plain` is a short Chinese sentence (one or two lines) shown directly below the label
+        in the data-source card. It must answer two questions in plain language:
+            • 它在测什么？(what is being measured)
+            • 多少算“好”，为什么重要？(what good looks like and why it matters)
+        Keep it <50 characters per line. Engineers should not have to open the tooltip to
+        decide whether this metric is acceptable. `note`/`basis` remain the technical detail.
+        """
         if status is None:
             status = grade(value, ok, warn, higher) if ok is not None else "info"
         fixc = fix if status != "bad" else (fix_bad or fix)
@@ -242,7 +250,7 @@ class Report:
                "status": status, "limits": limits or "", "fix": fixc if status in ("warn", "bad") else None,
                "fix_label": FIX_LABEL.get(fixc, "") if status in ("warn", "bad") else "",
                "alert": status in ("warn", "bad") and fixc in ("procedure", "none"),
-               "note": note, "basis": basis,
+               "plain": plain or "", "note": note, "basis": basis,
                "thresholds": ({"ok": float(ok), "warn": float(warn if warn is not None else ok), "higher": bool(higher)}
                               if ok is not None and isinstance(value, (int, float)) and not isinstance(value, bool) else None)}
         if extra:
@@ -736,25 +744,30 @@ def run(a):
     R.add(g_int, "topics", "必需话题", len(missing), "项缺失",
           status="bad" if core_missing or not lidar_topics else ("warn" if missing else "ok"),
           display="齐全" if not missing else "缺 " + ", ".join(missing), fix="none",
+          plain="标定与建图要用的话题全在吗？缺核心话题（IMU/雷达/INS 里程计）= 录包直接作废。",
           note="LIO 需要 LiDAR + imu_data + imu_data/odometry；ins_status 提供固定解/卫星数，navsat_fix 可选。",
           basis="缺 INS 里程计时无法做后轴对齐与 RTK 融合。")
     R.add(g_int, "lidar_count", "LiDAR 路数", len(lidar_topics), "路", ok=4, warn=1, higher=True, fix="none",
           display=f"{len(lidar_topics)} 路（{', '.join(short.values())}）",
+          plain="车上 4 路雷达是否都录到了。少一路覆盖就缺一块，多雷达互校验也跑不全。",
           note="车辆配置为 4 路（front / front_left / front_right / back）；少于 4 路时覆盖与多雷达一致性检查按实际路数进行。",
           basis="truck29 / truck05 均为 4 路。")
     gaps = summary.get("coverage_gaps", [])
     R.add(g_int, "coverage_gaps", "分段覆盖断裂", len(gaps), "处", ok=0, warn=0, fix="none",
           display="无" if not gaps else f"{len(gaps)} 处（最长 {max(x['gap_s'] for x in gaps):.1f} s）",
+          plain="相邻分段之间是否有秒级空洞。空洞=这段没数据，地图会断一块，前端要重收敛。",
           note="同一话题集合的相邻分段之间 >0.5 s 的空洞；空洞期间没有点云与 IMU，地图在此处缺失且前端需要重新收敛。",
           basis="dataset.py 覆盖检查；录制软件分段切换应无缝（truck29: 8 段无缝）。")
     dup, back = dropped.get("dropped_duplicate", 0), dropped.get("dropped_backwards", 0)
     dd_pct = 100.0 * (dup + back) / max(1, counters["messages"])
     R.add(g_int, "ordering", "重复 / 乱序消息", dd_pct, "%", ok=0.5, warn=2.0, fix="auto",
           display=f"{dup + back} 条（重复 {dup}，倒退 {back}；{dd_pct:.2f} %）",
+          plain="消息时间戳是否单调。分段边界几条重复正常；成片乱序说明录制时钟错乱，无法自动修复。",
           note="在线合并按每话题单调时间戳丢弃重复与倒退消息；分段边界的少量重复无影响，成片乱序说明录制时钟异常。",
           basis="truck29: 0；truck05: 621 条分段边界重复（0.23 %）。")
     R.add(g_int, "camera_present", "相机话题", 1 if cam_topic or ds.has_camera else 0, "", status="ok" if ds.has_camera else "warn",
           display=("有：" + ds.camera_topics[0]) if ds.has_camera else "无（仅可 LIO）", fix="none",
+          plain="有没有录相机数据。没相机=只能跑 LIO，地图无彩色，相机标定/闭环也无法做。",
           note="没有相机时只能运行 LIO 与 LiDAR 标定流水线，无法着色。", basis="Camera_* 分段包含 midrange_camera/ffmpeg。")
 
     # --- timing: IMU
@@ -765,12 +778,15 @@ def run(a):
         gaps_i = np.flatnonzero(dti > 20.0)
         R.add(g_time, "imu_rate", "IMU 采样间隔", med, "ms", ok=11.0, warn=21.0, fix="none",
               display=f"{med:.2f} ms（{1000 / med:.0f} Hz）",
+              plain="IMU 频率是否稳定在 100 Hz（10 ms）。掉频会放大急转时的去畸变误差。",
               note="前端去畸变与预积分按 100 Hz 设计；更低的采样率会放大高角速率段的去畸变误差。", basis="truck29/05: 10.0 ms。")
         R.add(g_time, "imu_max_gap", "IMU 最大断点", float(dti.max()), "ms", ok=15.0, warn=100.0, fix="auto", fix_bad="none",
+              plain="IMU 最长一次丢样本多久。≤100 ms 前端用插值桥接；更长=这一段建图会断/漂。",
               note="≤100 ms 由去畸变积分跨越（按两侧样本均值桥接）；更长的断流会中止或漂移本段建图。",
               basis="config: maximum_time_gap 0.1 s；修复前一次 20 ms 断点中止了约 50 轮中的 4 轮。")
         R.add(g_time, "imu_gaps", "IMU 断点数 (>20 ms)", int(len(gaps_i)), "次", ok=0, warn=5, fix="auto", fix_bad="none",
               display=f"{len(gaps_i)} 次" + (f"（首个 @ {(imu_ts_a[gaps_i[0]] / NS - t0):.1f} s）" if len(gaps_i) else ""),
+              plain="整段录包里 IMU 出现多少次 >20 ms 的小断点。零星几个可桥接；频繁=IMU 链路在丢包。",
               note="每个断点都是一次前端桥接；频繁断点说明 IMU 链路丢包。", basis="truck29: 0–1 次；truck05: 见结果。")
     else:
         R.add(g_time, "imu_rate", "IMU 采样间隔", None, "ms", status="bad", display="无 IMU 数据", fix="none")
@@ -798,6 +814,7 @@ def run(a):
     worst_topic = max(drop_share, key=drop_share.get) if drop_share else ""
     R.add(g_time, "lidar_drops", "LiDAR 丢帧率（最差一路）", worst_drop, "%", ok=0.1, warn=1.0, fix="none",
           display=f"{worst_drop:.2f} %（{worst_topic}）" if worst_drop is not None else "—",
+          plain="最差的一路雷达缺了多少帧。缺帧=合并帧里这路缺席，覆盖少一圈，无法补回。",
           note="由帧间隔 >1.5 倍周期推断的缺帧；缺帧处该雷达在合并帧中缺席，覆盖减少，无法补回。",
           basis="truck29: 0 %；truck05 回放丢帧属于回放侧（本项只看录制）。", extra=per_lidar)
     # scan-start dispersion across LiDARs
@@ -829,6 +846,7 @@ def run(a):
         status_span = "bad"
     R.add(g_time, "lidar_span", "多雷达扫描起始离散 P99", span_ms, "ms", ok=1.0, warn=20.0, status=status_span, fix="auto", fix_bad="none",
           display=(f"{span_ms:.2f} ms（最大 {float(spans.max()):.2f}；>1 ms {over1} 帧，>20 ms {over20} 帧 / {len(spans)}）" if span_ms is not None else "—"),
+          plain="同一合并帧内四路雷达 header 时间差。<1 ms 好；持续 >20 ms 说明某路雷达时钟跑偏，去畸变无法修复。",
           note="同一合并帧内四路雷达 header 时间戳的极差。默认合帧容差 20 ms，逐点保留真实采样时刻做 IMU 去畸变；超限时丢弃未匹配的旧帧并继续。此补偿不能修复传感器时钟错误。",
           basis="truck29 <1 ms；truck05 抖动 1.0–1.3 ms；zongyang truck07 稳定相位差 P99 16.58 ms，原 5 ms 容差使建图零帧。",
           extra={"count": int(len(spans)), "over_1ms": over1, "over_5ms": over5, "over_20ms": over20, "max_ms": float(spans.max()) if len(spans) else None})
@@ -844,6 +862,7 @@ def run(a):
     worst_lat = max(abs(v) for v in lat_med.values()) if lat_med else None
     R.add(g_time, "clock_offset", "录制时间 − 传感器时间戳", worst_lat, "ms", ok=300.0, warn=1000.0, fix="none",
           display=" · ".join(f"{k} {v:+.0f}" for k, v in lat_med.items()) + " ms" if lat_med else "—",
+          plain="各传感器时间戳和主机录制时刻的中位差。几百 ms 以内正常；秒级差异=时钟没同步，常数时间偏移无法覆盖漂移。",
           note="各传感器 header 时间戳与录制时间的中位差；LiDAR 以扫描起始计时约 +100…+200 ms 属正常。秒级差异表示传感器时钟未与主机同步，标定阶段的常数时间偏移无法覆盖漂移。",
           basis="truck29/05 各传感器均在 300 ms 内。", extra=lat_med)
 
@@ -856,12 +875,15 @@ def run(a):
         gaps_c = int((dtc > 2.5 * medc).sum())
         R.add(g_cam, "camera_rate", "相机帧间隔", medc, "ms", ok=40.0, warn=120.0, fix="none",
               display=f"{medc:.2f} ms（{1000 / medc:.1f} fps，{len(cam_ts_a)} 帧）",
+              plain="相机帧率是否稳定在额定值（25/30 fps）。<10 fps 视觉约束太稀疏，LIVO 退化到 LIO。",
               note="LIVO 每帧图像做一次视觉更新；帧率低于 10 fps 时视觉约束稀疏。", basis="truck29/05: 30 fps。")
         R.add(g_cam, "camera_jitter", "相机时间戳抖动 P95", jitter, "ms", ok=1.0, warn=3.0, fix="none",
               display=f"{jitter:.2f} ms（最大 {float(np.abs(dtc - medc).max()):.1f} ms）",
+              plain="帧到帧时间间隔稳不稳。常数偏移能标掉；逐帧抖直接变成投影误差（3 ms ≈ 2 cm），只能靠硬触发/PTP解决。",
               note="帧间隔相对中位数的偏差。常数偏移由 camtime 阶段标定；逐帧抖动直接进入投影误差（6.5 m/s × 3 ms ≈ 2 cm）并降低颜色对齐，只能靠硬件触发 / PTP 解决。",
               basis="truck29: 亚毫秒；truck05: ±ms 级抖动（相机常数偏移 −1.9 ms 已标定，抖动不可标定）。")
         R.add(g_cam, "camera_gaps", "相机断帧", gaps_c, "次", ok=0, warn=5, fix="none",
+              plain="有没有长时间没画面。断帧期间没视觉更新，HEVC 还要等下一关键帧才能恢复。",
               note="帧间隔 >2.5 倍周期；断帧期间无视觉更新且 HEVC 需等下一关键帧。", basis="truck29: 0。")
     elif cam_topic:
         R.add(g_cam, "camera_rate", "相机帧间隔", None, "ms", status="bad", display="相机话题无数据", fix="none")
@@ -887,8 +909,12 @@ def run(a):
         dt = np.diff(t)
         dP = np.diff(P, axis=0)
         speed_ins = np.linalg.norm(VW[:, :2], axis=1)
-        # moving detection on 0.5 s position windows
-        W = 50
+        # moving detection on 0.5 s position windows (duration-based: rate changes no longer shift the
+        # window width; also keeps the 0.5 s consistency stats below aligned to a true 0.5 s)
+        W_TARGET_S = 0.5
+        # find the sample stride closest to W_TARGET_S using the median dt
+        med_dt = float(np.median(dt[dt > 0])) if (dt > 0).any() else 0.01
+        W = max(1, int(round(W_TARGET_S / med_dt)))
         if len(P) > W + 1:
             disp = np.linalg.norm(P[W:, :2] - P[:-W, :2], axis=1)
             tw = t[W:] - t[:-W]
@@ -1001,51 +1027,64 @@ def run(a):
             sats = sats[sats >= 0]
             R.add(g_ref, "rtk_fix", "RTK 固定解占比", fix_share, "%", ok=99.0, warn=95.0, higher=True, fix="none",
                   display=f"{fix_share:.2f} %（模式分布 {', '.join(f'{int(k)}:{int(v)}' for k, v in zip(*np.unique(modes, return_counts=True)))}）",
+                  plain="RTK 是否全程固定解。浮点/单点期间参考位置差到分米级，融合会被带偏、评估也失真。",
                   note="ins_pos_mode=4 为 RTK 固定解；浮点/单点期间参考位置误差达分米级，融合会被拉偏且评估失真。",
                   basis="truck29/05 全程模式 4。")
             if len(sats):
                 p10 = float(np.percentile(sats, 10))
                 R.add(g_ref, "sats", "可用卫星数 P10", p10, "颗", ok=30.0, warn=20.0, higher=True, fix="none",
                       display=f"{p10:.0f} 颗（最少 {int(sats.min())}，中位 {int(np.median(sats))}）",
+                      plain="跟踪的卫星数。≥30 颗时 RTK 逐历元抖动在 cm 级；<20 颗固定解虽在但噪声明显变大。",
                       note="卫星数直接决定 RTK 固定解的几何强度与逐历元抖动；≥30 颗时参考位置逐步一致性达 1 cm 级。",
                       basis="truck29: 32–42 颗，参考 0.5 s 一致性 P95 1.3 cm；truck05: 22–24 颗，P95 10 cm，|Δv| 26 cm/s。")
         else:
             R.add(g_ref, "rtk_fix", "RTK 固定解占比", None, "%", status="warn", display="无 ins_status", fix="none",
+                  plain="录包里没有 ins_status 话题，无法判断固定解比例。参考精度只能靠位置-速度一致性间接估。",
                   note="没有 ins_status 就无法判断固定解与卫星数。")
         R.add(g_ref, "ins_gaps", "INS 里程计断点 (>50 ms)", gaps_o, "次", ok=0, warn=3, fix="auto", fix_bad="none",
+              plain="INS 里程计出现多少次 >50 ms 断点。断点期间融合只能靠前端推算，频繁断点=约束变稀。",
               note="断点期间融合只能靠前端里程推算；频繁断点降低 RTK 约束密度。", basis="truck29/05: 0。")
         R.add(g_ref, "ref_step_jumps", "参考位置阶跃事件 (>4 cm / 0.1 s)", len(jumps) * per10, "次/10min", ok=5.0, warn=150.0, fix="none",
               display=f"{len(jumps)} 次（{len(jumps) * per10:.0f} 次/10 min，最大 {jump_max:.1f} cm）" + (f"，首个 @ {t[jumps[0]]:.1f} s" if len(jumps) else ""),
+              plain="RTK 位置有没有突然跳一下（比 INS 速度积分多 >4 cm）。这种跳变原样出现在“误差”里，融合和评估都分不清它是跳还是真偏差。",
               note="0.1 s 内位置增量与 INS 速度积分之差 >4 cm（位置经 5 样本平滑，停顿/补步伪影已剔除）：参考位置相对自身速度流的阶跃，会原样出现在“误差”里，融合与评估都无法区分。",
               basis="truck29: 0 次；truck05: 72 次（每 3 s 一次 3–5 cm、最大 13.7 cm 的位置重整），397.24 s 单步 8.0 cm（INS 速度只允许 4.1 cm）→ 该处 xy 误差 10.1 cm。")
         R.add(g_ref, "ref_stale", "参考位置停顿样本", stale_pct, "%", ok=3.0, warn=10.0, fix="none",
               display=f"{stale_pct:.2f} %",
+              plain="RTK 位置流有没有“卡住一拍、下一拍跳两步”的样本。偶尔出现对融合鲁棒，但评估曲线会带毛刺。",
               note="100 Hz 位置流中“保持上一值、下一样本补双步”的样本占比；单个停顿在 6.5 m/s 下等于 3 cm 的瞬时参考误差，融合对其鲁棒但评估曲线会带毛刺。",
               basis="truck29: 1.7 %（精度仍 6 cm）；truck05: 0.1 %。")
         R.add(g_ref, "ref_xy_consistency", "参考位置-速度一致性 xy P95 (0.5 s)", percentile(exy_w, 95), "cm", ok=3.0, warn=8.0, fix="none",
               display=f"{percentile(exy_w, 95) or 0:.2f} cm（P50 {percentile(exy_w, 50) or 0:.2f}）" if len(exy_w) else "—",
+              plain="RTK 0.5 s 内位置差和速度积分对不对得上（平面）。这就是参考本身的逐历元噪声，融合和评估都没法再小。",
               note="0.5 s 内位置增量与速度积分之差（位置经 3 样本平滑）；反映 RTK 位置的逐历元抖动，是融合与评估都无法区分的参考噪声。",
               basis="truck29 P50/P95 0.6/2.2 cm；truck05 0.9/5.0 cm（卫星 22–24 颗）。")
         R.add(g_ref, "ref_z_consistency", "参考高程-速度一致性 z P95 (0.5 s)", percentile(ez_w, 95), "cm", ok=3.0, warn=12.0, fix="none",
               display=f"{percentile(ez_w, 95) or 0:.2f} cm（P50 {percentile(ez_w, 50) or 0:.2f}）" if len(ez_w) else "—",
+              plain="同上，但测高程。RTK 高程噪声通常是平面 2–3 倍，直接决定坡道上 z 的精度下限。",
               note="高程方向的同类指标；RTK 高程噪声通常是平面的 2–3 倍，直接决定坡道上的 z 精度。", basis="truck29 0.29/1.37 cm；truck05 1.55/10.3 cm（P50/P95）。")
         if len(ang):
             R.add(g_ref, "heading_track", "INS 航向 vs 轨迹方向（中位）", float(np.median(ang)), "°", ok=1.0, warn=2.5, fix="stage",
                   display=f"{float(np.median(ang)):+.2f}°（P95 抖动 {percentile(np.abs(ang - np.median(ang)), 95):.2f}°）",
+                  plain="车开起来（>2 m/s）时 INS 指的方向和轨迹方向差几度。常数偏角=INS→后轴的偏航安装角，由后轴对齐阶段标掉；抖动=参考噪声。",
                   note="行驶 >2 m/s 时车体前向轴与位置轨迹方向的夹角；常数项等价于 INS→后轴的偏航安装角，由后轴对齐阶段吸收；抖动项来自参考噪声。",
                   basis="axle 阶段（rpy_xy）求解参考雷达→后轴的整机旋转。")
         R.add(g_ref, "grade_height", "俯仰积分高程 vs RTK 高程 P95", percentile(diffs, 95), "cm/100m", ok=25.0, warn=45.0, fix="none",
               display=f"{percentile(diffs, 95):.1f} cm/100m（去常数偏差 {gh_bias:+.1f} 后；最大 {float(diffs.max()):.1f}）" if len(diffs) else "行驶距离不足",
+              plain="按 INS 俯仰积分的爬坡高度和 RTK 报的高度差多少（每 100 m）。差得大=姿态与高程在坡道上互相矛盾，z 误差随坡度出现，标定消不掉。",
               note="按 INS 俯仰角积分的高程变化与 RTK 高程变化之差（每 100 m 行程，扣除常数俯仰安装偏差后）。差异越大，INS 姿态与 RTK 高程在坡道上越矛盾，融合的 z 误差随坡度出现，标定无法消除。",
               basis="truck29 P95 19 cm/100m（坡道 |z| ≤ 5 cm）；truck05 39 cm/100m（+6–8 % 坡 z +13…+18 cm，−6–7 % 坡 z −20…−34 cm）。")
         R.add(g_ref, "ins_cov", "INS 协方差字段", cov_valid * 100, "%", status="ok" if cov_valid > 0.5 else "info",
               display="有效" if cov_valid > 0.5 else "全 0（按固定权重融合）", fix="none",
+              plain="INS 是否给了逐历元协方差。全 0=融合按配置里的固定 σ 加权，不按实时精度自适应；固定解质量好的数据没影响。",
               note="协方差全 0 时融合使用配置中的固定 σ，无法按逐历元精度加权；不影响固定解质量好的数据。",
               basis="truck29/05 均为全 0。")
         R.add(g_ref, "ins_quat", "INS 姿态四元数", int((~good_q).sum()), "条异常", ok=0, warn=10, fix="none",
+              plain="INS 给的姿态四元数模长是否=1。异常姿态会污染去畸变和融合。",
               note="模长偏离 1 的四元数；异常姿态会污染去畸变与融合。", basis="truck29/05: 0。")
     else:
         R.add(g_ref, "rtk_fix", "INS 里程计", None, "", status="bad", display="无 imu_data/odometry", fix="none",
+              plain="完全没有 INS 里程计话题。没它=RTK 融合、后轴对齐、精度评估全都没法做，录包作废。",
               note="没有 INS 里程计无法做 RTK 融合、后轴对齐与精度评估。")
 
     # --- LiDAR geometry
@@ -1054,6 +1093,7 @@ def run(a):
         weakest = min(pts_med, key=pts_med.get)
         R.add(g_lid, "lidar_points", "每帧点数（最稀一路中位）", pts_med[weakest], "点", ok=5000, warn=1500, higher=True, fix="none",
               display=" · ".join(f"{k} {v / 1000:.0f}k" for k, v in pts_med.items()),
+              plain="每路雷达一帧回来多少点。<1.5k 点/帧=该路太稀，行驶段 6-DoF 精修会缺匹配。",
               note="点数骤降表示遮挡、污损或回波异常；侧/后雷达低于 1.5k 点时行驶段 6-DoF 精修缺少匹配。", basis="truck29 各路点数为参照。",
               extra=pts_med)
         blocked = {}
@@ -1064,6 +1104,7 @@ def run(a):
         wb = max(blocked, key=blocked.get)
         R.add(g_lid, "lidar_blocked", "点数骤降帧占比（最差一路）", blocked[wb], "%", ok=0.0, warn=2.0, fix="none",
               display=f"{blocked[wb]:.2f} %（{wb}）",
+              plain="有多少帧点数比自己的中位数低 70% 以上。多=雷达被挡、被糊、或镜头/线束有问题。",
               note="点数低于该路中位数 30 % 的帧：短时遮挡（车辆、扬尘）或雷达异常。", basis="truck29: 0 %。", extra=blocked)
     # sampled slots: vertical structure availability (needs calibration)
     if calib and slots_eval:
@@ -1071,10 +1112,12 @@ def run(a):
         open_share = 100 * float((arr < 300).mean()) if len(arr) else None
         R.add(g_lid, "vertical_structure", "结构缺失帧占比（30 m 内地面以上 <300 点）", open_share, "%", ok=10.0, warn=30.0, fix="none",
               display=f"{open_share:.1f} %（{len(arr)} 个采样帧，中位 {int(np.median(arr))} 点）" if len(arr) else "—",
+              plain="多少帧 30 m 内几乎没电线杆/墙/设备（空场）。空场段 LiDAR 沿行进方向退化，行驶段精修靠 RTK 兜底。",
               note="开阔无结构路段：LiDAR 里程计沿行进方向退化、行驶段精修缺少竖直面匹配；只能依靠 RTK 约束。",
               basis="truck05 204 s 开阔料场：视觉/LiDAR 约束弱，LIO 仍 ≤3 cm 因 RTK 约束。", extra={"slots": slots_eval[:400]})
     elif not calib:
         R.add(g_lid, "vertical_structure", "结构缺失帧占比", None, "%", status="na", display="未提供标定文件", fix="none",
+              plain="需要激活的标定把点云变到后轴坐标系才能统计结构；先做后轴对齐再评估。",
               note="需要激活的标定版本把点云变换到后轴坐标系。")
     # static-start ground consistency
     gc = {}
@@ -1092,6 +1135,7 @@ def run(a):
               fix_bad="stage" if tilt <= 3.0 else "none",
               display=f"{tilt:.2f}°（{wt}：前后向 {solved[wt]['rot_x_deg']:+.2f}° 左右向 {solved[wt]['rot_y_deg']:+.2f}°）",
               limits="≤ 0.2° 正常（低于自检生效阈值）· ≤ 1.0° 关注（建图自检自动修正）· ≤ 3° 需 ground/driven 阶段 · 更大＝安装/文件错误",
+              plain="起步静止时各路雷达“看到的地面”和参考雷达差几度。≤0.2° 可接受；0.2–1° 起步自检会自动修正；>1° 需要 ground/driven 阶段重标。",
               note="各雷达静止地面相对参考雷达（front）地面的倾角差；对应 SLAM 起步静止外参自检的 roll/pitch 修正量。",
               basis="config: max_rotation_deg 1.0 / min_apply 0.2°；truck05 原始外参 0.3° 由 driven 阶段闭合。",
               extra={k: {kk: (round(vv, 3) if isinstance(vv, float) else vv) for kk, vv in v.items()} for k, v in gc.items()})
@@ -1099,11 +1143,13 @@ def run(a):
               fix_bad="stage" if dz <= 50.0 else "none",
               display=f"{dz:.1f} cm（{wz}，重叠 {solved[wz]['overlap_cells']} 格，残差 {solved[wz]['residual_cm']:.1f} cm）",
               limits="≤ 4 cm 正常 · ≤ 15 cm 关注（自检自动修正）· ≤ 50 cm 需 ground/driven 阶段 · 更大＝安装/文件错误",
+              plain="静止地面各路看出来的高度差几厘米。≤4 cm 好；4–15 cm 起步自检修；>15 cm 要 ground 阶段。",
               note="对应自检的 z 修正量（max_height 0.15 m / min_apply 0.04 m）。", basis="truck05 原始外参：后雷达 14 cm 沿车 + 6 cm z。")
     else:
         reason = "未提供标定文件" if not calib else ("起步无静止段（<2.5 s）" if static_s is not None and static_s < 2.5 else
                                              ("静止地面与参考雷达无重叠" if gc else "静止帧不足"))
         R.add(g_lid, "extrinsic_tilt", "静止段雷达间地面一致性", None, "", status="na", display=reason, fix="stage",
+              plain="起步时没有 ≥2.5 s 静止或没给标定，地面互校算不出。这种数据只能靠行驶段 driven 解外参。",
               note="没有静止段时建图自检与 ground 阶段无法运行；外参只能由行驶段 driven 阶段求解。")
 
     # --- camera content
@@ -1111,6 +1157,7 @@ def run(a):
         dec = [c for c in cam_eval if c["decoded"]]
         R.add(g_cam, "camera_decode", "HEVC 样例解码", len(dec), "帧", status="ok" if len(dec) == len(cam_eval) and dec else ("warn" if dec else "bad"),
               display=f"{len(dec)} / {len(cam_eval)} 个样例可解码", fix="none",
+              plain="抽样的几段 HEVC 能不能正常解码。解不开=那段视频没法做视觉更新也没颜色。",
               note="每个样例从关键帧起解码 4 个包；解码失败的区间没有视觉更新与颜色。", basis="")
         if dec:
             clip = max(c["clipped_pct"] for c in dec)
@@ -1118,25 +1165,32 @@ def run(a):
             means = [c["mean"] for c in dec]
             R.add(g_cam, "camera_clipping", "过曝像素占比（最差样例）", clip, "%", ok=3.0, warn=10.0, fix="procedure",
                   display=f"{clip:.1f} %（亮度均值 {min(means):.0f}–{max(means):.0f}）",
+                  plain="过曝（纯白）像素占多少。过曝区没纹理，视觉约束失效，彩色地图还会被洗白；调曝光或避开顺光段。",
                   note="过曝区域没有纹理，视觉更新在此退化并可能把错误的亮度写进彩色地图；需调整曝光/增益或避开顺光时段。",
                   basis="truck05 204 s 顺光开阔料场的视觉瞬态（LIO ≤3 cm，LIVO 跳变）。")
             R.add(g_cam, "camera_texture", "图像纹理（最弱样例，Laplacian 方差）", tex, "", ok=40.0, warn=15.0, higher=True, fix="none",
                   display=f"{tex:.0f}（中位 {np.median([c['texture'] for c in dec]):.0f}）",
+                  plain="画面里有没有角点/边缘等可跟踪的纹理。天空/平整料面/过曝=低纹理，视觉约束不可靠，LIVO 退回 LIO 水平。",
                   note="低纹理（天空/平整料面/过曝）时视觉约束不可靠；LIVO 会自动降低视觉权重但精度退回 LIO 水平，标定无法改善。",
                   basis="truck29 全程有灯柱/挡墙/设备纹理。")
             lo = sum(1 for m in means if m < 40 or m > 200)
             R.add(g_cam, "camera_exposure", "曝光异常样例", lo, "个", ok=0, warn=2, fix="procedure",
-                  display=f"{lo} / {len(dec)}（均值 <40 或 >200）", note="整体过暗/过亮的图像不能提供稳定的光度残差。", basis="")
+                  display=f"{lo} / {len(dec)}（均值 <40 或 >200）",
+                  plain="样例里整幅过暗/过亮的有几张。整体偏暗/偏亮的图给不出稳定的光度残差。",
+                  note="整体过暗/过亮的图像不能提供稳定的光度残差。", basis="")
     elif cam_topic:
-        R.add(g_cam, "camera_decode", "HEVC 样例解码", 0, "帧", status="warn", display="未采到关键帧样例", fix="none")
+        R.add(g_cam, "camera_decode", "HEVC 样例解码", 0, "帧", status="warn", display="未采到关键帧样例", fix="none",
+              plain="抽到的样例里没遇到关键帧，解码不出来。大概率是关键帧间隔问题，换几个时刻重抽。")
 
     # --- route / procedure
     if ref_stats:
         R.add(g_route, "static_start", "起步前静止时长", static_s, "s", ok=3.0, warn=1.0, higher=True, fix="procedure",
+              plain="车子开动前停了几秒。≥3 s 好（够 ground 阶段和起步自检用）；<1 s 静止段无法用。",
               note="静止外参自检需 ≥5 帧、ground 阶段需 ~2 s 静止；从静止开始录制。", basis="truck29/05 均从静止起步。")
         R.add(g_route, "path", "行驶里程 / 时长", ref_stats["path_m"], "m",
               status="ok" if ref_stats["path_m"] >= 200 else "warn", fix="procedure",
               display=f"{ref_stats['path_m']:.0f} m · 行驶 {ref_stats['moving_s']:.0f} s / 总 {span_s:.0f} s · 最高 {ref_stats['speed_max_mps'] * 3.6:.0f} km/h",
+              plain="一共开了多远多久。标定需要 ≥200 m 行驶；里程越长 RTK 对时间偏移的约束越强。",
               note="行驶段精修与后轴对齐需要 ≥200 m 的行驶；里程越长 RTK 对时间偏移的约束越强。", basis="")
         # turns and straight windows from 1 Hz profile
         tt = (ots - ots[0]) / 1e9
@@ -1166,16 +1220,20 @@ def run(a):
             else:
                 k += 1
         R.add(g_route, "turns", "转弯次数 (≥60°)", turns, "次", ok=2, warn=1, higher=True, fix="procedure",
+              plain="录到了几次 ≥60° 的转弯。后轴对齐和相机时间偏移靠转弯段激发可观性；全程直线这些量标不准。",
               note="转弯段给出 LiDAR/相机时间偏移与后轴对齐的可观测性（直线段对时间偏移不敏感）。", basis="axle / camtime 阶段依赖角速率。")
         R.add(g_route, "straight_windows", "直线匀速窗口 (4 s, ≥1.5 m/s)", straight, "个", ok=3, warn=1, higher=True, fix="procedure",
+              plain="有几段 ≥4 s 的直线匀速。ground 阶段取后雷达行驶帧、driven 阶段默认窗口都要用到直线段。",
               note="ground 阶段的后雷达行驶帧与 driven 阶段窗口选择需要直线段。", basis="livo_calib suggest_windows 规则。")
         kf = ref_stats["moving_s"] * 2.0
         R.add(g_route, "keyframes", "预计关键帧数（0.5 s 一帧）", kf, "帧", ok=1000, warn=1500, fix="procedure",
               display=f"≈{kf:.0f} 帧",
+              plain="整段大概会进后端多少关键帧。1000 帧以内实时；超过 1500 帧建议分段回放或降倍速，否则末段丢帧影响精度。",
               note="后端 iSAM2 求解时间随关键帧数增长（P50 78 ms@481 → 298 ms@1286 帧）；超过 1000 帧建议分段回放或 --rate 0.7，否则末段传输丢帧。",
               basis="truck05 720 s：末段负载丢帧使 LIO 最大误差 8.3 → 13.5 cm。")
         gp = ref_stats["grade_p99_pct"]
         R.add(g_route, "grade", "坡度 P99", gp, "%", status="info", fix="none",
+              plain="录到的最大坡度。坡度本身不是问题，要搭配“俯仰积分高程 vs RTK 高程”判断坡道上参考准不准。",
               note="坡度本身不是缺陷；结合“俯仰积分高程 vs RTK 高程”判断参考在坡道上的可信度。", basis="truck29 8.6 %；truck05 +8 % / −7 % 坡。")
 
     # --- resources
@@ -1188,11 +1246,13 @@ def run(a):
         free_gb = None
     R.add(g_res, "disk", "结果盘可用空间", free_gb, "GB", ok=3 * need_gb, warn=need_gb, higher=True, fix="procedure",
           display=f"{free_gb:.0f} GB（一轮建图约需 {need_gb:.0f} GB：数据 {size_gb:.1f} GB）" if free_gb is not None else "—",
+          plain="结果盘剩余空间够不够跑一轮。剩 <1 轮所需=跑到一半磁盘写满直接失败。",
           note="每轮建图保存地图、扫描存档与评估；磁盘写满会让轮次中途失败。", basis="truck05 一轮 10–12 GB；truck29 1–2 GB。")
     thr = counters["bytes"] / max(elapsed_pass, 1e-6) / 1e6
     bitrate = summary["size_bytes"] / max(summary["duration_s"], 1e-6) / 1e6
     R.add(g_res, "read_throughput", "读取带宽 vs 码率", thr / max(bitrate, 1e-6), "×", ok=2.0, warn=1.2, higher=True, fix="procedure",
           display=f"{thr:.0f} MB/s（码率 {bitrate:.0f} MB/s，{thr / max(bitrate, 1e-6):.1f}×）",
+          plain="这次评估读数据的速度是数据码率的几倍。≥2× 实时回放稳；<1.2× 得用 --rate 0.7 降倍速，否则丢帧。",
           note="回放需要以 ≥1× 码率读取并同时运行建图；低于 1.2× 时请用 --rate 0.7。", basis="本次评估读取实测。")
 
     verdict, counts, alerts, fixable = R.finish()

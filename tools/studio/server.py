@@ -184,7 +184,8 @@ class Handler(BaseHTTPRequestHandler):
             info = datasets.describe(q["path"], refresh=q.get("refresh") == "1")
             return self._send(200, info)
         if path == "/api/datasets/assessment":
-            return self._send(200, datasets.assessment(q["path"]))
+            return self._send(200, datasets.assessment(
+                q["path"], window_start=q.get("start"), window_duration=q.get("duration")))
         if path == "/api/vehicles":
             cat = calibration.catalogue(refresh=q.get("refresh") == "1")
             return self._send(200, {"vehicles": calibration.vehicles(cat), "stages": cat["stages"], "sources": cat["sources"]})
@@ -236,11 +237,15 @@ class Handler(BaseHTTPRequestHandler):
             mine, truck = body.get("mine"), body.get("truck")
             if mine and truck:
                 calib_file = calibration.vehicle_status(calibration.catalogue(), mine, truck).get("calibration_file")
-            cmd, report, info = datasets.assess_cmd(p, calib_file)
-            job = jobs.start("assess", f"数据评估 · {info.get('name')}",
-                             [{"title": "数据评估（一次流式读取 + 抽样点云/图像）", "cmd": cmd,
+            ws, wd = body.get("window_start"), body.get("window_duration")
+            cmd, report, info = datasets.assess_cmd(p, calib_file, window_start=ws, window_duration=wd)
+            title_extra = ""
+            if ws is not None or wd is not None:
+                title_extra = f"（{ws or 0} s 起，{f'{wd} s' if wd else '到结尾'}）"
+            job = jobs.start("assess", f"数据评估 · {info.get('name')}{title_extra}",
+                             [{"title": f"数据评估（流式读取{title_extra}）", "cmd": cmd,
                                "after": lambda ctx, lines, _r=report: ctx.update(datasets.assess_result_ctx(_r))}],
-                             meta={"path": p, "calibration": calib_file})
+                             meta={"path": p, "calibration": calib_file, "window_start": ws, "window_duration": wd})
             return self._send(200, job.to_json())
         if path == "/api/datasets/forget":
             state = load_state()

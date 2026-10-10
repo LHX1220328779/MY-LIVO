@@ -5,6 +5,12 @@ const S = {
   page: "home", state: null, system: null, vehicles: [], stages: {}, runs: [], jobs: [], dataset: null,
   cal: null, versionDetail: null, runDetail: null, live: null, job: null, jobLog: [], jobLogNext: 0,
   fs: null, drawer: null, fsTarget: null, busy: false, calibForm: { stage: "ground" }, timers: {},
+  // data-assessment and calibration time-window selection (seconds from dataset start). mode =
+  //   "auto"  : use the motion-profile suggestion (skip a standstill head, keep 8 s rest for IMU init)
+  //   "head"  : use the first `head_dur` seconds (typical short static+drive window)
+  //   "custom": explicit [start, end) in seconds
+  winAssess: { mode: "auto", head_dur: 60, start: 0, end: "" },
+  winCalib:  { mode: "auto", head_dur: 60, start: 0, end: "" },
   overlayForm: { times: "20,60,100", delta: "0 0 0", run: "" }, overlay: null, overlayBusy: false,
   assess: null, assessSummary: null, assessLoading: false,
 };
@@ -357,13 +363,58 @@ function pageData() {
       <div class="small muted mono" style="margin-bottom:10px">${esc(d?.path || "")}</div>${datasetSummary(d)}</div>
   </div>${assessmentCard()}`;
 }
+// ------------------------------------------------------------------ time-window selector
+function winEffective(w, durS) {
+  // Returns {start_s, duration_s} or null for "all". durS may be null/0 -> unknown; validation deferred to backend.
+  if (!w || w.mode === "auto") return null;
+  if (w.mode === "head") {
+    const d = Number(w.head_dur);
+    if (!(d > 0)) return null;
+    return { start_s: 0, duration_s: d };
+  }
+  const s = Number(w.start) || 0;
+  const e = w.end === "" || w.end === null ? NaN : Number(w.end);
+  if (isFinite(s) && isFinite(e) && e > s) return { start_s: s, duration_s: e - s };
+  if (isFinite(s) && !isFinite(e)) return { start_s: s, duration_s: 0 }; // 0 = "until end"
+  return null;
+}
+function winLabel(w, durS) {
+  const eff = winEffective(w, durS);
+  if (!eff) return "自动（按运动窗口，跳过静止起步段，保留 8 s 静止初始化 IMU）";
+  if (w.mode === "head") return `仅开头 ${eff.duration_s} s`;
+  if (!(eff.duration_s > 0)) return `从 ${eff.start_s} s 起（到结束）`;
+  return `${eff.start_s} – ${(eff.start_s + eff.duration_s).toFixed(0)} s（${eff.duration_s} s）`;
+}
+function windowWidget(stateKey, title) {
+  const w = S[stateKey];
+  const dur = S.dataset?.duration_s || 0;
+  const mode = w.mode || "auto";
+  const hint = `<div class="small muted" style="grid-column:1/-1">当前：<b>${esc(winLabel(w, dur))}</b>${dur ? ` · 数据总长 ${Math.round(dur)} s` : ""}</div>`;
+  const setMode = (m) => `data-act="win-mode" data-key="${stateKey}" data-mode="${m}"`;
+  const fi = (key, val, step, ph) => `<input type="number" step="${step}" min="0" data-act="win-field" data-key="${stateKey}" data-field="${key}" value="${val == null ? "" : esc(val)}" placeholder="${ph || ""}">`;
+  return `<section class="ax-win"><header><b>${esc(title)}</b><span class="small muted">评估/标定取哪一段时间</span></header>
+    <div class="ax-win-seg">
+      <button class="${mode === "auto" ? "active" : ""}" ${setMode("auto")}>自动（推荐）</button>
+      <button class="${mode === "head" ? "active" : ""}" ${setMode("head")}>开头 N 秒</button>
+      <button class="${mode === "custom" ? "active" : ""}" ${setMode("custom")}>自定义区间</button>
+    </div>
+    <div class="ax-win-grid">
+      ${mode === "head" ? `<div class="field"><label>开头使用时长 (s)</label>${fi("head_dur", w.head_dur, "1", "60")}</div>` : ""}
+      ${mode === "custom" ? `<div class="field"><label>起始 (s)</label>${fi("start", w.start, "0.1", "0")}</div>
+        <div class="field"><label>结束 (s，空=到结尾)</label>${fi("end", w.end, "0.1", "留空")}</div>` : ""}
+      ${hint}
+    </div></section>`;
+}
 // ------------------------------------------------------------------ data assessment (数据评估)
 const AX_STATUS = { ok: "正常", warn: "关注", bad: "异常", info: "参考", na: "未检" };
 async function loadAssessment(force = false) {
   const d = S.dataset;
   if (!d || d.error) { S.assess = null; return; }
   if (!force && S.assess && S.assess.path === d.path) return;
-  try { const res = await api(`/api/datasets/assessment?path=${encodeURIComponent(d.path)}`); S.assess = { ...res, path: d.path }; }
+  const w = winEffective(S.winAssess, d.duration_s);
+  const qs = new URLSearchParams({ path: d.path });
+  if (w) { qs.set("start", String(w.start_s)); qs.set("duration", w.duration_s > 0 ? String(w.duration_s) : "0"); }
+  try { const res = await api(`/api/datasets/assessment?${qs.toString()}`); S.assess = { ...res, path: d.path, _w: w }; }
   catch (e) { S.assess = { path: d.path, result: null, error: e.message || String(e) }; }
 }
 function verdictBadge(v, prefix = "评估") {
@@ -422,7 +473,8 @@ const AX_FIX_SHORT = { "标定/建图自动补偿": "自动补偿", "需运行�
 function axMetricRow(m) {
   const tip = [m.note, m.basis ? `依据：${m.basis}` : ""].filter(Boolean).join("\n");
   const fix = m.fix_label ? `<div class="ax-fix ${m.alert ? "alert" : ""}" title="${esc(m.fix_label)}">${m.alert ? "⚠ " : ""}${esc(AX_FIX_SHORT[m.fix_label] || m.fix_label)}</div>` : "";
-  return `<tr class="ax-r ${m.status}" title="${esc(tip)}"><td class="ax-l"><span class="dot ${m.status}"></span>${esc(m.label)}</td><td class="ax-v">${axValue(m.display)}${axBar(m)}</td><td class="ax-th">${axThresholds(m)}</td><td class="ax-s"><span class="badge sm ${m.status === "info" || m.status === "na" ? "" : m.status}">${AX_STATUS[m.status] || m.status}</span>${fix}</td></tr>`;
+  const plain = m.plain ? `<div class="ax-plain">${esc(m.plain)}</div>` : "";
+  return `<tr class="ax-r ${m.status}" title="${esc(tip)}"><td class="ax-l"><span class="dot ${m.status}"></span><div class="ax-lb">${esc(m.label)}${plain}</div></td><td class="ax-v">${axValue(m.display)}${axBar(m)}</td><td class="ax-th">${axThresholds(m)}</td><td class="ax-s"><span class="badge sm ${m.status === "info" || m.status === "na" ? "" : m.status}">${AX_STATUS[m.status] || m.status}</span>${fix}</td></tr>`;
 }
 function axGroup(g) {
   const c = { ok: 0, warn: 0, bad: 0, other: 0 };
@@ -445,6 +497,7 @@ function assessmentCard() {
   const head = `<div class="card-h"><h2>数据评估 ${r ? verdictBadge(r.verdict, "") : ""}</h2><div class="row">${btn}</div></div>`;
   if (!r) {
     return `<div class="card ax" style="margin-top:16px">${head}
+      ${windowWidget("winAssess", "评估时间窗口")}
       <div class="ax-hero ax-idle">${axGauge({}, null, 42)}<div class="ax-sum"><div class="ax-title">一次并行流式读取，给出这份录制能达到的精度上限</div>
         <div class="ax-text">按本项目在 truck29 / truck05 上遇到的全部数据问题逐项检查：完整性、时间同步、RTK/INS 参考自洽性、雷达几何与静止段外参、相机时间戳与图像内容、行驶工况与资源。每项都有阈值，并标明是标定/建图流程能自动补偿，还是<b>标定无法补救</b>。</div>
         <div class="ax-legend"><span><i class="dot ok"></i>7 个检查组 · 42 项指标</span><span><i class="dot"></i>truck29（120 s）≈ 2 s · truck05（720 s，25 GB）≈ 11 s</span><span><i class="dot accent"></i>标定流水线起步时自动执行，已有报告则跳过</span></div></div></div>
@@ -457,6 +510,7 @@ function assessmentCard() {
   const calName = r.calibration ? r.calibration.split("/").slice(-2, -1)[0] : "";
   const facts = [["时长", fmtDur(r.dataset?.duration_s || 0)], ["行驶", `${Math.round(ref.path_m || 0)} m`], ["消息", (r.messages || 0).toLocaleString()], ["数据量", `${((r.bytes || 0) / 1e9).toFixed(1)} GB`],
     ["用时", `${r.elapsed_s} s${r.workers > 1 ? ` · ${r.workers} 进程` : ""}`], ["外参检查", calName || "未提供标定"], ["生成", fmtT(r.generated)]];
+  const winCard = windowWidget("winAssess", "评估时间窗口");
   const hero = `<div class="ax-hero ${r.verdict}">${axGauge(c, r.verdict, total)}
     <div class="ax-sum"><div class="ax-title">${esc(o.title || "")}</div><div class="ax-text">${esc(o.text || "")}</div>
       <div class="ax-legend"><span><i class="dot ok"></i>正常 <b>${c.ok || 0}</b></span><span><i class="dot warn"></i>关注 <b>${c.warn || 0}</b></span><span><i class="dot bad"></i>异常 <b>${c.bad || 0}</b></span><span><i class="dot"></i>参考 <b>${(c.info || 0) + (c.na || 0)}</b></span><span class="ax-alertn ${(r.alerts || []).length ? "on" : ""}">⚠ 不可标定补救 <b>${(r.alerts || []).length}</b></span></div></div>
@@ -470,7 +524,7 @@ function assessmentCard() {
   const cams = (r.camera_samples || []).filter((s) => s.decoded && s.thumb);
   const thumbs = cams.length ? `<section class="ax-cams"><header class="ax-gh"><span class="dot ok"></span><h3>相机样例</h3><span class="ax-gc">均匀抽取 ${cams.length} 个时刻 · 时刻 / 亮度均值 / 纹理（过曝 >0.5 % 时标注）</span></header><div class="ax-thumbs">${cams.map((s) => `<figure class="ax-thumb"><img src="${s.thumb}" alt=""><figcaption class="mono" title="时刻 ${s.t_s} s · 亮度均值 ${Math.round(s.mean)} · 过曝 ${s.clipped_pct.toFixed(1)} % · 纹理 ${Math.round(s.texture)}">${Math.round(s.t_s)} s · ${Math.round(s.mean)}${s.clipped_pct > 0.5 ? ` · ${s.clipped_pct.toFixed(1)} %` : ""} · ${Math.round(s.texture)}</figcaption></figure>`).join("")}</div></section>` : "";
   const foot = `<div class="ax-foot small muted">评估范围 ${r.window ? `${r.window[0]}–${r.window[0] + r.window[1]} s` : "全程"} · 静止起步 ${ref.static_start_s != null ? ref.static_start_s.toFixed(1) : "—"} s · 行驶 ${Math.round(ref.moving_s || 0)} s · 报告 <span class="mono">${esc(a.file || "")}</span></div>`;
-  return `<div class="card ax" style="margin-top:16px">${head}${hero}${strip}${alerts}${fixable}${groups}${thumbs}${foot}</div>`;
+  return `<div class="card ax" style="margin-top:16px">${head}${winCard}${hero}${strip}${alerts}${fixable}${groups}${thumbs}${foot}</div>`;
 }
 function fsHtml() {
   const f = S.fs; if (!f) return `<div class="e dim">输入路径后点击“打开”</div>`;
@@ -500,6 +554,7 @@ function pageCalib() {
       <div class="stat" style="padding:14px"><div class="row" style="justify-content:space-between"><div><b>相机标定流水线</b><div class="small muted">相机时间偏移 → LIVO 建图 A（基线）→ 偏航复核（灯柱投影列偏差，俯仰不动）→ 俯仰闭环（标准＝±0.05° 扫描两轮拟合斜率；快速＝沿用历史斜率 0.105/°，只测零点）→ 闭环版本 → LIVO 验证建图 → 闭环判定 A/验证 → 校验${c.auto_activate ? " → 通过则激活" : ""}</div><div class="small muted">标准 ≈12 min（4 × 60 s 回放）· 快速 ≈8 min（2 × 60 s）· 默认只回放前 60 s（前两轮数据）· 需要含相机的数据源 · 未通过闭环的版本不会被激活</div></div><button class="btn primary" data-act="pipeline" data-kind="camera" ${running || !v?.active || !d?.livo_ready ? "disabled" : ""}>运行</button></div></div>
       <div class="stat" style="padding:14px"><div class="row" style="justify-content:space-between"><div><b>相机外参闭环微调（日常，最快）</b><div class="small muted">以当前激活版本为起点：<b>复用最近一次同版本 LIVO 轮次</b>作为零俯仰点（无需重跑）→ 用已知斜率算出过零点 → 闭环版本 → 一轮 LIVO 验证 → 闭环判定${c.auto_activate ? " → 通过则激活" : ""}</div><div class="small muted">快速 ≈4–5 min（1 次回放）· 标准 ≈15 min（4 次回放）· 复用要求该轮次已评估且时长 ≥50 s（60 s 短轮次可复用）</div></div><button class="btn primary" data-act="pipeline" data-kind="camloop" ${running || !v?.active || !d?.livo_ready ? "disabled" : ""}>运行</button></div></div>
     </div>
+    ${windowWidget("winCalib", "标定时间窗口")}
     <div class="row" style="margin-top:10px;justify-content:space-between"><div class="small muted">父版本：<b>${esc(v?.active || "—")}</b> · 数据源：<b>${esc(d?.name || "未选择")}</b> ${datasetBadges(d)}</div><div class="row" style="gap:18px"><label class="check small">${`<input type="checkbox" data-act="toggle" data-section="calibration" data-key="auto_activate" ${c.auto_activate ? "checked" : ""}><span class="switch"></span><span>流水线完成后自动激活（仅在闭环判定通过时）</span>`}</label><label class="check small">${`<input type="checkbox" data-act="toggle" data-section="calibration" data-key="fast" ${c.fast !== false ? "checked" : ""}><span class="switch"></span><span>快速模式（沿用本车实测俯仰斜率只测零点；本车无斜率或单点拟合被拒时自动转标准扫描；取消勾选＝标准扫描）</span>`}</label></div></div>
   </div>
   <div class="grid" style="grid-template-columns: 1fr 380px; margin-top:16px">
@@ -786,8 +841,10 @@ const A = {
     if (!v?.active) return toast("请先导入并激活一个标定版本", "bad");
     const std = c.fast === false;
     const label = { lidar: "LiDAR 标定流水线（后轴对齐 → 地面精修 → LIO 建图 → 行驶段精修 → 校验）", camera: `相机标定流水线（时间偏移 → LIVO 建图 A → 灯柱偏航复核 → 俯仰闭环${std ? "扫描" : "（快速）"} → 验证建图 → 闭环判定）`, camloop: `相机外参闭环微调（${std ? "标准" : "快速"}：${std ? "两轮扫描" : "复用已有轮次 + 一轮验证"} → 闭环判定）` }[kind];
-    if (!confirm(`运行 ${label}\n父版本：${v.active}\n数据源：${d?.path}\n流水线包含一次完整回放建图，请勿同时启动其他建图。`)) return;
-    await act(async () => { const job = await api("/api/calibrations/pipeline", "POST", { kind, id: v.active, dataset: d.path, activate: c.auto_activate !== false, use_rtk: true, rate: 1.0, note: "", mode: c.fast === false ? "standard" : "fast" }); S.job = job; S.jobLog = []; S.jobLogNext = 0; S.drawer = "job"; await loadOverview(); render(); }, "流水线已启动");
+    const w = winEffective(S.winCalib, d?.duration_s);
+    const winInfo = w ? `\n时间窗口：${winLabel(S.winCalib, d?.duration_s)}` : "\n时间窗口：自动（按运动窗口）";
+    if (!confirm(`运行 ${label}\n父版本：${v.active}\n数据源：${d?.path}${winInfo}\n流水线包含一次完整回放建图，请勿同时启动其他建图。`)) return;
+    await act(async () => { const job = await api("/api/calibrations/pipeline", "POST", { kind, id: v.active, dataset: d.path, activate: c.auto_activate !== false, use_rtk: true, rate: 1.0, note: "", mode: c.fast === false ? "standard" : "fast", window_start: w?.start_s ?? null, window_duration: w?.duration_s ?? null }); S.job = job; S.jobLog = []; S.jobLogNext = 0; S.drawer = "job"; await loadOverview(); render(); }, "流水线已启动");
   },
   "toggle-import"() { S.showImport = !S.showImport; render(); },
   async import() {
@@ -802,7 +859,8 @@ const A = {
   "calib-field"(el) { S.calibForm[el.dataset.key] = el.type === "checkbox" ? el.checked : el.value; },
   async "run-stage"() {
     const v = vehicle(); const f = S.calibForm; const d = S.dataset;
-    const body = { stage: f.stage, id: f.parent || v?.active, dataset: d?.path, run: f.run || ($("select[data-key=run]") || {}).value, run_dir: f.run_dir || ($("select[data-key=run_dir]") || {}).value, note: f.note, activate: !!f.activate, frames: f.frames };
+    const w = winEffective(S.winCalib, d?.duration_s);
+    const body = { stage: f.stage, id: f.parent || v?.active, dataset: d?.path, run: f.run || ($("select[data-key=run]") || {}).value, run_dir: f.run_dir || ($("select[data-key=run_dir]") || {}).value, note: f.note, activate: !!f.activate, frames: f.frames, window_start: w?.start_s ?? null, window_duration: w?.duration_s ?? null };
     if (f.stage === "manual") { if (f.camera_offset !== "" && f.camera_offset != null) body.camera_offset = Number(f.camera_offset); if (f.lidar_offset !== "" && f.lidar_offset != null) body.lidar_offset = Number(f.lidar_offset); if (f.camera_rot_delta && f.camera_rot_delta.trim()) body.camera_rot_delta = f.camera_rot_delta.trim().split(/[\s,]+/).map(Number); }
     await act(async () => { const job = await api("/api/calibrations/stage", "POST", body); S.job = job; S.jobLog = []; S.jobLogNext = 0; S.drawer = "job"; render(); }, "阶段已启动");
   },
@@ -845,10 +903,13 @@ const A = {
   async "select-dataset"(el) { await act(async () => { const r = await api("/api/datasets/select", "POST", { path: el.dataset.path }); S.state = r.state; S.dataset = r.dataset; await loadOverview(); render(); }, "已选择数据源"); },
   async "forget-dataset"(el) { await act(async () => { S.state = await api("/api/datasets/forget", "POST", { path: el.dataset.path }); render(); }); },
   "ax-jump"(el) { const t = document.getElementById(el.dataset.target); if (t) t.scrollIntoView({ behavior: "smooth", block: "start" }); },
+  "win-mode"(el) { const k = el.dataset.key; S[k].mode = el.dataset.mode; render(); },
+  "win-field"(el) { const k = el.dataset.key, f = el.dataset.field; const v = el.value === "" ? "" : Number(el.value); S[k][f] = v; render(); },
   async assess() {
     const d = S.dataset; const v = vehicle();
     if (!d || d.error) return toast("请先选择可用的数据源", "bad");
-    await act(async () => { const job = await api("/api/datasets/assess", "POST", { path: d.path, mine: v?.mine, truck: v?.truck }); S.job = job; S.jobLog = []; S.jobLogNext = 0; S.drawer = "job"; render(); }, "数据评估已启动");
+    const w = winEffective(S.winAssess, d?.duration_s);
+    await act(async () => { const job = await api("/api/datasets/assess", "POST", { path: d.path, mine: v?.mine, truck: v?.truck, window_start: w?.start_s ?? null, window_duration: w?.duration_s ?? null }); S.job = job; S.jobLog = []; S.jobLogNext = 0; S.drawer = "job"; render(); }, "数据评估已启动");
   },
   async "refresh-dataset"() { await act(async () => { S.dataset = await api(`/api/datasets?path=${encodeURIComponent(S.dataset.path)}&refresh=1`); render(); }, "已重新读取"); },
 };

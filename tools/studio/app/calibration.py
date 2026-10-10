@@ -299,6 +299,7 @@ def stage_cmd(stage, body):
         cmd += ["--bag", dataset]
     if command in ("driven", "camera-lidar"):
         cmd += ["--run", str(_run_dir(body.get("run") or ""))]
+    uw = _user_window(body)
     if command == "ground":
         if body.get("stationary"):
             cmd += ["--stationary", *[str(int(v)) for v in body["stationary"]]]
@@ -307,16 +308,34 @@ def stage_cmd(stage, body):
     if command == "axle":
         if body.get("window"):
             cmd += ["--window", *[str(float(v)) for v in body["window"]]]
+        elif uw is not None:
+            d = uw["duration_s"] if uw["duration_s"] is not None else 1e9
+            cmd += ["--window", f"{uw['start_s']:.3f}", f"{d:.3f}"]
         if body.get("dof") in ("rpy_xy", "rpy", "xy"):
             cmd += ["--dof", body["dof"]]
         if body.get("keep_time_offset"):
             cmd.append("--keep-time-offset")
-    if command == "driven" and body.get("window"):
-        cmd += ["--window", *[str(float(v)) for v in body["window"]]]
-    if command == "camera-time" and body.get("duration") not in (None, "", 0, "0"):
-        cmd += ["--duration", str(float(body["duration"]))]
-    if command == "camera-time" and body.get("start") not in (None, ""):
-        cmd += ["--start", str(float(body["start"]))]
+    if command == "driven":
+        if body.get("window"):
+            cmd += ["--window", *[str(float(v)) for v in body["window"]]]
+        elif uw is not None:
+            # driven --window is seconds after the round start; the round itself begins at round_start, which
+            # in manual mode equals uw["start_s"], so the driven window starts at 0 in round-relative time.
+            # When the user asked for "to end", play a long window so all native poses in the run are used.
+            if uw["duration_s"] is None:
+                d_end = 3600.0
+            else:
+                d_end = max(8.0, float(uw["duration_s"]))
+            cmd += ["--window", "0.0", f"{d_end:.3f}"]
+    if command == "camera-time":
+        if body.get("duration") not in (None, "", 0, "0"):
+            cmd += ["--duration", str(float(body["duration"]))]
+        elif uw is not None and uw["duration_s"] is not None:
+            cmd += ["--duration", f"{min(60.0, uw['duration_s']):.3f}"]
+        if body.get("start") not in (None, ""):
+            cmd += ["--start", str(float(body["start"]))]
+        elif uw is not None:
+            cmd += ["--start", f"{uw['start_s']:.3f}"]
     if command == "camera-lidar":
         cmd += ["--frames", str(int(body.get("frames") or 12))]
         if body.get("solve_intrinsics"):
@@ -371,15 +390,86 @@ def latest_fusion_dir(round_name):
     return str(runs[-1]).rstrip("/")
 
 
+def _user_window(body):
+    """Translate window_start / window_duration from the Studio form to a playback window.
+
+    Returns (start_offset, forced_lio_duration, axle_window, ground_override) or None when the user picked
+    "auto" (i.e. let _windows_step / suggest_windows decide). When a custom window is provided, no
+    motion-profile step is emitted and every round/stage runs inside that window:
+      * axle: --window [start, duration] (seconds relative to bag start)
+      * ground: stationary frames taken from [start, start+4 s); moving frames from a straight segment inside
+        the selected window (when detectable) or a 4 s stretch after start+10 s
+      * driven: --window [0, duration - start_round_offset] (seconds relative to round start, i.e.
+        the script's own convention)
+      * rounds (LIO/LIVO playback): start_offset + forced duration
+    """
+    ws = body.get("window_start")
+    wd = body.get("window_duration")
+    if ws in (None, "", 0) and wd in (None, "", 0):
+        return None
+    try:
+        s = float(ws) if ws not in (None, "") else 0.0
+        d = float(wd) if wd not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        return None
+    if s < 0:
+        s = 0.0
+    return {"start_s": s, "duration_s": d if d > 0 else None}
+
+
 def _round_start(ctx, body):
-    """Playback offset of every calibration round: the operator's explicit start_offset wins, otherwise the
-    motion-profile window (standstill head skipped, ROUND_LEAD_S of rest kept for the IMU initialisation)."""
+    """Playback offset of every calibration round: explicit window > explicit start_offset > motion-profile."""
+    uw = _user_window(body)
+    if uw is not None:
+        return float(uw["start_s"])
     if body.get("start_offset") not in (None, ""):
         return float(body["start_offset"]) or None
     return float((ctx.get("win") or {}).get("round_start_s") or 0.0) or None
 
 
-def _windows_step(steps, dataset, round_duration):
+def _round_duration(body, default):
+    uw = _user_window(body)
+    if uw is not None:
+        # manual window: explicit duration always wins; duration=None means "play to end" (duration=0
+        # is how the player/mapping pipeline interprets "use the whole recording from start_offset").
+        if uw["duration_s"] is None:
+            return None
+        return float(uw["duration_s"])
+    d = body.get("_round_duration")
+    if d is not None:
+        d = float(d)
+        return d if d else None
+    return default
+
+
+def _windows_step(steps, dataset, round_duration, body):
+    uw = _user_window(body)
+    if uw is not None:
+        # Manual window: skip the motion analysis step and inject a synthetic "win" ctx so the rest of the
+        # pipeline still picks up round_start_s / ground_* / camera_time_start_s from the user choice.
+        s = uw["start_s"]
+        d = uw["duration_s"] or 1e9
+        # Stationary frames for the ground stage: 10 Hz frames inside [s, s+min(d,4)] (aggregated). If the
+        # user started well into motion the script will simply fit poorly; we don't second-guess that.
+        stat0 = max(0, int(s * 10))
+        stat_n = max(2, int(min(4.0, d) * 10))
+        # Moving frames: default to [s+10s, 4 s] when we do not have a detected straight segment (straight
+        # detection is done in _ground_stage after the motion step is skipped -- we use a safe default and
+        # the script will fall back to its own straight search if these frames are not straight).
+        mv0 = int((s + min(10.0, max(0, d - 4))) * 10)
+        mv_n = int(min(4.0, max(d - 10, 4)) * 10) if d > 14 else 40
+        synth = {"round_start_s": s, "round_duration_s": d if d < 1e9 else 0,
+                 "motion_start_s": s, "camera_time_start_s": s,
+                 "ground_stationary_frames": [stat0, stat_n], "ground_moving_frames": [mv0, mv_n],
+                 "manual": True}
+
+        def _set(ctx, w=synth):
+            ctx["win"] = w
+        steps.append({"title": f"手动标定窗口：{s:.0f} s 起 · {f'{d:.0f} s' if d < 1e9 else '到结尾'}（跳过运动分析）",
+                      "build": lambda ctx: ["/bin/echo", f"manual window start={s:.2f}s " +
+                                            (f"duration={d:.2f}s" if d < 1e9 else "duration=until end")],
+                      "after": _set})
+        return
     steps.append({"title": "运动分析：选择标定窗口（跳过起步前静止段，保留 8 s 静止用于 IMU 初始化）",
                   "build": lambda ctx: [PY, str(CALIB_TOOL), "windows", "--bag", dataset,
                                         "--round-duration", f"{float(round_duration or 60):.0f}"],
@@ -560,25 +650,35 @@ def pipeline_steps(kind, body, mapping_cmd):
             base_file = str(calibration_file(parent))
         except Exception:  # noqa: BLE001 - parent without a file: assess without the extrinsic checks
             base_file = None
-        step0 = datasets.assess_pipeline_step(dataset, base_file)
+        step0 = datasets.assess_pipeline_step(
+            dataset, base_file,
+            window_start=body.get("window_start"), window_duration=body.get("window_duration"))
         if step0:
             steps.append(step0)
     if kind == "lidar":
         datasets.require(dataset)
         lio_duration = body.get("lidar_round_duration")
         lio_duration = 48.0 if lio_duration in (None, "") else float(lio_duration)
-        _windows_step(steps, dataset, lio_duration or 60)
+        lio_duration = _round_duration(body, lio_duration)
+        _windows_step(steps, dataset, lio_duration or 60, body)
         if body.get("skip_axle"):
             steps.append({"title": "跳过后轴对齐（沿用父版本的参考雷达外参）", "build": lambda ctx: ["/bin/echo", "axle skipped"],
                           "after": lambda ctx, lines: ctx.__setitem__("axle_id", parent)})
         else:
+            def _axle_body(ctx):
+                return {"id": parent, "dataset": dataset, "note": body.get("note") or "pipeline: axle",
+                        "window_start": body.get("window_start"), "window_duration": body.get("window_duration")}
             steps.append({"title": "后轴对齐 (axle：参考雷达→后轴，RTK/INS 位姿，整机刚体修正 + LiDAR 时间偏移)",
-                          "build": lambda ctx: stage_cmd("axle", {"id": parent, "dataset": dataset,
-                                                                  "note": body.get("note") or "pipeline: axle"}),
+                          "build": lambda ctx: stage_cmd("axle", _axle_body(ctx)),
                           "after": lambda ctx, lines: ctx.__setitem__("axle_id", parse_version_id(lines))})
-        steps.append({"title": "静止地面精修 (ground：静止帧取起步前，运动帧取行驶段)", "build": lambda ctx: stage_cmd(
-            "ground", {"id": ctx["axle_id"], "dataset": dataset, "note": body.get("note") or "pipeline: ground",
-                       "stationary": ctx["win"]["ground_stationary_frames"], "moving": ctx["win"]["ground_moving_frames"]}),
+        def _ground_body(ctx):
+            gb = {"id": ctx["axle_id"], "dataset": dataset, "note": body.get("note") or "pipeline: ground",
+                  "stationary": ctx["win"]["ground_stationary_frames"],
+                  "moving": ctx["win"]["ground_moving_frames"]}
+            # In manual-window mode ground works entirely on frame indices derived from start; no --window needed.
+            return gb
+        steps.append({"title": "静止地面精修 (ground：静止帧取窗口前段，运动帧取窗口内直线段)",
+                      "build": lambda ctx: stage_cmd("ground", _ground_body(ctx)),
             "after": lambda ctx, lines: ctx.__setitem__("ground_id", parse_version_id(lines))})
         round_name = f"calib_{truck}_lio_{stamp}"
         # The driven stage only reads native poses inside its window (default 8-40 s after the round start), so
@@ -590,19 +690,29 @@ def pipeline_steps(kind, body, mapping_cmd):
             round_name, "lio", str(calibration_file(ctx["ground_id"])), body, duration=lio_duration or None,
             start_offset=_round_start(ctx, body)),
             "after": lambda ctx, lines: ctx.update(round=round_name, fusion_dir=latest_fusion_dir(round_name))})
-        steps.append({"title": "行驶段 6-DoF 精修 (driven)", "build": lambda ctx: stage_cmd(
-            "driven", {"id": ctx["ground_id"], "dataset": dataset, "run": ctx["fusion_dir"],
-                       "note": body.get("note") or "pipeline: driven", "activate": auto_activate}),
+        def _driven_body(ctx):
+            return {"id": ctx["ground_id"], "dataset": dataset, "run": ctx["fusion_dir"],
+                    "note": body.get("note") or "pipeline: driven", "activate": auto_activate,
+                    "window_start": body.get("window_start"), "window_duration": body.get("window_duration")}
+        steps.append({"title": "行驶段 6-DoF 精修 (driven)", "build": lambda ctx: stage_cmd("driven", _driven_body(ctx)),
             "after": lambda ctx, lines: ctx.__setitem__("driven_id", parse_version_id(lines))})
         steps.append({"title": "校验新版本", "build": lambda ctx: [PY, str(CALIB_TOOL), "validate", "--id", ctx["driven_id"]],
                       "after": lambda ctx, lines: ctx.__setitem__("result_id", ctx["driven_id"])})
     elif kind == "camera":
         datasets.require(dataset, camera=True)
-        _windows_step(steps, dataset, cam_dur or 60)
-        steps.append({"title": "相机时间偏移 (camera-time，行驶段 60 s)", "build": lambda ctx: stage_cmd(
-            "camera-time", {"id": parent, "dataset": dataset, "note": body.get("note") or "pipeline: camera-time",
-                            "duration": body.get("camtime_duration") if body.get("camtime_duration") not in (None, "") else 60,
-                            "start": ctx["win"].get("camera_time_start_s", 0.0)}),
+        _windows_step(steps, dataset, cam_dur or 60, body)
+        def _camtime_body(ctx):
+            b = {"id": parent, "dataset": dataset, "note": body.get("note") or "pipeline: camera-time"}
+            if _user_window(body) is not None:
+                # stage_cmd() will inject --start/--duration from the window fields
+                b.update({"window_start": body.get("window_start"), "window_duration": body.get("window_duration")})
+                if body.get("camtime_duration") not in (None, ""):
+                    b["duration"] = float(body["camtime_duration"])
+            else:
+                b["duration"] = body.get("camtime_duration") if body.get("camtime_duration") not in (None, "") else 60
+                b["start"] = ctx["win"].get("camera_time_start_s", 0.0)
+            return b
+        steps.append({"title": "相机时间偏移 (camera-time，行驶段 60 s)", "build": lambda ctx: stage_cmd("camera-time", _camtime_body(ctx)),
             "after": lambda ctx, lines: ctx.__setitem__("camtime_id", parse_version_id(lines))})
         round_name = f"calib_{truck}_livo_{stamp}"
         steps.append({"title": f"LIVO 建图轮次 A {round_name}（基线，俯仰增量 0）", "retry": 1, "round": round_name, "build": lambda ctx: mapping_cmd(
@@ -616,7 +726,8 @@ def pipeline_steps(kind, body, mapping_cmd):
                        base_key="camlidar_id", round0_key="round", baseline_key="round", standard=standard)
     elif kind == "camloop":
         datasets.require(dataset, camera=True)
-        _windows_step(steps, dataset, cam_dur or 60)
+        cam_dur_eff = _round_duration(body, cam_dur or 60)
+        _windows_step(steps, dataset, cam_dur_eff or 60, body)
         steps.append({"title": "当前版本作为待微调版本", "build": lambda ctx: ["/bin/echo", "base version prepared"],
                       "after": lambda ctx, lines: ctx.__setitem__("base_id", parent)})
         _camloop_steps(steps, body, mapping_cmd, truck=truck, stamp=stamp, auto_activate=auto_activate,
