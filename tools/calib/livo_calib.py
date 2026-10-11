@@ -167,7 +167,13 @@ def all_versions():
         return out
     for meta in sorted(CAL_ROOT.glob("*/*/*/meta.json")):
         try:
-            out.append(json.loads(meta.read_text()))
+            m = json.loads(meta.read_text())
+            # the directory is the identity: a copied meta.json must not alias (or 'activate') another version
+            rel = str(meta.parent.relative_to(CAL_ROOT))
+            if m.get("id") != rel:
+                m["meta_id_mismatch"] = m.get("id")
+                m["id"] = rel
+            out.append(m)
         except Exception as e:  # noqa: BLE001
             out.append({"id": str(meta.parent.relative_to(CAL_ROOT)), "error": str(e)})
     return out
@@ -1066,9 +1072,67 @@ def suggest_windows(prof, round_duration=60.0):
             "stationary_head_s": float(ms) if rs > 0 else 0.0}
 
 
+MANUAL_LEAD_MAX_S = 60.0  # a manual window starting mid-drive backs playback up to a standstill at most this far
+
+
+def manual_window(prof, start_s, duration_s=None):
+    """Stage/round windows inside an operator-chosen segment [start, start+duration] (seconds from the bag start).
+
+    The calibration data stay inside the segment; only the playback of the mapping rounds may begin earlier:
+    when the segment starts while driving, the round starts at the last standstill (<= MANUAL_LEAD_MAX_S before),
+    so the mapper initialises at rest and has converged when the segment begins (lead_in_s). The driven stage then
+    uses [lead_in_s, lead_in_s + duration] of the round. Ground stationary frames come from a standstill inside the
+    segment, else the nearest one before it; moving frames from the straightest 4 s drive inside the segment."""
+    v = np.asarray(prof["speed_mps"], float)
+    w = np.radians(np.asarray(prof["yaw_rate_dps"], float))
+    n = len(v)
+    lo = int(min(max(0.0, float(start_s)), max(0, n - 1)))
+    hi = n if not duration_s else int(min(n, lo + float(duration_s)))
+    rest = v < 0.1
+    warnings = []
+    rs = float(lo)
+    if not rest[lo:lo + 2].all():
+        ends = [j for j in range(lo, max(3, int(lo - MANUAL_LEAD_MAX_S)) - 1, -1) if j >= 4 and rest[j - 4:j].all()]
+        if ends:
+            rs = float(max(0, ends[0] - 4))
+        elif lo > 0:
+            warnings.append(f"窗口起点在行驶中，前 {MANUAL_LEAD_MAX_S:.0f} s 内无静止段：建图将在运动中初始化")
+    still_in = [i for i in range(lo, max(lo, hi - 2)) if v[i:i + 2].max() < STATIONARY_MPS]
+    still_before = [i for i in range(lo - 2, -1, -1) if v[i:i + 2].max() < STATIONARY_MPS]
+    if still_in:
+        stationary = (10 * still_in[0] + 2, 20)
+    elif still_before:
+        stationary = (10 * still_before[0] + 2, 20)
+        warnings.append(f"窗口内无静止段：地面静止帧取窗口前 {lo - still_before[0]} s 的静止段")
+    else:
+        stationary = (10 * lo + 2, 20)
+        warnings.append("整段录包无静止段：ground 阶段的静止地面拟合不可信")
+    straight = [t for t in range(lo, max(lo, hi - 4)) if _straight(v, w, t)]
+    if 30 in straight:  # validated default (30-34 s) when it lies in the segment
+        moving_frames = (300, 40)
+    elif straight:
+        t_best = min(straight, key=lambda t: (float(np.degrees(w[t:t + 4]).max()), t))
+        moving_frames = (10 * t_best, 40)
+    else:
+        moving_frames = (10 * min(lo + 10, max(lo, hi - 4)), 40)
+        warnings.append("窗口内无 4 s 直线匀速段：ground 阶段运动帧可能不在直线上")
+    lead = float(lo) - rs
+    return {"manual": True, "window_start_s": float(lo), "window_end_s": float(hi), "lead_in_s": lead,
+            "round_start_s": rs, "round_duration_s": (hi - lo) + lead if duration_s else 0,
+            "motion_start_s": float(lo), "camera_time_start_s": float(lo),
+            "ground_stationary_frames": list(stationary), "ground_moving_frames": list(moving_frames),
+            "driving_m": round(float(v[lo:hi].sum()), 1), "turning_deg": round(float(np.degrees(w[lo:hi]).sum()), 1),
+            "warnings": warnings}
+
+
 def cmd_windows(a):
     prof = motion_profile(a.bag, refresh=a.refresh)
-    win = suggest_windows(prof, round_duration=a.round_duration)
+    if a.start is not None:
+        win = manual_window(prof, a.start, a.duration)
+        for msg in win["warnings"]:
+            print(f"warning: {msg}", flush=True)
+    else:
+        win = suggest_windows(prof, round_duration=a.round_duration)
     win.update({"bag": str(a.bag), "duration_s": prof["duration_s"], "path_m": prof["path_m"]})
     print(json.dumps(win, ensure_ascii=False))
 
@@ -2259,6 +2323,8 @@ def main():
     p.add_argument("--bag", required=True, help="recording: raw ROS 2 root (segment folders) or single bag folder")
     p.add_argument("--round-duration", type=float, default=60.0, help="length of a calibration round (s)")
     p.add_argument("--refresh", action="store_true", help="ignore the cached profile")
+    p.add_argument("--start", type=float, help="operator-chosen segment start (s from the bag start)")
+    p.add_argument("--duration", type=float, help="operator-chosen segment length (s); omitted = to the end")
     p.set_defaults(func=cmd_windows)
 
     p = sub.add_parser("camera-lidar")

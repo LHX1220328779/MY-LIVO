@@ -63,6 +63,10 @@ for pole in 1 3 4 5; do
   p90=$(echo "$shell_lines" | grep "^pole $pole:" | sed 's/.*P50\/P90\/P99 *[0-9.]*\/ *\([0-9.]*\)\/.*/\1/' || true)
   check "pole $pole shell |r-R| P90 [cm]" "$p90" "<=" 6.0
 done
+# startup lamp-pole ghost (view-independent shell metric, fused trajectory, 0-30 s): spread of the 2 s epoch
+# offsets. Native 8.4 cm; v069 fused 11.1 cm (the >=23 cm ghost seen in the viewer); v071 fused 6.0 cm.
+spread=$($py scripts/analysis/startup_pole_shell.py "$fusion" --traj trajectory_optimized.txt 2>/dev/null | grep "^SHELL" | sed 's/.*(max-min) *\([0-9.]*\) cm.*/\1/' || true)
+check "startup pole epoch-offset spread, fused [cm]" "$spread" "<=" 9.0
 # back-LiDAR along-track offset (cruise bin) and wall inter-source offset front_right vs back
 along=$($py scripts/analysis/along_track.py "results/$lio" 0 118 25 0.4 2>/dev/null | grep -A3 "^back_lidar" | grep "speed 5.5-8.0" | sed 's/.*median *\([-+0-9.]*\) cm.*/\1/' || true)
 check "back LiDAR along-track offset, cruise, |median| [cm]" "${along#-}" "<=" 3.0

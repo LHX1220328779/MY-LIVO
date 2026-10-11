@@ -10,6 +10,7 @@ based on:
   fix = auto       the mapping self-check / merger / time-offset stages compensate it automatically
   fix = stage      an offline calibration stage (ground / driven / camtime / axle) solves it
   fix = procedure  needs a change of the recording or playback procedure (re-record, split, rate)
+  fix = playback   only the playback settings need adjusting (split into segments, lower rate); not an alert
   fix = none       neither calibration nor procedure can recover the precision (hardware / source)
 
 A metric that is not 正常 and whose remedy is `procedure` or `none` becomes an *alert*: the
@@ -28,6 +29,7 @@ CLI::
         [--window START DURATION] [--sample-every 6] [--camera-samples 8] [--no-camera]
 """
 import argparse
+import re
 import base64
 import io
 import json
@@ -187,7 +189,7 @@ def verify_parsers(samples):
 
 # ----------------------------------------------------------------------------- metric records
 FIX_LABEL = {"auto": "标定/建图自动补偿", "stage": "需运行离线标定阶段", "procedure": "需调整采集或回放流程",
-             "none": "标定无法补救"}
+             "playback": "调整回放设置（分段 / 倍速）", "none": "标定无法补救"}
 STATUS_ORDER = {"ok": 0, "info": 0, "na": 0, "warn": 1, "bad": 2}
 
 
@@ -290,6 +292,21 @@ def load_calibration(path):
                 mats[topic] = np.asarray(entry[key], float).reshape(4, 4)
     return {"path": str(path), "matrices": mats, "time_offsets": calib.get("time_offsets", {}),
             "type": calib.get("calibration_type", "")}
+
+
+def vehicle_ids(ds, calib_path):
+    """(mine, truck number) of the recording (segment names `<Kind>_<mine>_<NN>_...`) and of the calibration path."""
+    data = set()
+    for seg in ds.segments:
+        m = re.match(r"^[A-Za-z]+_([a-z]+)_(\d+)_", getattr(seg, "name", ""))
+        if m:
+            data.add((m.group(1), int(m.group(2))))
+    cal = None
+    if calib_path:
+        m = re.search(r"/([a-z]+)/truck(\d+)[a-z]*/", str(calib_path)) or re.search(r"truck(\d+)", str(calib_path))
+        if m:
+            cal = (m.group(1), int(m.group(2))) if m.re.groups == 2 else (None, int(m.group(1)))
+    return data, cal
 
 
 def cloud_xyz(data, max_range=32.0):
@@ -758,6 +775,18 @@ def run(a):
           plain="相邻分段之间是否有秒级空洞。空洞=这段没数据，地图会断一块，前端要重收敛。",
           note="同一话题集合的相邻分段之间 >0.5 s 的空洞；空洞期间没有点云与 IMU，地图在此处缺失且前端需要重新收敛。",
           basis="dataset.py 覆盖检查；录制软件分段切换应无缝（truck29: 8 段无缝）。")
+
+    data_ids, cal_id = vehicle_ids(ds, a.calibration)
+    if data_ids and cal_id:
+        same = any(n == cal_id[1] and (cal_id[0] is None or m == cal_id[0]) for m, n in data_ids)
+        dname = "、".join(f"{m} {n} 号车" for m, n in sorted(data_ids))
+        cname = f"{cal_id[0] + ' ' if cal_id[0] else ''}{cal_id[1]} 号车"
+        R.add(g_int, "vehicle_match", "数据车号 vs 标定车号", 0 if same else 1, "", status="ok" if same else "bad",
+              fix="stage", display=f"一致（{dname}）" if same else f"数据 {dname} · 标定 {cname}",
+              plain="录包来自哪台车、所选标定属于哪台车。不一致时外参和时间偏移都不适用，下面的地面倾角/高度差等外参检查会虚高；"
+                    "先为这台车导入并标定，再评估和建图。",
+              note="数据车号取自分段名（如 Camera_wuhu_28_…），标定车号取自标定路径（…/wuhu/truck29/…）。",
+              basis="不同车的雷达安装不同：用 truck29 外参看 28 号车会出现数度倾角差、米级高度差。")
     dup, back = dropped.get("dropped_duplicate", 0), dropped.get("dropped_backwards", 0)
     dd_pct = 100.0 * (dup + back) / max(1, counters["messages"])
     R.add(g_int, "ordering", "重复 / 乱序消息", dd_pct, "%", ok=0.5, warn=2.0, fix="auto",
@@ -1132,17 +1161,17 @@ def run(a):
         st_t = "ok" if tilt <= 0.2 else "warn" if tilt <= 1.0 else "bad"
         st_z = "ok" if dz <= 4.0 else "warn" if dz <= 15.0 else "bad"
         R.add(g_lid, "extrinsic_tilt", "静止段雷达间地面倾角差（最大）", tilt, "°", status=st_t, fix="auto",
-              fix_bad="stage" if tilt <= 3.0 else "none",
+              fix_bad="stage",
               display=f"{tilt:.2f}°（{wt}：前后向 {solved[wt]['rot_x_deg']:+.2f}° 左右向 {solved[wt]['rot_y_deg']:+.2f}°）",
-              limits="≤ 0.2° 正常（低于自检生效阈值）· ≤ 1.0° 关注（建图自检自动修正）· ≤ 3° 需 ground/driven 阶段 · 更大＝安装/文件错误",
+              limits="≤ 0.2° 正常（低于自检生效阈值）· ≤ 1.0° 关注（建图自检自动修正）· > 1° 需 ground/driven 阶段重标；> 3° 多为安装变动或标定文件不属于这台车（见“数据车号 vs 标定车号”）",
               plain="起步静止时各路雷达“看到的地面”和参考雷达差几度。≤0.2° 可接受；0.2–1° 起步自检会自动修正；>1° 需要 ground/driven 阶段重标。",
               note="各雷达静止地面相对参考雷达（front）地面的倾角差；对应 SLAM 起步静止外参自检的 roll/pitch 修正量。",
               basis="config: max_rotation_deg 1.0 / min_apply 0.2°；truck05 原始外参 0.3° 由 driven 阶段闭合。",
               extra={k: {kk: (round(vv, 3) if isinstance(vv, float) else vv) for kk, vv in v.items()} for k, v in gc.items()})
         R.add(g_lid, "extrinsic_z", "静止段雷达间地面高度差（最大）", dz, "cm", status=st_z, fix="auto",
-              fix_bad="stage" if dz <= 50.0 else "none",
+              fix_bad="stage",
               display=f"{dz:.1f} cm（{wz}，重叠 {solved[wz]['overlap_cells']} 格，残差 {solved[wz]['residual_cm']:.1f} cm）",
-              limits="≤ 4 cm 正常 · ≤ 15 cm 关注（自检自动修正）· ≤ 50 cm 需 ground/driven 阶段 · 更大＝安装/文件错误",
+              limits="≤ 4 cm 正常 · ≤ 15 cm 关注（自检自动修正）· > 15 cm 需 ground 阶段重标；> 50 cm 多为安装变动或标定文件不属于这台车",
               plain="静止地面各路看出来的高度差几厘米。≤4 cm 好；4–15 cm 起步自检修；>15 cm 要 ground 阶段。",
               note="对应自检的 z 修正量（max_height 0.15 m / min_apply 0.04 m）。", basis="truck05 原始外参：后雷达 14 cm 沿车 + 6 cm z。")
     else:
@@ -1226,9 +1255,9 @@ def run(a):
               plain="有几段 ≥4 s 的直线匀速。ground 阶段取后雷达行驶帧、driven 阶段默认窗口都要用到直线段。",
               note="ground 阶段的后雷达行驶帧与 driven 阶段窗口选择需要直线段。", basis="livo_calib suggest_windows 规则。")
         kf = ref_stats["moving_s"] * 2.0
-        R.add(g_route, "keyframes", "预计关键帧数（0.5 s 一帧）", kf, "帧", ok=1000, warn=1500, fix="procedure",
+        R.add(g_route, "keyframes", "预计关键帧数（0.5 s 一帧）", kf, "帧", ok=1000, warn=1500, fix="playback", status="ok" if kf <= 1000 else "warn",
               display=f"≈{kf:.0f} 帧",
-              plain="整段大概会进后端多少关键帧。1000 帧以内实时；超过 1500 帧建议分段回放或降倍速，否则末段丢帧影响精度。",
+              plain="整段大概会进后端多少关键帧。这不是数据缺陷：1000 帧以内可整段实时回放；更多时在建图页设“起点 / 时长”分段回放或降倍速即可，否则末段可能丢帧。",
               note="后端 iSAM2 求解时间随关键帧数增长（P50 78 ms@481 → 298 ms@1286 帧）；超过 1000 帧建议分段回放或 --rate 0.7，否则末段传输丢帧。",
               basis="truck05 720 s：末段负载丢帧使 LIO 最大误差 8.3 → 13.5 cm。")
         gp = ref_stats["grade_p99_pct"]
@@ -1271,6 +1300,12 @@ def run(a):
 
 def precision_outlook(verdict, alerts, fixable):
     bad_alerts = [x for x in alerts if x["status"] == "bad"]
+    mismatch = next((x for x in fixable if x["id"] == "vehicle_match"), None)
+    if mismatch:
+        rest = f" 另有 {len(alerts)} 项数据源问题标定无法补救，见下方列表。" if alerts else ""
+        return {"level": "bad", "title": "所选标定不属于这台车",
+                "text": f"{mismatch['display']}。外参、地面倾角/高度差等检查是按别的车的标定算出来的，数值没有参考意义；"
+                        "先在标定页为这台车导入出厂标定并运行 LiDAR 标定流水线，再重新评估和建图。" + rest}
     if verdict == "ok":
         return {"level": "ok", "title": "数据质量达到 truck29 参照水平",
                 "text": "所有指标在正常区间：标定流水线与建图自检可按常规流程运行，预期融合精度与 truck29 同级（xy 最大误差 ≤ 8.5 cm）。"}

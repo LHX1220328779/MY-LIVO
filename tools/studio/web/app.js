@@ -385,11 +385,22 @@ function winLabel(w, durS) {
   if (!(eff.duration_s > 0)) return `从 ${eff.start_s} s 起（到结束）`;
   return `${eff.start_s} – ${(eff.start_s + eff.duration_s).toFixed(0)} s（${eff.duration_s} s）`;
 }
-function windowWidget(stateKey, title) {
+function winProblem(w, durS) {
+  // A typed-but-unusable window must not silently fall back to "auto".
+  if (!w || w.mode === "auto") return "";
+  if (w.mode === "head") return Number(w.head_dur) > 0 ? (durS && Number(w.head_dur) > durS ? "超过数据总长，将用到结尾" : "") : "请填写开头时长";
+  const s = Number(w.start) || 0;
+  const e = w.end === "" || w.end == null ? NaN : Number(w.end);
+  if (durS && s >= durS) return "起始超过数据总长";
+  if (isFinite(e) && e <= s) return "结束需大于起始，当前按自动处理";
+  return "";
+}
+function windowWidget(stateKey, title, note = "") {
   const w = S[stateKey];
   const dur = S.dataset?.duration_s || 0;
   const mode = w.mode || "auto";
-  const hint = `<div class="small muted" style="grid-column:1/-1">当前：<b>${esc(winLabel(w, dur))}</b>${dur ? ` · 数据总长 ${Math.round(dur)} s` : ""}</div>`;
+  const problem = winProblem(w, dur);
+  const hint = `<div class="small muted" style="grid-column:1/-1">当前：<b>${esc(winLabel(w, dur))}</b>${dur ? ` · 数据总长 ${Math.round(dur)} s` : ""}${problem ? ` · <b class="warn">${esc(problem)}</b>` : ""}${mode !== "auto" && note ? `<div>${esc(note)}</div>` : ""}</div>`;
   const setMode = (m) => `data-act="win-mode" data-key="${stateKey}" data-mode="${m}"`;
   const fi = (key, val, step, ph) => `<input type="number" step="${step}" min="0" data-act="win-field" data-key="${stateKey}" data-field="${key}" value="${val == null ? "" : esc(val)}" placeholder="${ph || ""}">`;
   return `<section class="ax-win"><header><b>${esc(title)}</b><span class="small muted">评估/标定取哪一段时间</span></header>
@@ -469,7 +480,7 @@ function axValue(display) {
   if (d.length > 40 && d.includes(" · ")) { const parts = d.split(" · "); return `<span class="mono">${esc(parts[0])}</span><div class="ax-vd">${esc(parts.slice(1).join(" · "))}</div>`; }
   return `<span class="mono">${esc(d)}</span>`;
 }
-const AX_FIX_SHORT = { "标定/建图自动补偿": "自动补偿", "需运行离线标定阶段": "离线标定阶段", "需调整采集或回放流程": "采集/回放流程", "标定无法补救": "标定无法补救" };
+const AX_FIX_SHORT = { "标定/建图自动补偿": "自动补偿", "需运行离线标定阶段": "离线标定阶段", "需调整采集或回放流程": "采集/回放流程", "标定无法补救": "标定无法补救", "调整回放设置（分段 / 倍速）": "回放设置" };
 function axMetricRow(m) {
   const tip = [m.note, m.basis ? `依据：${m.basis}` : ""].filter(Boolean).join("\n");
   const fix = m.fix_label ? `<div class="ax-fix ${m.alert ? "alert" : ""}" title="${esc(m.fix_label)}">${m.alert ? "⚠ " : ""}${esc(AX_FIX_SHORT[m.fix_label] || m.fix_label)}</div>` : "";
@@ -549,12 +560,12 @@ function pageCalib() {
     <div class="row">${v?.active ? `<span class="badge dark">激活：${esc(v.active.split("/").pop())}</span>` : '<span class="badge bad">无激活版本</span>'}<button class="btn sm" data-act="toggle-import">${S.showImport ? "收起" : "新建车辆 / 导入出厂标定"}</button></div></div>
     ${S.showImport || !S.vehicles.length ? importForm(c) : ""}
     ${stepperHtml(v)}
+    ${windowWidget("winCalib", "标定时间窗口", "标定只使用窗口内的数据；窗口从行驶中开始时，建图轮次自动从窗口前最近的静止处起播（IMU 需静止初始化），窗口内没有静止段时地面静止帧取窗口前的静止段。")}
     <div class="grid g2" style="margin-top:8px">
       <div class="stat" style="padding:14px"><div class="row" style="justify-content:space-between"><div><b>LiDAR 标定流水线</b><div class="small muted">后轴对齐（RTK/INS 位姿，参考雷达→后轴，整机修正）→ 静止地面精修 → LIO 建图（保存地图）→ 行驶段 6-DoF 精修 → 校验${c.auto_activate ? " → 激活" : ""}</div><div class="small muted">约 6 分钟（含一次 48 s 回放）· 需要 LiDAR/IMU/INS 数据源 · 原始出厂外参与已精修父版本都可直接运行</div></div><button class="btn primary" data-act="pipeline" data-kind="lidar" ${running || !v?.active || !d?.lio_ready ? "disabled" : ""}>运行</button></div></div>
       <div class="stat" style="padding:14px"><div class="row" style="justify-content:space-between"><div><b>相机标定流水线</b><div class="small muted">相机时间偏移 → LIVO 建图 A（基线）→ 偏航复核（灯柱投影列偏差，俯仰不动）→ 俯仰闭环（标准＝±0.05° 扫描两轮拟合斜率；快速＝沿用历史斜率 0.105/°，只测零点）→ 闭环版本 → LIVO 验证建图 → 闭环判定 A/验证 → 校验${c.auto_activate ? " → 通过则激活" : ""}</div><div class="small muted">标准 ≈12 min（4 × 60 s 回放）· 快速 ≈8 min（2 × 60 s）· 默认只回放前 60 s（前两轮数据）· 需要含相机的数据源 · 未通过闭环的版本不会被激活</div></div><button class="btn primary" data-act="pipeline" data-kind="camera" ${running || !v?.active || !d?.livo_ready ? "disabled" : ""}>运行</button></div></div>
       <div class="stat" style="padding:14px"><div class="row" style="justify-content:space-between"><div><b>相机外参闭环微调（日常，最快）</b><div class="small muted">以当前激活版本为起点：<b>复用最近一次同版本 LIVO 轮次</b>作为零俯仰点（无需重跑）→ 用已知斜率算出过零点 → 闭环版本 → 一轮 LIVO 验证 → 闭环判定${c.auto_activate ? " → 通过则激活" : ""}</div><div class="small muted">快速 ≈4–5 min（1 次回放）· 标准 ≈15 min（4 次回放）· 复用要求该轮次已评估且时长 ≥50 s（60 s 短轮次可复用）</div></div><button class="btn primary" data-act="pipeline" data-kind="camloop" ${running || !v?.active || !d?.livo_ready ? "disabled" : ""}>运行</button></div></div>
     </div>
-    ${windowWidget("winCalib", "标定时间窗口")}
     <div class="row" style="margin-top:10px;justify-content:space-between"><div class="small muted">父版本：<b>${esc(v?.active || "—")}</b> · 数据源：<b>${esc(d?.name || "未选择")}</b> ${datasetBadges(d)}</div><div class="row" style="gap:18px"><label class="check small">${`<input type="checkbox" data-act="toggle" data-section="calibration" data-key="auto_activate" ${c.auto_activate ? "checked" : ""}><span class="switch"></span><span>流水线完成后自动激活（仅在闭环判定通过时）</span>`}</label><label class="check small">${`<input type="checkbox" data-act="toggle" data-section="calibration" data-key="fast" ${c.fast !== false ? "checked" : ""}><span class="switch"></span><span>快速模式（沿用本车实测俯仰斜率只测零点；本车无斜率或单点拟合被拒时自动转标准扫描；取消勾选＝标准扫描）</span>`}</label></div></div>
   </div>
   <div class="grid" style="grid-template-columns: 1fr 380px; margin-top:16px">

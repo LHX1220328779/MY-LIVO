@@ -55,7 +55,8 @@ def catalogue(refresh=False):
         reg = read_json(CAL_ROOT / "registry.json", {"active": {}})
         versions = []
         for meta in sorted(CAL_ROOT.glob("*/*/*/meta.json")):
-            m = read_json(meta, {"id": str(meta.parent.relative_to(CAL_ROOT)), "error": "meta unreadable"})
+            m = read_json(meta, {"error": "meta unreadable"})
+            m["id"] = str(meta.parent.relative_to(CAL_ROOT))  # directory is the identity (copied meta.json)
             versions.append(m)
         payload = {"active": reg.get("active", {}), "versions": versions, "stages": STAGE_FALLBACK,
                    "tool_error": text.strip()[-400:]}
@@ -421,7 +422,7 @@ def _round_start(ctx, body):
     """Playback offset of every calibration round: explicit window > explicit start_offset > motion-profile."""
     uw = _user_window(body)
     if uw is not None:
-        return float(uw["start_s"])
+        return float((ctx.get("win") or {}).get("round_start_s", uw["start_s"]))
     if body.get("start_offset") not in (None, ""):
         return float(body["start_offset"]) or None
     return float((ctx.get("win") or {}).get("round_start_s") or 0.0) or None
@@ -442,33 +443,35 @@ def _round_duration(body, default):
     return default
 
 
+def _driven_window(ctx, body):
+    """driven --window (start, end) in seconds after the round's first frame for a manual segment."""
+    uw = _user_window(body)
+    lead = float((ctx.get("win") or {}).get("lead_in_s", 0.0))
+    end = 3600.0 if uw["duration_s"] is None else lead + max(8.0, float(uw["duration_s"]))
+    return [lead, end]
+
+
+def _play_duration(ctx, body, default):
+    """Round playback length: in manual mode lead-in + segment (None = to the end), else `default`."""
+    uw = _user_window(body)
+    if uw is None:
+        return default
+    if uw["duration_s"] is None:
+        return None
+    return float(uw["duration_s"]) + float((ctx.get("win") or {}).get("lead_in_s", 0.0))
+
+
 def _windows_step(steps, dataset, round_duration, body):
     uw = _user_window(body)
     if uw is not None:
-        # Manual window: skip the motion analysis step and inject a synthetic "win" ctx so the rest of the
-        # pipeline still picks up round_start_s / ground_* / camera_time_start_s from the user choice.
-        s = uw["start_s"]
-        d = uw["duration_s"] or 1e9
-        # Stationary frames for the ground stage: 10 Hz frames inside [s, s+min(d,4)] (aggregated). If the
-        # user started well into motion the script will simply fit poorly; we don't second-guess that.
-        stat0 = max(0, int(s * 10))
-        stat_n = max(2, int(min(4.0, d) * 10))
-        # Moving frames: default to [s+10s, 4 s] when we do not have a detected straight segment (straight
-        # detection is done in _ground_stage after the motion step is skipped -- we use a safe default and
-        # the script will fall back to its own straight search if these frames are not straight).
-        mv0 = int((s + min(10.0, max(0, d - 4))) * 10)
-        mv_n = int(min(4.0, max(d - 10, 4)) * 10) if d > 14 else 40
-        synth = {"round_start_s": s, "round_duration_s": d if d < 1e9 else 0,
-                 "motion_start_s": s, "camera_time_start_s": s,
-                 "ground_stationary_frames": [stat0, stat_n], "ground_moving_frames": [mv0, mv_n],
-                 "manual": True}
-
-        def _set(ctx, w=synth):
-            ctx["win"] = w
-        steps.append({"title": f"手动标定窗口：{s:.0f} s 起 · {f'{d:.0f} s' if d < 1e9 else '到结尾'}（跳过运动分析）",
-                      "build": lambda ctx: ["/bin/echo", f"manual window start={s:.2f}s " +
-                                            (f"duration={d:.2f}s" if d < 1e9 else "duration=until end")],
-                      "after": _set})
+        # Manual window: the motion analysis runs inside the chosen segment. Calibration data stay in the
+        # segment; a round whose segment starts mid-drive begins at the last standstill before it (lead-in)
+        # so the mapper initialises at rest (livo_calib manual_window).
+        s, d = uw["start_s"], uw["duration_s"]
+        args = ["--start", f"{s:.3f}"] + (["--duration", f"{d:.3f}"] if d else [])
+        steps.append({"title": f"手动标定窗口：{s:.0f} s 起 · {f'{d:.0f} s' if d else '到结尾'}（窗口内选静止/直线帧，建图从窗口前最近的静止处起播）",
+                      "build": lambda ctx: [PY, str(CALIB_TOOL), "windows", "--bag", dataset, *args],
+                      "after": lambda ctx, lines: ctx.__setitem__("win", _json_tail(lines))})
         return
     steps.append({"title": "运动分析：选择标定窗口（跳过起步前静止段，保留 8 s 静止用于 IMU 初始化）",
                   "build": lambda ctx: [PY, str(CALIB_TOOL), "windows", "--bag", dataset,
@@ -687,13 +690,14 @@ def pipeline_steps(kind, body, mapping_cmd):
         # lidar_round_duration=0 restores the previous full-length behaviour.
         title_extra = f"，{lio_duration:.0f} s（起点按运动窗口）" if lio_duration else ""
         steps.append({"title": f"LIO 建图轮次 {round_name}（用于行驶段精修{title_extra}）", "retry": 1, "round": round_name, "build": lambda ctx: mapping_cmd(
-            round_name, "lio", str(calibration_file(ctx["ground_id"])), body, duration=lio_duration or None,
+            round_name, "lio", str(calibration_file(ctx["ground_id"])), body, duration=_play_duration(ctx, body, lio_duration or None),
             start_offset=_round_start(ctx, body)),
             "after": lambda ctx, lines: ctx.update(round=round_name, fusion_dir=latest_fusion_dir(round_name))})
         def _driven_body(ctx):
             return {"id": ctx["ground_id"], "dataset": dataset, "run": ctx["fusion_dir"],
                     "note": body.get("note") or "pipeline: driven", "activate": auto_activate,
-                    "window_start": body.get("window_start"), "window_duration": body.get("window_duration")}
+                    "window_start": body.get("window_start"), "window_duration": body.get("window_duration"),
+                    **({"window": _driven_window(ctx, body)} if _user_window(body) is not None else {})}
         steps.append({"title": "行驶段 6-DoF 精修 (driven)", "build": lambda ctx: stage_cmd("driven", _driven_body(ctx)),
             "after": lambda ctx, lines: ctx.__setitem__("driven_id", parse_version_id(lines))})
         steps.append({"title": "校验新版本", "build": lambda ctx: [PY, str(CALIB_TOOL), "validate", "--id", ctx["driven_id"]],
