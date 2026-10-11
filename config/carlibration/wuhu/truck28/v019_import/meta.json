@@ -1,0 +1,187 @@
+{
+  "id": "wuhu/truck28/v019_import",
+  "mine": "wuhu",
+  "truck": "truck28",
+  "version": "v019_import",
+  "stage": "import",
+  "stage_label": "导入出厂标定",
+  "advisory": false,
+  "parent": null,
+  "lineage": [
+    "wuhu/truck28/v019_import"
+  ],
+  "created": "2026-10-11T23:31:53+08:00",
+  "note": "factory reproduction test 2026-10-11",
+  "inputs": {
+    "source": "/home/project/MY-LIVO/calibration/calibration_wuhu_2026.01.22_v5.0.6_1/calibration/perception_truck28.json"
+  },
+  "metrics": {
+    "normalisation": [
+      "transform_matrix_lidar_1: re-orthonormalised (max deviation 2.3e-05)",
+      "transform_matrix_lidar_2: re-orthonormalised (max deviation 8.4e-05)",
+      "transform_matrix_lidar_3: re-orthonormalised (max deviation 7.2e-05)",
+      "transform_matrix_lidar_6: re-orthonormalised (max deviation 5.2e-05)",
+      "raw supplier export: camera->rear-axle derived from transform_matrix_lidar_6 and tf_lidar_to_camera",
+      "rig-to-rear-axle alignment of a supplier file is unverified: run the axle stage next",
+      "camera intrinsics recovered from the supplier ground-distance curves: fx 1637.0 fy 1851.4 cx 1029.3 cy 495.6 (the truck29 defaults would be off by fx -0.3 % fy -0.2 % cx +58 px cy -39 px)"
+    ]
+  },
+  "changes_vs_parent": {},
+  "summary": {
+    "lidars": [
+      {
+        "lidar": "front_right_lidar",
+        "key": "transform_matrix_lidar_1",
+        "t": [
+          2.8852,
+          5.5561,
+          1.5282
+        ],
+        "rpy_deg": [
+          -0.034,
+          -0.012,
+          -0.762
+        ]
+      },
+      {
+        "lidar": "back_lidar",
+        "key": "transform_matrix_lidar_2",
+        "t": [
+          -0.0766,
+          -0.6194,
+          0.4304
+        ],
+        "rpy_deg": [
+          0.068,
+          2.614,
+          -91.022
+        ]
+      },
+      {
+        "lidar": "front_left_lidar",
+        "key": "transform_matrix_lidar_3",
+        "t": [
+          -2.9227,
+          5.3841,
+          1.5137
+        ],
+        "rpy_deg": [
+          -0.818,
+          1.69,
+          177.804
+        ]
+      },
+      {
+        "lidar": "front_lidar",
+        "key": "transform_matrix_lidar_6",
+        "t": [
+          0.1012,
+          7.6178,
+          -0.1568
+        ],
+        "rpy_deg": [
+          -0.493,
+          -2.768,
+          89.53
+        ]
+      }
+    ],
+    "camera_to_rear": {
+      "t": [
+        0.3599,
+        7.5373,
+        1.6068
+      ],
+      "rpy_deg": [
+        -101.092,
+        -2.34,
+        0.349
+      ]
+    },
+    "camera": {
+      "topic": "/midrange_camera/image_raw",
+      "width": 1920,
+      "height": 1080,
+      "intrinsics": [
+        1637.05,
+        1851.4,
+        1029.33,
+        495.55
+      ],
+      "distortion": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "intrinsics_check": {
+        "method": "supplier ground-distance curves (midrange_camera[0].equation_*m)",
+        "curves": 10,
+        "distances_m": [
+          10.0,
+          20.0,
+          30.0,
+          40.0,
+          50.0,
+          60.0,
+          70.0,
+          80.0,
+          90.0,
+          100.0
+        ],
+        "fits": {
+          "free": {
+            "intrinsics": [
+              1637.05,
+              1851.4,
+              1029.33,
+              495.55
+            ],
+            "rms_px": 0.014,
+            "circle_centre_rear_m": [
+              0.0,
+              7.38
+            ],
+            "ground_z_rear_m": -1.22
+          },
+          "square": {
+            "intrinsics": [
+              1639.36,
+              1639.36,
+              864.27,
+              446.63
+            ],
+            "rms_px": 1.072,
+            "circle_centre_rear_m": [
+              0.806,
+              7.314
+            ],
+            "ground_z_rear_m": -1.588
+          }
+        },
+        "model": "independent fx / fy",
+        "rms_px": 0.014,
+        "camera_height_m": 2.827,
+        "deviation_vs_truck29_defaults": {
+          "fx_pct": -0.34,
+          "fy_pct": -0.22,
+          "cx_px": 58.3,
+          "cy_px": -38.7
+        }
+      },
+      "source": "supplier ground-distance curves equation_*m (independent fx / fy, rms 0.014 px)"
+    },
+    "time_offsets": {
+      "lidar": -0.125,
+      "lidar_frontend": -0.125,
+      "camera": 0.0,
+      "rtk_position": 0.025,
+      "ins_attitude": 0.0,
+      "lidar_source": "import default (unmeasured; run the axle stage to auto-measure)",
+      "source": "import (verify with camera-time / LIO evaluation)"
+    }
+  },
+  "calibration_file": "/home/project/MY-LIVO/config/carlibration/wuhu/truck28/v019_import/calibration.json",
+  "overlays": []
+}

@@ -188,7 +188,9 @@ def icp(Q, Rm, Pw, T, center, lr, lt, target, active, x0, prior, normal_filter=N
         if it == 0:
             first = stats
         dt_med = float(np.median(np.abs(T[ok] - tq)))   # time gap between a point and its reference match
-        if np.linalg.norm(step[:3]) < 1e-6 and np.linalg.norm(step[3:]) < 1e-5:
+        # converged once a step is far below calibration precision (0.0006 deg / 0.1 mm): the re-matching of
+        # a few boundary points can otherwise keep a limit cycle of ~1e-6 rad / 0.03 mm going indefinitely
+        if np.linalg.norm(step[:3]) < 1e-5 and np.linalg.norm(step[3:]) < 1e-4:
             break
     return x, first, stats, dt_med
 

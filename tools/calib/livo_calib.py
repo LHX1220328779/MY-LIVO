@@ -79,6 +79,10 @@ STAGES = {
     "driven": {"order": 4, "label": "行驶段 6-DoF 精修", "command": "driven",
                "input": "原始录制 + 一次 LIO 建图结果", "output": "四个 LiDAR 之间的 6-DoF 一致性",
                "needs": ["dataset", "run"], "mapping": "lio", "advisory": False, "seconds": 90},
+    "rtktime": {"order": 4.5, "label": "RTK 位置关联时间", "command": "rtk-time",
+                "input": "1–2 次 LIO 建图结果（流水线自动生成）",
+                "output": "time_offsets.rtk_position（地图自洽：不同车速/方向下同一结构重合；两轮割线闭环）",
+                "needs": ["run"], "mapping": "lio", "advisory": False, "seconds": 30},
     "camtime": {"order": 5, "label": "相机时间偏移", "command": "camera-time",
                 "input": "原始录制（含相机）", "output": "time_offsets.camera（光流 vs 陀螺）",
                 "needs": ["dataset", "camera"], "mapping": None, "advisory": False, "seconds": 120},
@@ -698,6 +702,139 @@ def cmd_from_precheck(a):
                      note=a.note or f"adopted SLAM static-start self-check from {a.run_dir}",
                      inputs={"run_dir": a.run_dir, "report": str(report)}, metrics={"applied": applied},
                      activate=a.activate)
+
+
+# ----------------------------------------------------------------------------- RTK position time association
+# Fraction of an offset error that one round's map-consistency estimate recovers (the backend follows the
+# native odometry through the accelerations that make the offset observable). Measured on truck28: 0.55-0.65.
+# Only used to place the second (probe) round and as a fallback; the result comes from the two-round secant.
+RTK_TIME_GAIN_PRIOR = 0.6
+RTK_TIME_TOL_S = 0.0015     # |correction| below this: the parent is already map-consistent, nothing to do
+RTK_TIME_MAX_SE_S = 0.006   # observability gate (jackknife standard error of one round's estimate)
+RTK_TIME_SIGNIFICANCE = 2.5  # a correction must exceed this many standard errors to be acted on
+RTK_TIME_MAX_STEP_S = 0.08  # plausibility bound on the total change
+
+
+def _fusion_run(path):
+    p = pathlib.Path(path)
+    if (p / "frames.csv").exists():
+        return p
+    runs = sorted((p / "Log" / "fusion").glob("*/"))
+    if not runs:
+        sys.exit(f"rtk-time: {p} has no fusion run (Log/fusion/<stamp>/frames.csv)")
+    return runs[-1]
+
+
+def _run_calibration_file(run):
+    for line in (run / "parameters.txt").read_text().splitlines():
+        if line.startswith("multi_lidar.calibration_file="):
+            return line.split("=", 1)[1].strip()
+    return None
+
+
+def estimate_rtk_time(run, log_path):
+    """Map-consistency estimate of one round (scripts/estimate_rtk_time_offset.py), JSON dict."""
+    json_path = log_path.with_suffix(".json")
+    cmd = ["/usr/bin/python3", str(SCRIPTS / "estimate_rtk_time_offset.py"), "--run", str(run), "--json",
+           str(json_path), "--max-se-ms", f"{1000 * RTK_TIME_MAX_SE_S:.2f}"]
+    lines = run_script(cmd, log_path)
+    return json.loads(json_path.read_text()), lines
+
+
+def cmd_rtk_time(a):
+    """Two-step closed loop, both steps automatic (the Studio LiDAR pipeline chains them):
+      probe : --run R1 (round with the parent)  -> keep (unobservable / already consistent) or the
+              rtk_position of a probe round placed at the predicted optimum
+      final : --run R1 --run2 R2 (round with the probe value) -> secant zero of the two corrections ->
+              new version (stage rtktime)."""
+    pdir, parent_calib, mine, truck = parent_info(a.id)
+    offsets = parent_calib.get("time_offsets") or {}
+    rtk0 = float(offsets.get("rtk_position", DEFAULT_TIME_OFFSETS["rtk_position"]))
+    run1 = _fusion_run(a.run)
+    cal1 = _run_calibration_file(run1)
+    if cal1 and pathlib.Path(cal1).resolve() != (pdir / "calibration.json").resolve():
+        sys.exit(f"rtk-time: {run1} was mapped with {cal1}, not with the parent {a.id}")
+    work = run1.parent.parent.parent  # round directory
+    try:
+        est1, lines1 = estimate_rtk_time(run1, work / "rtk_time_estimate.log")
+    except SystemExit as exc:
+        if a.run2:
+            raise
+        # an optional refinement must not fail the pipeline: keep the parent and say why
+        why = f"estimate failed ({exc}): rtk_position of the parent kept"
+        print(why, flush=True)
+        print(json.dumps({"id": a.id, "decision": "keep", "reason": why, "probe_rtk_position_s": None}, ensure_ascii=False))
+        return
+    e1, d1, se1 = est1["run_effective_offset_s"], est1["correction_s"], est1["correction_se_s"]
+    summary = {"parent": a.id, "parent_rtk_position_s": rtk0, "round1": {"run": str(run1), "effective_s": e1,
+               "correction_s": d1, "se_s": se1, "observable": est1["observable"], "frames": est1["frames"],
+               "informative_voxels": est1["informative_voxels"]}}
+    if not a.run2:
+        if not est1["observable"]:
+            decision, why = "keep", (f"not observable on this round (se {1000 * se1:.1f} ms > {1000 * RTK_TIME_MAX_SE_S:.0f} ms "
+                                     f"or no interior minimum): rtk_position of the parent kept")
+        elif abs(d1) <= max(RTK_TIME_TOL_S, RTK_TIME_SIGNIFICANCE * se1):
+            decision, why = "keep", (f"parent already map-consistent (correction {1000 * d1:+.1f} ms, "
+                                     f"se {1000 * se1:.1f} ms)")
+        else:
+            decision, why = "probe", f"correction {1000 * d1:+.1f} ms: probe round at the predicted optimum"
+        step = float(np.clip(d1 / RTK_TIME_GAIN_PRIOR, -RTK_TIME_MAX_STEP_S, RTK_TIME_MAX_STEP_S))
+        out = {"id": a.id, "decision": decision, "reason": why, "probe_rtk_position_s": round(rtk0 + step, 4)
+               if decision == "probe" else None, **summary}
+        print(why, flush=True)
+        print(json.dumps(out, ensure_ascii=False))
+        return
+    run2 = _fusion_run(a.run2)
+    est2, lines2 = estimate_rtk_time(run2, run2.parent.parent.parent / "rtk_time_estimate.log")
+    if abs(est2["run_effective_offset_s"] - est1["run_effective_offset_s"]) < 1e-4:
+        sys.exit("rtk-time: both rounds ran with the same effective offset; the probe round must use the probe value")
+    e2, d2, se2 = est2["run_effective_offset_s"], est2["correction_s"], est2["correction_se_s"]
+    summary["round2"] = {"run": str(run2), "effective_s": e2, "correction_s": d2, "se_s": se2,
+                         "observable": est2["observable"], "frames": est2["frames"],
+                         "informative_voxels": est2["informative_voxels"]}
+    gain = (d1 - d2) / (e2 - e1) if abs(e2 - e1) > 1e-4 else float("nan")
+    if est1["observable"] and est2["observable"] and 0.25 <= gain <= 1.5:
+        best, method = e1 + d1 / gain, f"secant of both rounds (measured gain {gain:.2f})"
+        # uncertainty of the secant zero from the two jackknife errors
+        se_best = float(np.hypot(se1 * abs(e2 - best), se2 * abs(e1 - best)) / max(abs(gain * (e2 - e1)), 1e-4))
+    else:
+        # no usable secant: each usable round predicts the optimum with the prior gain; combine them weighted by
+        # their standard errors (a weak round still pulls a little instead of being thrown away)
+        def usable(est, se):
+            return est["observable"] or (np.isfinite(se) and se <= 2 * RTK_TIME_MAX_SE_S)
+        preds = [(e + d / RTK_TIME_GAIN_PRIOR, se / RTK_TIME_GAIN_PRIOR, tag)
+                 for est, e, d, se, tag in ((est1, e1, d1, se1, "first"), (est2, e2, d2, se2, "probe")) if usable(est, se)]
+        if not preds:
+            sys.exit("rtk-time: neither round is observable; parent kept")
+        w = np.array([1.0 / max(sp, 1e-4) ** 2 for _, sp, _ in preds])
+        best = float(np.dot(w, [p for p, _, _ in preds]) / w.sum())
+        se_best = float(1.0 / np.sqrt(w.sum()))
+        method = (f"{' + '.join(t for _, _, t in preds)} round{'s' if len(preds) > 1 else ''} with the prior gain "
+                  f"{RTK_TIME_GAIN_PRIOR}, standard-error weighted (secant gain {gain:.2f} not usable)")
+    best = float(np.clip(best, e1 - RTK_TIME_MAX_STEP_S, e1 + RTK_TIME_MAX_STEP_S))
+    rtk_new = round(rtk0 + (best - e1), 4)
+    summary.update(method=method, gain=None if gain != gain else round(gain, 3), best_effective_s=round(best, 5),
+                   best_se_s=round(se_best, 5), rtk_position_s={"from": rtk0, "to": rtk_new})
+    if a.dry_run:
+        print(json.dumps({"id": a.id, "dry_run": True, **summary}, ensure_ascii=False))
+        return
+    calib = copy.deepcopy(parent_calib)
+    to = calib.setdefault("time_offsets", dict(DEFAULT_TIME_OFFSETS))
+    to["rtk_position"] = rtk_new
+    to["rtk_position_source"] = (f"rtk-time: map consistency, {method}; effective {1000 * best:+.1f} ms "
+                                 f"(se {1000 * se_best:.1f} ms)")
+    out_dir = next_version_dir(mine, truck, "rtktime")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    report = [f"round 1: effective {1000 * e1:+.2f} ms -> correction {1000 * d1:+.2f} ms (se {1000 * se1:.2f})",
+              f"round 2: effective {1000 * e2:+.2f} ms -> correction {1000 * d2:+.2f} ms (se {1000 * se2:.2f})",
+              f"{method}: best effective {1000 * best:+.2f} ms (se {1000 * se_best:.2f} ms); "
+              f"rtk_position {rtk0:+.4f} -> {rtk_new:+.4f} s"]
+    for line in report:
+        print(line, flush=True)
+    finalize_version(out_dir, calib, mine=mine, truck=truck, stage="rtktime", parent=a.id,
+                     note=a.note or f"RTK position time association {rtk0:+.4f} -> {rtk_new:+.4f} s ({method})",
+                     inputs={"run": str(run1), "run2": str(run2)}, metrics={"rtk_time": summary},
+                     report_lines=report + [""] + lines1[-3:] + lines2[-3:], activate=a.activate)
 
 
 # ----------------------------------------------------------------------------- camera time offset
@@ -2334,6 +2471,13 @@ def main():
                         "head is skipped; 0 = from the first image)")
     common(p)
     p.set_defaults(func=cmd_camera_time)
+
+    p = sub.add_parser("rtk-time", help="RTK position time association from map self-consistency of LIO rounds")
+    p.add_argument("--run", required=True, help="LIO round (or its fusion dir) mapped with the parent version")
+    p.add_argument("--run2", help="probe round mapped with the probe rtk_position (final step: secant -> version)")
+    p.add_argument("--dry-run", action="store_true", help="final step: print the result without creating a version")
+    common(p)
+    p.set_defaults(func=cmd_rtk_time)
 
     p = sub.add_parser("windows", help="motion profile -> stationary/driving windows for stages and rounds (JSON)")
     p.add_argument("--bag", required=True, help="recording: raw ROS 2 root (segment folders) or single bag folder")

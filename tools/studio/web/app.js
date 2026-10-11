@@ -186,6 +186,7 @@ function stepperHtml(v) {
     ["import", "导入出厂标定", done.has("import")], ["axle", "后轴对齐", !!(v?.checks || []).find((c) => c.key === "axle")?.ok],
     ["ground", "静止地面精修", done.has("ground") || done.has("precheck")],
     ["lio", "LIO 建图", hasRun("lio") || done.has("driven")], ["driven", "行驶段精修", done.has("driven")],
+    ["rtktime", "RTK 关联时间", done.has("rtktime")],
     ["camtime", "相机时间偏移", !!(v?.checks || []).find((c) => c.key === "camtime")?.ok],
     ["livo", "LIVO 建图", hasRun("livo") || done.has("camlidar")], ["camlidar", "相机外参复核", done.has("camlidar"), true],
     ["active", "激活生产版本", !!v?.active],

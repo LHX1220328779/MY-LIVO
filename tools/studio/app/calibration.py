@@ -18,6 +18,7 @@ STAGE_FALLBACK = {
     "axle": {"order": 2, "label": "后轴对齐（RTK/INS）", "command": "axle", "advisory": False, "mapping": None},
     "ground": {"order": 3, "label": "静止地面精修", "command": "ground", "advisory": False, "mapping": None},
     "driven": {"order": 4, "label": "行驶段 6-DoF 精修", "command": "driven", "advisory": False, "mapping": "lio"},
+    "rtktime": {"order": 4.5, "label": "RTK 位置关联时间", "command": "rtk-time", "advisory": False, "mapping": "lio"},
     "camtime": {"order": 5, "label": "相机时间偏移", "command": "camera-time", "advisory": False, "mapping": None},
     "camlidar": {"order": 6, "label": "相机-LiDAR 偏航/横滚复核", "command": "camera-lidar", "advisory": True, "mapping": "livo"},
     "camloop": {"order": 7, "label": "相机外参闭环标定", "command": "set", "advisory": False, "mapping": "livo", "internal": True},
@@ -25,6 +26,10 @@ STAGE_FALLBACK = {
     "manual": {"order": 9, "label": "手动设置", "command": "set", "advisory": False, "mapping": None},
     "scan": {"order": 10, "label": "闭环扫描点（临时）", "command": "set", "advisory": True, "mapping": None, "internal": True},
 }
+# LIO rounds of the RTK time-association loop: long enough to contain start-up acceleration, turns and
+# speed changes (a 48 s single pass leaves the offset unobservable: jackknife se 7 ms on truck28), capped by
+# the recording; the window start is the pipeline's motion window like every other round.
+RTK_ROUND_S = 240.0
 SCAN_STEP_DEG = 0.05  # pitch increment of the closed-loop scan rounds (0.55 % scale change, 20x the run-to-run noise)
 DEFAULT_PITCH_SLOPE = 0.105  # path-length ratio change per degree of camera pitch (measured 0.104-0.106 on truck29)
 OVERLAY_DIR = RESULTS / ".studio" / "overlays"
@@ -125,6 +130,7 @@ def vehicle_status(cat, mine, truck):
     axle_done = "axle" in stages_done or "rear_axle_alignment" in ctype or not root_ctype.startswith("supplier_raw")
     lidar_refined = any(s in ("ground", "driven", "precheck") for s in stages_done) or "refined" in ctype
     driven_done = "driven" in stages_done or "driven" in ctype or "stage2" in ctype
+    rtk_time_done = "rtktime" in stages_done or "rtk-time" in str(offsets.get("rtk_position_source", ""))
     camera_time_ok = isinstance(offsets.get("camera"), (int, float)) and (offsets.get("camera") != 0.0 or "camera_source" in offsets)
     camera_ext_refined = "camlidar" in stages_done or "camera_lidar" in ctype or "camera_pole_yaw" in ctype
     camera_loop_failed = bool(work) and work.get("closed_loop") == "fail"
@@ -134,6 +140,7 @@ def vehicle_status(cat, mine, truck):
         {"key": "axle", "label": "参考雷达已对齐后轴（RTK/INS 位姿）", "ok": axle_done, "stage": "axle"},
         {"key": "lidar", "label": "LiDAR 外参已精修（地面/行驶段）", "ok": lidar_refined, "stage": "ground"},
         {"key": "driven", "label": "多 LiDAR 6-DoF 一致性已校正", "ok": driven_done, "stage": "driven"},
+        {"key": "rtktime", "label": "RTK 位置关联时间已标定（地图自洽）", "ok": rtk_time_done, "stage": "rtktime", "optional": True},
         {"key": "camtime", "label": "相机时间偏移已确认", "ok": camera_time_ok, "stage": "camtime",
          "value": offsets.get("camera")},
         {"key": "camlidar", "label": "相机偏航已复核（灯柱投影）", "ok": camera_ext_refined, "stage": "camlidar", "optional": True},
@@ -663,6 +670,40 @@ def _camloop_steps(steps, body, mapping_cmd, *, truck, stamp, auto_activate, bas
                   "after": lambda ctx, lines: ctx.__setitem__("activated", activate_ok(ctx))})
 
 
+def _rtk_time_steps(steps, body, mapping_cmd, *, truck, stamp, auto_activate):
+    """RTK position time association, fully automatic: LIO round with the driven version -> map-consistency
+    estimate -> (only when observable and not already consistent) probe version + LIO round at the predicted
+    optimum -> secant of both corrections -> rtktime version. Unobservable data keep the driven version."""
+    rtk_dur = body.get("rtk_round_duration")
+    rtk_dur = RTK_ROUND_S if rtk_dur in (None, "") else (float(rtk_dur) or None)
+    r1, r2 = f"calib_{truck}_rtk1_{stamp}", f"calib_{truck}_rtk2_{stamp}"
+    probing = lambda ctx: (ctx.get("rtk1") or {}).get("decision") == "probe"
+    steps.append({"title": f"LIO 建图轮次 {r1}（RTK 关联时间估计，{rtk_dur or 0:.0f} s，含起步/转弯/变速）", "retry": 1, "round": r1,
+                  "build": lambda ctx: mapping_cmd(r1, "lio", str(calibration_file(ctx["driven_id"])), body,
+                                                   duration=_play_duration(ctx, body, rtk_dur), start_offset=_round_start(ctx, body), quick=True),
+                  "after": lambda ctx, lines: ctx.update(rtk_round1=r1, rtk_fusion1=latest_fusion_dir(r1))})
+    steps.append({"title": "RTK 关联时间：地图自洽估计（不可观测或已自洽则沿用行驶段版本）",
+                  "build": lambda ctx: [PY, str(CALIB_TOOL), "rtk-time", "--id", ctx["driven_id"], "--run", ctx["rtk_fusion1"]],
+                  "after": lambda ctx, lines: ctx.__setitem__("rtk1", _json_tail(lines))})
+    steps.append({"title": "RTK 关联时间：探测版本（预测最优值，临时）",
+                  "build": lambda ctx: [PY, str(CALIB_TOOL), "set", "--id", ctx["driven_id"], "--stage", "scan",
+                                        "--rtk-position-offset", f"{ctx['rtk1']['probe_rtk_position_s']:.4f}",
+                                        "--note", "rtk-time probe point (temporary)"]
+                  if probing(ctx) else ["/bin/echo", f"no probe needed: {(ctx.get('rtk1') or {}).get('reason', '')}"],
+                  "after": lambda ctx, lines: ctx.__setitem__("rtk_probe_id", parse_version_id(lines) if probing(ctx) else None)})
+    steps.append({"title": f"LIO 建图轮次 {r2}（探测值，同一窗口）", "retry": 1, "round": r2,
+                  "build": lambda ctx: mapping_cmd(r2, "lio", str(calibration_file(ctx["rtk_probe_id"])), body,
+                                                   duration=_play_duration(ctx, body, rtk_dur), start_offset=_round_start(ctx, body), quick=True)
+                  if probing(ctx) else ["/bin/echo", "probe round skipped"],
+                  "after": lambda ctx, lines: ctx.update(rtk_fusion2=latest_fusion_dir(r2) if probing(ctx) else None)})
+    steps.append({"title": "RTK 关联时间：两轮割线定版（rtktime 版本）",
+                  "build": lambda ctx: [PY, str(CALIB_TOOL), "rtk-time", "--id", ctx["driven_id"], "--run", ctx["rtk_fusion1"],
+                                        "--run2", ctx["rtk_fusion2"], *(["--activate"] if auto_activate else [])]
+                  if probing(ctx) else ["/bin/echo", f"rtk_position kept: {(ctx.get('rtk1') or {}).get('reason', '')}"],
+                  "after": lambda ctx, lines: ctx.__setitem__("result_id", parse_version_id(lines) if probing(ctx) else ctx["driven_id"])})
+    steps.append({"title": "校验最终版本", "build": lambda ctx: [PY, str(CALIB_TOOL), "validate", "--id", ctx["result_id"]]})
+
+
 def pipeline_steps(kind, body, mapping_cmd):
     """Standard pipelines. `mapping_cmd(round_name, mode, calibration_file, body)` builds the round command.
 
@@ -748,6 +789,8 @@ def pipeline_steps(kind, body, mapping_cmd):
             "after": lambda ctx, lines: ctx.__setitem__("driven_id", parse_version_id(lines))})
         steps.append({"title": "校验新版本", "build": lambda ctx: [PY, str(CALIB_TOOL), "validate", "--id", ctx["driven_id"]],
                       "after": lambda ctx, lines: ctx.__setitem__("result_id", ctx["driven_id"])})
+        if not body.get("skip_rtk_time"):
+            _rtk_time_steps(steps, body, mapping_cmd, truck=truck, stamp=stamp, auto_activate=auto_activate)
     elif kind == "camera":
         datasets.require(dataset, camera=True)
         _windows_step(steps, dataset, cam_dur or 60, body)
