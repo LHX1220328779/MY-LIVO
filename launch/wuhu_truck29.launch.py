@@ -35,6 +35,14 @@ def launch_rviz(context, config, current_cloud):
     )]
 
 
+def _fastdds_profile():
+    for path in (os.path.join(get_package_share_directory("fast_livo"), "config", "fastdds_livo_shm.xml"),
+                 os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "config", "fastdds_livo_shm.xml")):
+        if os.path.isfile(path):
+            return os.path.realpath(path)
+    return ""
+
+
 def generate_launch_description():
     share = get_package_share_directory("fast_livo")
     installed_config = os.path.join(share, "config", "wuhu_truck29.yaml")
@@ -125,6 +133,10 @@ def generate_launch_description():
         # override for deployments that need another transport.
         SetEnvironmentVariable(name="FASTDDS_BUILTIN_TRANSPORTS",
                                value=os.environ.get("FASTDDS_BUILTIN_TRANSPORTS") or "SHM"),
+        # Large SHM segment + short heartbeat (config/fastdds_livo_shm.xml): the builtin 512 KB
+        # segment fragments clouds/images and delays repairs by seconds on long rounds.
+        SetEnvironmentVariable(name="FASTRTPS_DEFAULT_PROFILES_FILE",
+                               value=os.environ.get("FASTRTPS_DEFAULT_PROFILES_FILE") or _fastdds_profile()),
         DeclareLaunchArgument("use_camera", default_value="false"),
         DeclareLaunchArgument("use_rviz", default_value="false"),
         DeclareLaunchArgument("use_rtk", default_value="true"),

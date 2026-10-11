@@ -2241,6 +2241,22 @@ def cmd_set(a):
         P[:3, :3] = R.from_euler("xyz", a.camera_rot_delta, degrees=True).as_matrix()
         tf["transform_matrix"] = (T @ P).reshape(-1).tolist()  # delta expressed in the camera frame
         changes["camera_rot_delta_deg_cam_xyz"] = list(a.camera_rot_delta)
+    for item in getattr(a, "lidar_translation_delta", None) or []:
+        # operator correction of one LiDAR's lever arm, rear-axle frame (x right, y forward, z up), metres;
+        # e.g. the back LiDAR's measured along-track map offset (guard metric "back LiDAR along-track offset")
+        key, delta = item[0], item[1:]
+        try:
+            delta = [float(v) for v in delta]
+        except ValueError:
+            sys.exit(f"--lidar-translation-delta {' '.join(item)}: DX DY DZ must be numbers")
+        entry = next((e for e in calib.get("lidar", []) if key in e), None)
+        if entry is None:
+            sys.exit(f"--lidar-translation-delta: {key} not in calibration lidar list "
+                     f"({[k for e in calib.get('lidar', []) for k in e if k.startswith('transform_matrix')]})")
+        T = np.asarray(entry[key], float).reshape(4, 4)
+        T[:3, 3] += delta
+        entry[key] = T.reshape(-1).tolist()
+        changes[f"lidar_translation_delta.{key}"] = delta
     if not changes:
         sys.exit("nothing to set")
     stage = a.stage or "manual"
@@ -2364,6 +2380,9 @@ def main():
     p.add_argument("--camera-rot-delta", nargs=3, type=float, metavar=("RX", "RY", "RZ"),
                    help="rotate the camera extrinsic by these degrees (camera-frame xyz Euler); closed-loop tests")
     p.add_argument("--camera-offset", type=float)
+    p.add_argument("--lidar-translation-delta", nargs=4, action="append", metavar=("KEY", "DX", "DY", "DZ"),
+                   help="shift one LiDAR extrinsic (e.g. transform_matrix_lidar_2) by DX DY DZ metres in the rear-axle "
+                        "frame (x right, y forward, z up); repeatable")
     p.add_argument("--lidar-offset", type=float)
     p.add_argument("--lidar-frontend-offset", type=float,
                    help="scan<->IMU hardware offset consumed by the SLAM front-end (deskew/image pairing); "

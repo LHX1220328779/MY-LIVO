@@ -7,6 +7,12 @@ written by `livo_calib.py set --camera-rot-delta dp 0 0`) yields a native path-l
 slope of ~0.11 per degree (7-round measurement, docs/mcp-livo-native-drift-analysis.md), so the pitch that
 makes r = 1 is dp* = (1 - a) / b for the fitted line r = a + b * dp.
 
+When LiDAR fully constrains the scale (ratio flat at ~1.000 for every increment, e.g. truck28: 0.9996 at
+-0.05/0/+0.05 deg) the scale slope is ~0 and pitch is unobservable through it. The fit then falls back to the
+native drift itself (headline.native rmse_m, median_m when absent): a convex parabola through the scan points
+whose vertex lies inside the scanned range is adopted (clamped); a vertex within KEEP_DEG of 0 means "keep the
+current pitch" (ok + keep, no new extrinsic needed). Neither observable -> ok false with keep_recommended.
+
 Usage: camera_pitch_fit.py --point <round>=<dp_deg> [--point ...] [--target 1.0] [--max-abs 0.3] [--exit-zero]
 Prints one JSON line: {"ok", "pitch_delta_deg", "slope_per_deg", "intercept", "points", "rms", "reason"}.
 """
@@ -18,6 +24,9 @@ import sys
 REPO = pathlib.Path(__file__).resolve().parents[2]
 RESULTS = REPO / "results"
 EXPECTED_SLOPE = (0.03, 0.40)  # per degree; measured 0.11
+FLAT_SCALE = 0.002             # |intercept - 1| below this with a ~0 slope: scale already locked by LiDAR
+KEEP_DEG = 0.005               # drift-minimum vertex closer than this to 0 -> keep the current pitch
+MIN_DEPTH_REL, MIN_DEPTH_M = 0.05, 0.02  # parabola must rise this much at the scan ends to count as a minimum
 
 
 def ratio_of(round_name):
@@ -30,7 +39,59 @@ def ratio_of(round_name):
         r = (doc.get("run") or {}).get("path_length_ratio")
     if r is None:
         return None, f"{round_name}: path_length_ratio missing"
-    return (float(r), (doc.get("run") or {}).get("duration_s")), None
+    nat = doc.get("headline", {}).get("native", {}) or {}
+    drift = nat.get("rmse_m", nat.get("median_m"))
+    return (float(r), (doc.get("run") or {}).get("duration_s"), None if drift is None else float(drift)), None
+
+
+def drift_minimum(out, pts, max_abs):
+    """Scale locked by LiDAR: pick the pitch that minimises the native drift (parabola vertex)."""
+    scale_reason = out.get("reason")
+    q = [(p["pitch_delta_deg"], p["native_drift_m"]) for p in pts if p.get("native_drift_m") is not None]
+    xs = sorted({x for x, _ in q})
+    out["scale_reason"] = scale_reason
+    if len(xs) < 3:
+        out["reason"] = f"scale insensitive to pitch ({scale_reason}); drift minimum needs 3 increments"
+        out["keep_recommended"] = True
+        return
+    n = len(q)
+    # least-squares parabola y = c0 + c1 x + c2 x^2 (normal equations, 3x3)
+    S = [[sum(x ** (i + j) for x, _ in q) for j in range(3)] for i in range(3)]
+    T = [sum(y * x ** i for x, y in q) for i in range(3)]
+    def det(M):
+        return (M[0][0] * (M[1][1] * M[2][2] - M[1][2] * M[2][1]) - M[0][1] * (M[1][0] * M[2][2] - M[1][2] * M[2][0])
+                + M[0][2] * (M[1][0] * M[2][1] - M[1][1] * M[2][0]))
+    D = det(S)
+    c = [det([[T[r] if k == i else S[r][k] for k in range(3)] for r in range(3)]) / D for i in range(3)]
+    c0, c1, c2 = c
+    lo, hi = xs[0], xs[-1]
+    fit = {"drift_metric": "native rmse_m", "drift_poly": [round(v, 6) for v in c],
+           "drift_points": [[x, round(y, 4)] for x, y in q]}
+    out.update(fit)
+    if c2 <= 0:
+        out.update(reason=f"scale insensitive ({scale_reason}) and native drift has no minimum (concave)",
+                   keep_recommended=True)
+        return
+    v = -c1 / (2 * c2)
+    ymin = c0 + c1 * v + c2 * v * v
+    yedge = min(c0 + c1 * lo + c2 * lo * lo, c0 + c1 * hi + c2 * hi * hi)
+    depth = yedge - ymin
+    out["drift_vertex_deg"], out["drift_min_m"], out["drift_depth_m"] = round(v, 4), round(ymin, 4), round(depth, 4)
+    if not (lo <= v <= hi):
+        out.update(reason=f"native drift minimum at {v:+.3f} deg is outside the scanned range [{lo:+.2f}, {hi:+.2f}]",
+                   keep_recommended=True)
+        return
+    if depth < max(MIN_DEPTH_M, MIN_DEPTH_REL * max(ymin, 1e-6)):
+        out.update(reason=f"native drift too flat vs pitch (depth {100 * depth:.1f} cm): pitch unobservable",
+                   keep_recommended=True)
+        return
+    dp = max(-max_abs, min(max_abs, v))
+    keep = abs(dp) < KEEP_DEG
+    out.update({"ok": True, "keep": keep, "method": "native drift minimum", "pitch_delta_deg": 0.0 if keep else round(dp, 4),
+                "clamped": dp != v, "predicted_ratio": round(out["intercept"], 5),
+                "reason": (f"scale locked by LiDAR (slope {out['slope_per_deg']:+.4f}/deg); native drift minimum at "
+                           f"{v:+.4f} deg (rmse {ymin:.3f} m, +{100 * depth:.0f} cm at the scan ends)"
+                           + ("; current pitch kept" if keep else ""))})
 
 
 def main():
@@ -52,7 +113,8 @@ def main():
         if err:
             errors.append(err)
             continue
-        pts.append({"round": name.strip(), "pitch_delta_deg": float(dp), "path_length_ratio": r[0], "duration_s": r[1]})
+        pts.append({"round": name.strip(), "pitch_delta_deg": float(dp), "path_length_ratio": r[0], "duration_s": r[1],
+                    "native_drift_m": r[2]})
     out = {"ok": False, "points": pts, "target": a.target, "errors": errors}
     xs = [p["pitch_delta_deg"] for p in pts]
     ys = [p["path_length_ratio"] for p in pts]
@@ -106,6 +168,9 @@ def main():
             out.update({"ok": True, "pitch_delta_deg": round(dp_star, 4), "clamped": clamped,
                         "predicted_ratio": round(a0 + b * dp_star, 5),
                         "reason": "zero crossing of native scale vs camera pitch" + (" (clamped)" if clamped else "")})
+    if not out["ok"] and "slope_per_deg" in out and abs(out["slope_per_deg"]) < EXPECTED_SLOPE[0] \
+            and abs(out["intercept"] - 1.0) <= FLAT_SCALE:
+        drift_minimum(out, pts, a.max_abs)
     print(json.dumps(out, ensure_ascii=False))
     sys.exit(0 if out["ok"] or a.exit_zero else 1)
 

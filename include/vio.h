@@ -177,6 +177,12 @@ public:
   void warpAffine(const Matrix2d &A_cur_ref, const cv::Mat &img_ref, const Vector2d &px_ref, const int level_ref, const int search_level,
                   const int pyramid_level, const int halfpatch_size, float *patch);
   void insertPointIntoVoxelMap(VisualPoint *pt_new);
+  // Release the visual sparse map outside the cube |p - center|_inf > half_size (metres). Every patch
+  // feature keeps its whole source image alive (Feature::img_) and the upstream map never forgets, so a
+  // LIVO mapper grew by 25-35 MB per second of driving: the 1230 s truck28 round was OOM-killed at
+  // t=977 s with 24 GB resident. Called together with the LiDAR map sliding (same cube), so nothing the
+  // LiDAR map still holds is dropped from the visual map. Returns the number of released points.
+  std::size_t slideVisualMap(const V3D &center, double half_size);
   void plotTrackedPoints();
   void updateFrameState(StatesGroup state);
   void projectPatchFromRefToCur(const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &plane_map);

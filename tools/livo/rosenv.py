@@ -35,6 +35,9 @@ def clean_base_environment(base=None):
         env.pop(key, None)
     env["PATH"] = "/opt/ros/humble/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     env.setdefault("FASTDDS_BUILTIN_TRANSPORTS", "SHM")
+    profile = REPO / "config" / "fastdds_livo_shm.xml"
+    if profile.is_file():
+        env.setdefault("FASTRTPS_DEFAULT_PROFILES_FILE", str(profile))
     env.setdefault("LC_ALL", "C.UTF-8")
     env.setdefault("LANG", "C.UTF-8")
     return env

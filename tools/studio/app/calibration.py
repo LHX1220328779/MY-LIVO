@@ -487,6 +487,14 @@ def _camera_key(vid):
                        offs.get("camera"), offs.get("lidar"), c.get("lidar")], sort_keys=True)
 
 
+def _round_budget(round_name):
+    """Optimized-trajectory budget verdict (PASS/FAIL) of a finished round, None when not evaluated."""
+    if not round_name:
+        return None
+    doc = read_json(RESULTS / round_name / "evaluation" / "metrics.json", {}) or {}
+    return ((doc.get("headline") or {}).get("optimized") or {}).get("budget")
+
+
 def _json_tail(lines):
     for line in reversed(lines):
         line = line.strip()
@@ -583,38 +591,76 @@ def _camloop_steps(steps, body, mapping_cmd, *, truck, stamp, auto_activate, bas
                       "after": lambda ctx, lines, rn=rn, tag=tag: ctx.__setitem__(f"scan_{tag}_round", rn) if scan_needed(ctx) else None})
     steps.append({"title": f"拟合原生里程尺度 vs 俯仰增量，求过零点{skip}", "build": lambda ctx: [
         PY, fit_script, "--point", f"{ctx[round0_key]}=0", "--point", f"{ctx['scan_up_round']}={SCAN_STEP_DEG}",
-        "--point", f"{ctx['scan_dn_round']}={-SCAN_STEP_DEG}"] if scan_needed(ctx)
+        "--point", f"{ctx['scan_dn_round']}={-SCAN_STEP_DEG}", "--exit-zero"] if scan_needed(ctx)
         else ["/bin/echo", "one-point fit accepted: standard fit skipped"],
         "after": lambda ctx, lines: ctx.update(pitch_fit=_json_tail(lines), pitch_delta_deg=_json_tail(lines).get("pitch_delta_deg"),
                                                pitch_slope_source=None) if scan_needed(ctx) else None})
 
+    def pitch_mode(ctx):
+        """adopt: new pitch to verify | keep: evidence that the current pitch is best (drift minimum at 0) |
+        kept: pitch unobservable / fit rejected -> the base version is the result, nothing to verify"""
+        fit = ctx.get("pitch_fit") or {}
+        if not fit.get("ok"):
+            return "kept"
+        return "keep" if fit.get("keep") else "adopt"
+
     def set_cmd(ctx):
         fit = ctx["pitch_fit"]
+        mode = pitch_mode(ctx)
+        if mode == "kept":
+            return ["/bin/echo", f"pitch fit rejected ({fit.get('reason')}): camera pitch of {ctx[base_key]} kept, "
+                                 "no camloop version"]
+        if fit.get("method") == "native drift minimum":
+            note = (f"相机俯仰闭环：原生尺度被 LiDAR 锁定（斜率 {fit['slope_per_deg']:+.4f}/°，俯仰不可经尺度观测），改用原生漂移"
+                    f"最小点 {fit.get('drift_vertex_deg', 0):+.4f}°（rmse {fit.get('drift_min_m', 0):.3f} m，{len(fit['points'])} 轮）"
+                    + ("，保持当前俯仰" if mode == "keep" else f"，Δpitch={fit['pitch_delta_deg']:+.4f}°"))
+            return [PY, str(CALIB_TOOL), "set", "--id", ctx[base_key], "--camera-rot-delta", f"{fit['pitch_delta_deg']:.4f}",
+                    "0", "0", "--stage", "camloop", "--metrics-json", json.dumps({"pitch_fit": fit}, ensure_ascii=False),
+                    "--note", note]
         note = (f"相机俯仰闭环：Δpitch={fit['pitch_delta_deg']:+.3f}°（尺度斜率 {fit['slope_per_deg']:.3f}/°"
                 f"{'，沿用历史值 ' + str(ctx.get('pitch_slope_source') or '模型') if fit.get('slope_source') else ''}"
                 f"，{len(fit['points'])} 轮，预测原生尺度 {fit['predicted_ratio']:.4f}）")
         return [PY, str(CALIB_TOOL), "set", "--id", ctx[base_key], "--camera-rot-delta", f"{fit['pitch_delta_deg']:.4f}", "0", "0",
                 "--stage", "camloop", "--metrics-json", json.dumps({"pitch_fit": fit}, ensure_ascii=False), "--note", note]
-    steps.append({"title": "生成闭环标定版本 (camloop)", "build": set_cmd,
-                  "after": lambda ctx, lines: ctx.update(camloop_id=parse_version_id(lines), result_id=parse_version_id(lines))})
+    def set_after(ctx, lines):
+        vid = ctx[base_key] if pitch_mode(ctx) == "kept" else parse_version_id(lines)
+        ctx.update(camloop_id=vid, result_id=vid)
+    steps.append({"title": "生成闭环标定版本 (camloop；俯仰不可观测/拟合被拒绝时保持当前版本继续)", "build": set_cmd,
+                  "after": set_after})
     rv = f"calib_{truck}_livo_{stamp}_verify"
-    steps.append({"title": f"LIVO 验证建图 {rv}（闭环版本）", "retry": 1, "round": rv, "build": lambda ctx: mapping_cmd(
-        rv, "livo", str(calibration_file(ctx["camloop_id"])), body, duration=round_duration, start_offset=_round_start(ctx, body)),
-        "after": lambda ctx, lines: ctx.__setitem__("verify_round", rv)})
+    steps.append({"title": f"LIVO 验证建图 {rv}（闭环版本；俯仰保持不变时零俯仰轮次即验证，跳过）", "retry": 1, "round": rv,
+                  "build": lambda ctx: mapping_cmd(rv, "livo", str(calibration_file(ctx["camloop_id"])), body,
+                                                   duration=round_duration, start_offset=_round_start(ctx, body))
+                  if pitch_mode(ctx) == "adopt" else
+                  ["/bin/echo", f"camera pitch unchanged: round {ctx[round0_key]} already maps this extrinsic, verify skipped"],
+                  "after": lambda ctx, lines: ctx.__setitem__("verify_round", rv if pitch_mode(ctx) == "adopt" else ctx[round0_key])})
     steps.append({"title": "闭环判定：基线轮次 vs 闭环版本（原生里程尺度 / 后轴误差 / 偏航）", "build": lambda ctx: [
         PY, str(REPO / "scripts" / "analysis" / "closed_loop_verdict.py"), ctx[baseline_key], ctx["verify_round"],
         "--version-dir", str(CAL_ROOT.joinpath(*ctx["camloop_id"].split("/"))),
-        "--scale-margin", "0.002" if ctx.get("scan_needed", standard) else "0.0005", "--exit-zero"],
-        "after": lambda ctx, lines: ctx.update(closed_loop=_verdict(lines))})
+        "--scale-margin", "0.002" if ctx.get("scan_needed", standard) else "0.0005", "--exit-zero"]
+        if pitch_mode(ctx) == "adopt" else
+        ["/bin/echo", {"keep": "native drift is minimal at the current pitch: closed loop pass (pitch kept)",
+                       "kept": "camera pitch unobservable on this data: kept (base version is the result)"}[pitch_mode(ctx)]],
+        "after": lambda ctx, lines: ctx.update(closed_loop=_verdict(lines) if pitch_mode(ctx) == "adopt"
+                                               else ("pass" if pitch_mode(ctx) == "keep" else "kept"))})
     steps.append({"title": "校验新版本", "build": lambda ctx: [PY, str(CALIB_TOOL), "validate", "--id", ctx["camloop_id"], "--strict"]})
 
+    def activate_ok(ctx):
+        if not auto_activate:
+            return False
+        if ctx.get("closed_loop") == "pass":
+            return True
+        # pitch unobservable: the base version is still the best available one when its own round met the budget
+        return ctx.get("closed_loop") == "kept" and _round_budget(ctx.get(round0_key)) == "PASS"
+
     def activate_cmd(ctx):
-        if ctx.get("closed_loop") == "pass" and auto_activate:
+        if activate_ok(ctx):
             return [PY, str(CALIB_TOOL), "activate", "--id", ctx["camloop_id"]]
-        why = "闭环未通过" if ctx.get("closed_loop") != "pass" else "未勾选自动激活"
+        why = ("未勾选自动激活" if not auto_activate else
+               "俯仰不可观测且零俯仰轮次未达预算" if ctx.get("closed_loop") == "kept" else "闭环未通过")
         return [PY, "-c", f"print('not activated: {why}; active version unchanged')"]
-    steps.append({"title": "激活闭环版本（仅闭环通过且勾选自动激活时）", "build": activate_cmd,
-                  "after": lambda ctx, lines: ctx.__setitem__("activated", ctx.get("closed_loop") == "pass" and auto_activate)})
+    steps.append({"title": "激活闭环版本（闭环通过，或俯仰不可观测但零俯仰轮次达预算；需勾选自动激活）", "build": activate_cmd,
+                  "after": lambda ctx, lines: ctx.__setitem__("activated", activate_ok(ctx))})
 
 
 def pipeline_steps(kind, body, mapping_cmd):

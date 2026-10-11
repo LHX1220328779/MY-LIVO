@@ -224,6 +224,37 @@ void VIOManager::getImagePatch(cv::Mat img, V2D pc, float *patch_tmp, int level)
   }
 }
 
+std::size_t VIOManager::slideVisualMap(const V3D &center, double half_size)
+{
+  constexpr double voxel_size = 0.5;  // insertPointIntoVoxelMap
+  std::size_t released = 0;
+  for (auto it = feat_map.begin(); it != feat_map.end();)
+  {
+    const VOXEL_LOCATION &loc = it->first;
+    const V3D voxel_center((loc.x + 0.5) * voxel_size, (loc.y + 0.5) * voxel_size, (loc.z + 0.5) * voxel_size);
+    if (((voxel_center - center).cwiseAbs().array() > half_size).any())
+    {
+      released += it->second->voxel_points.size();
+      delete it->second;  // deletes its VisualPoints, their Features and with them the image references
+      it = feat_map.erase(it);
+    }
+    else
+    {
+      ++it;
+    }
+  }
+  if (released > 0)
+  {
+    // per-frame scratch holding raw VisualPoint pointers; rebuilt by the next retrieveFromVisualSparseMap
+    visual_submap->reset();
+    std::fill(retrieve_voxel_points.begin(), retrieve_voxel_points.end(), nullptr);
+    sub_feat_map.clear();
+    for (auto &pair : warp_map) delete pair.second;  // cache keyed by feature id; recomputed on demand
+    warp_map.clear();
+  }
+  return released;
+}
+
 void VIOManager::insertPointIntoVoxelMap(VisualPoint *pt_new)
 {
   V3D pt_w(pt_new->pos_[0], pt_new->pos_[1], pt_new->pos_[2]);

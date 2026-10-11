@@ -148,6 +148,15 @@ laser_mapping:
       # 且融合精度略升(LIO 0.75/2.73/6.16 cm, LIVO 0.77/2.14/4.29 cm)。关闭后
       # 原生轨迹即真实纯 LIO，便于跨模式对比。若弱场景前端发散可重新打开。
       frontend_attitude_aiding: false
+      # 2026-10-11 弱几何门控：仅当上一帧纯 LiDAR 平移信息（旋转块 Schur 补的最小特征值, 1/m^2）
+      # 低于该值时启用上述姿态辅助（0 = 关）；回到 1.5 倍以上即关闭。实测：结构丰富段 >= 4.5e5
+      # （truck29 起步灯杆段 4.8e5..8e5，truck28 巡航 ~1e6）；开阔平坦料场 2e4..1.2e5（truck28
+      # t=920-1000 s 纯 LIO 因 1-2 deg 倾角重力泄漏速度发散到 44 m/s；truck29 末段直道 2.3e4..7.5e4）。
+      frontend_attitude_weak_geometry_info: 200000.0
+      frontend_attitude_weak_release_factor: 1.5
+      # 且仅当传播姿态与合格 INS 横滚/俯仰相差超过该角度时才真正施加（同一弱几何段内锁存）。
+      # truck29 全程原生倾角偏差 <= 1.27 deg（末段直道 1.15），不触发、保持原精度；truck28 料场 ~2 deg 触发。
+      frontend_attitude_weak_tilt_deg: 1.5
       # sigma is the absolute floor (INS accuracy) that dominates when LiDAR
       # is weak. In rich scenes scan-to-map rows carry ~1e9 rad^-2 of
       # (map-relative) angular information, so the absolute reference also

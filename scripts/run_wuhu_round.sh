@@ -55,6 +55,8 @@ export PATH=/opt/ros/humble/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bi
 set +u; source /opt/ros/humble/setup.bash; source install/fast_livo/share/fast_livo/local_setup.bash; set -u
 export ROS_LOG_DIR="$out/roslog"; mkdir -p "$ROS_LOG_DIR"
 export FASTDDS_BUILTIN_TRANSPORTS=SHM
+# 128 MB SHM segment + 100 ms heartbeat for the player/mapper traffic (see config/fastdds_livo_shm.xml).
+export FASTRTPS_DEFAULT_PROFILES_FILE="${FASTRTPS_DEFAULT_PROFILES_FILE:-$repo/config/fastdds_livo_shm.xml}"
 export OPENBLAS_NUM_THREADS=1
 
 # Describe and validate the dataset (raw split recording or single bag) without converting it.
@@ -185,7 +187,18 @@ fi
 phase playing
 play_args=("$dataset" --preset "$mode" --rate "$rate" --start-offset "$start_offset")
 [[ -n "$duration" ]] && play_args+=(--duration "$duration")
-/usr/bin/python3 tools/livo/player.py "${play_args[@]}" > "$out/playback.log" 2>&1
+/usr/bin/python3 tools/livo/player.py "${play_args[@]}" > "$out/playback.log" 2>&1 &
+player_pid=$!
+# A mapper that stopped (FATAL input gap, OOM kill) consumes nothing more: stop the playback instead of
+# replaying the remaining minutes into nothing. Background jobs ignore SIGINT here, hence SIGTERM.
+while kill -0 "$player_pid" 2>/dev/null; do
+  if ! kill -0 "$mapper_pid" 2>/dev/null; then
+    echo "mapper exited during playback at $(date -u +%FT%TZ); stopping the player" >> "$out/run.log"
+    kill -TERM "$player_pid" 2>/dev/null; break
+  fi
+  sleep 2
+done
+wait "$player_pid"
 echo "playback_exit=$? at $(date -u +%FT%TZ)" >> "$out/run.log"
 
 # Drain: wait until the mapper has caught up with the played data (tail processed). With save_map the fusion
@@ -228,7 +241,8 @@ pkill -KILL -f "image_transport/republish" 2>/dev/null || true
 grep -E "RTK finalized|Final keyframe|INS attitude factors|position budget|Mapping failed|RTK backend failed" "$out/launch.log" >> "$out/run.log"
 # The node aborts on an input IMU gap (> maximum_time_gap, e.g. one dropped 100 Hz message under load) and
 # exports only the prefix: keep the output for diagnosis but mark the round incomplete (exit 4).
-mapper_error=$(grep -m1 -oE "Mapping failed: [^\r]*|RTK backend failed[^\r]*" "$out/launch.log" | head -1 | sed 's/"/\\"/g')
+# A FATAL stop (e.g. a backwards input stamp) or a killed mapper (OOM: exit -9) also leaves only a prefix.
+mapper_error=$(grep -m1 -oE "Mapping failed: [^[:cntrl:]]*|RTK backend failed[^[:cntrl:]]*|\[FATAL\] \[[0-9.]+\] \[laser_mapping\]: [^[:cntrl:]]*|\[fastlivo_mapping[^]]*\]: process has died \[pid [0-9]+, exit code -?[0-9]+" "$out/launch.log" | head -1 | sed 's/"/\\"/g')
 map_chunks=$(ls "$fusion_dir"/map_*.pcd 2>/dev/null | wc -l)
 echo "map_chunks=$map_chunks" >> "$out/run.log"
 echo "fusion_dir=$fusion_dir" >> "$out/run.log"

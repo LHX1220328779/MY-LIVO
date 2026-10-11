@@ -150,6 +150,12 @@ void LIVMapper::readParameters()
   nh.param<double>("rtk/frontend_attitude_huber_deg", frontend_attitude_huber_deg, 1.0);
   nh.param<double>("rtk/frontend_attitude_pull_fraction", frontend_attitude_pull_fraction, 0.05);
   nh.param("rtk/frontend_attitude_axis_mask", frontend_attitude_axis_mask, std::vector<double>{1.0, 1.0, 0.0});
+  nh.param<double>("rtk/frontend_attitude_weak_geometry_info", frontend_attitude_weak_geometry_info, 0.0);
+  nh.param<double>("rtk/frontend_attitude_weak_release_factor", frontend_attitude_weak_release_factor, 1.5);
+  nh.param<double>("rtk/frontend_attitude_weak_tilt_deg", frontend_attitude_weak_tilt_deg, 0.0);
+  if (!std::isfinite(frontend_attitude_weak_geometry_info) || frontend_attitude_weak_geometry_info < 0.0 ||
+      !std::isfinite(frontend_attitude_weak_release_factor) || frontend_attitude_weak_release_factor < 1.0)
+    throw std::runtime_error("rtk.frontend_attitude_weak_geometry_info must be >= 0 and weak_release_factor >= 1");
   if (frontend_attitude_axis_mask.size() != 3 || std::any_of(frontend_attitude_axis_mask.begin(),
       frontend_attitude_axis_mask.end(), [](double v) { return !(v == 0.0 || v == 1.0); }))
     throw std::runtime_error("rtk.frontend_attitude_axis_mask must be three 0/1 values (body x,y,z)");
@@ -837,6 +843,8 @@ void LIVMapper::initializeFiles()
     voxelmap_manager->collect_geometry_diagnostics_ = true;
     lio_geometry_log.exceptions(std::ios::badbit | std::ios::failbit);
     lio_geometry_log.open(root_dir + "Log/lio_geometry.csv");
+    attitude_gate_log.open(root_dir + "Log/attitude_gate.csv");
+    attitude_gate_log << "stamp,weakest_translation_information,roll_pitch_disagreement_deg,weak_geometry,aiding\n";
     lio_geometry_log << "stamp,effective_points,point_plane_rms_m,rotation_radius_m";
     for (int i = 0; i < 6; ++i) lio_geometry_log << ",lambda" << i;
     lio_geometry_log << ",lambda_min_max_ratio";
@@ -1315,12 +1323,35 @@ void LIVMapper::handleLIO()
   // It never touches position/velocity; without it, scan-to-map registration
   // on this multi-LiDAR rig drifted native pitch ~0.01 deg per metre.
   voxelmap_manager->attitude_aiding_ = false;
-  if (rtk_fusion_ && frontend_attitude_aiding && rtk_observations_enabled)
+  // Always-on aiding imprints INS roll/pitch biases into well-constrained scans (truck29 startup
+  // pole ghost), so by default the aid is applied only while the LiDAR geometry is weak: on an
+  // open, flat quarry floor (truck28 t=920-1000 s) the translation is unobserved, a 1-2 deg tilt
+  // error leaks gravity into the velocity and pure LIO ran away to 44 m/s.
+  const bool weak_gate = frontend_attitude_weak_geometry_info > 0.0;
+  attitude_gate_tilt_deg_ = -1.0;
+  if (rtk_fusion_ && (frontend_attitude_aiding || weak_gate) && rtk_observations_enabled)
   {
     RtkFusion::Observation reference;
     gtsam::Pose3 alignment;
     if (rtk_fusion_->referenceAt(LidarMeasures.last_lio_update_time, reference) &&
         reference.orientation_valid && rtk_fusion_->frontendAlignment(alignment))
+    {
+      const M3D measurement = alignment.rotation().matrix().transpose() * reference.orientation.toRotationMatrix();
+      const V3D mask(frontend_attitude_axis_mask[0], frontend_attitude_axis_mask[1], frontend_attitude_axis_mask[2]);
+      attitude_gate_tilt_deg_ = Log(M3D(measurement.transpose() * state_propagat.rot_end)).cwiseProduct(mask).norm() * 180.0 / M_PI;
+      if (weak_gate && weak_geometry_active_ && attitude_gate_tilt_deg_ > frontend_attitude_weak_tilt_deg && !weak_tilt_latched_)
+      {
+        weak_tilt_latched_ = true;
+        RCLCPP_INFO(node_->get_logger(), "Weak LiDAR geometry with %.2f deg roll/pitch disagreement at %.3f: INS roll/pitch aiding on",
+                    attitude_gate_tilt_deg_, LidarMeasures.last_lio_update_time);
+      }
+      if (attitude_gate_log.is_open())
+        attitude_gate_log << std::setprecision(17) << LidarMeasures.last_lio_update_time << ',' << weakest_translation_information_
+                          << ',' << attitude_gate_tilt_deg_ << ',' << int(weak_geometry_active_) << ',' << int(weak_tilt_latched_) << '\n';
+    }
+    // attitude_gate_tilt_deg_ >= 0: a qualified reference and the frontend alignment exist.
+    if (attitude_gate_tilt_deg_ >= 0.0 &&
+        (frontend_attitude_aiding || (weak_gate && weak_geometry_active_ && weak_tilt_latched_)))
     {
       voxelmap_manager->attitude_measurement_ =
           alignment.rotation().matrix().transpose() * reference.orientation.toRotationMatrix();
@@ -1336,6 +1367,37 @@ void LIVMapper::handleLIO()
   voxelmap_manager->StateEstimation(state_propagat);
   _state = voxelmap_manager->state_;
   _pv_list = voxelmap_manager->pv_list_;
+  if (frontend_attitude_weak_geometry_info > 0.0 && voxelmap_manager->collect_geometry_diagnostics_)
+  {
+    // LiDAR-only information (attitude rows are added after it is captured), state order [rot, pos].
+    const Eigen::Matrix<double, 6, 6> &information = voxelmap_manager->lidar_information_body_;
+    const Eigen::Matrix3d rotation_block = information.topLeftCorner<3, 3>();
+    Eigen::Matrix3d translation = information.bottomRightCorner<3, 3>();
+    const Eigen::LDLT<Eigen::Matrix3d> ldlt(rotation_block);
+    if (ldlt.info() == Eigen::Success && rotation_block.trace() > 0.0)
+      translation -= information.block<3, 3>(3, 0) * ldlt.solve(information.block<3, 3>(0, 3));
+    const Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig(0.5 * (translation + translation.transpose()));
+    weakest_translation_information_ = eig.info() == Eigen::Success ? std::max(0.0, eig.eigenvalues()(0)) : 0.0;
+    const bool was_active = weak_geometry_active_;
+    if (weakest_translation_information_ > frontend_attitude_weak_release_factor * frontend_attitude_weak_geometry_info)
+      weak_geometry_armed_ = true;
+    if (weak_geometry_armed_ && !weak_geometry_active_ &&
+        weakest_translation_information_ < frontend_attitude_weak_geometry_info)
+      weak_geometry_active_ = true;
+    else if (weak_geometry_active_ &&
+             weakest_translation_information_ > frontend_attitude_weak_release_factor * frontend_attitude_weak_geometry_info)
+      weak_geometry_active_ = false;
+    if (!weak_geometry_active_) weak_tilt_latched_ = false;
+    if (weak_geometry_active_ && weak_tilt_latched_) ++weak_geometry_frames_;
+    if (weak_geometry_active_ != was_active)
+    {
+      if (weak_geometry_active_) ++weak_geometry_episodes_;
+      RCLCPP_INFO(node_->get_logger(), "Weak LiDAR geometry %s at %.3f: translational information %.3g (gate %.3g)%s",
+                  weak_geometry_active_ ? "entered" : "left", LidarMeasures.last_lio_update_time,
+                  weakest_translation_information_, frontend_attitude_weak_geometry_info,
+                  weak_geometry_active_ ? "; INS roll/pitch aiding armed (roll/pitch disagreement gate)" : "; aiding off");
+    }
+  }
   if (lio_geometry_log.is_open())
   {
     // A fixed metric radius makes spectra comparable across frames; it is a
@@ -1413,7 +1475,18 @@ void LIVMapper::handleLIO()
 
   if(voxelmap_manager->config_setting_.map_sliding_en)
   {
+    const V3D slide_before = voxelmap_manager->last_slide_position;
     voxelmap_manager->mapSliding();
+    // The visual sparse map slides with the LiDAR map (same cube), see VIOManager::slideVisualMap.
+    if (vio_manager && (voxelmap_manager->last_slide_position - slide_before).squaredNorm() > 0.0)
+    {
+      const double half_size = voxelmap_manager->config_setting_.half_map_size *
+                               voxelmap_manager->config_setting_.max_voxel_size_;
+      const std::size_t released = vio_manager->slideVisualMap(voxelmap_manager->last_slide_position, half_size);
+      if (released > 0)
+        RCLCPP_INFO(node_->get_logger(), "Visual map sliding: released %zu points outside +-%.0f m (%zu voxels kept)",
+                    released, half_size, vio_manager->feat_map.size());
+    }
   }
   
   PointCloudXYZI::Ptr laserCloudFullRes(dense_map_en ? feats_undistort : feats_down_body);
@@ -1611,11 +1684,18 @@ void LIVMapper::savePCD()
 void LIVMapper::run(const volatile std::sig_atomic_t &stop_requested)
 {
   rclcpp::Rate rate(1000.0);
+  // rclcpp::spin_some() takes at most one message per subscription per call.
+  // With one call per processed frame (~80 ms in LIVO) the 100 Hz IMU backlog
+  // grew to ~0.9 s inside DDS, and long playbacks then lost or reordered IMU
+  // samples (fatal gap / backwards stamp). Drain every ready message into the
+  // mapper's own buffers instead; playback lead is bounded by the player.
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(node_);
   while (rclcpp::ok())
   {
     // Once stopped, drain already accepted complete LiDAR/IMU groups, but
     // stop admitting an unbounded live stream into the finalization queue.
-    if (!stop_requested) rclcpp::spin_some(node_);
+    if (!stop_requested) executor.spin_all(std::chrono::milliseconds(50));
     if (!sync_packages(LidarMeasures)) 
     {
       if (stop_requested) break;
@@ -1636,6 +1716,9 @@ void LIVMapper::run(const volatile std::sig_atomic_t &stop_requested)
   if (fout_lidar_pos.is_open()) fout_lidar_pos.flush();
   if (rtk_fusion_) rtk_fusion_->finish();
   savePCD();
+  if (frontend_attitude_weak_geometry_info > 0.0)
+    RCLCPP_INFO(node_->get_logger(), "Weak-geometry attitude aiding: %ld aided scans, %ld weak episodes (gate %.3g)",
+                weak_geometry_frames_, weak_geometry_episodes_, frontend_attitude_weak_geometry_info);
   printCalibrationSummary("final");
 }
 
@@ -2481,6 +2564,21 @@ void LIVMapper::imu_cbk(const sensor_msgs::Imu::ConstSharedPtr &msg_in)
           "Dropping an out-of-order startup IMU sample %.9f s older than "
           "the latest sample; no LiDAR deskew has started yet",
           last_timestamp_imu - timestamp);
+      mtx_buffer.unlock();
+      sig_buffer.notify_all();
+      return;
+    }
+    // A sample at most imu_stale_tolerance older than the newest one is a late or repeated delivery
+    // (the recording itself is strictly monotonic; seen once at t=978 s of the 1230 s truck28 round while
+    // the mapper lagged under load, which aborted the whole run). The newer samples are already
+    // buffered, so dropping it changes nothing; only a real clock jump stops the run.
+    constexpr double imu_stale_tolerance = 0.5;
+    if (last_timestamp_imu - timestamp <= imu_stale_tolerance)
+    {
+      ++imu_stale_dropped_;
+      RCLCPP_WARN(node_->get_logger(),
+                  "Dropping a stale IMU sample %.9f s older than the newest one (late/repeated delivery, "
+                  "%zu so far)", last_timestamp_imu - timestamp, imu_stale_dropped_);
       mtx_buffer.unlock();
       sig_buffer.notify_all();
       return;

@@ -108,6 +108,7 @@ public:
   double initial_gyr_bias_sigma = std::sqrt(1e-5);
   double blind_rgb_points = 0.0;
   double last_timestamp_lidar = -1.0, last_timestamp_imu = -1.0, last_timestamp_img = -1.0;
+  std::size_t imu_stale_dropped_ = 0;
   double filter_size_surf_min = 0;
   double filter_size_pcd = 0;
   double _first_lidar_time = 0.0;
@@ -301,6 +302,20 @@ public:
   double frontend_attitude_sigma_deg = 0.3, frontend_attitude_huber_deg = 1.0;
   double frontend_attitude_pull_fraction = 0.05;
   std::vector<double> frontend_attitude_axis_mask{1.0, 1.0, 0.0};
+  // Weak-geometry gate: aid only while the previous scan's LiDAR-only translational information
+  // (Schur complement of the rotation block, weakest eigenvalue, 1/m^2) is below this value
+  // (0 = off). Released above frontend_attitude_weak_release_factor * threshold.
+  double frontend_attitude_weak_geometry_info = 0.0, frontend_attitude_weak_release_factor = 1.5;
+  // Armed after the first well-constrained scan: the first scans after map creation carry almost
+  // no information (empty map) and must not switch the aid on during the stationary start.
+  bool weak_geometry_active_ = false, weak_geometry_armed_ = false;
+  long weak_geometry_frames_ = 0, weak_geometry_episodes_ = 0;
+  double weakest_translation_information_ = 0.0;
+  // Second condition: the propagated roll/pitch disagrees with the qualified INS attitude by more
+  // than this [deg] (0 = geometry alone). Latched for the rest of the weak episode.
+  double frontend_attitude_weak_tilt_deg = 0.0, attitude_gate_tilt_deg_ = -1.0;
+  bool weak_tilt_latched_ = false;
+  ofstream attitude_gate_log;
   struct PendingRtkLivoFrame
   {
     bool valid = false;

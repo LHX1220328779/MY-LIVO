@@ -268,8 +268,14 @@ def build_parser():
     ap.add_argument("--progress-interval", type=float, default=5.0)
     ap.add_argument("--pace-topic", default="/aft_mapped_to_init",
                     help="mapper odometry topic used for flow control ('' = free-running playback)")
-    ap.add_argument("--max-lead", type=float, default=3.0,
-                    help="hold the playback when the data time is more than this many seconds ahead of the mapper")
+    # 1.0 s, not 3.0: the point-cloud writers keep KEEP_LAST(20) = 2.0 s of LiDAR (make_qos). With a 3 s lead a
+    # mapper lagging 2-3 s had its unacknowledged clouds overwritten per topic, the multi-LiDAR merger lost its
+    # scan-start alignment ("Dropping unmatched ... span 1600 ms") and only ~35 % of the frames were mapped from
+    # t=555 s of the 1230 s truck28 recording (results/wuhu_28_livo_1_test, 2026-10-11). The lead must stay
+    # well inside the cloud history.
+    ap.add_argument("--max-lead", type=float, default=1.0,
+                    help="hold the playback when the data time is more than this many seconds ahead of the mapper "
+                         "(keep it below the 2 s point-cloud writer history)")
     ap.add_argument("--hold-timeout", type=float, default=20.0,
                     help="release a hold when the mapper has made no progress for this long (deadlock guard)")
     ap.add_argument("--dry-run", action="store_true", help="describe what would be played and exit")
