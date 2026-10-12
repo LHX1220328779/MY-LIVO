@@ -19,6 +19,7 @@ STAGE_FALLBACK = {
     "ground": {"order": 3, "label": "静止地面精修", "command": "ground", "advisory": False, "mapping": None},
     "driven": {"order": 4, "label": "行驶段 6-DoF 精修", "command": "driven", "advisory": False, "mapping": "lio"},
     "rtktime": {"order": 4.5, "label": "RTK 位置关联时间", "command": "rtk-time", "advisory": False, "mapping": "lio"},
+    "gcons": {"order": 4.7, "label": "后向雷达地面一致性（tilt/z）", "command": "gcons", "advisory": False, "mapping": "lio"},
     "camtime": {"order": 5, "label": "相机时间偏移", "command": "camera-time", "advisory": False, "mapping": None},
     "camlidar": {"order": 6, "label": "相机-LiDAR 偏航/横滚复核", "command": "camera-lidar", "advisory": True, "mapping": "livo"},
     "camloop": {"order": 7, "label": "相机外参闭环标定", "command": "set", "advisory": False, "mapping": "livo", "internal": True},
@@ -301,11 +302,11 @@ def stage_cmd(stage, body):
         return import_cmd(body)
     parent = _parent(body)
     cmd = [PY, str(CALIB_TOOL), command, "--id", parent]
-    if command in ("axle", "ground", "driven", "camera-time", "camera-lidar"):
+    if command in ("axle", "ground", "driven", "gcons", "camera-time", "camera-lidar"):
         dataset = str(safe_path(body.get("dataset") or ""))
         datasets.require(dataset, camera=command in ("camera-time", "camera-lidar"))
         cmd += ["--bag", dataset]
-    if command in ("driven", "camera-lidar"):
+    if command in ("driven", "gcons", "camera-lidar"):
         cmd += ["--run", str(_run_dir(body.get("run") or ""))]
     uw = _user_window(body)
     if command == "ground":
@@ -807,7 +808,9 @@ def pipeline_steps(kind, body, mapping_cmd):
     """Standard pipelines. `mapping_cmd(round_name, mode, calibration_file, body)` builds the round command.
 
     lidar  : axle (reference LiDAR -> rear axle from RTK/INS, rig correction; skip_axle=true skips it)
-             -> ground -> LIO round (save_map, evaluated) -> driven -> validate [-> activate]
+             -> ground -> LIO round (save_map, evaluated) -> driven -> validate -> RTK time association (LIO
+             rounds) -> gcons (rear-facing LiDAR tilt/z vs the all-LiDAR ground; skip_gcons=true skips it)
+             -> validate [-> activate]
     camera : camera-time -> LIVO round A -> camera-lidar (pole yaw, pitch untouched)
              -> pitch scan (2 temporary versions, 2 LIVO rounds) -> zero crossing -> camloop version
              -> LIVO verify round -> closed-loop verdict A vs verify -> validate [-> activate if pass]
@@ -892,6 +895,17 @@ def pipeline_steps(kind, body, mapping_cmd):
                       "after": lambda ctx, lines: ctx.__setitem__("result_id", ctx["driven_id"])})
         if not body.get("skip_rtk_time"):
             _rtk_time_steps(steps, body, mapping_cmd, truck=truck, stamp=stamp, auto_activate=auto_activate)
+            if not body.get("skip_gcons"):
+                # The RTK time-association round already maps the whole window with the driven extrinsics and
+                # RTK-optimized poses: the rear-facing LiDAR is then tied to the ground seen by ALL LiDARs (the
+                # driven stage could only use the front LiDAR's far, cross-time ground). No significant offset ->
+                # the stage keeps the current version (it prints the parent id).
+                steps.append({"title": "后向雷达地面一致性 (gcons：全部雷达共识地面 → 后向雷达 tilt/z，无显著偏差则沿用)",
+                              "build": lambda ctx: [PY, str(CALIB_TOOL), "gcons", "--id", ctx["result_id"], "--bag", dataset,
+                                                    "--run", ctx["rtk_fusion1"], "--note", body.get("note") or "pipeline: gcons"],
+                              "after": lambda ctx, lines: ctx.__setitem__("result_id", parse_version_id(lines))})
+                steps.append({"title": "校验最终版本（gcons 之后）",
+                              "build": lambda ctx: [PY, str(CALIB_TOOL), "validate", "--id", ctx["result_id"]]})
         if auto_activate:
             # intermediate versions are never activated: a pipeline that stops half-way leaves the vehicle on its
             # previous calibration; only the final version, after validation, is promoted

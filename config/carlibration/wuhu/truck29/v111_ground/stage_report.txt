@@ -1,0 +1,12 @@
+calibration=/home/project/MY-LIVO/config/carlibration/wuhu/truck29/v110_axle/calibration.json
+bag=/home/project/data/haibo/wuhu_livo/ros2bag
+reference=front_lidar
+stationary frames 2..22 (aggregated) for side LiDARs; moving frames 300..340 (per frame) for back LiDAR
+stationary check (front_lidar, first vs last frame of 20): scan displacement median 11.3 cm / P90 35.0 cm (limit 30 cm) -> stationary
+front_right_lidar: stationary aggregated points 12228
+back_lidar: stationary aggregated points 2427
+front_left_lidar: stationary aggregated points 18528
+front_lidar: stationary aggregated points 43542
+front_right_lidar: yaw/xy solved=False; matches 3775->3751; |res| median 6.06->4.02 cm; ground 6.07->4.01 cm (n=3663); vertical 4.89->3.11 cm (n=38); correction rot deg (x,y,z)=(-0.114,+0.360,+0.000) trans cm=(+0.0,+0.0,+1.3); iters 17
+front_left_lidar: yaw/xy solved=False; matches 4543->4862; |res| median 16.46->5.10 cm; ground 16.68->5.10 cm (n=4745); vertical 5.50->5.09 cm (n=53); correction rot deg (x,y,z)=(+0.106,-1.311,+0.000) trans cm=(+0.0,+0.0,-0.9); iters 25
+back_lidar: (moving, per-frame vs refined sides) yaw/xy solved=False; matches 36617->36769; |res| median 8.22->7.97 cm; ground 7.83->7.61 cm (n=31445); vertical n=3995; correction rot deg (x,y,z)=(+0.225,-0.133,+0.000) trans cm=(+0.0,+0.0,+2.0); iters 16

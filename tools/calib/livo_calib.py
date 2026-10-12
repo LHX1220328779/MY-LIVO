@@ -15,6 +15,7 @@ inputs. Stages (version suffix = stage; see STAGES for the operator-facing catal
                 every LiDAR and the camera + LiDAR time shift; scripts/refine_rear_axle_extrinsic.py); no mapping run
   ground        static-start roll/pitch/z refinement of every LiDAR (scripts/refine_multi_lidar_extrinsics.py)
   driven        driven-window 6-DoF refinement (scripts/refine_multi_lidar_yaw.py); needs a LIO run
+  gcons         rear-facing LiDAR tilt/z vs the multi-LiDAR ground consensus (scripts/refine_lidar_ground_consensus.py)
   camera-time   camera->IMU time offset from optical flow vs gyro
   camera-lidar  camera->rear-axle extrinsic refinement by LiDAR depth-edge / image-edge alignment
                 (advisory: writes overlays/ images, activate only after inspecting them)
@@ -79,6 +80,10 @@ STAGES = {
     "driven": {"order": 4, "label": "行驶段 6-DoF 精修", "command": "driven",
                "input": "原始录制 + 一次 LIO 建图结果", "output": "四个 LiDAR 之间的 6-DoF 一致性",
                "needs": ["dataset", "run"], "mapping": "lio", "advisory": False, "seconds": 90},
+    "gcons": {"order": 4.7, "label": "后向雷达地面一致性（tilt/z）", "command": "gcons",
+              "input": "原始录制 + 一次 LIO 建图结果（当前外参，RTK 优化位姿；流水线取 RTK 关联时间轮次）",
+              "output": "后向 LiDAR 相对全部雷达共识地面的 roll / pitch / z（无显著偏差则沿用父版本）",
+              "needs": ["dataset", "run"], "mapping": "lio", "advisory": False, "seconds": 120},
     "rtktime": {"order": 4.5, "label": "RTK 位置关联时间", "command": "rtk-time",
                 "input": "1–2 次 LIO 建图结果（流水线自动生成）",
                 "output": "time_offsets.rtk_position（地图自洽：不同车速/方向下同一结构重合；两轮割线闭环）",
@@ -687,6 +692,35 @@ def cmd_driven(a):
     finalize_version(out_dir, calib, mine=mine, truck=truck, stage="driven", parent=a.id,
                      note=a.note or "driven-window 6-DoF refinement", inputs={"bag": a.bag, "dataset": ds_info,
                      "run": a.run, "window": list(a.window)}, metrics={"refinement": metrics}, report_lines=lines,
+                     activate=a.activate)
+
+
+def cmd_gcons(a):
+    pdir, parent_calib, mine, truck = parent_info(a.id)
+    _, ds_info = require_dataset(a.bag, what="gcons")
+    if not ((pathlib.Path(a.run) / "frames.csv").exists() and (pathlib.Path(a.run) / "trajectory_optimized.txt").exists()):
+        sys.exit(f"gcons: {a.run} is not an RTK-fused fusion run directory (frames.csv / trajectory_optimized.txt missing)")
+    out_dir = next_version_dir(mine, truck, "gcons")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # frames.csv / trajectory_optimized.txt are stamped in the front-end time base (see cmd_driven)
+    offsets = parent_calib.get("time_offsets", {})
+    lidar_offset = offsets.get("lidar_frontend", offsets.get("lidar", -0.125))
+    cmd = ["/usr/bin/python3", str(SCRIPTS / "refine_lidar_ground_consensus.py"), "--calibration",
+           str(pdir / "calibration.json"), "--bag", a.bag, "--run", a.run, "--lidar-time-offset", str(lidar_offset),
+           "--output", str(out_dir / "calibration.json"), "--report", str(out_dir / "stage_report.txt")]
+    lines = run_script(cmd, out_dir / "stage.log")
+    if not (out_dir / "calibration.json").exists():
+        # no significant correction: the parent stays the result (the pipeline continues with it)
+        shutil.rmtree(out_dir, ignore_errors=True)
+        if out_dir in CREATED_DIRS:
+            CREATED_DIRS.remove(out_dir)
+        print(json.dumps({"id": a.id, "kept": True, "reason": "no significant ground-consensus correction"}, ensure_ascii=False))
+        return
+    calib = json.loads((out_dir / "calibration.json").read_text())
+    metrics = {"ground_consensus": calib.get("refinement", {}).get("ground_consensus", {})}
+    finalize_version(out_dir, calib, mine=mine, truck=truck, stage="gcons", parent=a.id,
+                     note=a.note or "rear-facing LiDAR tilt/z from the multi-LiDAR ground consensus",
+                     inputs={"bag": a.bag, "dataset": ds_info, "run": a.run}, metrics=metrics, report_lines=lines,
                      activate=a.activate)
 
 
@@ -2465,6 +2499,13 @@ def main():
     p.add_argument("--moving", nargs=2, type=int, default=(300, 40))
     common(p)
     p.set_defaults(func=cmd_ground)
+
+    p = sub.add_parser("gcons")
+    p.add_argument("--bag", required=True, help="recording: raw ROS 2 root (segment folders) or single bag folder")
+    p.add_argument("--run", required=True, help="fusion run directory (Log/fusion/<stamp>) of an RTK-fused LIO round "
+                   "made with the parent's extrinsics")
+    common(p)
+    p.set_defaults(func=cmd_gcons)
 
     p = sub.add_parser("driven")
     p.add_argument("--bag", required=True, help="recording: raw ROS 2 root (segment folders) or single bag folder")
