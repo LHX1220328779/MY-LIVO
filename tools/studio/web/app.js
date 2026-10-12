@@ -692,7 +692,7 @@ function drawerJob() {
   const res = j.results || {};
   const resHtml = Object.keys(res).length ? `<div class="kv small" style="margin:10px 0">${Object.entries(res).map(([k, v]) => `<div class="k">${esc(k)}</div><div class="mono">${esc(v)}</div></div>`).join("")}</div>` : "";
   return `<div class="drawer-h"><div><h2>${esc(j.title)}</h2><div class="small muted">${fmtT(j.started)} · ${j.status === "running" ? "运行中" : esc(j.status)} ${j.error ? `· <span class="bad">${esc(j.error)}</span>` : ""}</div></div>
-    <div class="row">${j.status === "running" ? `<button class="btn" data-act="stop" data-mode="finish">提前结束并保存</button><button class="btn danger" data-act="stop" data-mode="abort">强制终止</button>` : ""}<button class="btn sm" data-act="close">关闭</button></div></div>
+    <div class="row">${j.status === "running" ? `<button class="btn" data-act="stop" data-mode="finish">提前结束并保存</button><button class="btn danger" data-act="stop" data-mode="abort">强制终止</button>` : ""}${j.kind === "pipeline" && ["failed", "stopped", "lost"].includes(j.status) ? `<button class="btn" data-act="resumeJob" title="从第一个未完成的步骤继续，已完成的阶段与轮次不再重跑">从失败步骤续跑</button>` : ""}<button class="btn sm" data-act="close">关闭</button></div></div>
     ${j.steps.length > 1 ? `<div class="list" id="job-steps">${jobStepsHtml()}</div>` : ""}${resHtml}
     ${res.result_id ? `<div class="row" style="margin-bottom:10px"><button class="btn" data-act="open-version" data-id="${esc(res.result_id)}">查看版本 ${esc(res.result_id.split("/").pop())}</button>${res.camlidar_id ? `<button class="btn" data-act="open-version" data-id="${esc(res.camlidar_id)}">查看相机复核 ${esc(res.camlidar_id.split("/").pop())}</button>` : ""}</div>` : ""}
     ${j.meta?.round || res.round ? `<div class="row" style="margin-bottom:10px"><button class="btn" data-act="open-run" data-round="${esc(res.round || j.meta.round)}">查看轮次 ${esc(res.round || j.meta.round)}</button></div>` : ""}
@@ -846,6 +846,10 @@ const A = {
     const mode = el.dataset.mode;
     if (mode === "abort" && !confirm("强制终止会杀掉建图与回放进程，本轮结果不完整。确定？")) return;
     await act(async () => { if (S.job?.id) await api(`/api/jobs/${S.job.id}/stop`, "POST", { mode }); else await api("/api/mapping/stop", "POST", { mode }); await pollJob(); patchLive(); }, mode === "finish" ? "已停止回放，正在收尾导出" : "已发送终止信号");
+  },
+  async resumeJob() {
+    const j = S.job; if (!j) return;
+    await act(async () => { const job = await api("/api/calibrations/pipeline", "POST", { ...(j.meta?.options || {}), kind: j.meta?.kind, resume: j.id }); S.job = job; S.jobLog = []; S.jobLogNext = 0; await loadOverview(); render(); }, "已从失败步骤续跑");
   },
   async kill() { if (!confirm("清理所有残留的 fastlivo_mapping / 回放 / launch 进程？")) return; await act(() => api("/api/mapping/kill", "POST", {}), "已发送清理信号"); await loadOverview(); render(); },
   async pipeline(el) {

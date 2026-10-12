@@ -670,6 +670,22 @@ def _camloop_steps(steps, body, mapping_cmd, *, truck, stamp, auto_activate, bas
                   "after": lambda ctx, lines: ctx.__setitem__("activated", activate_ok(ctx))})
 
 
+def _rtk_round_start(ctx, body, rtk_dur):
+    """Start of the RTK time-association rounds. The offset is only observable through accelerations, so the
+    round should be as long as allowed: among the motion-window candidates take the one with the most
+    recording left (up to the round length), ties broken by the driving score. Explicit windows win."""
+    if _user_window(body) is not None or body.get("start_offset") not in (None, ""):
+        return _round_start(ctx, body)
+    win = ctx.get("win") or {}
+    total = float(win.get("duration_s") or 0.0)
+    cands = [c for c in win.get("candidates") or [] if c.get("round_start_s") is not None]
+    if not cands or total <= 0:
+        return _round_start(ctx, body)
+    cap = rtk_dur or total
+    best = max(cands, key=lambda c: (round(min(cap, total - float(c["round_start_s"]))), float(c.get("score") or 0.0)))
+    return float(best["round_start_s"]) or None
+
+
 def _rtk_time_steps(steps, body, mapping_cmd, *, truck, stamp, auto_activate):
     """RTK position time association, fully automatic: LIO round with the driven version -> map-consistency
     estimate -> (only when observable and not already consistent) probe version + LIO round at the predicted
@@ -678,9 +694,9 @@ def _rtk_time_steps(steps, body, mapping_cmd, *, truck, stamp, auto_activate):
     rtk_dur = RTK_ROUND_S if rtk_dur in (None, "") else (float(rtk_dur) or None)
     r1, r2 = f"calib_{truck}_rtk1_{stamp}", f"calib_{truck}_rtk2_{stamp}"
     probing = lambda ctx: (ctx.get("rtk1") or {}).get("decision") == "probe"
-    steps.append({"title": f"LIO 建图轮次 {r1}（RTK 关联时间估计，{rtk_dur or 0:.0f} s，含起步/转弯/变速）", "retry": 1, "round": r1,
+    steps.append({"title": f"LIO 建图轮次 {r1}（RTK 关联时间估计，{rtk_dur or 0:.0f} s，起点取剩余时长最长的运动窗口）", "retry": 1, "round": r1,
                   "build": lambda ctx: mapping_cmd(r1, "lio", str(calibration_file(ctx["driven_id"])), body,
-                                                   duration=_play_duration(ctx, body, rtk_dur), start_offset=_round_start(ctx, body), quick=True),
+                                                   duration=_play_duration(ctx, body, rtk_dur), start_offset=_rtk_round_start(ctx, body, rtk_dur), quick=True),
                   "after": lambda ctx, lines: ctx.update(rtk_round1=r1, rtk_fusion1=latest_fusion_dir(r1))})
     steps.append({"title": "RTK 关联时间：地图自洽估计（不可观测或已自洽则沿用行驶段版本）",
                   "build": lambda ctx: [PY, str(CALIB_TOOL), "rtk-time", "--id", ctx["driven_id"], "--run", ctx["rtk_fusion1"]],
@@ -693,15 +709,74 @@ def _rtk_time_steps(steps, body, mapping_cmd, *, truck, stamp, auto_activate):
                   "after": lambda ctx, lines: ctx.__setitem__("rtk_probe_id", parse_version_id(lines) if probing(ctx) else None)})
     steps.append({"title": f"LIO 建图轮次 {r2}（探测值，同一窗口）", "retry": 1, "round": r2,
                   "build": lambda ctx: mapping_cmd(r2, "lio", str(calibration_file(ctx["rtk_probe_id"])), body,
-                                                   duration=_play_duration(ctx, body, rtk_dur), start_offset=_round_start(ctx, body), quick=True)
+                                                   duration=_play_duration(ctx, body, rtk_dur), start_offset=_rtk_round_start(ctx, body, rtk_dur), quick=True)
                   if probing(ctx) else ["/bin/echo", "probe round skipped"],
                   "after": lambda ctx, lines: ctx.update(rtk_fusion2=latest_fusion_dir(r2) if probing(ctx) else None)})
     steps.append({"title": "RTK 关联时间：两轮割线定版（rtktime 版本）",
                   "build": lambda ctx: [PY, str(CALIB_TOOL), "rtk-time", "--id", ctx["driven_id"], "--run", ctx["rtk_fusion1"],
-                                        "--run2", ctx["rtk_fusion2"], *(["--activate"] if auto_activate else [])]
+                                        "--run2", ctx["rtk_fusion2"]]
                   if probing(ctx) else ["/bin/echo", f"rtk_position kept: {(ctx.get('rtk1') or {}).get('reason', '')}"],
                   "after": lambda ctx, lines: ctx.__setitem__("result_id", parse_version_id(lines) if probing(ctx) else ctx["driven_id"])})
     steps.append({"title": "校验最终版本", "build": lambda ctx: [PY, str(CALIB_TOOL), "validate", "--id", ctx["result_id"]]})
+
+
+RESUME_PREFIX = "续跑："
+
+
+def _resume_steps(body, mapping_cmd):
+    """Continue a failed / stopped / lost pipeline from its first unfinished step.
+
+    The step list is rebuilt from the original request with the same round-name stamp (current code, so a fix
+    made after the failure is used), the finished steps are replaced by no-ops and the original job context
+    (version ids, round directories, estimates) is restored first. Refused when the rebuilt step list no longer
+    matches the original one (pipeline structure changed in between)."""
+    import copy
+    from . import jobs  # never hot-reloaded: holds the live and stored job records
+    src = jobs.get(str(body["resume"]))
+    if src is None:
+        raise StudioError(f"找不到要续跑的任务 {body['resume']}")
+    doc = src.to_json()
+    if doc.get("kind") != "pipeline" or doc.get("status") not in ("failed", "stopped", "lost"):
+        raise StudioError("只有失败、终止或中断的流水线任务可以续跑")
+    meta = doc.get("meta") or {}
+    opts = {k: v for k, v in (meta.get("options") or {}).items() if k != "resume"}
+    # the data assessment step only exists when no cached report was present; it is done either way by now
+    old = [st for st in doc.get("steps") or [] if not st["title"].startswith((RESUME_PREFIX, "数据评估"))]
+    opts["skip_assess"] = True
+    stamp = next((m.group(1) for st in old for m in [re.search(r"_(\d{4}_\d{6})", st["title"])] if m), None)
+    if stamp is None:
+        raise StudioError("原任务中找不到轮次时间戳，无法续跑")
+    opts["_stamp"] = stamp
+    steps, info = pipeline_steps(meta.get("kind") or opts.get("kind") or "lidar", opts, mapping_cmd)
+    done = 0
+    while done < len(old) and old[done]["status"] == "done":
+        done += 1
+    # only the finished prefix has to be the same pipeline (its results are reused); the remaining steps come
+    # from the current code on purpose, so a fix made after the failure is picked up
+    for a, b in zip(steps[:done], old[:done]):
+        if a["title"] != b["title"]:
+            raise StudioError(f"已完成的步骤与当前流水线不一致（原：{b['title']}；现：{a['title']}），请重新运行完整流水线")
+    if done >= len(steps):
+        raise StudioError("原任务的所有步骤都已完成")
+    saved = copy.deepcopy(doc.get("results") or {})
+    out = [{"title": f"{RESUME_PREFIX}恢复任务 {doc['id']} 的结果，从第 {done + 1} 步继续",
+            "cmd": ["/bin/echo", f"resume {doc['id']} at step {done + 1}: {old[done]['title']}"],
+            "after": lambda ctx, lines: ctx.update(copy.deepcopy(saved))}]
+    out += [{"title": st["title"], "cmd": ["/bin/echo", f"done in job {doc['id']}"]} for st in steps[:done]]
+    first = dict(steps[done])
+    if first.get("round") and first.get("build"):
+        # a half-written round directory of the failed attempt is kept for diagnosis, as the retry logic does
+        def build(ctx, orig=first["build"], rn=first["round"]):
+            d = RESULTS / rn
+            if d.is_dir():
+                k = 1
+                while (RESULTS / f"{rn}.failed{k}").exists():
+                    k += 1
+                d.rename(RESULTS / f"{rn}.failed{k}")
+            return orig(ctx)
+        first["build"] = build
+    out += [first] + steps[done + 1:]
+    return out, {**info, "resumed_from": doc["id"], "resumed_at_step": done + 1}
 
 
 def pipeline_steps(kind, body, mapping_cmd):
@@ -716,6 +791,8 @@ def pipeline_steps(kind, body, mapping_cmd):
     The native odometry scale reacts with ~11 %/deg of camera pitch error and is repeatable to ~0.03 %,
     so it is the acceptance test; edge/pole alignment alone cannot resolve pitch (36-line ring spacing).
     """
+    if body.get("resume"):
+        return _resume_steps(body, mapping_cmd)
     parent = _parent(body)
     dataset = str(safe_path(body.get("dataset") or ""))
     mine, truck = parent.split("/")[:2]
@@ -730,7 +807,7 @@ def pipeline_steps(kind, body, mapping_cmd):
     cam_dur = 60.0 if cam_dur in (None, "") else (float(cam_dur) or None)  # default: 60 s rounds; 0 = full
     body = {**body, "_parent_id": parent, "pitch_slope": slope_info["slope"], "pitch_slope_source": slope_info["source"],
             "_cam_round_duration": cam_dur, "_has_zero_round": kind == "camera"}
-    stamp = dt.datetime.now().strftime("%m%d_%H%M%S")
+    stamp = body.get("_stamp") or dt.datetime.now().strftime("%m%d_%H%M%S")  # _stamp: resume keeps round names
     auto_activate = bool(body.get("activate", True))
     steps = []
     if body.get("dataset") and not body.get("skip_assess"):
@@ -782,7 +859,7 @@ def pipeline_steps(kind, body, mapping_cmd):
             "after": lambda ctx, lines: ctx.update(round=round_name, fusion_dir=latest_fusion_dir(round_name))})
         def _driven_body(ctx):
             return {"id": ctx["ground_id"], "dataset": dataset, "run": ctx["fusion_dir"],
-                    "note": body.get("note") or "pipeline: driven", "activate": auto_activate,
+                    "note": body.get("note") or "pipeline: driven", "activate": False,
                     "window_start": body.get("window_start"), "window_duration": body.get("window_duration"),
                     **({"window": _driven_window(ctx, body)} if _user_window(body) is not None else {})}
         steps.append({"title": "行驶段 6-DoF 精修 (driven)", "build": lambda ctx: stage_cmd("driven", _driven_body(ctx)),
@@ -791,6 +868,12 @@ def pipeline_steps(kind, body, mapping_cmd):
                       "after": lambda ctx, lines: ctx.__setitem__("result_id", ctx["driven_id"])})
         if not body.get("skip_rtk_time"):
             _rtk_time_steps(steps, body, mapping_cmd, truck=truck, stamp=stamp, auto_activate=auto_activate)
+        if auto_activate:
+            # intermediate versions are never activated: a pipeline that stops half-way leaves the vehicle on its
+            # previous calibration; only the final version, after validation, is promoted
+            steps.append({"title": "激活最终版本（仅在全部步骤成功后）",
+                          "build": lambda ctx: [PY, str(CALIB_TOOL), "activate", "--id", ctx["result_id"]],
+                          "after": lambda ctx, lines: ctx.__setitem__("activated", ctx["result_id"])})
     elif kind == "camera":
         datasets.require(dataset, camera=True)
         _windows_step(steps, dataset, cam_dur or 60, body)
