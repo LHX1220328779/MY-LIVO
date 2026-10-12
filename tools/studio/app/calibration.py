@@ -125,9 +125,9 @@ def vehicle_status(cat, mine, truck):
                              .get("calibration_type", ""))
     ctype = str(calib.get("calibration_type", ""))
     offsets = calib.get("time_offsets") or {}
-    # a raw supplier import is not aligned to the rear axle until the axle stage ran; lineages that
-    # started from a hand-tuned schema-5 export (non supplier_raw) were aligned manually
-    axle_done = "axle" in stages_done or "rear_axle_alignment" in ctype or not root_ctype.startswith("supplier_raw")
+    # no import is aligned to the rear axle until the axle stage ran (hand-tuned exports included: truck29
+    # v001_import was 0.2 deg off the INS)
+    axle_done = "axle" in stages_done or "rear_axle_alignment" in ctype
     lidar_refined = any(s in ("ground", "driven", "precheck") for s in stages_done) or "refined" in ctype
     driven_done = "driven" in stages_done or "driven" in ctype or "stage2" in ctype
     rtk_time_done = "rtktime" in stages_done or "rtk-time" in str(offsets.get("rtk_position_source", ""))
@@ -779,6 +779,30 @@ def _resume_steps(body, mapping_cmd):
     return out, {**info, "resumed_from": doc["id"], "resumed_at_step": done + 1}
 
 
+_CLEANUP_CODE = """import pathlib, sys
+root, pattern = pathlib.Path(sys.argv[1]), sys.argv[2]
+total = count = 0
+for run in sorted(root.glob(pattern)):
+    for f in run.glob("Log/fusion/*/*"):
+        if f.name in ("scans.bin", "sources.bin", "colors.bin") or (
+                f.suffix == ".pcd" and f.name.startswith(("map_", "rgb_map_"))):
+            total += f.stat().st_size; count += 1; f.unlink()
+print("removed %d files, %.2f GB from %s (keep_calib_maps=false)" % (count, total / 1e9, pattern))
+"""
+
+
+def _cleanup_step(steps, body, truck, stamp):
+    """Calibration rounds archive every scan (scans.bin/colors.bin/sources.bin) and export map_N/rgb_map_N.pcd
+    because the later stages of the same pipeline read them (driven: frames.csv, rtk-time / camera-lidar:
+    scans.bin). Once the pipeline succeeded they are dead weight (truck29: ~1.7 GB per LIO round, truck28 ~3.5 GB):
+    removed unless keep_calib_maps. Trajectories, frames.csv, diagnostics and evaluation stay. A failed pipeline
+    keeps everything (resume reuses the finished rounds)."""
+    if body.get("keep_calib_maps"):
+        return
+    steps.append({"title": "清理标定轮次的地图 PCD 与扫描存档（默认不保留；轨迹/评估保留）",
+                  "cmd": [PY, "-c", _CLEANUP_CODE, str(RESULTS), f"calib_{truck}_*_{stamp}*"]})
+
+
 def pipeline_steps(kind, body, mapping_cmd):
     """Standard pipelines. `mapping_cmd(round_name, mode, calibration_file, body)` builds the round command.
 
@@ -910,6 +934,7 @@ def pipeline_steps(kind, body, mapping_cmd):
                        base_key="base_id", round0_key="round", baseline_key="round", standard=standard)
     else:
         raise StudioError(f"未知流水线 {kind}")
+    _cleanup_step(steps, body, truck, stamp)
     return steps, {"mine": mine, "truck": truck, "parent": parent, "dataset": dataset,
                    "mode": "standard" if standard else "fast", "mode_note": mode_note,
                    "pitch_slope": None if standard else slope_info["slope"],

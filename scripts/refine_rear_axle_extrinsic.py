@@ -23,8 +23,9 @@ C is applied to EVERY LiDAR and to the camera, so the relative calibration of th
 camera stages) is preserved: the same command aligns a raw supplier file or fine-tunes a refined version.
 Precision is reported as the spread of two independent half-recording solutions.
 
-DoF policy (livo_calib.py axle --dof auto): a raw supplier import needs rpy_xy (its rotation is off by
-degrees). An already aligned parent (hand-tuned schema-5 lineage or a previous axle version) gets xy: the
+DoF policy (livo_calib.py axle --dof auto): every import that this stage has not aligned yet gets rpy_xy (raw
+supplier files are off by degrees, the hand-tuned truck29 v001 export by 0.2 deg, enough for 14.5 m of native
+LIO drift in 120 s). A parent already aligned by a previous axle version gets xy: the
 rotation is kept and only the lever arm and the LiDAR time shift are applied (always solved jointly with the
 rotation: with a fixed rotation that is 0.2 deg off, the two half-recording lever arms differ by 30-55 cm). On truck29 the full-rotation
 solution is INS-consistent to 0.1 deg and improves trajectory/ground/attitude metrics, but in LIVO it shifts

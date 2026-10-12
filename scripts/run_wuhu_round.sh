@@ -53,6 +53,11 @@ cd "$repo"
 unset CONDA_PREFIX CONDA_DEFAULT_ENV PYTHONHOME PYTHONPATH
 export PATH=/opt/ros/humble/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 set +u; source /opt/ros/humble/setup.bash; source install/fast_livo/share/fast_livo/local_setup.bash; set -u
+# Every SIGINT/SIGKILL-ed node leaves its 128 MB Fast DDS shared-memory segment in /dev/shm; after ~15 aborted
+# or killed rounds the 2 GB container shm is full and the next mapper dies with "rcl node's rmw handle is
+# invalid" (2026-10-12: two pipeline retries lost). `fastdds shm clean` removes only zombie segments (no live
+# owner), so it is safe while other ROS processes run.
+timeout 30 fastdds shm clean >/dev/null 2>&1 || true
 export ROS_LOG_DIR="$out/roslog"; mkdir -p "$ROS_LOG_DIR"
 export FASTDDS_BUILTIN_TRANSPORTS=SHM
 # 128 MB SHM segment + 100 ms heartbeat for the player/mapper traffic (see config/fastdds_livo_shm.xml).

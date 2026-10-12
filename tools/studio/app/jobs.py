@@ -84,7 +84,12 @@ class Job:
                         if spec.get("round"):
                             src = RESULTS / spec["round"]
                             if src.is_dir():
-                                src.rename(RESULTS / f"{spec['round']}.failed{attempt}")
+                                # a resumed job retries under the same round name: never collide with the
+                                # .failedN directory an earlier job left behind
+                                n = attempt
+                                while (RESULTS / f"{spec['round']}.failed{n}").exists():
+                                    n += 1
+                                src.rename(RESULTS / f"{spec['round']}.failed{n}")
                     self._log(f"=== [{i + 1}/{len(self.steps)}] {step['title']}\n$ {' '.join(cmd)}")
                     lines = []
                     try:

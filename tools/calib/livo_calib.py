@@ -575,9 +575,14 @@ def cmd_axle(a):
     out_dir = next_version_dir(mine, truck, "axle")
     out_dir.mkdir(parents=True, exist_ok=True)
     dof = a.dof
-    if dof == "auto":  # a raw supplier import needs the rotation; an aligned parent keeps it (see the script docstring)
+    if dof == "auto":
+        # Only a parent this stage already aligned keeps its rotation. Any other import (raw supplier file or a
+        # hand-tuned schema-5 export) has never been checked against RTK/INS: the old "hand-tuned = aligned" rule
+        # left truck29 v001_import 0.14/0.15/0.23 deg (pitch/roll/yaw) off the INS although the solver measured it
+        # with 0.002/0.001/0.05 deg half-to-half repeatability; the LiDAR/IMU tilt made native LIO drift 14.5 m in
+        # 120 s (same code, aligned lineage: 2.1 m). On an aligned parent the solved rotation is ~0 anyway.
         ctype = str(parent_calib.get("calibration_type", ""))
-        dof = "rpy_xy" if ctype.startswith("supplier_raw") and "rear_axle_alignment" not in ctype else "xy"
+        dof = "xy" if "rear_axle_alignment" in ctype else "rpy_xy"
         print(f"axle: --dof auto -> {dof} (parent calibration_type {ctype or '-'})", flush=True)
     cmd = ["/usr/bin/python3", str(SCRIPTS / "refine_rear_axle_extrinsic.py"), "--calibration",
            str(pdir / "calibration.json"), "--bag", a.bag, "--output", str(out_dir / "calibration.json"),
@@ -598,6 +603,15 @@ def cmd_axle(a):
         offsets = calib.setdefault("time_offsets", dict(DEFAULT_TIME_OFFSETS))
         solved = offsets.get("lidar")
         template = offsets.get("lidar_frontend")
+        if template is None:
+            # versions imported before lidar_frontend existed: compare against the default every new import
+            # carries instead of replacing it with lidar + lag (truck29 v082: -0.1335 instead of the hardware
+            # -0.125; the yaw-rate lag on this INS reads 12.5 ms on every truck, the 0.02 s tolerance absorbs it).
+            # Written explicitly: without the key the mapper deskews with time_offsets.lidar (21 ms off on truck29).
+            template = DEFAULT_TIME_OFFSETS["lidar_frontend"]
+            offsets["lidar_frontend"] = template
+            offsets["lidar_frontend_source"] = "axle: import default (parent version had no lidar_frontend)"
+            (out_dir / "calibration.json").write_text(json.dumps(calib, indent=1))
         if isinstance(solved, (int, float)):
             lag, corr, yaw_rms = measure_imu_ins_clock_lag(a.bag)
             frontend_sync = {"imu_ins_lag_s": lag, "corr": round(corr, 4),

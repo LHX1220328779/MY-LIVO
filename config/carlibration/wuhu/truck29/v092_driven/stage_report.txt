@@ -1,0 +1,17 @@
+calibration=/home/project/MY-LIVO/config/carlibration/wuhu/truck29/v091_ground/calibration.json
+run=/home/project/MY-LIVO/results/calib_truck29_lio_1012_095506/Log/fusion/1791770346069759987
+window 8.0..40.0 s, lidar_time_offset -0.125
+pass 1 poses: native frames.csv (6 DoF); pass 2 poses: RTK-optimized trajectory_optimized.txt (tilt about x/y and z of LiDARs with median match time gap > 2.0 s)
+scans used: front_right_lidar:322, back_lidar:322, front_left_lidar:322, front_lidar:322
+matching: viewing-side consistent (oriented normals)
+reference front_lidar: 514245 world points
+front_right_lidar: pass 1 matches 183742->183377 |res| median 3.47->2.90 cm; ground 3.28->2.75 (n=149058); vertical 5.10->3.76 (n=15604); match time gap median 3.0 s; correction rot deg (x,y,z)=(+0.031,-0.083,+0.009) trans cm=(+1.6,+7.1,-0.6); iters 11
+    pass 2 (cross-time LiDAR, drift-free poses, ground only): ground 3.28->3.09 cm (n=146815); tilt about x/y adjusted by (-0.026,-0.032) deg, z by +1.4 cm; iters 6
+    final correction rot deg (x,y,z)=(+0.006,-0.116,+0.009) trans cm=(+1.6,+7.1,+0.8)  [quality: ok]
+front_left_lidar: pass 1 matches 218089->218298 |res| median 5.15->4.93 cm; ground 4.98->4.88 (n=140999); vertical 4.64->3.92 (n=26029); match time gap median 5.4 s; correction rot deg (x,y,z)=(+0.054,+0.059,+0.087) trans cm=(+2.3,+8.0,-0.6); iters 12
+    pass 2 (cross-time LiDAR, drift-free poses, ground only): ground 5.05->4.94 cm (n=138296); tilt about x/y adjusted by (+0.040,-0.017) deg, z by -0.4 cm; iters 7
+    final correction rot deg (x,y,z)=(+0.095,+0.042,+0.087) trans cm=(+2.3,+8.0,-1.0)  [quality: ok]
+back_lidar: pass 1 matches 40758->41171 |res| median 6.32->3.45 cm; ground 6.74->3.25 (n=33407); vertical 4.59->5.12 (n=2163); match time gap median 10.5 s; correction rot deg (x,y,z)=(-0.081,+0.129,+0.067) trans cm=(-2.4,+10.3,-10.1); iters 13
+    pass 2 (cross-time LiDAR, drift-free poses, ground only): ground 3.66->3.14 cm (n=32811); tilt about x/y adjusted by (+0.119,-0.072) deg, z by +2.3 cm; iters 6
+    final correction rot deg (x,y,z)=(+0.038,+0.057,+0.067) trans cm=(-2.4,+10.3,-7.8)  [quality: warn; vertical residual regressed 4.59->5.12 cm]
+quality: warn  (back_lidar: vertical residual regressed 4.59->5.12 cm)
