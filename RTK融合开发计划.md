@@ -563,3 +563,12 @@
 
 **仍然存在的问题**
 - 坡道/路肩的去平面厚度、起步前几秒的瞬态、侧雷达后方远处的非刚性偏差。这些靠外参解决不了，只能靠距离上限或屏蔽。
+
+
+## 2026-10-14 · truck29raw 20261013 数据：左前雷达安装位姿已变，ground 阶段平面粗对齐
+
+- 现象：Studio 流水线（父 v001_import，窗口 0–120 s）在 driven 阶段被质量门拒绝（front_left 2.41°/41 cm）。
+- 根因：front_left_lidar 相对 v001_import 俯仰约 6°、横滚约 3°（8 月数据只差 1.3–1.7°），超出 ground 精修器收敛域；v016_ground 把它越修越差（15.5 → 20.3 cm）仍落盘。数据本身正常。
+- 修复：`refine_multi_lidar_extrinsics.py` 每路先用自身 RANSAC 地面平面与参考比对，>0.5°/5 cm 且能降低起始残差时用平面闭式对齐作起点（先验以起点为中心）；结果更差不落盘；每路 ok/warn 质量结论写入 calibration/meta。收敛域内逐位一致（旧数据 `--no-coarse` 与 v003_ground 矩阵差 0.0）。
+- 结果：v015_axle → v017_ground → v018_driven（front_left 4.7 cm，0.1°，ok）→ v019_gcons 激活。同窗 LIO 轮：优化 P95 2.98 → 2.49 cm，姿态 P95 0.59 → 0.31°，地图地面平面偏移 111 → 29 mm。
+- 详见 `docs/mcp-truck29-20261013-ground-stage-plane-start.md`。

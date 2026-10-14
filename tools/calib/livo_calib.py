@@ -658,7 +658,10 @@ def cmd_ground(a):
            "--moving", str(a.moving[0]), str(a.moving[1])]
     lines = run_script(cmd, out_dir / "stage.log")
     calib = json.loads((out_dir / "calibration.json").read_text())
-    metrics = {"corrections": calib.get("refinement", {}).get("corrections", {})}
+    refinement = calib.get("refinement", {})
+    # quality: ok / warn per LiDAR (a LiDAR outside the refinement basin - mount moved since the parent file - is
+    # re-initialised from its own ground plane and flagged; the stage never writes a regressed matrix)
+    metrics = {"corrections": refinement.get("corrections", {}), "quality": refinement.get("quality", "ok")}
     finalize_version(out_dir, calib, mine=mine, truck=truck, stage="ground", parent=a.id,
                      note=a.note or "static-start ground roll/pitch/z refinement",
                      inputs={"bag": a.bag, "dataset": ds_info, "stationary": list(a.stationary),

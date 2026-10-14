@@ -1,0 +1,15 @@
+calibration=/home/project/MY-LIVO/config/carlibration/wuhu/truck29raw/v015_axle/calibration.json
+bag=/home/project/data/haibo/wuhu/29/20261013/ros2bag
+reference=front_lidar
+stationary frames 2..22 (aggregated) for side LiDARs; moving frames 810..850 (per frame) for back LiDAR
+stationary check (front_lidar, first vs last frame of 20): scan displacement median 10.9 cm / P90 163.5 cm (limit 30 cm) -> stationary
+front_right_lidar: stationary aggregated points 22799
+back_lidar: stationary aggregated points 830
+front_left_lidar: stationary aggregated points 24917
+front_lidar: stationary aggregated points 56850
+front_right_lidar: yaw/xy solved=True; matches 5510->5464; |res| median 8.52->6.11 cm; ground 9.60->6.68 cm (n=4412); vertical 7.31->4.74 cm (n=693); correction rot deg (x,y,z)=(-0.119,+0.296,+0.105) trans cm=(+3.1,+4.8,-0.8); iters 16  [quality: ok]
+front_left_lidar: plane start: own ground vs reference tilt 6.75 deg (fore-aft -6.23, lateral -2.60), height -4.0 cm over 1 plane pair(s) -> start rot deg (x,y,z)=(-6.232,+2.589,+0.110) z -4.0 cm; ground residual 15.47->8.85 cm (n=2672->5352): used
+front_left_lidar: yaw/xy solved=True; matches 3004->6411; |res| median 15.53->7.64 cm; ground 15.47->8.80 cm (n=5335); vertical 16.03->3.60 cm (n=617); correction rot deg (x,y,z)=(-6.287,+2.627,+0.093) trans cm=(+1.7,+2.6,-3.1); iters 25  [quality: warn; plane start applied (6.75 deg / -4.0 cm): the sensor moved relative to the parent calibration; yaw/x/y are re-checked by the driven stage]
+back_lidar: plane start: own ground vs reference tilt 1.93 deg (fore-aft -0.14, lateral +1.92), height +10.6 cm over 40 plane pair(s) -> start rot deg (x,y,z)=(-0.143,-1.924,+0.006) z +10.6 cm; ground residual 10.71->16.18 cm (n=29320->24993): not used (does not improve the overlap)
+back_lidar: (moving, per-frame vs refined sides) yaw/xy solved=False; matches 32392->32410; |res| median 11.58->10.40 cm; ground 10.71->9.56 cm (n=29334); vertical 25.61->26.71 cm (n=1741); correction rot deg (x,y,z)=(-0.426,-0.158,+0.000) trans cm=(+0.0,+0.0,-5.7); iters 21  [quality: ok]
+quality: warn  (front_left_lidar: plane start applied (6.75 deg / -4.0 cm): the sensor moved relative to the parent calibration; yaw/x/y are re-checked by the driven stage)
