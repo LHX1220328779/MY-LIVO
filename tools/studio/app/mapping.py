@@ -105,6 +105,12 @@ def start(body):
     cid = body.get("calibration_id") or ""
     if cid == "active" or not cid:
         cid = calibration.active_id(body.get("mine") or "", body.get("truck") or "") or ""
+    if not cid:
+        # Without a version the mapper silently fell back to config/wuhu_truck29.yaml's calibration_file, a hand-tuned
+        # file of the 2026-08 truck29 data: truck29raw 20261013 rounds wuhu_29_livo_4..6 ran with front_left_lidar
+        # 6.4/3.7 deg off (startup precheck: out of gates, calibration kept) and the maps showed tilted, crossing blocks.
+        raise StudioError(f"车辆 {body.get('mine') or '?'}/{body.get('truck') or '?'} 没有可用的标定版本（未选择且无激活版本）："
+                          f"请在建图页选择标定版本。建图不再静默回退到配置文件里的默认外参（该文件属于 2026-08 truck29 手调标定）")
     # A stale UI draft can carry another vehicle's calibration id (the dropdown then shows
     # "active version" because the id is missing from the current vehicle's list, but the
     # submit still sends the stale id). Mapping with another truck's extrinsics/time offsets

@@ -32,6 +32,14 @@ Two passes, two pose sources:
         LiDARs), while the optimized poses are locally smooth (fused-native relative motion
         <=0.6 cm per second) and drift-free at the cm level.
 
+Pairing (pass 1, LiDARs that overlap the reference at the same time): --pairing same-time (default) matches a
+        return only against reference returns observed within --block-s/--pad-s of its own time (time-blocked
+        targets, nearest-range observation per voxel). The accumulated target (--pairing accumulated, previous
+        behaviour) keeps the FIRST observation per voxel, i.e. the reference LiDAR's far look-ahead, so the side
+        LiDARs were matched to returns ~5 s older: the native trajectory error over 5 s (truck29raw 20261013:
+        z drift ~0.7 cm/s on the ramp) entered their z/tilt (v018: both side LiDARs 4-7 cm low, 0.1-0.15 deg tilt;
+        same-time residual 3.5/5.6 cm vs 1.2/1.4 cm after correction; map blocks 3 s apart tilted up to 0.27 deg).
+
 A per-LiDAR quality verdict (convergence, vertical-structure support, residual regression,
 correction magnitude) is written to the report/JSON; a `fail` verdict aborts the stage (exit 3)
 without writing calibration.json unless --no-gate is given.
@@ -77,7 +85,7 @@ def voxel_down(P, size):
 
 
 class Target:
-    def __init__(self, A, times, k=12, sensors=None):
+    def __init__(self, A, times, k=12, sensors=None, max_sigma=0.05):
         self.A = A; self.times = times; self.tree = cKDTree(A)
         d, idx = self.tree.query(A, k=k); nbr = A[idx]; c = nbr.mean(1)
         cov = np.einsum("nki,nkj->nij", nbr - c[:, None], nbr - c[:, None]) / k
@@ -87,7 +95,7 @@ class Target:
             flip = np.einsum("ni,ni->n", sensors - A, self.normals) < 0
             self.normals[flip] *= -1
         self.oriented = sensors is not None
-        self.planar = (w[:, 0] < 0.0025) & (w[:, 1] > 4 * w[:, 0] + 1e-9)
+        self.planar = (w[:, 0] < max_sigma ** 2) & (w[:, 1] > 4 * w[:, 0] + 1e-9)
 
     def match(self, B, max_dist, sensors=None):
         """sensors: world position of the LiDAR that produced each B point; with oriented normals a match is
@@ -127,42 +135,98 @@ def load_optimized(run, stamps):
     return Poses(stamps, R.from_quat(arr[:, 4:8]), arr[:, 1:4], "RTK-optimized trajectory_optimized.txt")
 
 
-def world_points(scans, M_t, lr, lt, poses):
-    """Vehicle-frame points Q with their per-point world pose (rotation matrices Rm, positions Pw) and times."""
+def world_points(scans, M_t, lr, lt, poses, time_bin=None, max_points=600000):
+    """Vehicle-frame points Q with their per-point world pose (rotation matrices Rm, positions Pw) and times.
+    time_bin=None: one 0.15 m vehicle-frame voxel set over the whole window (previous behaviour). Every voxel then
+    keeps its FIRST observation only, so a window that starts parked (truck29raw 20261013: 14 s) is represented
+    almost entirely by the stationary start frames and the 6-DoF fit hardly sees the drive (side-LiDAR roll stayed
+    biased by the start terrain: -0.13/+0.13 deg measured over the whole recording). time_bin > 0: voxels per time
+    bin, uniformly thinned to max_points, so every part of the window contributes."""
     Qs, Rs, Ps, Ts = [], [], [], []
     for P, ts, h in scans:
         Q = P @ M_t[:3, :3].T + M_t[:3, 3]
         rr, pp = poses.at(h + ts)
         Qs.append(Q); Rs.append(rr.as_matrix()); Ps.append(pp); Ts.append(h + ts)
     Q = np.vstack(Qs); Rm = np.vstack(Rs).reshape(-1, 3, 3); Pw = np.vstack(Ps); T = np.concatenate(Ts)
-    sub = voxel_down(Q, 0.15)   # subsample in the vehicle frame keeps far structure
+    if not time_bin:
+        sub = voxel_down(Q, 0.15)   # subsample in the vehicle frame keeps far structure
+    else:
+        # uniform in time at raw density: a density-equalising voxel over-weights the sparse far returns, and roll,
+        # the weakest-determined DoF of a side LiDAR, then disagreed with the map/LIO weighting by ~0.05 deg
+        sub = np.arange(len(Q)) if len(Q) <= max_points else np.linspace(0, len(Q) - 1, max_points).astype(np.int64)
     return Q[sub], Rm[sub], Pw[sub], T[sub]
 
 
-def build_target(scans, M_ref, lr, lt, poses, voxel, same_side=True):
-    """Reference LiDAR accumulated in the world frame (per-point deskew), voxelised at `voxel`.
-    With same_side the normals are oriented towards the reference LiDAR position at the observation time."""
+def reference_world(scans, M_ref, lr, lt, poses):
+    """Reference LiDAR returns in the world frame (per-point deskew) with time and observing-sensor position."""
     Ws, Ts, Ss = [], [], []
     sensor_imu = lr @ M_ref[:3, 3] + lt
     for P, ts, h in scans:
         B = (P @ M_ref[:3, :3].T + M_ref[:3, 3]) @ lr.T + lt
         rr, pp = poses.at(h + ts)
         Ws.append(rr.apply(B) + pp); Ts.append(h + ts); Ss.append(rr.apply(np.tile(sensor_imu, (len(B), 1))) + pp)
-    W = np.vstack(Ws); T = np.concatenate(Ts); S = np.vstack(Ss)
-    sub = voxel_down(W, voxel)
+    return np.vstack(Ws), np.concatenate(Ts), np.vstack(Ss)
+
+
+def nearest_first_voxels(W, S, voxel):
+    """Voxel subsample keeping the observation nearest to its sensor (finest ring spacing, least angular error)."""
+    order = np.argsort(np.einsum("ni,ni->n", W - S, W - S), kind="stable")
+    return order[voxel_down(W[order], voxel)]
+
+
+def build_target(scans, M_ref, lr, lt, poses, voxel, same_side=True, nearest_first=True):
+    """Reference LiDAR accumulated in the world frame (per-point deskew), voxelised at `voxel`.
+    With same_side the normals are oriented towards the reference LiDAR position at the observation time.
+    nearest_first keeps the closest observation per voxel (False: first in time order, previous behaviour)."""
+    W, T, S = reference_world(scans, M_ref, lr, lt, poses)
+    sub = nearest_first_voxels(W, S, voxel) if nearest_first else voxel_down(W, voxel)
     return Target(W[sub], T[sub], sensors=S[sub] if same_side else None)
 
 
-def icp(Q, Rm, Pw, T, center, lr, lt, target, active, x0, prior, normal_filter=None):
+class BlockTarget:
+    """Reference returns in time blocks: a source return is matched only against the block around its own time
+    (same-time pairing), so the trajectory error between the two observations is that of <= block + 2 pad seconds."""
+    def __init__(self, scans, M_ref, lr, lt, poses, voxel, block=1.0, pad=0.5, same_side=True, nearest=True):
+        W, T, S = reference_world(scans, M_ref, lr, lt, poses)
+        self.t0, self.block = float(T.min()), block
+        n_blocks = int(np.ceil((T.max() - self.t0) / block)) + 1
+        order = np.argsort(T, kind="stable"); W, T, S = W[order], T[order], S[order]
+        self.blocks, self.count = [], 0
+        for b in range(n_blocks):
+            lo, hi = np.searchsorted(T, [self.t0 + b * block - pad, self.t0 + (b + 1) * block + pad])
+            if hi - lo < 500:
+                self.blocks.append(None); continue
+            sub = lo + (nearest_first_voxels(W[lo:hi], S[lo:hi], voxel) if nearest else voxel_down(W[lo:hi], voxel))
+            tgt = Target(W[sub], T[sub], sensors=S[sub] if same_side else None, max_sigma=0.03)
+            self.blocks.append(tgt); self.count += len(sub)
+
+    def match(self, B, max_dist, sensors=None, times=None):
+        ok = np.zeros(len(B), bool); n = np.zeros((len(B), 3)); q = np.zeros((len(B), 3)); tq = np.zeros(len(B))
+        bi = np.clip(((times - self.t0) // self.block).astype(int), 0, len(self.blocks) - 1)
+        for b in np.unique(bi):
+            tgt = self.blocks[b]
+            if tgt is None: continue
+            idx = np.flatnonzero(bi == b)
+            okb, nb, qb, tb = tgt.match(B[idx], max_dist, sensors[idx] if sensors is not None else None)
+            sel = idx[okb]; ok[sel] = True; n[sel] = nb; q[sel] = qb; tq[sel] = tb
+        return ok, n[ok], q[ok], tq[ok]
+
+
+def icp(Q, Rm, Pw, T, center, lr, lt, target, active, x0, prior, normal_filter=None, radii=(0.6,)):
     """Robust point-to-plane ICP of one LiDAR against the reference target.
-    Correction x = (rotvec about the LiDAR position, translation) in the vehicle frame."""
+    Correction x = (rotvec about the LiDAR position, translation) in the vehicle frame.
+    radii: match radius per pair of iterations (last value kept); convergence only counts at the final radius.
+    A fixed 0.6 m radius keeps matches on neighbouring surfaces that anchor the solution towards zero correction
+    (same-time pass on truck29raw: side-LiDAR roll 0.04 deg with 0.6 m vs 0.09 deg with the 0.6/0.4/0.3 schedule)."""
     x = x0.copy(); stats = first = None; dt_med = np.nan
     sensors = np.einsum("nij,j->ni", Rm, lr @ center + lt) + Pw   # this LiDAR's world position per point
     for it in range(MAX_ITERS):
         Rc = R.from_rotvec(x[:3]).as_matrix()
         Qc = (Q - center) @ Rc.T + center + x[3:]
         W = np.einsum("nij,nj->ni", Rm, Qc @ lr.T + lt) + Pw
-        ok, n, q, tq = target.match(W, 0.6, sensors)
+        radius = radii[min(it // 2, len(radii) - 1)]
+        ok, n, q, tq = (target.match(W, radius, sensors, T) if isinstance(target, BlockTarget)
+                        else target.match(W, radius, sensors))
         if normal_filter is not None:
             keep = normal_filter(n)
             idx_ok = np.flatnonzero(ok); ok = np.zeros_like(ok); ok[idx_ok[keep]] = True; n, q, tq = n[keep], q[keep], tq[keep]
@@ -190,7 +254,7 @@ def icp(Q, Rm, Pw, T, center, lr, lt, target, active, x0, prior, normal_filter=N
         dt_med = float(np.median(np.abs(T[ok] - tq)))   # time gap between a point and its reference match
         # converged once a step is far below calibration precision (0.0006 deg / 0.1 mm): the re-matching of
         # a few boundary points can otherwise keep a limit cycle of ~1e-6 rad / 0.03 mm going indefinitely
-        if np.linalg.norm(step[:3]) < 1e-5 and np.linalg.norm(step[3:]) < 1e-4:
+        if np.linalg.norm(step[:3]) < 1e-5 and np.linalg.norm(step[3:]) < 1e-4 and it // 2 >= len(radii) - 1:
             break
     return x, first, stats, dt_med
 
@@ -233,6 +297,60 @@ def fmt_x(x):
             f"trans cm=({100*x[3]:+.1f},{100*x[4]:+.1f},{100*x[5]:+.1f})")
 
 
+ARCHIVE_TOPICS = ["front_right_lidar", "back_lidar", "front_left_lidar", "front_lidar"]  # multi_lidar.topics order
+
+
+def round_extrinsics(run, fallback):
+    """Extrinsics the mapper actually used in a round: Log/extrinsic_precheck.json (before / after an applied startup
+    correction) or the round's calibration file; `fallback` (parent) when neither is available."""
+    rnd = run.parents[2] if len(run.parents) > 2 else run
+    pre = rnd / "Log" / "extrinsic_precheck.json"
+    out = {}
+    if pre.exists():
+        doc = json.loads(pre.read_text())
+        for e in doc.get("sources", []):
+            topic = str(e.get("topic", "")).strip("/")
+            mat = e.get("rear_from_lidar_after") if e.get("applied") else e.get("rear_from_lidar_before")
+            if topic in fallback and mat and len(mat) == 16:
+                out[topic] = np.array(mat, dtype=float).reshape(4, 4)
+    if len(out) < len(fallback):
+        try:
+            cal_path = json.loads((rnd / "round.json").read_text()).get("calibration")
+            cal = json.load(open(cal_path)) if cal_path else None
+        except (OSError, ValueError):
+            cal = None
+        for entry in (cal or {}).get("lidar", []):
+            for topic, k in KEYS.items():
+                if k in entry and topic not in out:
+                    out[topic] = np.array(entry[k], dtype=float).reshape(4, 4)
+    for topic, m in fallback.items():
+        out.setdefault(topic, m)
+    return out
+
+
+def archive_scans(run, rows, window, t0, M_run, max_range, stride=2):
+    """Per-LiDAR scans from the round's own archive (scans.bin + sources.bin): exactly the returns the mapper put in
+    the map (its deskew, body and range filters). Returned in each LiDAR frame (inverse of the round's extrinsics) and
+    stamped at the scan end, so world_points/build_target reproduce the map geometry with the frame poses."""
+    scans = {t: [] for t in ARCHIVE_TOPICS}
+    with open(run / "scans.bin", "rb") as fs, open(run / "sources.bin", "rb") as fsrc:
+        for row in rows:
+            stamp, begin, off, count = row[0], row[1], int(row[2]), int(row[3])
+            if begin - t0 < window[0] - 0.2 or begin - t0 > window[1] or count <= 0:
+                continue
+            fs.seek(off); q = np.frombuffer(fs.read(count * 20), "<f4").reshape(-1, 5)[:, :3].astype(float)
+            fsrc.seek(8 + (off - 8) // 20); src = np.frombuffer(fsrc.read(count), np.uint8)
+            for k, topic in enumerate(ARCHIVE_TOPICS):
+                Q = q[src == k]
+                if len(Q) < 100: continue
+                Mr = M_run[topic]
+                P = (Q - Mr[:3, 3]) @ Mr[:3, :3]                       # rear-axle -> LiDAR frame
+                r = np.linalg.norm(P, axis=1); P = P[(r > 3.0) & (r < max_range)][::stride]
+                if len(P) < 100: continue   # raw density (no voxel): weighted like the mapper/LIO and the map itself
+                scans[topic].append((P, np.full(len(P), stamp - begin), begin))
+    return scans
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--calibration", required=True); ap.add_argument("--bag", required=True)
@@ -252,6 +370,16 @@ def main():
     ap.add_argument("--pass1-poses", choices=("native", "optimized"), default="native",
                     help="pose source of pass 1 (yaw/x/y or 6 DoF): native frames.csv (default) or the RTK-optimized trajectory")
     ap.add_argument("--no-gate", action="store_true", help="write the output even when a LiDAR fails the quality gate")
+    ap.add_argument("--pairing", choices=("same-time", "accumulated"), default="same-time",
+                    help="pass-1 matching of LiDARs that overlap the reference at the same time: time-blocked targets "
+                         "(default) or one accumulated target with first-observation voxels (previous behaviour)")
+    ap.add_argument("--block-s", type=float, default=1.0, help="same-time pairing: block length (s)")
+    ap.add_argument("--block-voxels", choices=("nearest", "first"), default="nearest",
+                    help="same-time pairing: observation kept per target voxel inside a block")
+    ap.add_argument("--pad-s", type=float, default=0.5, help="same-time pairing: reference returns this much before/after a block also match")
+    ap.add_argument("--scans", choices=("auto", "archive", "bag"), default="auto",
+                    help="returns to register: the round's own deskewed archive scans.bin/sources.bin (auto when present; "
+                         "the geometry the map is built from) or the raw bag with a per-point re-deskew")
     a = ap.parse_args()
     calib = json.load(open(a.calibration))
     M = {}
@@ -283,10 +411,23 @@ def main():
         print(f"warning: window end {a.window[1]:.1f} s exceeds available poses ({pose_end:.1f} s); clamping", flush=True)
         a.window = (a.window[0], max(a.window[0] + 1.0, pose_end - 0.5))
 
-    dataset = Dataset.open(a.bag)  # raw split recording or single bag, merged in time order
     topics = list(KEYS)
-    scans = {t: [] for t in topics}; n_used = {t: 0 for t in topics}
-    for topic, data, _ in dataset.iter_messages(topics):
+    use_archive = a.scans == "archive" or (a.scans == "auto" and (run / "scans.bin").exists() and (run / "sources.bin").exists())
+    if use_archive:
+        M_run = round_extrinsics(run, M)
+        scans = archive_scans(run, rows, a.window, t0, M_run, a.max_range)
+        for topic in topics:   # the excluded body box is applied below exactly as for bag scans
+            kept = []
+            for P, ts, h in scans[topic]:
+                Q = P @ M[topic][:3, :3].T + M[topic][:3, 3]
+                excl = (Q[:, 0] > -2.8) & (Q[:, 0] < 2.8) & (Q[:, 1] > -4.5) & (Q[:, 1] < 9.5)
+                if (~excl).sum() >= 100: kept.append((P[~excl], ts[~excl], h))
+            scans[topic] = kept
+        n_used = {t: len(scans[t]) for t in topics}
+    else:
+        scans = {t: [] for t in topics}; n_used = {t: 0 for t in topics}
+    dataset = Dataset.open(a.bag) if not use_archive else None  # raw split recording or single bag, merged in time order
+    for topic, data, _ in (dataset.iter_messages(topics) if dataset is not None else ()):
         topic = topic.split("/")[-1] if topic.split("/")[-1] in scans else topic
         if topic not in scans: continue
         msg = deserialize_message(data, PointCloud2)
@@ -312,15 +453,27 @@ def main():
     report = [f"calibration={a.calibration}", f"run={run}",
               f"window {a.window[0]}..{a.window[1]} s, lidar_time_offset {a.lidar_time_offset}",
               f"pass 1 poses: {pose1.label} ({'yaw/x/y, vertical matches only' if a.vertical_only else '6 DoF'}); pass 2 poses: {pass2_label} (tilt about x/y and z of LiDARs with median match time gap > {a.cross_time_s:.1f} s)",
-              "scans used: " + ", ".join(f"{t}:{n_used[t]}" for t in topics)]
+              "scans used: " + ", ".join(f"{t}:{n_used[t]}" for t in topics),
+              "scan source: " + ("round archive scans.bin/sources.bin (mapper deskew; returns at scan end, round extrinsics inverted)"
+                                 if use_archive else "raw bag, per-point deskew with the frame poses")]
     if not scans[REFERENCE]:
         pathlib.Path(a.report).parent.mkdir(parents=True, exist_ok=True)
         report.append("no reference scans in the window"); pathlib.Path(a.report).write_text("\n".join(report) + "\n")
         print("\n".join(report)); sys.exit(3)
-    target1 = build_target(scans[REFERENCE], M[REFERENCE], lr, lt, pose1, a.voxel, same_side=not a.no_same_side)
+    legacy = a.pairing == "accumulated"
+    target1 = build_target(scans[REFERENCE], M[REFERENCE], lr, lt, pose1, a.voxel, same_side=not a.no_same_side,
+                           nearest_first=not legacy)
     report.append(f"matching: {'viewing-side consistent (oriented normals)' if not a.no_same_side else 'any side (legacy)'}")
     target2 = None
     report.append(f"reference {REFERENCE}: {len(target1.A)} world points")
+    target_same = None
+    if not legacy:
+        target_same = BlockTarget(scans[REFERENCE], M[REFERENCE], lr, lt, pose1, min(a.voxel, 0.12), a.block_s, a.pad_s,
+                                  same_side=not a.no_same_side, nearest=a.block_voxels == "nearest")
+        report.append(f"pairing: same-time for LiDARs overlapping the reference ({a.block_s:.1f} s blocks +-{a.pad_s:.1f} s, "
+                      f"{target_same.count} block points); cross-time LiDARs use the accumulated target (nearest-range voxels)")
+    else:
+        report.append("pairing: accumulated target, first observation per voxel (legacy)")
     prior = np.diag([1 / np.radians(a.prior_rot_deg) ** 2] * 3 + [1 / a.prior_trans_m ** 2] * 3)
     active1 = np.array([not a.vertical_only, not a.vertical_only, True, True, True, not a.vertical_only])
     filt1 = (lambda n: np.abs(n[:, 2]) < 0.3) if a.vertical_only else None
@@ -330,8 +483,13 @@ def main():
             refined[t] = M[t].copy(); report.append(f"{t}: no scans  [quality: warn]")
             quality[t] = {"level": "warn", "reasons": ["no scans in window"]}; continue
         center = M[t][:3, 3]
-        Q, Rm, Pw, T = world_points(scans[t], M[t], lr, lt, pose1)
-        x, first, stats, dt_med = icp(Q, Rm, Pw, T, center, lr, lt, target1, active1, np.zeros(6), prior, filt1)
+        tgt = target_same if (target_same is not None and t != "back_lidar") else target1
+        # time-uniform raw-density sampling only for same-time pairing: a cross-time LiDAR (back) matched at raw density
+        # puts its dense near returns on reference returns ~5 s older, and the native along-track drift then entered
+        # its forward offset (truck29raw: +15.8 cm, rejected by the gate); it keeps the vehicle-frame voxel sampling.
+        Q, Rm, Pw, T = world_points(scans[t], M[t], lr, lt, pose1, time_bin=None if (legacy or tgt is target1) else a.block_s)
+        x, first, stats, dt_med = icp(Q, Rm, Pw, T, center, lr, lt, tgt, active1, np.zeros(6), prior, filt1,
+                                      radii=(0.6,) if (legacy or tgt is target1) else (0.6, 0.4, 0.3))
         if stats is None:
             refined[t] = M[t].copy(); report.append(f"{t}: insufficient matches; manual matrix kept  [quality: warn]")
             quality[t] = {"level": "warn", "reasons": ["insufficient matches; matrix kept"]}; continue
@@ -340,7 +498,8 @@ def main():
         pass2 = None
         if optimized is not None and dt_med > a.cross_time_s and q1["level"] != "fail":
             if target2 is None:
-                target2 = build_target(scans[REFERENCE], M[REFERENCE], lr, lt, optimized, a.voxel, same_side=not a.no_same_side)
+                target2 = build_target(scans[REFERENCE], M[REFERENCE], lr, lt, optimized, a.voxel, same_side=not a.no_same_side,
+                                       nearest_first=not legacy)
             Q2, Rm2, Pw2, T2 = world_points(scans[t], M[t], lr, lt, optimized)
             active2 = np.array([True, True, False, False, False, True])
             x2, first2, stats2, dt2 = icp(Q2, Rm2, Pw2, T2, center, lr, lt, target2, active2, x, prior,
@@ -385,7 +544,9 @@ def main():
     out["calibration_type"] = calib.get("calibration_type", "") + tag
     out.setdefault("refinement", {})["stage3_vertical" if a.vertical_only else "stage2_6dof"] = dict(
         reference=REFERENCE, corrections=corrections, run=str(run), window=list(a.window), prior=[a.prior_rot_deg, a.prior_trans_m],
-        poses={"pass1": pose1.label, "pass2": pass2_label, "cross_time_s": a.cross_time_s}, quality=overall)
+        poses={"pass1": pose1.label, "pass2": pass2_label, "cross_time_s": a.cross_time_s},
+        pairing={"mode": a.pairing, "block_s": a.block_s, "pad_s": a.pad_s},
+        scan_source="archive" if use_archive else "bag", quality=overall)
     pathlib.Path(a.output).parent.mkdir(parents=True, exist_ok=True); json.dump(out, open(a.output, "w"), indent=2)
     print("written", a.output)
 

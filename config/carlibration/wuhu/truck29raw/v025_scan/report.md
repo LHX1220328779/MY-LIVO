@@ -1,0 +1,136 @@
+# wuhu/truck29raw/v025_scan
+
+- stage: scan (闭环扫描点（临时）)
+- parent: wuhu/truck29raw/v024_driven
+- lineage: wuhu/truck29raw/v001_import -> wuhu/truck29raw/v022_axle -> wuhu/truck29raw/v023_ground -> wuhu/truck29raw/v024_driven -> wuhu/truck29raw/v025_scan
+- created: 2026-10-14T22:16:58+08:00
+- note: rtk-time probe point (temporary)
+
+## changes vs parent
+
+```
+{
+  "time_offsets": {
+    "rtk_position": {
+      "from": 0.025,
+      "to": 0.0097
+    }
+  }
+}
+```
+
+## metrics
+
+```
+{
+  "changes": {
+    "time_offsets.rtk_position": 0.0097
+  }
+}
+```
+
+## summary
+
+```
+{
+  "lidars": [
+    {
+      "lidar": "front_right_lidar",
+      "key": "transform_matrix_lidar_1",
+      "t": [
+        2.7877,
+        5.9219,
+        1.8117
+      ],
+      "rpy_deg": [
+        -0.991,
+        -2.98,
+        -1.228
+      ]
+    },
+    {
+      "lidar": "back_lidar",
+      "key": "transform_matrix_lidar_2",
+      "t": [
+        -0.0593,
+        -0.2922,
+        0.6529
+      ],
+      "rpy_deg": [
+        -1.039,
+        0.284,
+        -91.367
+      ]
+    },
+    {
+      "lidar": "front_left_lidar",
+      "key": "transform_matrix_lidar_3",
+      "t": [
+        -3.0784,
+        5.6739,
+        1.9976
+      ],
+      "rpy_deg": [
+        3.193,
+        -4.466,
+        178.262
+      ]
+    },
+    {
+      "lidar": "front_lidar",
+      "key": "transform_matrix_lidar_6",
+      "t": [
+        -0.106,
+        7.9492,
+        0.051
+      ],
+      "rpy_deg": [
+        1.485,
+        -1.56,
+        89.984
+      ]
+    }
+  ],
+  "camera_to_rear": {
+    "t": [
+      0.0067,
+      7.9506,
+      1.7516
+    ],
+    "rpy_deg": [
+      -96.477,
+      1.668,
+      0.485
+    ]
+  },
+  "camera": {
+    "topic": "/midrange_camera/image_raw",
+    "width": 1920,
+    "height": 1080,
+    "intrinsics": [
+      1642.570556640625,
+      1855.53173828125,
+      971.0083025529602,
+      534.2602337509306
+    ],
+    "distortion": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "source": "defaults (wuhu truck29 yaml)"
+  },
+  "time_offsets": {
+    "lidar": -0.0361,
+    "camera": 0.0,
+    "rtk_position": 0.0097,
+    "ins_attitude": 0.0,
+    "source": "import (verify with camera-time / LIO evaluation)",
+    "lidar_source": "rear-axle alignment (cross-time consistency vs INS poses)",
+    "lidar_frontend": -0.0311,
+    "lidar_frontend_source": "axle: lidar -0.0361 + imu/ins clock lag +0.0050 (corr 0.998); template -0.1250 replaced"
+  }
+}
+```

@@ -1,0 +1,167 @@
+{
+  "id": "wuhu/truck29raw/v026_rtktime",
+  "mine": "wuhu",
+  "truck": "truck29raw",
+  "version": "v026_rtktime",
+  "stage": "rtktime",
+  "stage_label": "RTK 位置关联时间",
+  "advisory": false,
+  "parent": "wuhu/truck29raw/v024_driven",
+  "lineage": [
+    "wuhu/truck29raw/v001_import",
+    "wuhu/truck29raw/v022_axle",
+    "wuhu/truck29raw/v023_ground",
+    "wuhu/truck29raw/v024_driven",
+    "wuhu/truck29raw/v026_rtktime"
+  ],
+  "created": "2026-10-14T22:21:17+08:00",
+  "note": "RTK position time association +0.0250 -> +0.0143 s (secant of both rounds (measured gain 0.86))",
+  "inputs": {
+    "run": "/home/project/MY-LIVO/results/calib_truck29raw_rtk1_1014_215840/Log/fusion/1791987176654082966",
+    "run2": "/home/project/MY-LIVO/results/calib_truck29raw_rtk2_1014_215840/Log/fusion/1791987419719958826"
+  },
+  "metrics": {
+    "rtk_time": {
+      "parent": "wuhu/truck29raw/v024_driven",
+      "parent_rtk_position_s": 0.025,
+      "round1": {
+        "run": "/home/project/MY-LIVO/results/calib_truck29raw_rtk1_1014_215840/Log/fusion/1791987176654082966",
+        "effective_s": 0.02,
+        "correction_s": -0.009156005105620485,
+        "se_s": 0.0032564398268183797,
+        "observable": true,
+        "frames": 1176,
+        "informative_voxels": 12222
+      },
+      "round2": {
+        "run": "/home/project/MY-LIVO/results/calib_truck29raw_rtk2_1014_215840/Log/fusion/1791987419719958826",
+        "effective_s": 0.004699999999999999,
+        "correction_s": 0.0039851963780426275,
+        "se_s": 0.0031757046030901465,
+        "observable": true,
+        "frames": 1176,
+        "informative_voxels": 12257
+      },
+      "method": "secant of both rounds (measured gain 0.86)",
+      "gain": 0.859,
+      "best_effective_s": 0.00934,
+      "best_se_s": 0.00282,
+      "rtk_position_s": {
+        "from": 0.025,
+        "to": 0.0143
+      }
+    }
+  },
+  "changes_vs_parent": {
+    "time_offsets": {
+      "rtk_position": {
+        "from": 0.025,
+        "to": 0.0143
+      }
+    }
+  },
+  "summary": {
+    "lidars": [
+      {
+        "lidar": "front_right_lidar",
+        "key": "transform_matrix_lidar_1",
+        "t": [
+          2.7877,
+          5.9219,
+          1.8117
+        ],
+        "rpy_deg": [
+          -0.991,
+          -2.98,
+          -1.228
+        ]
+      },
+      {
+        "lidar": "back_lidar",
+        "key": "transform_matrix_lidar_2",
+        "t": [
+          -0.0593,
+          -0.2922,
+          0.6529
+        ],
+        "rpy_deg": [
+          -1.039,
+          0.284,
+          -91.367
+        ]
+      },
+      {
+        "lidar": "front_left_lidar",
+        "key": "transform_matrix_lidar_3",
+        "t": [
+          -3.0784,
+          5.6739,
+          1.9976
+        ],
+        "rpy_deg": [
+          3.193,
+          -4.466,
+          178.262
+        ]
+      },
+      {
+        "lidar": "front_lidar",
+        "key": "transform_matrix_lidar_6",
+        "t": [
+          -0.106,
+          7.9492,
+          0.051
+        ],
+        "rpy_deg": [
+          1.485,
+          -1.56,
+          89.984
+        ]
+      }
+    ],
+    "camera_to_rear": {
+      "t": [
+        0.0067,
+        7.9506,
+        1.7516
+      ],
+      "rpy_deg": [
+        -96.477,
+        1.668,
+        0.485
+      ]
+    },
+    "camera": {
+      "topic": "/midrange_camera/image_raw",
+      "width": 1920,
+      "height": 1080,
+      "intrinsics": [
+        1642.570556640625,
+        1855.53173828125,
+        971.0083025529602,
+        534.2602337509306
+      ],
+      "distortion": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "source": "defaults (wuhu truck29 yaml)"
+    },
+    "time_offsets": {
+      "lidar": -0.0361,
+      "camera": 0.0,
+      "rtk_position": 0.0143,
+      "ins_attitude": 0.0,
+      "source": "import (verify with camera-time / LIO evaluation)",
+      "lidar_source": "rear-axle alignment (cross-time consistency vs INS poses)",
+      "lidar_frontend": -0.0311,
+      "lidar_frontend_source": "axle: lidar -0.0361 + imu/ins clock lag +0.0050 (corr 0.998); template -0.1250 replaced",
+      "rtk_position_source": "rtk-time: map consistency, secant of both rounds (measured gain 0.86); effective +9.3 ms (se 2.8 ms)"
+    }
+  },
+  "calibration_file": "/home/project/MY-LIVO/config/carlibration/wuhu/truck29raw/v026_rtktime/calibration.json",
+  "overlays": []
+}

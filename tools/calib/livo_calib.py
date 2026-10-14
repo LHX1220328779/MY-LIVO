@@ -574,6 +574,56 @@ def run_script(cmd, log_path):
     return lines
 
 
+def axle_lateral_pass(a, out_dir, ds_info, calib):
+    """Lateral lever arm of the rig from the WHOLE recording, applied on top of the window solution.
+
+    The window (Studio: the manual calibration window, typically 0-120 s of one-way driving) observes the lateral
+    rig offset only through a few turns (truck29raw 20261013: x repeatability 3.6 cm, sqrt-info 38/m). A body-fixed
+    lateral error separates opposite-direction passes by twice its value, so the round trips of a full recording
+    observe it directly; truck29raw v019 had 8-10 cm between the ramp ascent and descent (fused map). Only x is
+    taken: the forward offset of a round trip is indistinguishable from an along-track timing error (RTK
+    association / INS latency; an unconstrained full-recording solve moved y by 21 cm and broke the along-track
+    consistency of the fused map 3.9 -> 36 cm) and stays with the window solution and the rtk-time stage. Rotation and
+    time offset are kept (the joint solve still estimates every DoF). Applied when converged, |x| <= 15 cm and the
+    matches come from revisits (match time gap median >= 30 s); never aborts the stage."""
+    dur = float((ds_info or {}).get("duration_s") or 0.0)
+    w0, w1 = float(a.window[0]), float(a.window[1])
+    if dur <= 0.0 or min(w1, dur) - max(w0, 0.0) >= dur - 60.0:
+        return {"decision": "skipped (the window already covers the recording)"}
+    tmp, rep = out_dir / "lateral_calibration.json", out_dir / "stage_report_lateral.txt"
+    cmd = ["/usr/bin/python3", str(SCRIPTS / "refine_rear_axle_extrinsic.py"), "--calibration", str(out_dir / "calibration.json"),
+           "--bag", a.bag, "--output", str(tmp), "--report", str(rep), "--dof", "x", "--keep-time-offset", "--every", "6"]
+    print("+", " ".join(cmd), flush=True)
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=REPO)
+    (out_dir / "stage_lateral.log").write_text(proc.stdout)
+    print(proc.stdout, end="", flush=True)
+    if proc.returncode != 0 or not tmp.exists():
+        return {"decision": f"skipped (lateral solve exit {proc.returncode})",
+                "lines": [f"lateral lever arm (whole recording): skipped, solver exit {proc.returncode}"]}
+    sol = json.loads(tmp.read_text()); tmp.unlink()
+    meta = sol.get("refinement", {}).get("rear_axle_alignment", {})
+    dx = float((meta.get("correction_translation_cm") or [0.0])[0])
+    m = re.search(r"match time gap median ([\d.]+) s", proc.stdout); gap = float(m.group(1)) if m else 0.0
+    out = {"correction_x_cm": round(dx, 2), "match_gap_median_s": gap, "converged": bool(meta.get("converged")),
+           "residual_cm": meta.get("residual_cm"), "repeatability_halves": meta.get("repeatability_halves"),
+           "scans_used": meta.get("scans_used"), "window_s": meta.get("window_s")}
+    if out["converged"] and abs(dx) <= 15.0 and gap >= 30.0:
+        calib["lidar"] = sol["lidar"]
+        if sol.get("transforms"):
+            calib["transforms"] = sol["transforms"]
+        calib["calibration_type"] = str(calib.get("calibration_type", "")) + "+rtk_rear_axle_lateral"
+        out["decision"] = f"applied x {dx:+.1f} cm"
+        calib.setdefault("refinement", {})["rear_axle_lateral"] = dict(out)
+        (out_dir / "calibration.json").write_text(json.dumps(calib, indent=1))
+    else:
+        out["decision"] = "not applied (" + ("not converged" if not out["converged"] else
+                                             f"|x| {abs(dx):.1f} cm > 15" if abs(dx) > 15.0 else
+                                             f"no round trips: match time gap median {gap:.0f} s < 30") + ")"
+    out["lines"] = [f"lateral lever arm (whole recording, dof x, rotation/time kept): {out['decision']}; "
+                    f"solved x {dx:+.1f} cm, match time gap median {gap:.0f} s"]
+    return out
+
+
 def cmd_axle(a):
     pdir, parent_calib, mine, truck = parent_info(a.id)
     _, ds_info = require_dataset(a.bag, what="axle")
@@ -638,8 +688,10 @@ def cmd_axle(a):
                          % (frontend_sync["decision"],
                             "n/a" if lag is None else "%+.1f ms" % (lag * 1000.0),
                             corr, yaw_rms))
+    lateral = {"decision": "disabled (--no-lateral)"} if getattr(a, "no_lateral", False) else axle_lateral_pass(a, out_dir, ds_info, calib)
+    lines += lateral.pop("lines", [])
     metrics = {"rear_axle_alignment": calib.get("refinement", {}).get("rear_axle_alignment", {}),
-               "frontend_sync": frontend_sync}
+               "frontend_sync": frontend_sync, "lateral": lateral}
     finalize_version(out_dir, calib, mine=mine, truck=truck, stage="axle", parent=a.id,
                      note=a.note or "reference-LiDAR -> rear-axle alignment from RTK/INS poses (rig correction)",
                      inputs={"bag": a.bag, "dataset": ds_info, "window": list(a.window), "dof": dof,
@@ -2493,6 +2545,9 @@ def main():
     p.add_argument("--keep-time-offset", action="store_true", help="do not estimate/apply the LiDAR time shift")
     p.add_argument("--no-frontend-sync", action="store_true",
                    help="keep time_offsets.lidar_frontend untouched (skip the imu/ins clock-lag check)")
+    p.add_argument("--no-lateral", action="store_true",
+                   help="skip the whole-recording lateral lever-arm pass (default: run it when the window is shorter "
+                        "than the recording)")
     common(p)
     p.set_defaults(func=cmd_axle)
 

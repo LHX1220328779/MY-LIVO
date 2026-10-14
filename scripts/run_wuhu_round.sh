@@ -58,6 +58,12 @@ set +u; source /opt/ros/humble/setup.bash; source install/fast_livo/share/fast_l
 # invalid" (2026-10-12: two pipeline retries lost). `fastdds shm clean` removes only zombie segments (no live
 # owner), so it is safe while other ROS processes run.
 timeout 30 fastdds shm clean >/dev/null 2>&1 || true
+# Private DDS domain per round: the mapper must receive only this round's player traffic. A recording looped by
+# hand on the default domain (e.g. `ros2 bag play -l` for RViz) was otherwise either merged into the round input
+# (duplicate / out-of-order messages) or killed by the stale-process cleanup below. LIVO_ROUND_DOMAIN_ID overrides;
+# a caller's explicit non-zero ROS_DOMAIN_ID is kept. RViz started by the launch file inherits the same domain.
+if [[ -n "${LIVO_ROUND_DOMAIN_ID:-}" ]]; then export ROS_DOMAIN_ID="$LIVO_ROUND_DOMAIN_ID"
+elif [[ -z "${ROS_DOMAIN_ID:-}" || "${ROS_DOMAIN_ID}" == "0" ]]; then export ROS_DOMAIN_ID=37; fi
 export ROS_LOG_DIR="$out/roslog"; mkdir -p "$ROS_LOG_DIR"
 export FASTDDS_BUILTIN_TRANSPORTS=SHM
 # 128 MB SHM segment + 100 ms heartbeat for the player/mapper traffic (see config/fastdds_livo_shm.xml).
@@ -154,10 +160,12 @@ with open(dst, "w", encoding="utf-8") as f:
 PY
 
 # Refuse to start on top of a stale mapper/player from an earlier round.
-stale='fastlivo_mapping|livo/player.py|livo.player|ros2 bag play|wuhu_truck29.launch'
+# Only this pipeline's own processes count as stale (an earlier mapper competes for CPU/memory). A foreign
+# `ros2 bag play` on another DDS domain cannot reach the round any more and is left alone.
+stale='fastlivo_mapping|livo/player.py|livo.player|wuhu_truck29.launch'
 if pgrep -f "$stale" >/dev/null; then
   echo "stale ROS processes present; killing them" | tee -a "$out/run.log"
-  pkill -INT -f 'livo/player.py|livo.player|ros2 bag play' || true; sleep 1
+  pkill -INT -f 'livo/player.py|livo.player' || true; sleep 1
   pkill -TERM -f 'fastlivo_mapping' || true; sleep 2
   pkill -TERM -f 'wuhu_truck29.launch' || true; sleep 2
   pkill -KILL -f "$stale" || true
@@ -166,10 +174,15 @@ fi
 {
 echo "round=$round"; echo "mode=$mode use_rtk=$use_rtk save_map=$save_map rviz=$use_rviz rate=$rate start_offset=$start_offset duration=${duration:-all}"
 echo "overrides=${sets[*]:-none}"
-echo "bag=$dataset"; echo "dataset=$dataset"; echo "calibration=${calibration:-yaml}"
+echo "bag=$dataset"; echo "dataset=$dataset"; echo "calibration=${calibration:-yaml}"; echo "ros_domain_id=$ROS_DOMAIN_ID"
 echo "start=$(date -u +%FT%TZ)"; echo "commit=$(git rev-parse --short HEAD 2>/dev/null)"; echo "branch=$(git branch --show-current 2>/dev/null)"
 git status --short -- src include config launch scripts tools CMakeLists.txt 2>/dev/null | sed 's/^/dirty: /'
 } > "$out/run.log"
+if [[ -z "$calibration" ]]; then
+  # The yaml fallback is a fixed file, not the vehicle's calibration version: a recording of another date/vehicle
+  # (sensor moved, new firmware) maps with stale extrinsics (truck29raw 20261013: front_left 6.4 deg off).
+  echo "WARNING: no --calibration: the mapper uses the yaml multi_lidar.calibration_file fallback, not a registered calibration version" | tee -a "$out/run.log" >&2
+fi
 
 use_camera=false; [[ "$mode" == "livo" ]] && use_camera=true
 ros2 launch fast_livo wuhu_truck29.launch.py use_camera:=$use_camera use_rtk:=$use_rtk rtk_backend:=$rtk_backend use_rviz:=$use_rviz \

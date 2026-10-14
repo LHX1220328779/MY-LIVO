@@ -75,6 +75,9 @@ def main():
     ap.add_argument("--min-range", type=float, default=4.0); ap.add_argument("--max-range", type=float, default=40.0)
     ap.add_argument("--cell", type=float, default=0.5); ap.add_argument("--max-slope", type=float, default=6.0)
     ap.add_argument("--output", required=True); ap.add_argument("--report", required=True)
+    ap.add_argument("--scans", choices=("auto", "archive", "bag"), default="auto",
+                    help="returns: the round's own deskewed archive scans.bin/sources.bin (auto when present; the geometry "
+                         "the map is built from) or the raw bag re-deskewed per point with the optimized poses")
     a = ap.parse_args()
 
     calib = json.load(open(a.calibration))
@@ -102,8 +105,33 @@ def main():
     topics = list(rm.KEYS)
     Qs, Ts, Ss = [], [], []
     count = {t: 0 for t in topics}; used = {t: 0 for t in topics}
-    dataset = rm.Dataset.open(a.bag)
-    for topic, data, _ in dataset.iter_messages(topics):
+    use_archive = a.scans == "archive" or (a.scans == "auto" and (run / "scans.bin").exists() and (run / "sources.bin").exists())
+
+    def add_scan(topic, P, ts, h):
+        Q = P @ M[topic][:3, :3].T + M[topic][:3, 3]                      # rear-axle frame
+        rng = np.linalg.norm(Q[:, :2] - M[topic][:2, 3], axis=1)
+        excl = (Q[:, 0] > -2.8) & (Q[:, 0] < 2.8) & (Q[:, 1] > -4.5) & (Q[:, 1] < 9.5)
+        keep = (rng > a.min_range) & (rng < a.max_range) & ~excl
+        if keep.sum() < 200:
+            return
+        Q, ts = Q[keep], ts[keep]
+        low = Q[:, 2] < np.percentile(Q[:, 2], 40) + 1.5                  # coarse ground band of this scan
+        Q, ts = Q[low], ts[low]
+        sub = rm.voxel_down(Q, 0.2)
+        Qs.append(Q[sub]); Ts.append(h + ts[sub]); Ss.append(np.full(len(sub), topics.index(topic), np.int8))
+        used[topic] += 1
+
+    if use_archive:
+        # Same returns as the map (mapper deskew; the re-deskew of raw bag returns disagreed with the map geometry:
+        # truck29raw v033 back LiDAR +5 cm / 0.14 deg vs the same-time multi-LiDAR consistency of the map itself).
+        arch = rm.archive_scans(run, rows, (max(a.window[0], 0.5), t_end), t0, rm.round_extrinsics(run, M), a.max_range, stride=1)
+        for topic in topics:
+            for i, (P, ts, h) in enumerate(arch.get(topic, [])):
+                if i % a.stride == 0:
+                    add_scan(topic, P, ts, h)
+        report.append("scan source: round archive scans.bin/sources.bin (mapper deskew)")
+    dataset = rm.Dataset.open(a.bag) if not use_archive else None
+    for topic, data, _ in (dataset.iter_messages(topics) if dataset is not None else ()):
         topic = topic.split("/")[-1]
         if topic not in M:
             continue
@@ -123,18 +151,7 @@ def main():
         ts = np.asarray(arr["timestamp"], dtype=float)
         if ts.max() > 1e6: ts = ts - ts.min()
         if ts.max() > 1.0: ts = ts * 1e-3 if ts.max() < 1e3 else ts * 1e-9
-        Q = P @ M[topic][:3, :3].T + M[topic][:3, 3]                      # rear-axle frame
-        rng = np.linalg.norm(Q[:, :2] - M[topic][:2, 3], axis=1)
-        excl = (Q[:, 0] > -2.8) & (Q[:, 0] < 2.8) & (Q[:, 1] > -4.5) & (Q[:, 1] < 9.5)
-        keep = (rng > a.min_range) & (rng < a.max_range) & ~excl
-        if keep.sum() < 200:
-            continue
-        Q, ts = Q[keep], ts[keep]
-        low = Q[:, 2] < np.percentile(Q[:, 2], 40) + 1.5                  # coarse ground band of this scan
-        Q, ts = Q[low], ts[low]
-        sub = rm.voxel_down(Q, 0.2)
-        Qs.append(Q[sub]); Ts.append(h + ts[sub]); Ss.append(np.full(len(sub), topics.index(topic), np.int8))
-        used[topic] += 1
+        add_scan(topic, P, ts, h)
     if not Qs:
         report.append("no scans in the window: parent kept"); finish(a, report, None, calib, {}); return
     Q = np.vstack(Qs); T = np.concatenate(Ts); S = np.concatenate(Ss)

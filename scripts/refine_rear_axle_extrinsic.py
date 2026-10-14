@@ -272,7 +272,7 @@ def main():
     ap.add_argument("--calibration", required=True); ap.add_argument("--bag", required=True)
     ap.add_argument("--output", required=True); ap.add_argument("--report", required=True)
     ap.add_argument("--window", nargs=2, type=float, default=(0.0, 1e9), help="seconds after the first reference scan (default: all)")
-    ap.add_argument("--dof", choices=("rpy_xy", "rpy", "xy"), default="rpy_xy",
+    ap.add_argument("--dof", choices=("rpy_xy", "rpy", "xy", "x"), default="rpy_xy",
                     help="parts of the solution that are APPLIED (rotation + horizontal translation are always solved "
                          "together: a fixed, inconsistent rotation would leak into the lever arm). rpy_xy: all (default, "
                          "needed for a raw supplier file); rpy: rotation only; xy: lever arm only (fine-tuning an aligned version)")
@@ -383,6 +383,12 @@ def main():
         T_apply[:3, :3] = sol["T"][:3, :3]
     if a.dof in ("rpy_xy", "xy"):
         T_apply[:3, 3] = sol["T"][:3, 3]
+    elif a.dof == "x":
+        # Lateral lever arm only (the joint solve still estimates every DoF). Round trips make the lateral offset
+        # directly observable (a body-fixed lateral error separates opposite passes by twice its value), while the
+        # forward offset of a round trip is indistinguishable from an along-track timing error (RTK association /
+        # INS latency) and stays with the window solution and the rtk-time stage.
+        T_apply[0, 3] = sol["T"][0, 3]
     C, rv, dtcm = correction(T_apply, T_ref)
     h0, h1 = sol["hist"][0], sol["hist"][-1]
     report.append(f"residual median {h0['median_cm']:.2f} -> {h1['median_cm']:.2f} cm (ground {h0['ground_cm']:.2f} -> {h1['ground_cm']:.2f}, "
