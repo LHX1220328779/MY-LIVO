@@ -101,6 +101,13 @@ def lineage(versions_by_id, vid):
     return chain
 
 
+def factory_root(vid):
+    """Factory import (stage import) at the root of the lineage of `vid`; None for versions without one."""
+    by_id = {v["id"]: v for v in catalogue()["versions"]}
+    chain = lineage(by_id, vid)
+    return chain[0] if chain and by_id[chain[0]].get("stage") == "import" else None
+
+
 def vehicle_status(cat, mine, truck):
     """Readiness of one truck: active version, which stages its lineage contains, recommended next step."""
     key = f"{mine}/{truck}"
@@ -282,7 +289,13 @@ def _parent(body):
     return vid
 
 
+# Stages whose tool command reads a saved-map fusion run (--run) and the mapping mode that run must have.
+RUN_STAGES = {"driven": "lio", "gcons": "lio", "rtk-time": "lio", "camera-lidar": "livo", "camera-focus": "livo"}
+
+
 def _run_dir(raw):
+    if not str(raw or "").strip():
+        raise StudioError("没有选择建图结果（run）")
     run = safe_path(raw)
     if (run / "Log" / "fusion").is_dir():  # a round directory was given: take its latest fusion run
         runs = sorted((run / "Log" / "fusion").glob("*/"))
@@ -302,12 +315,20 @@ def stage_cmd(stage, body):
         return import_cmd(body)
     parent = _parent(body)
     cmd = [PY, str(CALIB_TOOL), command, "--id", parent]
-    if command in ("axle", "ground", "driven", "gcons", "camera-time", "camera-lidar"):
+    if command in ("axle", "ground", "driven", "gcons", "camera-time", "camera-lidar", "camera-focus"):
         dataset = str(safe_path(body.get("dataset") or ""))
-        datasets.require(dataset, camera=command in ("camera-time", "camera-lidar"))
+        datasets.require(dataset, camera=command in ("camera-time", "camera-lidar", "camera-focus"))
         cmd += ["--bag", dataset]
-    if command in ("driven", "gcons", "camera-lidar"):
-        cmd += ["--run", str(_run_dir(body.get("run") or ""))]
+    if command in RUN_STAGES:
+        # Every run-based stage gets its --run here; an empty selection (the UI lists no finished round of the
+        # right mode for this dataset) must fail with a clear message, not with the tool's argparse usage text.
+        if not str(body.get("run") or "").strip():
+            kind = "LIVO" if RUN_STAGES[command] == "livo" else "LIO"
+            hint = ("；RTK 位置关联时间在 LiDAR 流水线中自动完成，单步执行时轮次必须是用该父版本建图的"
+                    if command == "rtk-time" else "")
+            raise StudioError(f"阶段 {stages.get(stage, {}).get('label', command)} 需要选择一轮已保存地图、"
+                              f"状态为完成的 {kind} 建图结果（run）{hint}")
+        cmd += ["--run", str(_run_dir(body["run"]))]
     uw = _user_window(body)
     if command == "ground":
         if body.get("stationary"):
@@ -318,8 +339,10 @@ def stage_cmd(stage, body):
         if body.get("window"):
             cmd += ["--window", *[str(float(v)) for v in body["window"]]]
         elif uw is not None:
-            d = uw["duration_s"] if uw["duration_s"] is not None else 1e9
-            cmd += ["--window", f"{uw['start_s']:.3f}", f"{d:.3f}"]
+            # refine_rear_axle_extrinsic.py --window is [start, END] seconds after the first reference scan (not a
+            # duration): a window starting at 100 s with 120 s used to solve on 100..120 s only
+            end = uw["start_s"] + uw["duration_s"] if uw["duration_s"] is not None else 1e9
+            cmd += ["--window", f"{uw['start_s']:.3f}", f"{end:.3f}"]
         if body.get("dof") in ("rpy_xy", "rpy", "xy"):
             cmd += ["--dof", body["dof"]]
         if body.get("keep_time_offset"):
@@ -469,6 +492,17 @@ def _play_duration(ctx, body, default):
     return float(uw["duration_s"]) + float((ctx.get("win") or {}).get("lead_in_s", 0.0))
 
 
+def _cam_round_duration(ctx, body, default):
+    """Length of a camera-loop LIVO round: the configured length (default 60 s), but never past the end of a
+    manual data window (window + lead-in to the last standstill). Before, a 30 s window still mapped 60 s and a
+    window with cam_round_duration=0 mapped the whole recording."""
+    uw = _user_window(body)
+    if uw is None or uw["duration_s"] is None:
+        return default
+    limit = float(uw["duration_s"]) + float((ctx.get("win") or {}).get("lead_in_s", 0.0))
+    return limit if default is None else min(float(default), limit)
+
+
 def _windows_step(steps, dataset, round_duration, body):
     uw = _user_window(body)
     if uw is not None:
@@ -542,7 +576,8 @@ def _camloop_steps(steps, body, mapping_cmd, *, truck, stamp, auto_activate, bas
         def zero_build(ctx, rn=rn0):
             if _camera_key(ctx[base_key]) == _camera_key(ctx["camtime_id"]):
                 return ["/bin/echo", f"camera-lidar left the camera unchanged: round {ctx[round0_key]} is the zero-pitch point"]
-            return mapping_cmd(rn, "livo", str(calibration_file(ctx[base_key])), body, duration=round_duration,
+            return mapping_cmd(rn, "livo", str(calibration_file(ctx[base_key])), body,
+                               duration=_cam_round_duration(ctx, body, round_duration),
                                start_offset=_round_start(ctx, body))
 
         def zero_after(ctx, lines, rn=rn0):
@@ -561,7 +596,8 @@ def _camloop_steps(steps, body, mapping_cmd, *, truck, stamp, auto_activate, bas
                 if r:
                     ctx["_reused_round"] = r["round"]
                     return ["/bin/echo", f"reuse round {r['round']} ({r['duration_s']:.0f} s, scale {r.get('scale')}) as the zero-pitch point"]
-            return mapping_cmd(rn, "livo", str(calibration_file(ctx[base_key])), body, duration=round_duration,
+            return mapping_cmd(rn, "livo", str(calibration_file(ctx[base_key])), body,
+                               duration=_cam_round_duration(ctx, body, round_duration),
                                start_offset=_round_start(ctx, body))
         steps.append({"title": f"LIVO 零俯仰建图 {rn0}（当前版本{'；快速模式优先复用同窗口的已有轮次' if not standard else ''}）",
                       "retry": 1, "round": rn0, "build": base_build,
@@ -594,7 +630,8 @@ def _camloop_steps(steps, body, mapping_cmd, *, truck, stamp, auto_activate, bas
         steps.append({"title": f"LIVO 扫描建图 {rn}（Δpitch {dp:+.2f}°，只评估轨迹）{skip}", "retry": 1, "round": rn,
                       "build": lambda ctx, rn=rn, tag=tag: mapping_cmd(
                           rn, "livo", str(calibration_file(ctx[f"scan_{tag}_id"])), body,
-                          duration=round_duration, save_map=False, quick=True, start_offset=_round_start(ctx, body))
+                          duration=_cam_round_duration(ctx, body, round_duration), save_map=False, quick=True,
+                          start_offset=_round_start(ctx, body))
                       if scan_needed(ctx) else ["/bin/echo", "one-point fit accepted: scan round skipped"],
                       "after": lambda ctx, lines, rn=rn, tag=tag: ctx.__setitem__(f"scan_{tag}_round", rn) if scan_needed(ctx) else None})
     steps.append({"title": f"拟合原生里程尺度 vs 俯仰增量，求过零点{skip}", "build": lambda ctx: [
@@ -638,7 +675,8 @@ def _camloop_steps(steps, body, mapping_cmd, *, truck, stamp, auto_activate, bas
     rv = f"calib_{truck}_livo_{stamp}_verify"
     steps.append({"title": f"LIVO 验证建图 {rv}（闭环版本；俯仰保持不变时零俯仰轮次即验证，跳过）", "retry": 1, "round": rv,
                   "build": lambda ctx: mapping_cmd(rv, "livo", str(calibration_file(ctx["camloop_id"])), body,
-                                                   duration=round_duration, start_offset=_round_start(ctx, body))
+                                                   duration=_cam_round_duration(ctx, body, round_duration),
+                                                   start_offset=_round_start(ctx, body))
                   if pitch_mode(ctx) == "adopt" else
                   ["/bin/echo", f"camera pitch unchanged: round {ctx[round0_key]} already maps this extrinsic, verify skipped"],
                   "after": lambda ctx, lines: ctx.__setitem__("verify_round", rv if pitch_mode(ctx) == "adopt" else ctx[round0_key])})
@@ -695,7 +733,10 @@ def _rtk_time_steps(steps, body, mapping_cmd, *, truck, stamp, auto_activate):
     rtk_dur = RTK_ROUND_S if rtk_dur in (None, "") else (float(rtk_dur) or None)
     r1, r2 = f"calib_{truck}_rtk1_{stamp}", f"calib_{truck}_rtk2_{stamp}"
     probing = lambda ctx: (ctx.get("rtk1") or {}).get("decision") == "probe"
-    steps.append({"title": f"LIO 建图轮次 {r1}（RTK 关联时间估计，{rtk_dur or 0:.0f} s，起点取剩余时长最长的运动窗口）", "retry": 1, "round": r1,
+    uw = _user_window(body)
+    span = (f"手动窗口 {uw['duration_s']:.0f} s" if uw["duration_s"] else "手动窗口到结尾") if uw is not None else \
+        f"{rtk_dur or 0:.0f} s，起点取剩余时长最长的运动窗口"
+    steps.append({"title": f"LIO 建图轮次 {r1}（RTK 关联时间估计，{span}）", "retry": 1, "round": r1,
                   "build": lambda ctx: mapping_cmd(r1, "lio", str(calibration_file(ctx["driven_id"])), body,
                                                    duration=_play_duration(ctx, body, rtk_dur), start_offset=_rtk_round_start(ctx, body, rtk_dur), quick=True),
                   "after": lambda ctx, lines: ctx.update(rtk_round1=r1, rtk_fusion1=latest_fusion_dir(r1))})
@@ -820,7 +861,11 @@ def pipeline_steps(kind, body, mapping_cmd):
     """
     if body.get("resume"):
         return _resume_steps(body, mapping_cmd)
-    parent = _parent(body)
+    parent = requested_parent = _parent(body)
+    if kind == "lidar" and body.get("from_factory", True):
+        # A complete calibration starts from the factory import of the vehicle (root of the requested version's
+        # lineage), never from an earlier refinement: the result does not depend on previous pipeline runs.
+        parent = factory_root(parent) or parent
     dataset = str(safe_path(body.get("dataset") or ""))
     mine, truck = parent.split("/")[:2]
     standard = (body.get("mode") or "standard") != "fast"
@@ -879,7 +924,8 @@ def pipeline_steps(kind, body, mapping_cmd):
         # the LIO round does not need the whole recording: cap playback at window end + drain margin. The round
         # starts ROUND_LEAD_S before the first drive (motion window), so 8-40 s is driving, not a standstill.
         # lidar_round_duration=0 restores the previous full-length behaviour.
-        title_extra = f"，{lio_duration:.0f} s（起点按运动窗口）" if lio_duration else ""
+        title_extra = (f"，{lio_duration:.0f} s（{'手动窗口' if _user_window(body) is not None else '起点按运动窗口'}）"
+                       if lio_duration else "")
         steps.append({"title": f"LIO 建图轮次 {round_name}（用于行驶段精修{title_extra}）", "retry": 1, "round": round_name, "build": lambda ctx: mapping_cmd(
             round_name, "lio", str(calibration_file(ctx["ground_id"])), body, duration=_play_duration(ctx, body, lio_duration or None),
             start_offset=_round_start(ctx, body)),
@@ -930,7 +976,8 @@ def pipeline_steps(kind, body, mapping_cmd):
             "after": lambda ctx, lines: ctx.__setitem__("camtime_id", parse_version_id(lines))})
         round_name = f"calib_{truck}_livo_{stamp}"
         steps.append({"title": f"LIVO 建图轮次 A {round_name}（基线，俯仰增量 0）", "retry": 1, "round": round_name, "build": lambda ctx: mapping_cmd(
-            round_name, "livo", str(calibration_file(ctx["camtime_id"])), body, duration=cam_dur, start_offset=_round_start(ctx, body)),
+            round_name, "livo", str(calibration_file(ctx["camtime_id"])), body,
+            duration=_cam_round_duration(ctx, body, cam_dur), start_offset=_round_start(ctx, body)),
             "after": lambda ctx, lines: ctx.update(round=round_name, fusion_dir=latest_fusion_dir(round_name))})
         steps.append({"title": "相机-LiDAR 偏航复核 (camera-lidar：灯柱投影列偏差，俯仰不动)", "build": lambda ctx: stage_cmd(
             "camera-lidar", {"id": ctx["camtime_id"], "dataset": dataset, "run": ctx["fusion_dir"],
@@ -949,7 +996,7 @@ def pipeline_steps(kind, body, mapping_cmd):
     else:
         raise StudioError(f"未知流水线 {kind}")
     _cleanup_step(steps, body, truck, stamp)
-    return steps, {"mine": mine, "truck": truck, "parent": parent, "dataset": dataset,
+    return steps, {"mine": mine, "truck": truck, "parent": parent, "requested_parent": requested_parent, "dataset": dataset,
                    "mode": "standard" if standard else "fast", "mode_note": mode_note,
                    "pitch_slope": None if standard else slope_info["slope"],
                    "pitch_slope_source": None if standard else slope_info["source"]}

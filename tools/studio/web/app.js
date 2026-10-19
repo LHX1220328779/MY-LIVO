@@ -141,6 +141,8 @@ function patchLive() {
 // ------------------------------------------------------------------ shared components
 function calibFlags() { return (S.state && S.state.calibration) || {}; }
 function vehicle() { const v = S.state?.vehicle || {}; return S.vehicles.find((x) => x.mine === v.mine && x.truck === v.truck) || S.vehicles[0] || null; }
+// Factory import at the root of a version's lineage: where the LiDAR pipeline starts by default.
+function factoryOf(id) { const by = new Map((S.cal?.versions || []).map((x) => [x.id, x])); let cur = by.get(id); const seen = new Set(); while (cur && cur.parent && by.has(cur.parent) && !seen.has(cur.id)) { seen.add(cur.id); cur = by.get(cur.parent); } return cur && cur.stage === "import" ? cur.id : null; }
 function jobPill() {
   const j = S.job;
   if (j && j.status === "running") {
@@ -223,9 +225,32 @@ function trajectoryChart(live, noRtk) {
     return multiChart(lines, 0.1);
   }
   return multiChart([
-    ...(noRtk ? [] : [{ series: live?.diagnostics, key: "rtk_residual_m", color: "#0071e3", label: "优化后关键帧 RTK 残差（实时）" }]),
+    ...(noRtk ? [] : [{ series: live?.diagnostics, key: "rtk_residual_m", color: "#0071e3", label: "在线发布位姿 vs RTK（后轴，发布时刻定值）" }]),
     { series: live?.online_series, key: "latest", color: "#5e5ce6", dash: "5 4", label: "在线轨迹 vs INS（实时）" },
   ], 0.1);
+}
+// Throughput / resource panel (results/<round>/resources.csv written by tools/livo/resmon.py)
+function resourceStats(live) {
+  const r = live?.resources; if (!r) return "";
+  const n = (k) => { const v = parseFloat(r[k]); return Number.isFinite(v) ? v : null; };
+  const gb = (mb) => (mb == null ? "—" : (mb / 1024).toFixed(mb >= 10240 ? 0 : 1));
+  const rt = n("rt_factor"), fps = n("fps");
+  const skip = live?.player?.skip_windows ? `<div class="small muted" style="margin-top:4px">长时间静止跳过：${live.player.skip_windows} 段，共 ${live.player.skip_s.toFixed(0)} s（快进期间 IMU/INS 全量、激光按间隔抽稀）</div>` : "";
+  return `<div class="grid g4" style="margin-top:10px">
+      <div class="stat"><div class="k">处理帧率</div><div class="v">${fps == null ? "—" : fps.toFixed(1)}<small>Hz</small></div></div>
+      <div class="stat"><div class="k">实时倍率</div><div class="v ${rt != null && rt < 0.95 ? "warn" : ""}">${rt == null ? "—" : rt.toFixed(2)}<small>×</small></div></div>
+      <div class="stat"><div class="k">后端耗时（均值）</div><div class="v">${n("backend_ms") == null ? "—" : n("backend_ms").toFixed(0)}<small>ms/帧</small></div></div>
+      <div class="stat"><div class="k">建图进程内存 / CPU</div><div class="v">${gb(n("mapper_rss_mb"))}<small>GB · ${n("mapper_cpu_pct") == null ? "—" : n("mapper_cpu_pct").toFixed(0)}%</small></div></div>
+    </div>
+    <div class="small muted" style="margin-top:4px">系统内存 ${gb(n("sys_used_mb"))} GB · 交换 ${gb(n("swap_used_mb"))} GB${n("decoder_rss_mb") ? ` · 相机解码 ${gb(n("decoder_rss_mb"))} GB / ${n("decoder_cpu_pct")?.toFixed(0)}%` : ""} · 回放 CPU ${n("player_cpu_pct") == null ? "—" : n("player_cpu_pct").toFixed(0)}%　（实时倍率 &lt; 1 表示建图慢于录制，回放会自动等待）</div>${skip}`;
+}
+function resourceCharts(live) {
+  const s = live?.resource_series; if (!s || s.length < 2) return "";
+  const gbS = s.map((p) => ({ t: p.t, mapper: p.mapper_rss_mb != null ? p.mapper_rss_mb / 1024 : null, sys: p.sys_used_mb != null ? p.sys_used_mb / 1024 : null, swap: p.swap_used_mb != null ? p.swap_used_mb / 1024 : null }));
+  return `<div class="grid g2" style="margin-top:12px">
+      <div><h4>处理帧率 (Hz)　<span class="small muted">墙钟时间轴</span></h4>${multiChart([{ series: s, key: "fps", color: "#34c759", label: "已处理帧/秒" }], 12)}</div>
+      <div><h4>内存 (GB)</h4>${multiChart([{ series: gbS, key: "mapper", color: "#ff9500", label: "建图进程 RSS" }, { series: gbS, key: "sys", color: "#8e8e93", dash: "4 3", label: "系统已用" }, { series: gbS, key: "swap", color: "#ff3b30", dash: "2 3", label: "交换" }], 1)}</div>
+    </div>`;
 }
 
 // ------------------------------------------------------------------ live monitor
@@ -255,10 +280,13 @@ function liveMonitor() {
       <div class="stat"><div class="k">后端 RTK 残差</div><div class="v">${cm(latest.rtk_residual_m)}</div></div>
       <div class="stat"><div class="k">车速</div><div class="v">${num(latest.frontend_speed_mps, 1)}<small>m/s</small></div></div>
     </div>
+    ${resourceStats(live)}
     <div class="grid g2" style="margin-top:12px">
       <div><h4>前端 RTK 残差 (m)</h4>${chart(live?.diagnostics, "frontend_rtk_residual_m", "#0071e3", 0.1)}</div>
-      <div><h4>${live?.record?.options?.use_rtk === false ? `在线轨迹 vs INS (m)　<span class="small muted">无 RTK/INS 融合</span>` : `优化后轨迹 vs RTK (m)　<span class="small muted">虚线：在线轨迹 vs INS</span>`}</h4>${trajectoryChart(live, live?.record?.options?.use_rtk === false)}</div>
+      <div><h4>${live?.record?.options?.use_rtk === false ? `在线轨迹 vs INS (m)　<span class="small muted">无 RTK/INS 融合</span>` : live?.error_series?.length ? `优化后轨迹 vs RTK (m)　<span class="small muted">实线：交付轨迹（评估）；虚线：在线轨迹 vs INS</span>` : `在线位姿 vs RTK (m)　<span class="small muted">发布时刻的因果误差，写入后不再改变；交付轨迹误差在导出评估后显示</span>`}</h4>${trajectoryChart(live, live?.record?.options?.use_rtk === false)}</div>
     </div>
+    <div class="small muted" style="margin-top:4px">曲线按固定时间分箱（每箱取最大值）绘制，已完成的时间段不会随刷新改变。</div>
+    ${resourceCharts(live)}
     ${live?.launch_events?.length ? `<details style="margin-top:10px"><summary>算法事件（${live.launch_events.length}）</summary><div class="events">${live.launch_events.slice(-40).map((e) => `<div class="${/WARN/.test(e) ? "warn" : /ERROR|FATAL|died/.test(e) ? "bad" : ""}">${esc(e)}</div>`).join("")}</div></details>` : ""}
   </div>`;
 }
@@ -563,11 +591,11 @@ function pageCalib() {
     ${stepperHtml(v)}
     ${windowWidget("winCalib", "标定时间窗口", "标定只使用窗口内的数据；窗口从行驶中开始时，建图轮次自动从窗口前最近的静止处起播（IMU 需静止初始化），窗口内没有静止段时地面静止帧取窗口前的静止段。")}
     <div class="grid g2" style="margin-top:8px">
-      <div class="stat" style="padding:14px"><div class="row" style="justify-content:space-between"><div><b>LiDAR 标定流水线</b><div class="small muted">后轴对齐（RTK/INS 位姿，参考雷达→后轴，整机修正）→ 静止地面精修 → LIO 建图（保存地图）→ 行驶段 6-DoF 精修 → 校验${c.auto_activate ? " → 激活" : ""}</div><div class="small muted">约 6 分钟（含一次 48 s 回放）· 需要 LiDAR/IMU/INS 数据源 · 原始出厂外参与已精修父版本都可直接运行</div></div><button class="btn primary" data-act="pipeline" data-kind="lidar" ${running || !v?.active || !d?.lio_ready ? "disabled" : ""}>运行</button></div></div>
-      <div class="stat" style="padding:14px"><div class="row" style="justify-content:space-between"><div><b>相机标定流水线</b><div class="small muted">相机时间偏移 → LIVO 建图 A（基线）→ 偏航复核（灯柱投影列偏差，俯仰不动）→ 俯仰闭环（标准＝±0.05° 扫描两轮拟合斜率；快速＝沿用历史斜率 0.105/°，只测零点）→ 闭环版本 → LIVO 验证建图 → 闭环判定 A/验证 → 校验${c.auto_activate ? " → 通过则激活" : ""}</div><div class="small muted">标准 ≈12 min（4 × 60 s 回放）· 快速 ≈8 min（2 × 60 s）· 默认只回放前 60 s（前两轮数据）· 需要含相机的数据源 · 未通过闭环的版本不会被激活</div></div><button class="btn primary" data-act="pipeline" data-kind="camera" ${running || !v?.active || !d?.livo_ready ? "disabled" : ""}>运行</button></div></div>
+      <div class="stat" style="padding:14px"><div class="row" style="justify-content:space-between"><div><b>LiDAR 标定流水线</b><div class="small muted">后轴对齐（RTK/INS 位姿，参考雷达→后轴，整机修正）→ 静止地面精修 → LIO 建图（保存地图）→ 行驶段 6-DoF 精修 → 校验${c.auto_activate ? " → 激活" : ""}</div><div class="small muted">180 s 窗口实测 7–10 分钟（2–3 轮 LIO 回放，2.5 倍速；RTK 关联时间已自洽时省掉探测轮）· 需要 LiDAR/IMU/INS 数据源 · 默认从出厂导入版本开始（不在以前的精修结果上叠加）</div></div><button class="btn primary" data-act="pipeline" data-kind="lidar" ${running || !v?.active || !d?.lio_ready ? "disabled" : ""}>运行</button></div></div>
+      <div class="stat" style="padding:14px"><div class="row" style="justify-content:space-between"><div><b>相机标定流水线</b><div class="small muted">相机时间偏移 → LIVO 建图 A（基线）→ 偏航复核（灯柱投影列偏差，俯仰不动）→ 俯仰闭环（标准＝±0.05° 扫描两轮拟合斜率；快速＝沿用历史斜率 0.105/°，只测零点）→ 闭环版本 → LIVO 验证建图 → 闭环判定 A/验证 → 校验${c.auto_activate ? " → 通过则激活" : ""}</div><div class="small muted">标准 ≈7.5 min（4 × 60 s 回放，实测）· 快速 ≈5 min（2–3 × 60 s）· 默认只回放前 60 s（前两轮数据）· 需要含相机的数据源 · 未通过闭环的版本不会被激活</div></div><button class="btn primary" data-act="pipeline" data-kind="camera" ${running || !v?.active || !d?.livo_ready ? "disabled" : ""}>运行</button></div></div>
       <div class="stat" style="padding:14px"><div class="row" style="justify-content:space-between"><div><b>相机外参闭环微调（日常，最快）</b><div class="small muted">以当前激活版本为起点：<b>复用最近一次同版本 LIVO 轮次</b>作为零俯仰点（无需重跑）→ 用已知斜率算出过零点 → 闭环版本 → 一轮 LIVO 验证 → 闭环判定${c.auto_activate ? " → 通过则激活" : ""}</div><div class="small muted">快速 ≈4–5 min（1 次回放）· 标准 ≈15 min（4 次回放）· 复用要求该轮次已评估且时长 ≥50 s（60 s 短轮次可复用）</div></div><button class="btn primary" data-act="pipeline" data-kind="camloop" ${running || !v?.active || !d?.livo_ready ? "disabled" : ""}>运行</button></div></div>
     </div>
-    <div class="row" style="margin-top:10px;justify-content:space-between"><div class="small muted">父版本：<b>${esc(v?.active || "—")}</b> · 数据源：<b>${esc(d?.name || "未选择")}</b> ${datasetBadges(d)}</div><div class="row" style="gap:18px"><label class="check small">${`<input type="checkbox" data-act="toggle" data-section="calibration" data-key="auto_activate" ${c.auto_activate ? "checked" : ""}><span class="switch"></span><span>流水线完成后自动激活（仅在闭环判定通过时）</span>`}</label><label class="check small">${`<input type="checkbox" data-act="toggle" data-section="calibration" data-key="fast" ${c.fast !== false ? "checked" : ""}><span class="switch"></span><span>快速模式（沿用本车实测俯仰斜率只测零点；本车无斜率或单点拟合被拒时自动转标准扫描；取消勾选＝标准扫描）</span>`}</label><label class="check small">${`<input type="checkbox" data-act="toggle" data-section="calibration" data-key="keep_maps" ${c.keep_maps === true ? "checked" : ""}><span class="switch"></span><span>保留标定轮次的地图与扫描存档（每轮 1–4 GB；默认关闭＝流水线成功后删除 PCD/scans.bin，轨迹与评估保留）</span>`}</label></div></div>
+    <div class="row" style="margin-top:10px;justify-content:space-between"><div class="small muted">父版本：LiDAR 流水线 <b>${esc((c.from_factory !== false && factoryOf(v?.active)) || v?.active || "—")}</b> · 相机/微调 <b>${esc(v?.active || "—")}</b> · 数据源：<b>${esc(d?.name || "未选择")}</b> ${datasetBadges(d)}</div><div class="row" style="gap:18px"><label class="check small">${`<input type="checkbox" data-act="toggle" data-section="calibration" data-key="from_factory" ${c.from_factory !== false ? "checked" : ""}><span class="switch"></span><span>LiDAR 流水线从出厂导入版本开始（推荐：结果不依赖以前的精修；取消＝从激活版本开始）</span>`}</label><label class="check small">${`<input type="checkbox" data-act="toggle" data-section="calibration" data-key="auto_activate" ${c.auto_activate ? "checked" : ""}><span class="switch"></span><span>流水线完成后自动激活（仅在闭环判定通过时）</span>`}</label><label class="check small">${`<input type="checkbox" data-act="toggle" data-section="calibration" data-key="fast" ${c.fast !== false ? "checked" : ""}><span class="switch"></span><span>快速模式（沿用本车实测俯仰斜率只测零点；本车无斜率或单点拟合被拒时自动转标准扫描；取消勾选＝标准扫描）</span>`}</label><label class="check small">${`<input type="checkbox" data-act="toggle" data-section="calibration" data-key="keep_maps" ${c.keep_maps === true ? "checked" : ""}><span class="switch"></span><span>保留标定轮次的地图与扫描存档（每轮 1–4 GB；默认关闭＝流水线成功后删除 PCD/scans.bin，轨迹与评估保留）</span>`}</label></div></div>
   </div>
   <div class="grid" style="grid-template-columns: 1fr 380px; margin-top:16px">
     <div class="card"><div class="card-h"><h2>版本（${versions.length}）</h2><span class="small muted">点击查看详情 · ★ 为激活版本</span></div>
@@ -623,10 +651,19 @@ function pageMap() {
       <div class="field"><label>几何点云截取距离 (m)</label><input type="number" step="1" min="0" data-act="field" data-section="mapping" data-key="map_range" value="${esc(m.map_range ?? 45)}" ${m.save_map ? "" : "disabled"}></div>
       <div class="field"><label>彩色点云截取距离 (m，LIVO 生效)</label><input type="number" step="1" min="0" data-act="field" data-section="mapping" data-key="rgb_range" value="${esc(m.rgb_range ?? 60)}" ${m.save_map ? "" : "disabled"} title="rgb_map_N.pcd 的截取距离；LIO 模式不生成彩色点云，这里的值会保存并在下次 LIVO 建图时使用"></div>
       <div class="field"><label>相机帧抽稀 (frame_divider)</label><input type="number" step="1" min="1" max="10" data-act="field" data-section="mapping" data-key="frame_divider" value="${esc(m.frame_divider ?? 1)}"></div>
+      <div class="field"><label>静止跳过：最短静止时长 (s)</label><input type="number" step="5" min="10" data-act="field" data-section="mapping" data-key="stationary_min" value="${esc(m.stationary_min ?? 30)}" ${m.skip_stationary ? "" : "disabled"} title="起步后、持续时间不短于该值的静止段被快进；起步前的静止段始终正常回放（IMU 初始化、外参自检）"></div>
+      <div class="field"><label>静止跳过：快进期激光间隔 (s)</label><input type="number" step="0.5" min="0.2" max="5" data-act="field" data-section="mapping" data-key="stationary_lidar_interval" value="${esc(m.stationary_lidar_interval ?? 1)}" ${m.skip_stationary ? "" : "disabled"} title="快进期间每隔多少秒保留一帧激光（IMU/INS 全量回放）"></div>
+      <div class="field"><label>地图导出：体素 (m，0 = 不滤波)</label><input type="number" step="0.01" min="0" max="2" data-act="field" data-section="mapping" data-key="map_voxel" value="${esc(m.map_voxel ?? 0.05)}" ${m.save_map && m.map_export !== false ? "" : "disabled"} title="global_map.pcd 的体素边长；每个体素输出质心与平均强度"></div>
+      <div class="field"><label>地图导出：点云来源</label><select data-act="field" data-section="mapping" data-key="map_source" ${m.save_map && m.map_export !== false ? "" : "disabled"}><option value="all" ${(m.map_source || "all") === "all" ? "selected" : ""}>全部扫描（最密）</option><option value="keyframes" ${m.map_source === "keyframes" ? "selected" : ""}>仅后端关键帧（约 1/5 数据量）</option></select></div>
+      <div class="field"><label>地图导出：分块 (m，0 = 仅整图)</label><input type="number" step="10" min="0" data-act="field" data-section="mapping" data-key="map_tile" value="${esc(m.map_tile ?? 0)}" ${m.save_map && m.map_export !== false ? "" : "disabled"}></div>
+      <div class="field"><label>地图导出：每体素最少点数 (1 = 全保留)</label><input type="number" step="1" min="1" max="1000" data-act="field" data-section="mapping" data-key="map_min_points" value="${esc(m.map_min_points ?? 1)}" ${m.save_map && m.map_export !== false ? "" : "disabled"} title="少于该点数的体素视为噪点/短暂出现的移动物体而剔除（如 3）；静止结构在 5 cm 体素内通常累积数十至数百个回波"></div>
       <div class="field wide"><label>额外参数覆盖（空格分隔 key=value，例如 vio.img_point_cov=100 time_offset.img_time_offset=-0.115）</label><input type="text" class="mono" data-act="field" data-section="mapping" data-key="extra_sets" value="${esc(m.extra_sets || "")}"></div>
     </div>
     <div class="small muted" style="margin-top:10px">截取距离仅控制导出的 PCD 范围，0 表示不限距离。几何和彩色点云可分别设置；彩色点云只在 LIVO 模式生成，在 LIO 模式下也可以预先设置。</div>
-    <div class="row" style="margin-top:14px;gap:22px">${toggle("use_rtk", "RTK / INS 融合", m.use_rtk)}${toggle("save_map", "保存地图 (PCD/扫描存档)", m.save_map)}${toggle("rviz", "RViz", m.rviz)}${toggle("precheck", "起步静止外参自检", m.precheck)}${toggle("evaluate", "自动评估", m.evaluate)}</div>
+    <div class="row" style="margin-top:14px;gap:22px">${toggle("use_rtk", "RTK / INS 融合", m.use_rtk)}${toggle("save_map", "保存地图 (PCD/扫描存档)", m.save_map)}${toggle("rviz", "RViz", m.rviz)}${toggle("precheck", "起步静止外参自检", m.precheck)}${toggle("evaluate", "自动评估", m.evaluate)}${toggle("skip_stationary", "长时间静止跳过（仅 LIO）", m.skip_stationary)}${toggle("map_export", "导出标准地图", m.map_export !== false)}${toggle("map_keyframes", "导出关键帧点云", m.map_keyframes)}${toggle("auto_cleanup", "磁盘不足时自动精简旧轮次", m.auto_cleanup !== false)}</div>
+    <div class="row" style="margin-top:8px;gap:10px"><label class="small">自动精简阈值：可用空间低于 <input type="number" min="15" step="5" style="width:70px" data-act="field" data-section="mapping" data-key="auto_cleanup_free_gb" value="${esc(m.auto_cleanup_free_gb ?? 50)}" ${m.auto_cleanup !== false ? "" : "disabled"}> GB 时，开跑前按时间从旧到新精简未保护的历史轮次（见 系统 › 磁盘与历史数据）</label></div>
+    <div class="small muted" style="margin-top:6px">地图产品（保存地图时生成，<code>Log/fusion/&lt;运行&gt;/map/</code>）：<b>global_map.pcd</b> 体素滤波整图（全部扫描或仅关键帧）、LIVO 另有 <b>global_map_rgb.pcd</b>；可选分块 tiles/ 与关键帧点云 keyframes/（机体系点云 + poses.txt）；<b>map_info.json</b> 记录坐标系、体素、范围、点数与输入。原始时间序分块 map_N.pcd（评估用）与扫描存档始终保留，可在结果页按其他体素/来源重新导出而无需重新建图。</div>
+    <div class="small muted" style="margin-top:6px">长时间静止跳过（仅 LIO）：起步后的长静止段（停车等待）只快进中段——前 3 s 与重新起步前 5 s 照常回放，快进期间 IMU/INS 全量连续、激光按间隔抽稀；状态估计与 RTK/INS 关联保持连续，地图不重复累积静止帧。LIVO 轮次忽略此选项、照常回放（相机硬解码输出有延迟，快进后视觉更新会中断）。</div>
     <div class="sep"></div>
     <div class="row" style="justify-content:space-between"><div class="small muted">启动前会校验数据源话题与标定版本；进行中可“提前结束并保存”（停止回放，保留优化/导出/评估）。</div><button class="btn primary big" data-act="start" ${running || !canLIO || !v?.active ? "disabled" : ""}>${running ? "建图进行中…" : `开始 ${mode.toUpperCase()} 建图`}</button></div>
   </div>`;
@@ -667,7 +704,24 @@ function pageSystem() {
         <div class="k">停止语义</div><div>“提前结束并保存”= 中断回放，算法继续收尾优化、导出与评估；“强制终止”= 杀掉全部进程，结果不完整。</div>
       </div></div>
   </div>
+  ${resultsUsageCard()}
   <div class="card" style="margin-top:16px"><div class="card-h"><h2>任务历史</h2><button class="btn sm" data-act="reload-jobs">刷新</button></div>${jobsTable(S.jobs)}</div>`;
+}
+function resultsUsageCard() {
+  const u = S.usage; const f = S.cleanupForm || (S.cleanupForm = { target: 100, allowDelete: false });
+  const gb = (b) => (b / 1e9).toFixed(1);
+  const badge = (r) => [r.running ? '<span class="badge accent">运行中</span>' : "", r.pinned ? '<span class="badge ok">保留</span>' : "", r.recent && !r.running ? '<span class="badge">最近</span>' : "", r.slim ? '<span class="badge">已精简</span>' : ""].join(" ");
+  const rows = (u?.rounds || []).slice().reverse().map((r) => `<tr><td class="small nowrap">${esc(r.date.replace("T", " "))}</td><td class="mono small">${esc(r.round)}</td><td class="small">${esc(r.status || "—")}${r.kind === "calibration" ? ' <span class="muted">标定</span>' : ""}</td><td class="num">${gb(r.bytes)}</td><td class="num">${gb(r.heavy_bytes)}</td><td>${badge(r)}</td>
+      <td class="nowrap"><button class="btn sm" data-act="results-pin" data-round="${esc(r.round)}" data-pinned="${r.pinned ? 0 : 1}" ${r.running ? "disabled" : ""}>${r.pinned ? "取消保留" : "保留"}</button>
+      <button class="btn sm" data-act="results-cleanup" data-action="slim" data-round="${esc(r.round)}" ${r.protected || r.slim ? "disabled" : ""}>精简</button>
+      <button class="btn sm danger" data-act="results-cleanup" data-action="delete" data-round="${esc(r.round)}" ${r.protected ? "disabled" : ""}>删除</button></td></tr>`).join("");
+  return `<div class="card" style="margin-top:16px"><div class="card-h"><h2>磁盘与历史数据</h2><button class="btn sm" data-act="results-usage">刷新</button></div>
+    ${u ? `<div class="small" style="margin-bottom:8px">磁盘可用 <b>${u.disk.free_gb} GB</b> / ${u.disk.total_gb} GB（已用 ${u.disk.used_pct}%）· results 共 ${gb(u.total_bytes)} GB · 可精简释放 ${gb(u.reclaimable_bytes)} GB</div>
+    <div class="row" style="gap:10px;flex-wrap:wrap;margin-bottom:8px"><label class="small">释放到可用 <input type="number" min="10" step="10" style="width:80px" data-act="cleanup-field" data-key="target" value="${esc(f.target)}"> GB</label>
+      <label class="small"><input type="checkbox" data-act="cleanup-field" data-key="allowDelete" ${f.allowDelete ? "checked" : ""}> 精简不够时删除整轮</label>
+      <button class="btn sm" data-act="results-auto">一键清理（从最旧开始）</button></div>
+    <div class="small muted" style="margin-bottom:8px">精简 = 删除扫描存档（scans/colors/sources.bin）、全分辨率分块 map_N/rgb_map_N.pcd、分块/关键帧点云与 roslog，保留轨迹、评估指标、标准整图 global_map.pcd 与 map_info.json（结果页数字不变，可随时查看整图）；删除 = 移除整个轮次目录。运行中、最近 3 轮与“保留”的轮次受保护。建图页可开启“磁盘不足时自动精简”。</div>
+    <div style="max-height:360px;overflow:auto"><table class="tbl small"><thead><tr><th>时间</th><th>轮次</th><th>状态</th><th class=num>总计 GB</th><th class=num>可精简 GB</th><th></th><th></th></tr></thead><tbody>${rows}</tbody></table></div>` : `<div class="small muted">加载中…</div>`}</div>`;
 }
 
 // ------------------------------------------------------------------ drawers
@@ -813,10 +867,22 @@ function drawerRun() {
     <div class="kv small" style="margin:10px 0"><div class="k">数据源</div><div class="mono">${esc(r.dataset)}</div><div class="k">标定</div><div class="mono">${esc(r.calibration || "config yaml 内置")}</div><div class="k">参数</div><div class="mono">${esc(JSON.stringify(r.options || {}))} ${esc(Array.isArray(r.overrides) ? r.overrides.join(" ") : r.overrides || "")}</div><div class="k">fusion</div><div class="mono">${esc(l.fusion_dir || "")}</div><div class="k">地图</div><div>${l.map_chunks ?? 0} 块 · ${l.map_size_mb ?? 0} MB${l.rgb_map_chunks ? ` · RGB ${l.rgb_map_chunks} 块` : ""}</div></div>
     ${metricsPanel(l)}
     <div class="grid g2" style="margin:12px 0"><div><h4>前端 RTK 残差 (m)</h4>${chart(l.diagnostics, "frontend_rtk_residual_m", "#0071e3", 0.1)}</div><div><h4>${l.record?.options?.use_rtk === false ? `在线轨迹 vs INS (m)　<span class="small muted">无 RTK/INS 融合</span>` : `优化后轨迹 vs RTK (m)　<span class="small muted">虚线：在线轨迹 vs INS</span>`}</h4>${trajectoryChart(l, l.record?.options?.use_rtk === false)}</div></div>
+    ${mapProductsPanel(r, l)}
     ${l.summary ? `<details><summary>评估摘要原文（summary.txt）</summary><pre class="small" style="max-height:320px;overflow:auto">${esc(l.summary.join("\n"))}</pre></details>` : ""}
     ${preHtml}
     <details><summary>算法事件（${(l.launch_events || []).length}）</summary><div class="events">${(l.launch_events || []).map((e) => `<div class="${/WARN/.test(e) ? "warn" : /ERROR|FATAL|died/.test(e) ? "bad" : ""}">${esc(e)}</div>`).join("")}</div></details>
     <div class="sep"></div><div class="row">${files}</div>`;
+}
+
+function mapProductsPanel(r, l) {
+  if (!l.fusion_dir) return "";
+  const prods = l.map_products || [];
+  const f = S.exportForm || (S.exportForm = { voxel: 0.05, source: "all", tile: 0, keyframes: false, min_points: 1 });
+  const rows = prods.map((p) => `<tr><td class="mono">${esc(p.dir)}</td><td>${p.voxel_m === 0 ? "不滤波" : `${(p.voxel_m * 100).toFixed(0)} cm`}</td><td>${p.source === "keyframes" ? "关键帧" : "全部扫描"}${p.min_points > 1 ? ` · ≥${p.min_points} 点` : ""}</td><td>${p.tile_m ? `${p.tile_m} m` : "—"}</td><td>${p.files.map((x) => `<a href="/api/runs/${encodeURIComponent(r.round)}/file?name=${encodeURIComponent(`Log/fusion/${l.fusion_dir.split("/").pop()}/${x.name}`)}" target="_blank">${esc(x.name.split("/").pop())}</a> ${x.points != null ? `${(x.points / 1e6).toFixed(1)} M 点` : ""} · ${x.mb} MB`).join("<br>")}</td><td class="small muted">${esc(fmtT(p.created))}${p.elapsed_s != null ? ` · ${p.elapsed_s} s` : ""}</td></tr>`).join("");
+  return `<details ${prods.length ? "" : "open"}><summary>地图产品（${prods.length}）</summary>
+    ${prods.length ? `<table class="tbl small"><thead><tr><th>目录</th><th>体素</th><th>来源</th><th>分块</th><th>文件</th><th>生成</th></tr></thead><tbody>${rows}</tbody></table>` : `<div class="small muted">尚未导出标准地图产品。</div>`}
+    ${l.has_archive ? `<div class="row" style="margin-top:8px;gap:10px;flex-wrap:wrap"><label class="small">体素 (m) <input type="number" step="0.01" min="0" max="2" style="width:80px" data-act="export-field" data-key="voxel" value="${esc(f.voxel)}"></label><label class="small">来源 <select data-act="export-field" data-key="source"><option value="all" ${f.source === "all" ? "selected" : ""}>全部扫描</option><option value="keyframes" ${f.source === "keyframes" ? "selected" : ""}>仅关键帧</option></select></label><label class="small">分块 (m) <input type="number" step="10" min="0" style="width:80px" data-act="export-field" data-key="tile" value="${esc(f.tile)}"></label><label class="small">最少点数/体素 <input type="number" step="1" min="1" style="width:60px" data-act="export-field" data-key="min_points" value="${esc(f.min_points ?? 1)}"></label><label class="small"><input type="checkbox" data-act="export-field" data-key="keyframes" ${f.keyframes ? "checked" : ""}> 关键帧点云</label><button class="btn sm" data-act="export-map" data-round="${esc(r.round)}">按此设置重新导出</button></div><div class="small muted">从扫描存档按最终优化位姿重投影（与建图输出一致），不需要重新建图；默认设置写入 map/，其他设置写入独立目录。</div>` : `<div class="small muted">本轮没有扫描存档（scans.bin），无法重新导出。</div>`}
+  </details>`;
 }
 
 // ------------------------------------------------------------------ actions
@@ -829,6 +895,7 @@ const A = {
     saveState({ ui: { page } });
     render();
     if (page === "data" && !S.fs) A["fs-open"]({ dataset: { path: S.dataset?.path ? S.dataset.path.replace(/\/[^/]+$/, "") : "/home/project" } });
+    if (page === "system") A["results-usage"]();
   },
   close() { S.drawer = null; renderDrawer(); },
   async "drawer-job"() { S.drawer = "job"; if (!S.job && S.jobs.length) { await A["open-job"]({ dataset: { id: S.jobs[0].id } }); return; } renderDrawer(); if (S.job) { await pollJob(); renderDrawer(); } },
@@ -859,8 +926,10 @@ const A = {
     const label = { lidar: "LiDAR 标定流水线（后轴对齐 → 地面精修 → LIO 建图 → 行驶段精修 → 校验）", camera: `相机标定流水线（时间偏移 → LIVO 建图 A → 灯柱偏航复核 → 俯仰闭环${std ? "扫描" : "（快速）"} → 验证建图 → 闭环判定）`, camloop: `相机外参闭环微调（${std ? "标准" : "快速"}：${std ? "两轮扫描" : "复用已有轮次 + 一轮验证"} → 闭环判定）` }[kind];
     const w = winEffective(S.winCalib, d?.duration_s);
     const winInfo = w ? `\n时间窗口：${winLabel(S.winCalib, d?.duration_s)}` : "\n时间窗口：自动（按运动窗口）";
-    if (!confirm(`运行 ${label}\n父版本：${v.active}\n数据源：${d?.path}${winInfo}\n流水线包含一次完整回放建图，请勿同时启动其他建图。`)) return;
-    await act(async () => { const job = await api("/api/calibrations/pipeline", "POST", { kind, id: v.active, dataset: d.path, activate: c.auto_activate !== false, use_rtk: true, rate: 1.0, note: "", mode: c.fast === false ? "standard" : "fast", window_start: w?.start_s ?? null, window_duration: w?.duration_s ?? null, keep_calib_maps: c.keep_maps === true }); S.job = job; S.jobLog = []; S.jobLogNext = 0; S.drawer = "job"; await loadOverview(); render(); }, "流水线已启动");
+    const fromFactory = kind === "lidar" && c.from_factory !== false;
+    const parent = (fromFactory && factoryOf(v.active)) || v.active;
+    if (!confirm(`运行 ${label}\n父版本：${parent}${parent !== v.active ? `（出厂导入版本；当前激活 ${v.active}）` : ""}\n数据源：${d?.path}${winInfo}\n流水线包含一次完整回放建图，请勿同时启动其他建图。`)) return;
+    await act(async () => { const job = await api("/api/calibrations/pipeline", "POST", { kind, id: v.active, from_factory: fromFactory, dataset: d.path, activate: c.auto_activate !== false, use_rtk: true, rate: 1.0, note: "", mode: c.fast === false ? "standard" : "fast", window_start: w?.start_s ?? null, window_duration: w?.duration_s ?? null, keep_calib_maps: c.keep_maps === true }); S.job = job; S.jobLog = []; S.jobLogNext = 0; S.drawer = "job"; await loadOverview(); render(); }, "流水线已启动");
   },
   "toggle-import"() { S.showImport = !S.showImport; render(); },
   async import() {
@@ -912,8 +981,25 @@ const A = {
   async evaluate(el) { await act(async () => { const job = await api("/api/evaluate", "POST", { round: el.dataset.round }); S.job = job; S.jobLog = []; S.jobLogNext = 0; S.drawer = "job"; render(); }, "评估已启动"); },
   async "from-precheck"(el) { const v = vehicle(); await act(async () => { const job = await api("/api/calibrations/stage", "POST", { stage: "precheck", id: v.active, run_dir: `${S.system.results}/${el.dataset.round}`, note: `adopted precheck of ${el.dataset.round}` }); S.job = job; S.jobLog = []; S.jobLogNext = 0; S.drawer = "job"; render(); }, "已启动"); },
   async "reload-runs"() { await loadRuns(); render(); },
+  "export-field"(el) { const f = S.exportForm || (S.exportForm = {}); const k = el.dataset.key; f[k] = el.type === "checkbox" ? el.checked : el.tagName === "SELECT" ? el.value : parseFloat(el.value); },
+  async "export-map"(el) { const round = el.dataset.round; await act(async () => { const job = await api(`/api/runs/${encodeURIComponent(round)}/export-map`, "POST", S.exportForm || {}); S.job = job; S.jobLog = []; S.jobLogNext = 0; }, "地图导出已启动（完成后刷新本页查看产品）"); },
   async "reload-jobs"() { await loadJobs(); render(); },
-  async "reload-system"() { await loadOverview(); render(); },
+  async "reload-system"() { await loadOverview(); await A["results-usage"](); },
+  async "results-usage"() { try { S.usage = await api("/api/results/usage"); } catch (e) { toast(String(e.message || e), "bad"); } render(); },
+  "cleanup-field"(el) { const f = S.cleanupForm || (S.cleanupForm = {}); f[el.dataset.key] = el.type === "checkbox" ? el.checked : parseFloat(el.value); },
+  async "results-pin"(el) { await act(() => api("/api/results/pin", "POST", { round: el.dataset.round, pinned: el.dataset.pinned === "1" }), el.dataset.pinned === "1" ? "已设为保留" : "已取消保留"); await A["results-usage"](); },
+  async "results-cleanup"(el) {
+    const action = el.dataset.action, round = el.dataset.round;
+    if (!confirm(action === "delete" ? `删除整个轮次 ${round}？此操作不可恢复。` : `精简轮次 ${round}？将删除扫描存档与全分辨率分块（保留轨迹、评估与标准整图）。`)) return;
+    await act(() => api("/api/results/cleanup", "POST", { action, rounds: [round] }), action === "delete" ? "已删除" : "已精简"); await A["results-usage"]();
+  },
+  async "results-auto"() {
+    const f = S.cleanupForm || {};
+    const plan = await api("/api/results/cleanup", "POST", { action: "auto", apply: false, target_free_gb: f.target || 100, allow_delete: !!f.allowDelete });
+    if (!plan.plan.length) { toast("无需清理或没有可清理的轮次（受保护的轮次不会被动）", "ok"); return; }
+    if (!confirm(`将按时间从旧到新处理 ${plan.plan.length} 个轮次，释放约 ${(plan.freed_bytes / 1e9).toFixed(1)} GB：\n` + plan.plan.map((p) => `${p.action === "delete" ? "删除" : "精简"} ${p.round}（${(p.bytes / 1e9).toFixed(1)} GB）`).join("\n"))) return;
+    await act(() => api("/api/results/cleanup", "POST", { action: "auto", target_free_gb: f.target || 100, allow_delete: !!f.allowDelete }), "清理完成"); await A["results-usage"]();
+  },
   async "fs-go"() { await A["fs-open"]({ dataset: { path: $("#fs-path").value.trim() } }); },
   async "fs-open"(el) { await act(async () => { S.fs = await api(`/api/fs?path=${encodeURIComponent(el.dataset.path)}`); const box = $(".fsb"); if (box) box.innerHTML = fsHtml(); const inp = $("#fs-path"); if (inp) inp.value = S.fs.path; }); },
   async "select-dataset"(el) { await act(async () => { const r = await api("/api/datasets/select", "POST", { path: el.dataset.path }); S.state = r.state; S.dataset = r.dataset; await loadOverview(); render(); }, "已选择数据源"); },
@@ -957,6 +1043,7 @@ document.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && S.draw
     if (S.job) { await pollJob(); await pollLive(); }
     render();
     if (S.page === "data") A["fs-open"]({ dataset: { path: S.dataset?.path ? S.dataset.path.replace(/\/[^/]+$/, "") : "/home/project" } });
+    if (S.page === "system") A["results-usage"]();
     schedule();
   } catch (e) {
     $("#page").innerHTML = `<div class="callout bad">无法连接 Studio 后端：${esc(e.message)}</div>`;

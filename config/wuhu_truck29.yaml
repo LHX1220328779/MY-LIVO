@@ -251,6 +251,51 @@ laser_mapping:
       # concern vehicle-position revisits only, not long-range surface overlap.
       revisit_radius_m: 8.0
       revisit_min_age_sec: 15.0
+      # optional: a revisit must have driven away and back (native path between both knots); 0 = time gate only.
+      # Kept at 0: links between standstill knots >= revisit_min_age_sec apart are what pins the yaw of a long
+      # parking (without them the optimized yaw wandered +0.4 deg over a 300 s standstill on truck29raw 20261013)
+      revisit_min_path_m: 0.0
+      # standstill knot spacing (native motion < stationary_translation_m / _rotation_deg and speed <
+      # stationary_speed_mps since the last knot); 0 = keyframe_interval_sec everywhere. Dense knots (0) on the
+      # full 870 s truck29raw 20261013 recording: backend behind real time (player held 254 s), max error 12.8 cm.
+      keyframe_stationary_interval_sec: 5.0
+      stationary_translation_m: 0.05
+      stationary_rotation_deg: 0.2
+      stationary_speed_mps: 0.1
+      # standstill hold: consecutive parked knots are also tied by their native increment with these fixed sigmas
+      # (the odometry of a static scene does not random-walk like while driving); 0 = off
+      standstill_hold_rotation_deg: 0.005
+      standstill_hold_translation_m: 0.002
+      # online graph upkeep: covisibility/revisit candidate index rebuilt every N knots (new knots are
+      # inserted at once), full-graph cost breakdown logged every N knots; final LM relinearizes all
+      index_rebuild_keys: 10
+      online_log_interval_keys: 10
+      # final submap-to-submap loop closure on revisited sections (needs save_map: reads the scan archive)
+      loop_closure_enabled: true
+      loop_radius_m: 12.0
+      loop_min_path_m: 60.0
+      loop_min_age_sec: 30.0
+      loop_spacing_m: 4.0
+      loop_submap_half_path_m: 12.0
+      loop_voxel_m: 0.15
+      loop_max_range_m: 40.0
+      loop_max_correction_m: 0.15
+      loop_max_correction_deg: 0.3
+      loop_max_rms_m: 0.08
+      loop_min_overlap: 0.15
+      loop_point_sigma_m: 0.05
+      loop_effective_points: 300
+      # systematic registration error added to the ICP covariance: a loop pulls passes together without bending them
+      loop_floor_translation_m: 0.02
+      loop_floor_rotation_deg: 0.03
+      loop_max_pairs: 600
+      # final solve: a keyframe farther than this from its RTK fix drops the loop factors within
+      # loop_rtk_bound_keys keyframes and re-solves (loops redistribute the RTK error, never break the 10 cm budget)
+      loop_rtk_bound_m: 0.08
+      loop_rtk_bound_keys: 20
+      relinearize_rotation_deg: 0.01
+      relinearize_translation_m: 0.005
+      relinearize_misalignment_deg: 0.05
       match_max_distance_m: 1.2
       # Absolute body attitude from the qualified INS solution (same mode-4
       # gate and -0.1 s timing as positions). Native LIO attitude is only
@@ -282,6 +327,9 @@ laser_mapping:
       output_directory: ""
       save_map: false
       export_chunk_points: 1000000
+      # Complete delivered clouds map_N.pcd / rgb_map_N.pcd of a save_map round. Calibration rounds only read the
+      # archives (scans.bin / colors.bin / sources.bin): run_wuhu_round.sh --no-map-chunks sets false.
+      export_map_chunks: true
       # Saved-map PRODUCT filter (map_N.pcd and rgb_map_N.pcd only; the archive, the estimator and the
       # evaluation are untouched): drop returns farther than this from the virtual LiDAR origin. Far
       # returns carry the sensor's range/angular footprint (measured on truck29: lamp-pole shell
@@ -381,6 +429,16 @@ laser_mapping:
       # 10% weakest-LiDAR frames; truck05 W598: x56 median, LIVO 16.5 -> 6.1 cm, no divergence).
       # 0.1 was not better (docs/mcp-colour-only-and-time-offset-audit.md section 10).
       lidar_parity_ratio: 1.0
+      # half size (m) of the visual sparse map cube (slides with the LiDAR map, 0 = same +-150 m cube). Every kept
+      # patch feature pins its full-HD reference image: +-150 m retained ~40 MB/s of driving (swap on 870 s rounds)
+      visual_half_map_m: 60.0
+      # visual points more than this far BEHIND the camera (along the heading) are released at every map slide:
+      # a forward camera never sees them again, but each pins its full-HD reference image (0 = cube only)
+      visual_behind_m: 20.0
+      # standstill guard: new visual points only after the camera moved >= 0.1 m or turned >= 0.5 deg since the
+      # last generation (a parked vehicle otherwise keeps adding points in every untracked grid cell)
+      new_points_min_move_m: 0.1
+      new_points_min_turn_deg: 0.5
       patch_size: 8
       patch_pyrimid_level: 4
       grid_size: 20

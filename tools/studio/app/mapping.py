@@ -6,10 +6,71 @@ import re
 import subprocess
 
 from . import calibration, datasets, jobs
-from .common import (PY, REPO, RESULTS, ROUND_SCRIPT, ROS_PROCESS_PATTERN, StudioError, count_lines, csv_rows,
-                     parse_kv_log, pgrep, read_json, read_tail, safe_path)
+from .common import (PY, REPO, RESULTS, ROUND_SCRIPT, ROS_PROCESS_PATTERN, StudioError, binned_series, count_lines,
+                     csv_last, csv_rows, parse_kv_log, pgrep, read_json, read_tail, safe_path)
 
 METRICS_SCRIPT = REPO / "scripts" / "analysis" / "round_metrics.py"
+MAP_EXPORT_TOOL = REPO / "tools" / "livo" / "map_export.py"
+
+
+def _map_export_args(body, prefix=""):
+    """Validated map-export settings from a form body (keys: map_voxel/map_source/map_tile/map_keyframes or the
+    same without the map_ prefix for the results-page re-export)."""
+    g = lambda k, d=None: body.get(prefix + k, d)  # noqa: E731
+    try:
+        voxel = float(g("voxel", 0.05) if g("voxel", 0.05) not in (None, "") else 0.05)
+        tile = float(g("tile", 0) or 0)
+    except (TypeError, ValueError):
+        raise StudioError("地图导出参数必须是数字") from None
+    source = g("source", "all") or "all"
+    try:
+        min_points = int(g("min_points", 1) or 1)
+    except (TypeError, ValueError):
+        raise StudioError("地图导出：每体素最少点数必须是整数") from None
+    if not (0 <= voxel <= 2.0) or not (0 <= tile <= 2000) or source not in ("all", "keyframes") or not 1 <= min_points <= 1000:
+        raise StudioError("地图导出：体素 0–2 m（0 = 不滤波）、分块 0–2000 m、来源 all/keyframes、每体素最少点数 1–1000")
+    return voxel, source, tile, bool(g("keyframes", False)), min_points
+
+
+def export_map(round_name, body):
+    """Re-export the standard map products of a finished round from its scan archive (no SLAM re-run)."""
+    round_name = re.sub(r"[^A-Za-z0-9_\-.]", "", round_name or "")
+    p = RESULTS / round_name
+    runs = sorted((p / "Log" / "fusion").glob("*/")) if (p / "Log" / "fusion").is_dir() else []
+    if not runs or not (runs[-1] / "scans.bin").exists() or not (runs[-1] / "corrections.txt").exists():
+        raise StudioError(f"轮次 {round_name} 没有扫描存档（scans.bin / corrections.txt）：需要开启“保存地图”的建图轮次")
+    if jobs.active("export"):
+        raise StudioError("已有地图导出任务在运行")
+    voxel, source, tile, kf, min_points = _map_export_args(body)
+    fusion = runs[-1]
+    name = "map" if (voxel == 0.05 and source == "all" and not tile and not kf and min_points == 1) else \
+        f"map_{voxel * 100:g}cm_{source}{f'_tile{tile:g}' if tile else ''}{'_kf' if kf else ''}" \
+        f"{f'_min{min_points}' if min_points > 1 else ''}"
+    cmd = [PY, str(MAP_EXPORT_TOOL), str(fusion), "--voxel", f"{voxel:g}", "--source", source, "--tile", f"{tile:g}",
+           "--min-points", str(min_points), "--out", str(fusion / name)]
+    if kf:
+        cmd.append("--keyframe-clouds")
+    return jobs.start("export", f"地图导出 · {round_name} · {name}", [{"title": f"导出 {name}", "cmd": cmd}],
+                      meta={"round": round_name, "out": str(fusion / name)})
+
+
+def map_products(fusion):
+    """Map product directories (map*/map_info.json) of a fusion run, newest first."""
+    out = []
+    for info in sorted(fusion.glob("map*/map_info.json"), key=lambda f: f.stat().st_mtime, reverse=True):
+        doc = read_json(info, {}) or {}
+        files = []
+        for fname in ("global_map.pcd", "global_map_rgb.pcd"):
+            f = info.parent / fname
+            if f.exists():
+                files.append({"name": f"{info.parent.name}/{fname}", "mb": round(f.stat().st_size / 1e6, 1),
+                              "points": (doc.get("points") or {}).get(fname)})
+        out.append({"dir": info.parent.name, "voxel_m": doc.get("voxel_m"), "source": doc.get("source"),
+                    "min_points": doc.get("min_points_per_voxel", 1),
+                    "tile_m": doc.get("tile_m"), "keyframe_clouds": doc.get("keyframe_clouds"),
+                    "created": doc.get("created"), "elapsed_s": doc.get("elapsed_s"), "files": files,
+                    "frames_used": (doc.get("frames") or {}).get("frames_used")})
+    return out
 
 PLAYER_RE = re.compile(r"\[player\] t=([\d.]+)/([\d.]+) s (\d+)% msgs=(\d+) lag=(-?\d+) ms")
 EVENT_KEYS = ("Extrinsic precheck", "[WARN]", "[ERROR]", "[FATAL]", "RTK finalized", "Final keyframe",
@@ -44,6 +105,31 @@ def round_cmd(round_name, mode, calibration_file, body, *, force_save_map=False,
             if not math.isfinite(distance) or distance < 0:
                 raise StudioError("点云截取距离必须是有限非负数（0 表示不限距离）")
             cmd += [flag, str(distance)]
+    if body.get("skip_stationary"):
+        try:
+            smin = float(body.get("stationary_min") or 30)
+            slidar = float(body.get("stationary_lidar_interval") or 1.0)
+        except (TypeError, ValueError):
+            raise StudioError("静止跳过参数必须是数字") from None
+        if not (smin >= 10 and 0.2 <= slidar <= 5):
+            raise StudioError("静止跳过：最短静止时长 >= 10 s，快进期激光间隔 0.2–5 s")
+        cmd += ["--stationary-min", f"{smin:g}", "--stationary-lidar-interval", f"{slidar:g}"]
+    if body.get("save_map", True) or force_save_map:
+        voxel, source, tile, kf, min_points = _map_export_args(body, "map_")
+        if body.get("map_export", True) is False:
+            cmd.append("--no-map-export")
+        else:
+            cmd += ["--map-voxel", f"{voxel:g}", "--map-source", source, "--map-tile", f"{tile:g}",
+                    "--map-min-points", str(min_points)]
+            if kf:
+                cmd.append("--map-keyframes")
+    if body.get("auto_cleanup", True):
+        try:
+            free_gb = float(body.get("auto_cleanup_free_gb") or 50)
+        except (TypeError, ValueError):
+            raise StudioError("磁盘清理阈值必须是数字（GB）") from None
+        if free_gb > 0:
+            cmd += ["--min-free-gb", f"{free_gb:g}"]
     cmd += ["--set", f"multi_lidar.precheck.enabled={'true' if body.get('precheck', True) else 'false'}"]
     if int(body.get("frame_divider") or 1) > 1:
         cmd += ["--set", f"camera.frame_divider={int(body['frame_divider'])}"]
@@ -66,10 +152,27 @@ def pipeline_round_cmd(round_name, mode, calibration_file, body, **overrides):
     fit and the closed-loop verdict is in both cases the same), start_offset (s, motion-profile window of the
     pipeline; None = from the start of the recording)."""
     body = {**body, **{k: v for k, v in overrides.items() if k in ("save_map", "evaluate", "duration", "start_offset")}}
+    # Calibration rounds feed stages (frames.csv / scans.bin / trajectories) and the closed-loop verdict (trajectory
+    # metrics): the standard map products are never used and are deleted by the pipeline cleanup, and the quick
+    # evaluation (trajectory + summary + metrics.json) carries every number the pipeline reads (~2 min less per round).
+    body["map_export"] = False
+    # Playback speed of calibration rounds. The player holds whenever the mapper is more than 1 s behind (lossless
+    # flow control), so a higher rate only removes idle time: LIO rounds run at the mapper's own speed (~2.5x real
+    # time, 25 fps of 40 ms LIO updates; identical result to 1x, see docs/mcp-my-livo-8-indicators.md); LIVO rounds
+    # stay at 1x (photometric update ~40 ms per image already uses the real-time budget).
+    try:
+        body["rate"] = float(body.get("calib_lio_rate") or 2.5) if mode == "lio" else float(body.get("calib_livo_rate") or 1.0)
+    except (TypeError, ValueError):
+        raise StudioError("标定轮次回放倍速必须是数字") from None
+    body["skip_stationary"] = False  # calibration windows are chosen on the motion profile / by the operator
     cmd = round_cmd(round_name, mode, calibration_file, body,
                     force_save_map=bool(overrides.get("save_map", True)), evaluate=overrides.get("evaluate", True))
-    if overrides.get("quick"):
+    if overrides.get("quick", True) and "--no-eval" not in cmd:
         cmd.append("--quick-eval")
+    if not body.get("keep_calib_maps"):
+        # the stages read the archives only: map_N / rgb_map_N.pcd (1.7 GB and ~15 s of export per 180 s LIO
+        # round) were written and then deleted unread by the pipeline cleanup
+        cmd.append("--no-map-chunks")
     return cmd
 
 
@@ -142,7 +245,9 @@ def start(body):
     cmd = round_cmd(round_name, mode, calib_file, body)
     meta = {"round": round_name, "mode": mode, "dataset": dataset, "calibration_id": cid,
             "options": {k: body.get(k) for k in ("use_rtk", "save_map", "rviz", "rate", "precheck", "frame_divider",
-                                                  "evaluate", "extra_sets", "start_offset", "duration", "map_range", "rgb_range")}}
+                                                  "evaluate", "extra_sets", "start_offset", "duration", "map_range", "rgb_range",
+                                                  "skip_stationary", "stationary_min", "stationary_lidar_interval",
+                                                  "map_export", "map_voxel", "map_source", "map_tile", "map_keyframes")}}
     title = f"{'LIVO' if mode == 'livo' else 'LIO'} 建图 · {round_name}"
     return jobs.start("mapping", title, [{"title": title, "cmd": cmd}], meta=meta)
 
@@ -265,6 +370,13 @@ def launch_events(path, limit=60):
 def player_progress(path):
     text = read_tail(path, 8_000)
     out = {}
+    head = read_tail(path, 4_000) if path.exists() and path.stat().st_size <= 4_000 else ""
+    if not head and path.exists():
+        with path.open("rb") as f:
+            head = f.read(4_000).decode("utf-8", "replace")
+    m = re.search(r"\[player\] standstill fast-forward: (\d+) window\(s\), ([\d.]+) s", head)
+    if m:
+        out["skip_windows"], out["skip_s"] = int(m.group(1)), float(m.group(2))
     for line in text.splitlines():
         m = PLAYER_RE.search(line)
         if m:
@@ -297,38 +409,35 @@ def live(round_name):
         f = fusion[-1]
         out["fusion_dir"] = str(f).rstrip("/")
         out["frames"] = max(0, count_lines(f / "frames.csv") - 4)
-        hdr, rows = csv_rows(f / "diagnostics.csv")
-        if rows:
-            col = {n: i for i, n in enumerate(hdr)}
-            series = []
-            for r in rows:
-                try:
-                    series.append({"t": float(r[col["stamp"]]), "frontend_rtk_residual_m": float(r[col["frontend_rtk_residual_m"]]),
-                                   "speed": float(r[col["frontend_speed_mps"]]), "keyframes": int(float(r[col["keyframes"]])),
-                                   "lag": float(r[col["publish_lag_sec"]]) if "publish_lag_sec" in col else 0.0,
-                                   "rtk_residual_m": float(r[col["rtk_residual_m"]]),
-                                   "published_diff_m": float(r[col["published_imu_reference_difference_m"]]) if "published_imu_reference_difference_m" in col else None})
-                except (ValueError, KeyError, IndexError):
-                    continue
+        # Live curves: stable time bins (max per bin for errors), see common.binned_series. Every value is the
+        # error of the pose PUBLISHED at that time (causal online estimate); it is written once and never revised.
+        # The delivered (smoothed, final-LM) trajectory error is only known after export and is shown from
+        # evaluation/error_series.csv once the round has been evaluated.
+        series = binned_series(
+            f / "diagnostics.csv", "stamp",
+            ["frontend_rtk_residual_m", "rtk_residual_m", "frontend_speed_mps", "keyframes", "publish_lag_sec",
+             "published_imu_reference_difference_m", "processing_ms"],
+            agg={"frontend_speed_mps": "mean", "keyframes": "last", "processing_ms": "mean"},
+            rename={"frontend_speed_mps": "speed", "publish_lag_sec": "lag",
+                    "published_imu_reference_difference_m": "published_diff_m", "processing_ms": "backend_ms"})
+        if series:
             out["diagnostics"] = series
-            last = rows[-1]
-            out["latest"] = {n: last[i] for n, i in col.items() if n in (
+            last = csv_last(f / "diagnostics.csv")
+            out["latest"] = {n: v for n, v in last.items() if n in (
                 "stamp", "keyframes", "planes", "factors", "rtk_residual_m", "frontend_rtk_residual_m",
                 "frontend_speed_mps", "publish_lag_sec", "latest_key_rtk_residual_m", "processing_ms")}
-            finite = [s["frontend_rtk_residual_m"] for s in series if s["frontend_rtk_residual_m"] == s["frontend_rtk_residual_m"]]
+            finite = [s["frontend_rtk_residual_m"] for s in series if s.get("frontend_rtk_residual_m") is not None]
             out["latest"]["frontend_rtk_residual_m"] = finite[-1] if finite else None
-        hdr, rows = csv_rows(f / "online_path.csv")
-        if rows:
-            col = {n: i for i, n in enumerate(hdr)}
-            last = rows[-1]
-            out["online"] = {n: last[i] for n, i in col.items()}
-            try:
-                out["online_series"] = [{"t": float(r[col["stamp"]]), "latest": float(r[col["latest_imu_difference_m"]]),
-                                         "max": float(r[col["max_imu_difference_m"]])} for r in rows]
-            except (KeyError, ValueError):
-                out["online_series"] = []
+        online = binned_series(f / "online_path.csv", "stamp", ["latest_imu_difference_m", "max_imu_difference_m"],
+                               agg={"max_imu_difference_m": "last"},
+                               rename={"latest_imu_difference_m": "latest", "max_imu_difference_m": "max"})
+        if online:
+            out["online"] = csv_last(f / "online_path.csv")
+            out["online_series"] = online
         maps = sorted(f.glob("map_*.pcd"))
         out["map_chunks"] = len(maps)
+        out["map_products"] = map_products(f)
+        out["has_archive"] = (f / "scans.bin").exists()
     # per-frame rear-axle error of the optimized (delivered) and native trajectories vs RTK, written by
     # scripts/analysis/round_summary.py at evaluation time (already downsampled to <= 600 rows)
     hdr, rows = csv_rows(p / "evaluation" / "error_series.csv")
@@ -344,6 +453,15 @@ def live(round_name):
         out["error_series"] = series
         out["rgb_map_chunks"] = len(list(f.glob("rgb_map_*.pcd")))
         out["map_size_mb"] = round(sum(m.stat().st_size for m in maps) / 1e6, 1)
+    # Throughput / resources (tools/livo/resmon.py): processed frames per second, real-time factor, backend time,
+    # RSS/CPU of the mapper, camera decoder and player, host memory and swap.
+    res = p / "resources.csv"
+    if res.exists():
+        out["resources"] = csv_last(res)
+        out["resource_series"] = binned_series(
+            res, "elapsed_s", ["fps", "rt_factor", "mapper_rss_mb", "decoder_rss_mb", "sys_used_mb", "swap_used_mb",
+                               "mapper_cpu_pct"],
+            max_points=300, agg={"fps": "mean", "rt_factor": "mean", "mapper_cpu_pct": "mean"})
     pre = p / "Log" / "extrinsic_precheck.json"
     if pre.exists():
         out["precheck"] = read_json(pre, {"status": "unreadable"})

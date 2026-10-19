@@ -160,6 +160,8 @@ public:
   bool vio_ekf_update_en = true;
   bool print_frame_timing = false;
   double status_interval_sec = 10.0;
+  void logMemoryStatus();
+  void releaseFrontendMaps();
   double last_status_print_time_ = -1.0;
   void printCalibrationSummary(const char *stage) const;
   deque<PointCloudXYZI::Ptr> lid_raw_data_buffer;
@@ -240,6 +242,14 @@ public:
   int camera_height = 1080;
   double IMG_POINT_COV;
   double vio_lidar_parity_ratio = 0.0;
+  // > 0: side length / 2 (m) of the visual sparse map cube; it slides together with the LiDAR map but
+  // can be much smaller, because every retained patch feature pins its full source image in memory
+  // (Feature::img_). 0 = same cube as the LiDAR map (local_map/half_map_size * voxel size).
+  double vio_visual_half_map_m = 0.0;
+  // Visual points more than this far behind the camera (along the heading) are released at map slides; 0 = off.
+  double vio_visual_behind_m = 0.0;
+  // New visual points only after the camera moved this much since the last generation (standstill guard).
+  double vio_new_points_min_move_m = 0.1, vio_new_points_min_turn_deg = 0.5;
 
   bool mine_frame_initialized = false;
   std::string lio_world_frame = "mine";

@@ -16,6 +16,7 @@ Studio can display playback progress; the process name/cmdline contains ``livo.p
 targeted signalling (``pkill -INT -f livo.player``).
 """
 import argparse
+import collections
 import json
 import os
 import pathlib
@@ -26,6 +27,11 @@ import time
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from livo import rosenv  # noqa: E402
 from livo.dataset import Dataset, PRESETS  # noqa: E402
+from livo import motion  # noqa: E402
+
+# Flow control: the mapper counts as drained when its progress is within this many seconds of the previous
+# published LiDAR sweep (sweep period 0.1 s, LiDAR->IMU time offset ~0.13 s).
+DRAIN_TOL_S = 0.3
 
 CLOCK_TOPIC = "/clock"
 
@@ -54,6 +60,20 @@ class Player:
             raise SystemExit("--start-offset is beyond the end of the dataset")
         self.end_ns = None if args.duration is None else self.start_ns + int(args.duration * 1e9)
         self.span_ns = (min(self.end_ns, self.dataset.end_ns) if self.end_ns else self.dataset.end_ns) - self.start_ns
+        # Long standstills after the first drive are fast-forwarded (see livo.motion.standstill_skips):
+        # IMU/INS stay complete (continuous propagation and RTK/INS association), LiDAR scans are thinned
+        # to one per --stationary-lidar-interval. Windows are seconds from the dataset start. LIO only: the
+        # camera stream decodes only from key frames (2 s apart) and the hardware decoder releases each one late,
+        # so a fast-forwarded LIVO round starved the photometric update (aborted rounds, truck29raw 20261013).
+        self.skips = []
+        if args.skip_stationary:
+            if any(t in self.dataset.camera_topics for t in self.topics):
+                raise SystemExit("--skip-stationary is LIO-only: play the LiDAR/IMU/INS topics (--preset lio)")
+            prof = motion.motion_profile(str(self.dataset.root))
+            end_s = None if self.end_ns is None else (self.end_ns - self.dataset.start_ns) / 1e9
+            windows = motion.standstill_skips(prof, min_s=args.stationary_min_s, head_s=args.stationary_head_s,
+                                              tail_s=args.stationary_tail_s, start_s=args.start_offset, end_s=end_s)
+            self.skips = [(self.dataset.start_ns + int(f * 1e9), self.dataset.start_ns + int(t * 1e9)) for f, t in windows]
 
     # ------------------------------------------------------------------ ROS setup
     def setup_ros(self):
@@ -154,6 +174,12 @@ class Player:
             f"{self.dataset.duration_s:.1f} s, topics {self.topics}")
         log(f"start_offset={a.start_offset:.3f} s duration={'all' if a.duration is None else f'{a.duration:.1f} s'} "
             f"rate={a.rate} clock={'on' if a.clock else 'off'} qos={a.qos}")
+        if a.skip_stationary:
+            total = sum(t - f for f, t in self.skips) / 1e9
+            log(f"standstill fast-forward: {len(self.skips)} window(s), {total:.1f} s "
+                f"(min standstill {a.stationary_min_s:.0f} s, head {a.stationary_head_s:.1f} s, tail {a.stationary_tail_s:.1f} s, "
+                f"LiDAR every {a.stationary_lidar_interval:.1f} s, rate x{a.stationary_rate or 'max'}): " +
+                ", ".join(f"{(f - self.dataset.start_ns) / 1e9:.1f}-{(t - self.dataset.start_ns) / 1e9:.1f} s" for f, t in self.skips))
         self.publish_clock(self.start_ns)
         self.wait_for_subscribers()
         if a.delay > 0 and not self.stop_requested:
@@ -170,6 +196,19 @@ class Player:
         max_lag = 0.0
         paced_total = 0.0
         t_begin = time.monotonic()
+        # standstill fast-forward state
+        skips, si, in_skip = self.skips, 0, False
+        lidar_topics = {t for t in self.topics if t in self.dataset.lidar_topics}
+        camera_topics = {t for t in self.topics if t in self.dataset.camera_topics}
+        keep_interval_ns = int(a.stationary_lidar_interval * 1e9)
+        group_ns = 50_000_000  # the merged LiDAR scans of one sweep arrive within ~1 ms of each other
+        group_start, group_keep, next_keep = None, True, 0
+        skip_log, cur = [], None
+        virt, last_ts = 0.0, None
+        # bag times of the newest and the previous published LiDAR sweep (all sources within group_ns) and of the
+        # recent published camera packets (LIVO drain check)
+        last_sweep_ts = prev_sweep_ts = None
+        recent_images = collections.deque(maxlen=256)
         try:
             for topic, data, ts in self.dataset.iter_messages(self.topics, self.start_ns, self.end_ns, stats):
                 if self.stop_requested:
@@ -178,7 +217,46 @@ class Player:
                     first_ts = ts
                     wall0 = time.monotonic()
                     last_clock = ts - clock_period
-                target = wall0 + (ts - first_ts) / 1e9 / rate
+                if skips:
+                    while si < len(skips) and ts >= skips[si][1]:
+                        if in_skip:
+                            in_skip = False
+                            cur["wall_s"] = round(time.monotonic() - cur.pop("_wall0"), 1)
+                            skip_log.append(cur)
+                            log(f"standstill fast-forward done: {cur['from_s']:.1f}-{cur['to_s']:.1f} s in {cur['wall_s']:.1f} s, "
+                                f"LiDAR scans kept {cur['lidar_kept']} dropped {cur['lidar_dropped']}")
+                        si += 1
+                    if not in_skip and si < len(skips) and ts >= skips[si][0]:
+                        in_skip = True
+                        group_start, next_keep = None, 0
+                        cur = {"from_s": round((skips[si][0] - self.dataset.start_ns) / 1e9, 2),
+                               "to_s": round((skips[si][1] - self.dataset.start_ns) / 1e9, 2),
+                               "lidar_kept": 0, "lidar_dropped": 0, "_wall0": time.monotonic()}
+                        log(f"standstill fast-forward: {cur['from_s']:.1f}-{cur['to_s']:.1f} s")
+                # Playback clock: real time / rate, inside a fast-forward window / (rate * stationary_rate);
+                # stationary_rate 0 = as fast as the mapper consumes (flow control below still applies).
+                if last_ts is not None:
+                    dt = (ts - last_ts) / 1e9
+                    if not in_skip:
+                        virt += dt / rate
+                    elif a.stationary_rate > 0:
+                        virt += dt / (rate * a.stationary_rate)
+                    else:
+                        # unpaced fast-forward: keep the real-time schedule anchored at "now", otherwise the
+                        # wall time spent in the window would be caught up by rushing the data after it
+                        wall0 = time.monotonic() - virt
+                last_ts = ts
+                if in_skip and topic in lidar_topics:
+                    if group_start is None or ts - group_start > group_ns:
+                        group_start = ts
+                        group_keep = ts >= next_keep
+                        if group_keep:
+                            next_keep = ts + keep_interval_ns - group_ns
+                    if not group_keep:
+                        cur["lidar_dropped"] += 1
+                        continue
+                    cur["lidar_kept"] += 1
+                target = wall0 + virt
                 now = time.monotonic()
                 if target > now:
                     if self.pace_sub is not None:
@@ -196,7 +274,25 @@ class Player:
                         self.rclpy.spin_once(self.node, timeout_sec=0.0)
                 if self.pace_sub is not None and self.mapper_progress is not None:
                     hold0 = None
-                    while not self.stop_requested and ts / 1e9 - self.mapper_progress > a.max_lead:
+                    # thinned LiDAR inside a fast-forward window: the mapper advances one kept scan at a time
+                    lead_limit = a.max_lead + (a.stationary_lidar_interval + 0.5 if in_skip else 0.0)
+                    # Hold only while the mapper still has LiDAR data it can consume. It releases a sweep only when
+                    # the next one arrives (multi-LiDAR merger), so once its progress has reached the PREVIOUS sweep
+                    # (within DRAIN_TOL_S; the LiDAR->IMU time offset is inside the tolerance) it can only advance on
+                    # new data. Without this check the end of every fast-forward window (last kept sweep up to
+                    # stationary_lidar_interval before the first full-rate one) deadlocked until --hold-timeout:
+                    # 20 s per window on truck29raw 20261013.
+                    # LIVO: an update ends at an image and needs LiDAR up to that image, so the consumable data end
+                    # at the newest image covered by the newest sweep (holding on the newest image deadlocks
+                    # whenever images and sweeps are not interleaved, e.g. after a sensor gap).
+                    drain_ref = None
+                    if ts / 1e9 - self.mapper_progress > lead_limit:
+                        if not camera_topics:
+                            drain_ref = prev_sweep_ts
+                        elif last_sweep_ts is not None:
+                            drain_ref = next((t for t in reversed(recent_images) if t <= last_sweep_ts + 100_000_000), None)
+                    while (not self.stop_requested and ts / 1e9 - self.mapper_progress > lead_limit and
+                           (drain_ref is None or self.mapper_progress < drain_ref / 1e9 - DRAIN_TOL_S)):
                         if hold0 is None:
                             hold0 = time.monotonic()
                             prog0 = self.mapper_progress
@@ -216,6 +312,10 @@ class Player:
                     self.publish_clock(ts)
                     last_clock = ts
                 self.pubs[topic].publish(data)
+                if topic in lidar_topics and (last_sweep_ts is None or ts - last_sweep_ts > group_ns):
+                    prev_sweep_ts, last_sweep_ts = last_sweep_ts, ts
+                elif topic in camera_topics:
+                    recent_images.append(ts)
                 msgs += 1
                 per_topic[topic] = per_topic.get(topic, 0) + 1
                 now = time.monotonic()
@@ -230,8 +330,12 @@ class Player:
         finally:
             status = "interrupted" if self.stop_requested else "completed"
             elapsed = time.monotonic() - t_begin
+            if in_skip and cur is not None:
+                cur["wall_s"] = round(time.monotonic() - cur.pop("_wall0"), 1)
+                skip_log.append(cur)
             summary = {"status": status, "messages": msgs, "per_topic": per_topic, "elapsed_s": round(elapsed, 2),
                        "max_lag_ms": round(max_lag * 1000, 1), "paced_s": round(paced_total, 1),
+                       "stationary_skips": skip_log,
                        **{k: v for k, v in stats.items()}}
             log(f"{status}: {msgs} messages in {elapsed:.1f} s (max lag {max_lag * 1000:.0f} ms, "
                 f"held for the mapper {paced_total:.1f} s, "
@@ -278,6 +382,18 @@ def build_parser():
                          "(keep it below the 2 s point-cloud writer history)")
     ap.add_argument("--hold-timeout", type=float, default=20.0,
                     help="release a hold when the mapper has made no progress for this long (deadlock guard)")
+    ap.add_argument("--skip-stationary", action="store_true",
+                    help="fast-forward long standstills after the first drive (IMU/INS complete, LiDAR thinned; "
+                         "LIO topics only); the initial standstill is always played")
+    ap.add_argument("--stationary-min-s", type=float, default=30.0, help="shortest standstill that is fast-forwarded")
+    ap.add_argument("--stationary-head-s", type=float, default=3.0,
+                    help="seconds at the start of a standstill still played at the normal rate")
+    ap.add_argument("--stationary-tail-s", type=float, default=5.0,
+                    help="seconds before the vehicle moves again played at the normal rate")
+    ap.add_argument("--stationary-lidar-interval", type=float, default=1.0,
+                    help="LiDAR scan spacing inside a fast-forwarded standstill (s)")
+    ap.add_argument("--stationary-rate", type=float, default=0.0,
+                    help="playback speed-up inside a fast-forwarded standstill (0 = as fast as the mapper consumes)")
     ap.add_argument("--dry-run", action="store_true", help="describe what would be played and exit")
     return ap
 
@@ -286,12 +402,19 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     if args.rate <= 0:
         raise SystemExit("--rate must be positive")
+    if args.stationary_lidar_interval < 0.1 or args.stationary_rate < 0 or args.stationary_min_s < 10:
+        raise SystemExit("--stationary-lidar-interval >= 0.1 s, --stationary-rate >= 0, --stationary-min-s >= 10 s")
     if args.dry_run:
         ds = Dataset.open(args.dataset)
         topics = ds.resolve_topics(args.topics if args.topics else args.preset)
-        print(json.dumps({"dataset": str(ds.root), "kind": ds.kind, "segments": [s.name for s in ds.segments],
-                          "duration_s": round(ds.duration_s, 2), "topics": topics,
-                          "has_camera": ds.has_camera}, ensure_ascii=False, indent=2))
+        doc = {"dataset": str(ds.root), "kind": ds.kind, "segments": [s.name for s in ds.segments],
+               "duration_s": round(ds.duration_s, 2), "topics": topics, "has_camera": ds.has_camera}
+        if args.skip_stationary:
+            end_s = None if args.duration is None else args.start_offset + args.duration
+            doc["stationary_skips"] = motion.standstill_skips(
+                motion.motion_profile(str(ds.root)), min_s=args.stationary_min_s, head_s=args.stationary_head_s,
+                tail_s=args.stationary_tail_s, start_s=args.start_offset, end_s=end_s)
+        print(json.dumps(doc, ensure_ascii=False, indent=2))
         return 0
     rosenv.ensure()
     return Player(args).run()

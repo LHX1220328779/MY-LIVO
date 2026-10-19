@@ -50,7 +50,9 @@ echo "evaluation start $(date -u +%FT%TZ) run=$fusion_dir dataset=$dataset time_
 # INS/RTK reference straight from the recording (cached once per round).
 ref_dir="$eval_dir/reference_csv"
 if [[ ! -s "$ref_dir/ins_odometry.csv" ]]; then
-  $py scripts/dump_bag_reference.py --bag "$dataset" --output "$ref_dir" > "$eval_dir/reference.log" 2>&1
+  # only the round's time span of the recording (calibration rounds are 1-4 min of a 15 min recording)
+  span=$(awk 'NR==1{a=$1} {b=$1} END{if (NR) printf "%.3f %.3f", a, b}' "$fusion_dir/trajectory_lio.txt")
+  $py scripts/dump_bag_reference.py --bag "$dataset" --output "$ref_dir" ${span:+--span $span} > "$eval_dir/reference.log" 2>&1
   echo "reference dump exit=$?"
 fi
 

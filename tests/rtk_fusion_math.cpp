@@ -763,8 +763,9 @@ void qualityAndRecovery()
     plane.tangent = normal.unitOrthogonal();
     for (int u = -2; u <= 2; ++u) for (int v = -2; v <= 2; ++v)
     {
-      plane.support.push_back(center + .15 * (u * plane.tangent + v * normal.cross(plane.tangent)));
-      plane.extendSupport(plane.support.back());
+      const V3D support = center + .15 * (u * plane.tangent + v * normal.cross(plane.tangent));
+      plane.support.push_back(support.cast<float>());
+      plane.extendSupport(support);
     }
     return plane;
   };

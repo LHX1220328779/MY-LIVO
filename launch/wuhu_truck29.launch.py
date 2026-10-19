@@ -43,6 +43,22 @@ def _fastdds_profile():
     return ""
 
 
+def hevc_decoders():
+    """Decoder preference of the camera stream. hevc_cuvid (NVDEC) is tried first only when the CUDA driver
+    answers: with the GPU in a fault state (kernel Xid 31/154 "reboot required", cuInit -> CUDA_ERROR_UNKNOWN)
+    the republish node segfaults inside the cuvid decoder instead of falling back, and a LIVO round then ends
+    with zero frames. Without a working driver the stream is decoded in software (1080p HEVC at 30 fps fits
+    on a few cores)."""
+    import ctypes
+    try:
+        if ctypes.CDLL("libcuda.so.1").cuInit(0) == 0:
+            return "hevc_cuvid,hevc_qsv,hevc_v4l2m2m,hevc"
+        print("[wuhu_truck29.launch] CUDA driver unavailable (cuInit failed): camera stream decoded in software")
+    except OSError:
+        print("[wuhu_truck29.launch] libcuda.so.1 not found: camera stream decoded in software")
+    return "hevc"
+
+
 def generate_launch_description():
     share = get_package_share_directory("fast_livo")
     installed_config = os.path.join(share, "config", "wuhu_truck29.yaml")
@@ -77,8 +93,7 @@ def generate_launch_description():
         condition=IfCondition(use_camera),
         arguments=["ffmpeg", "raw"],
         parameters=[{
-            "in.ffmpeg.decoders.hevc":
-                "hevc_cuvid,hevc_qsv,hevc_v4l2m2m,hevc",
+            "in.ffmpeg.decoders.hevc": hevc_decoders(),
         }],
         # In Humble the executable creates the suffixed input endpoint before
         # base-name remapping, so remap the concrete transport topic.

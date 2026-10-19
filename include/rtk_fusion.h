@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common_lib.h"
+#include "loop_closure.h"
 #include <limits>
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <gtsam/geometry/Pose3.h>
@@ -76,7 +77,9 @@ struct RtkFusion
     // support the same type, common footprint and rigid registration.
     bool linear = false;
     V3D tangent = V3D::Zero();
-    std::vector<V3D> support;
+    // Sensor-frame support returns (float: |p| < 200 m -> < 20 um rounding). Kept for every geometry
+    // anchor because any keyframe can become a revisit partner; float halves the dominant backend memory.
+    std::vector<Eigen::Vector3f> support;
     Eigen::Vector2d support_min = Eigen::Vector2d::Constant(std::numeric_limits<double>::infinity());
     Eigen::Vector2d support_max = -support_min;
     Eigen::Vector2d supportCoordinates(const V3D &point) const
@@ -108,9 +111,11 @@ struct RtkFusion
   struct Keyframe
   {
     double stamp;
+    // Native path length from the first keyframe (m): revisit links require driving away and back.
+    double path = 0;
     gtsam::Pose3 raw, optimized;
     std::vector<Plane> planes;
-    std::unordered_map<FusionVoxelKey, std::vector<std::size_t>, FusionVoxelKeyHash> cells;
+    std::unordered_map<FusionVoxelKey, std::vector<std::uint32_t>, FusionVoxelKeyHash> cells;
     bool has_position = false;
     double position_information_weight = 0;
     // 0 accepted, 1 no bracket, 2 gap, 3 no status, 4 stale,
@@ -143,6 +148,9 @@ struct RtkFusion
   M3D lidar_rotation;
   V3D lidar_translation, lever;
   bool require_status = true, save_map = false, color_enabled = false;
+  // save_map: write the delivered clouds map_N.pcd / rgb_map_N.pcd at the end (false: archives only, e.g. the
+  // calibration rounds, whose stages read scans.bin / colors.bin / sources.bin and delete the chunks unread).
+  bool export_map_chunks = true;
   double recovery_stable_interval = 0.5;
   // A non-fixed startup keeps the frontend in its original local frame.
   // A single fixed frame transform later anchors it; its voxel map never jumps.
@@ -195,6 +203,45 @@ struct RtkFusion
   bool pending_discontinuity_key = false;
   double plane_voxel = 2, plane_thickness = 0.05, plane_noise_floor = 0.05;
   double revisit_radius = 8, revisit_age = 15, match_distance = 1.2;
+  // A revisit needs the vehicle to have driven away and come back: native path length between both
+  // keyframes >= revisit_min_path. Without it a standstill links every knot to the knots >= revisit_age
+  // earlier at the same spot (truck29raw 20261013: 300 s parking -> dense graph, 0.7-0.9 s per solve).
+  double revisit_min_path = 20;
+  // Standstill knot spacing: while the native motion since the last keyframe stays below
+  // stationary_translation / stationary_rotation and the native speed below stationary_speed, knots are
+  // key_stationary_interval apart instead of key_interval (0 = legacy spacing everywhere).
+  double key_stationary_interval = 5, stationary_translation = 0.05, stationary_rotation = 0.2 * M_PI / 180,
+         stationary_speed = 0.1;
+  // Standstill hold: consecutive knots while parked (same thresholds) are also tied by their native increment
+  // with fixed sigmas. The odometry of a static scene does not random-walk like while driving (motionSigmas),
+  // and without this the optimized yaw of a parking followed the RTK noise once its knots were sparse
+  // (truck29raw 20261013: 0.13-0.21 deg across a 300 s parking against the static native pose). <= 0 = off.
+  double standstill_hold_rotation = 0.005 * M_PI / 180, standstill_hold_translation = 0.002;
+  bool knot_parked = false;
+  // iSAM2 relinearization thresholds (pose rotation rad / translation m, misalignment rad). The final
+  // batch LM relinearizes everything; online thresholds only bound per-update work.
+  double relinearize_rotation = 0.0001, relinearize_translation = 0.002, relinearize_misalignment = 0.0001;
+  // Covisibility/revisit candidate indices are rebuilt from the solved poses every index_rebuild_keys
+  // keyframes (new anchors are inserted immediately); 1 = every keyframe. Full-graph online cost logging
+  // every online_log_interval keyframes (1 = every keyframe).
+  int index_rebuild_keys = 1, online_log_interval = 1;
+  std::size_t keys_since_index_rebuild = 0;
+  double last_memory_log = -1e18;
+  // The initial standstill keeps the dense knots: it carries the start anchor (gravity datum, averaged INS
+  // fixes) that the first metres of the route are judged against. Spacing applies after the first drive.
+  bool motion_seen = false;
+  // Final submap-to-submap loop closure over revisited road sections (loop_closure.h); needs the scan archive.
+  LoopClosureConfig loop_config;
+  // Accepted loop factors (keyframe indices + factor); finalizeOptimization adds them and enforces the RTK bound.
+  struct LoopFactorRecord
+  {
+    std::size_t a = 0, b = 0;
+    gtsam::NonlinearFactor::shared_ptr factor;
+  };
+  std::vector<LoopFactorRecord> collectLoopClosures();
+  std::size_t last_relinearized = 0, last_reeliminated = 0, last_cliques = 0;
+  gtsam::ISAM2Params solverParameters() const;
+  void indexAnchor(std::size_t i);
   double publish_interval = 1, last_publish = -1;
   // INS attitude factors: bounded absolute roll/pitch/yaw evidence. Sigmas are
   // per body axis (x=right, y=forward, z=up) in radians after configuration.
@@ -293,4 +340,5 @@ struct RtkFusion
   void publishCurrent(const Frame &frame);
   void publish(double stamp, bool force = false);
   void exportMap();
+  void accumulateSolverStats(const gtsam::ISAM2Result &result);
 };

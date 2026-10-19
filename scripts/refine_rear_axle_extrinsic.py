@@ -38,9 +38,12 @@ Usage (container):
 """
 import argparse
 import json
+import multiprocessing as mp
+import os
 import pathlib
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path as _LivoPath
 
 import numpy as np
@@ -70,6 +73,39 @@ GATE_MAX_ROT_DEG, GATE_MAX_TRANS_M, GATE_MAX_DT_S = 6.0, 0.6, 0.08
 GATE_MAX_ABS_DT_S = 0.25   # |final time offset| beyond this is not a calibration but a wrong recording
 PROFILE = tuple(np.arange(-0.18, 0.0001, 0.03))  # candidate time-shift baselines for the auto-detect
 WARN_SPLIT_ROT_DEG, WARN_SPLIT_TRANS_M, WARN_SPLIT_DT_S = 0.2, 0.2, 0.01
+QUERY_WORKERS = -1  # KD-tree query threads of solve() (-1 = all cores; reduced inside parallel workers)
+_FORK = {}
+
+
+def parallel_map(fn, items, jobs):
+    """[fn(x) for x in items] in forked worker processes (fn and the arrays it reads are inherited, not pickled).
+
+    solve() is dominated by single-threaded numpy work (KD-tree build, batched 3x3 eigen-decompositions), so the
+    independent solves of this stage (time-offset candidates, repeatability halves) ran one after another on one
+    core: 7 candidates x 14 iterations were ~70 % of the stage. Same seeds and data -> same results as sequential."""
+    items = list(items)
+    jobs = max(1, min(int(jobs), len(items)))
+    if jobs == 1:
+        return [fn(x) for x in items]
+    _FORK.update(fn=fn, query_workers=max(1, (os.cpu_count() or 1) // jobs))
+    with ProcessPoolExecutor(jobs, mp_context=mp.get_context("fork")) as pool:
+        return list(pool.map(_forked_call, items))
+
+
+def default_jobs():
+    """<= 8 workers and ~1.5 GB of available memory each: a forked solve holds its own KD-trees and neighbour
+    arrays (truck29 180 s window: 7 workers 1.2 GB each on top of the 2.2 GB parent)."""
+    try:
+        avail_gb = next(int(l.split()[1]) for l in open("/proc/meminfo") if l.startswith("MemAvailable:")) / 1e6
+    except (OSError, StopIteration, ValueError):
+        avail_gb = 8.0
+    return max(1, min(8, os.cpu_count() or 1, int((avail_gb - 2.0) / 1.5)))
+
+
+def _forked_call(item):
+    global QUERY_WORKERS
+    QUERY_WORKERS = _FORK["query_workers"]
+    return _FORK["fn"](item)
 
 
 def stamp(msg):
@@ -215,7 +251,7 @@ def solve(data, T0, active, *, solve_dt, gap, nq, K=20, prior=(5.0, 0.5, 0.1), i
         tree = cKDTree(pw)
         H = np.zeros((7, 7)); g = np.zeros(7); res, nz, gaps = [], [], []
         for ch in np.array_split(sel, max(1, len(sel) // 40000)):
-            d, nb = tree.query(pw[ch], k=K, distance_upper_bound=radius, workers=-1)
+            d, nb = tree.query(pw[ch], k=K, distance_upper_bound=radius, workers=QUERY_WORKERS)
             fin = np.isfinite(d); nbc = np.where(fin, nb, 0)
             valid = fin & (np.abs(tau[nbc] - tau[ch][:, None]) > gap)
             cnt = valid.sum(1); ok = cnt >= 6
@@ -287,6 +323,9 @@ def main():
     ap.add_argument("--no-split", action="store_true", help="skip the two half-recording repeatability solves")
     ap.add_argument("--no-profile", action="store_true", help="skip the fixed-dt time-offset profile (start the joint solve at dt=0)")
     ap.add_argument("--no-gate", action="store_true", help="write the output even when the quality gate fails")
+    ap.add_argument("--jobs", type=int, default=default_jobs(),
+                    help="worker processes for the independent solves (time-offset candidates, halves); 1 = sequential "
+                         "(default: <= 8, limited by the available memory, ~1.5 GB per worker)")
     a = ap.parse_args()
     t_start = time.time()
     calib = json.load(open(a.calibration))
@@ -337,16 +376,17 @@ def main():
             Rw2, tw2 = poses.at(data["tau"] + gts)
             d2["R"], d2["t"] = Rw2, tw2
             return d2
-        def candidate(gts):
+        def solve_candidate(gts):
             s_ = solve(shifted(float(gts)), T_ref, active, solve_dt=True, gap=a.gap,
                        nq=max(a.samples // 2, 100000), iters=14, fine=False, seed=1, dt0=0.0)
-            if s_ is not None and s_["hist"]:
-                eff = float(gts) + s_["dt"]
-                profile.append({"baseline_s": round(float(gts), 4), "dt_s": round(eff, 4),
-                                "median_cm": round(s_["hist"][-1]["median_cm"], 3),
-                                "ground_cm": round(s_["hist"][-1]["ground_cm"], 3), "T": s_["T"]})
-        for gts in PROFILE:
-            candidate(gts)
+            if s_ is None or not s_["hist"]:
+                return None
+            return {"baseline_s": round(float(gts), 4), "dt_s": round(float(gts) + s_["dt"], 4),
+                    "median_cm": round(s_["hist"][-1]["median_cm"], 3),
+                    "ground_cm": round(s_["hist"][-1]["ground_cm"], 3), "T": s_["T"]}
+        def candidate(*values):
+            profile.extend(p_ for p_ in parallel_map(solve_candidate, values, a.jobs) if p_ is not None)
+        candidate(*PROFILE)
         # The default grid covers truck29-like offsets (-0.18..0). Other vehicles
         # can sit outside it (truck05: effective offset near/above 0); while the
         # best candidate lies on a grid edge, extend the grid in that direction
@@ -404,12 +444,13 @@ def main():
     info = {n_: float(np.sqrt(max(sol["H"][i, i], 0))) for n_, i in zip(("rx", "ry", "rz", "tx", "ty", "tz", "dt"), range(7)) if i in idx}
     split = None
     if not a.no_split:
-        mid = np.median(rel); halves = []
-        for part in (used[rel <= mid], used[rel > mid]):
-            m = np.isin(data["scan"], part)
-            s = solve({k: v[m] for k, v in data.items()}, sol["T"], active, solve_dt=solve_dt, gap=a.gap, nq=a.samples // 2,
-                      iters=10, fine=True, seed=1, dt0=float(sol["dt"]))
-            halves.append(s)
+        mid = np.median(rel)
+        parts = (used[rel <= mid], used[rel > mid])
+        def solve_half(i):
+            m = np.isin(data["scan"], parts[i])
+            return solve({k: v[m] for k, v in data.items()}, sol["T"], active, solve_dt=solve_dt, gap=a.gap, nq=a.samples // 2,
+                         iters=10, fine=True, seed=1, dt0=float(sol["dt"]))
+        halves = parallel_map(solve_half, (0, 1), a.jobs)
         if all(s is not None for s in halves):
             d_rot = np.degrees(R.from_matrix(halves[0]["T"][:3, :3] @ halves[1]["T"][:3, :3].T).as_rotvec())
             d_tr = halves[0]["T"][:3, 3] - halves[1]["T"][:3, 3]

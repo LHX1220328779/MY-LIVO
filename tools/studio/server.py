@@ -29,6 +29,7 @@ from livo import rosenv  # noqa: E402
 rosenv.ensure()
 
 from studio.app import calibration, common, datasets, jobs, mapping  # noqa: E402
+from livo import results_gc  # noqa: E402
 from studio.app.common import (CAL_ROOT, MAPPER_BINARY, REPO, RESULTS, STUDIO_DIR, WEB, StudioError,  # noqa: E402
                                load_state, now, remember_dataset, update_state)
 
@@ -209,6 +210,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, doc)
         if path == "/api/runs":
             return self._send(200, mapping.list_runs(limit=int(q.get("limit", 100))))
+        if path == "/api/results/usage":
+            return self._send(200, results_gc.usage(int(q.get("keep_recent", 3))))
         m = re.match(r"^/api/runs/([A-Za-z0-9_\-.]+)/live$", path)
         if m:
             return self._send(200, mapping.live(m.group(1)))
@@ -290,6 +293,23 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, mapping.stop(body.get("mode", "finish")))
         if path == "/api/mapping/kill":
             return self._send(200, mapping.kill_all())
+        if path == "/api/results/cleanup":
+            # slim (scan archives / full-resolution chunks) or delete rounds; auto = oldest unprotected first
+            try:
+                doc = results_gc.run(body.get("action", "auto"), body.get("rounds") or [],
+                                     apply=body.get("apply", True) is not False,
+                                     target_free_gb=float(body.get("target_free_gb") or 80),
+                                     allow_delete=bool(body.get("allow_delete")),
+                                     keep_recent=int(body.get("keep_recent", 3)),
+                                     keep_maps=body.get("keep_maps", True) is not False, force=bool(body.get("force")))
+            except ValueError as exc:
+                raise StudioError(str(exc)) from None
+            return self._send(200, doc)
+        if path == "/api/results/pin":
+            return self._send(200, {"pinned": results_gc.set_pinned([body["round"]], bool(body.get("pinned", True)))})
+        m = re.match(r"^/api/runs/([A-Za-z0-9_\-.]+)/export-map$", path)
+        if m:
+            return self._send(200, mapping.export_map(m.group(1), body).to_json())
         if path == "/api/evaluate":
             round_name = re.sub(r"[^A-Za-z0-9_\-.]", "", body.get("round") or "")
             if not (RESULTS / round_name).is_dir():

@@ -79,15 +79,24 @@ GATE_VERT_REGRESS_M = 0.005      # vertical residual may not get worse by more t
 
 
 def voxel_down(P, size):
+    """Index of the first point of every occupied voxel, in lexicographic voxel order. Same result as
+    np.unique(key, axis=0, return_index=True), which sorts the rows as a structured dtype (~40 % of the stage on a
+    180 s window); one packed int64 key per row sorts in a fraction of that."""
     key = np.floor(P / size).astype(np.int64)
-    _, idx = np.unique(key, axis=0, return_index=True)
+    if len(key) == 0:
+        return np.zeros(0, np.int64)
+    key -= key.min(0)
+    if key.max() >= 1 << 21:
+        _, idx = np.unique(key, axis=0, return_index=True)
+        return idx
+    _, idx = np.unique((key[:, 0] << 42) | (key[:, 1] << 21) | key[:, 2], return_index=True)
     return idx
 
 
 class Target:
     def __init__(self, A, times, k=12, sensors=None, max_sigma=0.05):
         self.A = A; self.times = times; self.tree = cKDTree(A)
-        d, idx = self.tree.query(A, k=k); nbr = A[idx]; c = nbr.mean(1)
+        d, idx = self.tree.query(A, k=k, workers=-1); nbr = A[idx]; c = nbr.mean(1)
         cov = np.einsum("nki,nkj->nij", nbr - c[:, None], nbr - c[:, None]) / k
         w, v = np.linalg.eigh(cov)
         self.normals = v[:, :, 0]
@@ -100,7 +109,7 @@ class Target:
     def match(self, B, max_dist, sensors=None):
         """sensors: world position of the LiDAR that produced each B point; with oriented normals a match is
         kept only when that LiDAR saw the plane from the same side as the reference (no opposite-face pulls)."""
-        dist, j = self.tree.query(B, distance_upper_bound=max_dist)
+        dist, j = self.tree.query(B, distance_upper_bound=max_dist, workers=-1)
         ok = np.isfinite(dist); ok[ok] &= self.planar[j[ok]]
         if sensors is not None and self.oriented:
             idx = np.flatnonzero(ok)
@@ -115,12 +124,15 @@ class Poses:
         self.stamps, self.rot, self.pos, self.label = stamps, rot, pos, label
 
     def at(self, t):
+        # Interpolated once per distinct time: archive scans stamp every return at the scan end, and the per-point
+        # slerp of identical times was a third of the stage (same values, expanded by index).
+        t, inv = np.unique(t, return_inverse=True)
         s = self.stamps
         j = np.clip(np.searchsorted(s, t), 1, len(s) - 1)
         ta, tb = s[j - 1], s[j]; r = np.clip((t - ta) / (tb - ta), 0, 1)
         ra, rb = self.rot[j - 1], self.rot[j]
         rr = ra * R.from_rotvec((ra.inv() * rb).as_rotvec() * r[:, None])
-        return rr, self.pos[j - 1] * (1 - r)[:, None] + self.pos[j] * r[:, None]
+        return rr[inv], (self.pos[j - 1] * (1 - r)[:, None] + self.pos[j] * r[:, None])[inv]
 
 
 def load_optimized(run, stamps):

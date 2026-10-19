@@ -244,6 +244,11 @@ class Dataset:
                         rosbag2_py.ConverterOptions("", ""))
             names = [t for t in seg.topics if t in selected]
             reader.set_filter(rosbag2_py.StorageFilter(topics=names + ["/" + t for t in names]))
+            if start_ns is not None and start_ns > seg.start_ns:
+                try:  # jump into the segment instead of reading and discarding its head
+                    reader.seek(int(start_ns))
+                except Exception:  # noqa: BLE001 - storage plugins without seek: sequential skip below
+                    pass
             readers.append(reader)
             counters["segments_opened"] += 1
             idx = len(readers) - 1

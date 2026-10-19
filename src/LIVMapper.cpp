@@ -16,7 +16,9 @@ which is included as part of this source code package.
 #include <json/json.h>
 
 #include <fstream>
+#include <malloc.h>
 #include <set>
+#include <unordered_set>
 
 namespace
 {
@@ -316,6 +318,18 @@ void LIVMapper::readParameters()
   // > 0: bound the visual information per frame to this multiple of the LiDAR information
   // (see VIOManager::parityCovarianceScale); 0 = original fixed-weight LIVO update.
   nh.param<double>("vio/lidar_parity_ratio", vio_lidar_parity_ratio, 0.0);
+  // > 0: half size (m) of the visual sparse map cube, independent of the LiDAR map cube (0 = same cube).
+  // Full-HD LIVO at 10 fps otherwise retains ~40 MB of reference images per second of driving.
+  nh.param<double>("vio/visual_half_map_m", vio_visual_half_map_m, 0.0);
+  nh.param<double>("vio/visual_behind_m", vio_visual_behind_m, 0.0);
+  nh.param<double>("vio/new_points_min_move_m", vio_new_points_min_move_m, 0.1);
+  nh.param<double>("vio/new_points_min_turn_deg", vio_new_points_min_turn_deg, 0.5);
+  if (!(vio_new_points_min_move_m >= 0.0) || !(vio_new_points_min_turn_deg >= 0.0))
+    throw std::runtime_error("vio/new_points_min_move_m and vio/new_points_min_turn_deg must be nonnegative");
+  if (!std::isfinite(vio_visual_behind_m) || vio_visual_behind_m < 0.0)
+    throw std::runtime_error("vio/visual_behind_m must be finite and nonnegative (0 = cube only)");
+  if (!std::isfinite(vio_visual_half_map_m) || vio_visual_half_map_m < 0.0)
+    throw std::runtime_error("vio/visual_half_map_m must be finite and nonnegative (0 = LiDAR map cube)");
   nh.param<bool>("vio/raycast_en", raycast_en, false);
   nh.param<bool>("vio/exposure_estimate_en", exposure_estimate_en, true);
   nh.param<double>("vio/inv_expo_cov", inv_expo_cov, 0.2);
@@ -782,6 +796,8 @@ void LIVMapper::initializeComponents()
   vio_manager->colmap_output_en = colmap_output_en;
   vio_manager->ekf_update_en = vio_ekf_update_en;
   vio_manager->print_frame_timing = print_frame_timing;
+  vio_manager->new_points_min_move_m = vio_new_points_min_move_m;
+  vio_manager->new_points_min_turn_deg = vio_new_points_min_turn_deg;
   vio_manager->initializeVIO();
 
   p_imu->set_extrinsic(extT, extR);
@@ -1480,38 +1496,58 @@ void LIVMapper::handleLIO()
     // The visual sparse map slides with the LiDAR map (same cube), see VIOManager::slideVisualMap.
     if (vio_manager && (voxelmap_manager->last_slide_position - slide_before).squaredNorm() > 0.0)
     {
-      const double half_size = voxelmap_manager->config_setting_.half_map_size *
-                               voxelmap_manager->config_setting_.max_voxel_size_;
-      const std::size_t released = vio_manager->slideVisualMap(voxelmap_manager->last_slide_position, half_size);
+      const double lidar_half_size = voxelmap_manager->config_setting_.half_map_size *
+                                     voxelmap_manager->config_setting_.max_voxel_size_;
+      // Never keep visual points the LiDAR map already dropped; optionally keep far fewer.
+      const double half_size = vio_visual_half_map_m > 0.0 ? std::min(vio_visual_half_map_m, lidar_half_size)
+                                                           : lidar_half_size;
+      // heading of the camera side: body forward axis (RFU y) projected to the horizontal
+      V3D forward = _state.rot_end * V3D(0.0, 1.0, 0.0);
+      forward.z() = 0.0;
+      if (forward.norm() > 1e-6) forward.normalize();
+      const std::size_t released = vio_manager->slideVisualMap(voxelmap_manager->last_slide_position, half_size,
+                                                               forward, vio_visual_behind_m);
       if (released > 0)
         RCLCPP_INFO(node_->get_logger(), "Visual map sliding: released %zu points outside +-%.0f m (%zu voxels kept)",
                     released, half_size, vio_manager->feat_map.size());
     }
   }
   
-  PointCloudXYZI::Ptr laserCloudFullRes(dense_map_en ? feats_undistort : feats_down_body);
-  int size = laserCloudFullRes->points.size();
-  PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
-
-  for (int i = 0; i < size; i++) 
+  // World-frame copies of the scan are display products in LIO mode (the RTK backend archives the
+  // body-frame deskewed scan). LIVO always needs pcl_w_wait_pub: the next VIO update colours it for the
+  // RGB map. Without a subscriber (no RViz) the two ~100k-point transforms + PointCloud2 serializations
+  // per frame (~10 MB) were pure overhead.
+  const bool world_cloud_needed = slam_mode_ == LIVO || pcd_save_en ||
+                                  pubLaserCloudFullRes->get_subscription_count() > 0;
+  if (world_cloud_needed)
   {
-    RGBpointBodyToWorld(&laserCloudFullRes->points[i], &laserCloudWorld->points[i]);
-  }
-  *pcl_w_wait_pub = *laserCloudWorld;
+    PointCloudXYZI::Ptr laserCloudFullRes(dense_map_en ? feats_undistort : feats_down_body);
+    int size = laserCloudFullRes->points.size();
+    PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
 
-  publish_frame_world(pubLaserCloudFullRes, vio_manager);
-  sensor_msgs::PointCloud2 current_frame_msg;
-  PointCloudXYZI::Ptr current_frame_world(new PointCloudXYZI(feats_undistort->size(), 1));
-  for (size_t i = 0; i < feats_undistort->size(); i++)
-  {
-    RGBpointBodyToWorld(&feats_undistort->points[i], &current_frame_world->points[i]);
+    for (int i = 0; i < size; i++)
+    {
+      RGBpointBodyToWorld(&laserCloudFullRes->points[i], &laserCloudWorld->points[i]);
+    }
+    *pcl_w_wait_pub = *laserCloudWorld;
+
+    publish_frame_world(pubLaserCloudFullRes, vio_manager);
   }
-  // Keep physical reflectivity, including for native LIO without RTK. Camera
-  // mode displays /cloud_registered instead, which retains actual RGB.
-  pcl::toROSMsg(*current_frame_world, current_frame_msg);
-  current_frame_msg.header.stamp = stampFromSec(LidarMeasures.last_lio_update_time);
-  current_frame_msg.header.frame_id = lio_world_frame;
-  pubCurrentFrame->publish(current_frame_msg);
+  if (pubCurrentFrame->get_subscription_count() > 0)
+  {
+    sensor_msgs::PointCloud2 current_frame_msg;
+    PointCloudXYZI::Ptr current_frame_world(new PointCloudXYZI(feats_undistort->size(), 1));
+    for (size_t i = 0; i < feats_undistort->size(); i++)
+    {
+      RGBpointBodyToWorld(&feats_undistort->points[i], &current_frame_world->points[i]);
+    }
+    // Keep physical reflectivity, including for native LIO without RTK. Camera
+    // mode displays /cloud_registered instead, which retains actual RGB.
+    pcl::toROSMsg(*current_frame_world, current_frame_msg);
+    current_frame_msg.header.stamp = stampFromSec(LidarMeasures.last_lio_update_time);
+    current_frame_msg.header.frame_id = lio_world_frame;
+    pubCurrentFrame->publish(current_frame_msg);
+  }
   if (pub_effect_point_en) publish_effect_world(pubLaserCloudEffect, voxelmap_manager->ptpl_list_);
   if (voxelmap_manager->config_setting_.is_pub_plane_map_) voxelmap_manager->pubVoxelMap();
   publish_path(pubPath);
@@ -1572,6 +1608,7 @@ void LIVMapper::handleLIO()
                 1000.0 * (t4 - t0), 1000.0 * aver_time_consu, feats_down_body->points.size(),
                 1000.0 * vio_manager->ave_total,
                 slam_mode_ == LIVO ? (vio_ekf_update_en ? " [LIVO]" : " [LIVO colour-only]") : " [LIO]");
+    logMemoryStatus();
   }
   if (print_frame_timing)
   {
@@ -1714,6 +1751,7 @@ void LIVMapper::run(const volatile std::sig_atomic_t &stop_requested)
   // diagnostics first, so its completion cannot precede buffered LIO rows.
   if (lio_geometry_log.is_open()) lio_geometry_log.flush();
   if (fout_lidar_pos.is_open()) fout_lidar_pos.flush();
+  releaseFrontendMaps();
   if (rtk_fusion_) rtk_fusion_->finish();
   savePCD();
   if (frontend_attitude_weak_geometry_info > 0.0)
@@ -3024,8 +3062,72 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
   ROS_ERROR("out sync");
 }
 
+void LIVMapper::releaseFrontendMaps()
+{
+  // After the last scan the LIO voxel map and the visual map are dead weight, but the backend's final phase
+  // (loop-closure submaps, colour voxels of rgb_map_N, map chunks) peaked on top of them (truck29raw 20261013
+  // LIVO 870 s: 5.8 GB at the last scan -> 9.3 GB). Nothing reads them after the processing loop.
+  std::size_t lio = 0, visual = 0;
+  if (voxelmap_manager)
+  {
+    lio = voxelmap_manager->voxel_map_.size();
+    for (auto &entry : voxelmap_manager->voxel_map_) delete entry.second;
+    voxelmap_manager->voxel_map_.clear();
+  }
+  if (vio_manager)
+  {
+    visual = vio_manager->feat_map.size();
+    for (auto &entry : vio_manager->feat_map) delete entry.second;
+    vio_manager->feat_map.clear();
+  }
+  malloc_trim(0);
+  RCLCPP_INFO(node_->get_logger(), "Released the frontend maps before the final optimization (%zu LIO voxels, %zu visual voxels)",
+              lio, visual);
+}
+
+void LIVMapper::logMemoryStatus()
+{
+  // Resident memory and the size of the two front-end maps (status interval; a full traversal costs a few ms).
+  double rss_mb = std::numeric_limits<double>::quiet_NaN();
+  {
+    std::ifstream statm("/proc/self/statm");
+    long total_pages = 0, resident_pages = 0;
+    if (statm >> total_pages >> resident_pages)
+      rss_mb = static_cast<double>(resident_pages) * static_cast<double>(sysconf(_SC_PAGESIZE)) / 1048576.0;
+  }
+  const MapMemoryStats lio = voxelmap_manager->memoryStats();
+  std::size_t visual_voxels = 0, visual_points = 0, observations = 0;
+  double image_mb = 0.0;
+  if (slam_mode_ == LIVO && vio_manager)
+  {
+    std::unordered_set<const uchar *> images;
+    for (const auto &entry : vio_manager->feat_map)
+    {
+      ++visual_voxels;
+      for (const VisualPoint *point : entry.second->voxel_points)
+      {
+        ++visual_points;
+        for (const Feature *feature : point->obs_)
+        {
+          ++observations;
+          if (!feature->img_.empty() && images.insert(feature->img_.data).second)
+            image_mb += static_cast<double>(feature->img_.total() * feature->img_.elemSize()) / 1048576.0;
+        }
+      }
+    }
+  }
+  RCLCPP_INFO(node_->get_logger(),
+              "[memory] RSS %.0f MB | LIO map %zu voxels, %zu nodes, %zu planes (%zu plane objects), %zu held returns "
+              "(cap %zu) ~%.0f MB | visual map %zu voxels, %zu points, %zu patches, pinned images %.0f MB",
+              rss_mb, lio.roots, lio.nodes, lio.planes, lio.plane_objects, lio.points, lio.point_capacity,
+              lio.bytes / 1048576.0,
+              visual_voxels, visual_points, observations, image_mb);
+}
+
 void LIVMapper::publish_img_rgb(const image_transport::Publisher &pubImage, VIOManagerPtr vio_manager)
 {
+  // Display only: toImageMsg() deep-copies the 6 MB full-HD frame at every VIO update.
+  if (pubImage.getNumSubscribers() == 0) return;
   cv::Mat img_rgb = vio_manager->img_cp;
   cv_bridge::CvImage out_msg;
   out_msg.header.stamp = stampFromSec(LidarMeasures.last_lio_update_time);
@@ -3081,19 +3183,22 @@ PointCloudXYZRGB::Ptr LIVMapper::publish_frame_world(const rclcpp::Publisher<sen
     }
   }
 
-  /*** Publish Frame ***/
-  sensor_msgs::PointCloud2 laserCloudmsg;
-  if (slam_mode_ == LIVO && LidarMeasures.lio_vio_flg == VIO)
+  /*** Publish Frame (display only: skipped without a subscriber) ***/
+  if (pubLaserCloudFullRes->get_subscription_count() > 0)
   {
-    pcl::toROSMsg(*laserCloudWorldRGB, laserCloudmsg);
+    sensor_msgs::PointCloud2 laserCloudmsg;
+    if (slam_mode_ == LIVO && LidarMeasures.lio_vio_flg == VIO)
+    {
+      pcl::toROSMsg(*laserCloudWorldRGB, laserCloudmsg);
+    }
+    if (slam_mode_ == ONLY_LIO || slam_mode_ == ONLY_LO)
+    {
+      pcl::toROSMsg(*pcl_w_wait_pub, laserCloudmsg);
+    }
+    laserCloudmsg.header.stamp = stampFromSec(LidarMeasures.last_lio_update_time);
+    laserCloudmsg.header.frame_id = lio_world_frame;
+    pubLaserCloudFullRes->publish(laserCloudmsg);
   }
-  if (slam_mode_ == ONLY_LIO || slam_mode_ == ONLY_LO)
-  { 
-    pcl::toROSMsg(*pcl_w_wait_pub, laserCloudmsg); 
-  }
-  laserCloudmsg.header.stamp = stampFromSec(LidarMeasures.last_lio_update_time);
-  laserCloudmsg.header.frame_id = lio_world_frame;
-  pubLaserCloudFullRes->publish(laserCloudmsg);
 
   /**************** save map ****************/
   /* 1. make sure you have enough memories

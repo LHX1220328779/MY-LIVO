@@ -224,15 +224,17 @@ void VIOManager::getImagePatch(cv::Mat img, V2D pc, float *patch_tmp, int level)
   }
 }
 
-std::size_t VIOManager::slideVisualMap(const V3D &center, double half_size)
+std::size_t VIOManager::slideVisualMap(const V3D &center, double half_size, const V3D &forward, double behind_m)
 {
   constexpr double voxel_size = 0.5;  // insertPointIntoVoxelMap
   std::size_t released = 0;
+  const bool prune_behind = behind_m > 0.0 && forward.squaredNorm() > 0.5;
   for (auto it = feat_map.begin(); it != feat_map.end();)
   {
     const VOXEL_LOCATION &loc = it->first;
     const V3D voxel_center((loc.x + 0.5) * voxel_size, (loc.y + 0.5) * voxel_size, (loc.z + 0.5) * voxel_size);
-    if (((voxel_center - center).cwiseAbs().array() > half_size).any())
+    if (((voxel_center - center).cwiseAbs().array() > half_size).any() ||
+        (prune_behind && (voxel_center - center).dot(forward) < -behind_m))
     {
       released += it->second->voxel_points.size();
       delete it->second;  // deletes its VisualPoints, their Features and with them the image references
@@ -956,12 +958,13 @@ void VIOManager::updateVisualMapPoints(cv::Mat img)
 
     V2D pc(new_frame_->w2c(pt->pos_));
     bool add_flag = false;
-    
-    float *patch_temp = new float[patch_size_total];
-    getImagePatch(img, pc, patch_temp, 0);
+
     // TODO: condition: distance and view_angle
     // Step 1: time
-    Feature *last_feature = pt->obs_.back();
+    // The NEWEST observation: addFrameRef() pushes to the front, so obs_.back() was the oldest one and the view
+    // change was measured against the first sighting - every point seen from elsewhere added a patch at EVERY
+    // frame (each pinning its full image): on a 300 s parking the visual map grew by ~20 MB/s (truck29raw 20261013).
+    Feature *last_feature = pt->obs_.front();
     // if(new_frame_->id_ >= last_feature->id_ + 10) add_flag = true; // 10
 
     // Step 2: delta_pose
@@ -988,6 +991,10 @@ void VIOManager::updateVisualMapPoints(cv::Mat img)
     {
       update_num += 1;
       update_flag[i] = 1;
+      // allocated only for a new patch (owned by the Feature); it was allocated for every point and frame and
+      // leaked whenever no patch was added (~256 B x submap points x 10 Hz)
+      float *patch_temp = new float[patch_size_total];
+      getImagePatch(img, pc, patch_temp, 0);
       Vector3d f = cam->cam2world(pc);
       Feature *ftr_new = new Feature(pt, patch_temp, pc, f, new_frame_->T_f_w_, visual_submap->search_levels[i]);
       ftr_new->img_ = img;
@@ -1871,7 +1878,26 @@ void VIOManager::processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unor
 
   double t3 = omp_get_wtime();
 
-  generateVisualMapPoints(img, pg);
+  // Visual map maintenance only after the camera moved: every new point or reference patch pins the full image
+  // of this frame (Feature::img_), so a parked vehicle that keeps adding a few of them per frame grows the map by
+  // one full image per VIO update (~20 MB/s on the 300 s parking of truck29raw 20261013) without adding geometry.
+  bool camera_moved = true;
+  {
+    const SE3 T_w_f = new_frame_->T_f_w_.inverse();
+    const V3D camera_pos = T_w_f.translation();
+    const M3D camera_rot = T_w_f.rotation_matrix();
+    const double turned_deg =
+        Eigen::AngleAxisd(last_generation_rot_.transpose() * camera_rot).angle() * 180.0 / M_PI;
+    camera_moved = !new_points_generated_ || (camera_pos - last_generation_pos_).norm() >= new_points_min_move_m ||
+                   turned_deg >= new_points_min_turn_deg;
+    if (camera_moved)
+    {
+      generateVisualMapPoints(img, pg);
+      new_points_generated_ = true;
+      last_generation_pos_ = camera_pos;
+      last_generation_rot_ = camera_rot;
+    }
+  }
 
   double t4 = omp_get_wtime();
   
@@ -1881,7 +1907,7 @@ void VIOManager::processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unor
 
   double t5 = omp_get_wtime();
 
-  updateVisualMapPoints(img);
+  if (camera_moved) updateVisualMapPoints(img);
 
   double t6 = omp_get_wtime();
 

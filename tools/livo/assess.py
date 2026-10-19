@@ -1163,8 +1163,8 @@ def run(a):
         R.add(g_lid, "extrinsic_tilt", "静止段雷达间地面倾角差（最大）", tilt, "°", status=st_t, fix="auto",
               fix_bad="stage",
               display=f"{tilt:.2f}°（{wt}：前后向 {solved[wt]['rot_x_deg']:+.2f}° 左右向 {solved[wt]['rot_y_deg']:+.2f}°）",
-              limits="≤ 0.2° 正常（低于自检生效阈值）· ≤ 1.0° 关注（建图自检自动修正）· > 1° 需 ground/driven 阶段重标；> 3° 多为安装变动或标定文件不属于这台车（见“数据车号 vs 标定车号”）",
-              plain="起步静止时各路雷达“看到的地面”和参考雷达差几度。≤0.2° 可接受；0.2–1° 起步自检会自动修正；>1° 需要 ground/driven 阶段重标。",
+              limits="≤ 0.2° 正常（低于自检生效阈值）· ≤ 1.0° 关注（建图自检自动修正）· > 1° 需 ground 阶段重标（先按地面平面粗对齐再精修，数度的安装变动也能收敛）并经 driven 复核；> 3° 多为安装变动或标定文件不属于这台车（见“数据车号 vs 标定车号”）",
+              plain="起步静止时各路雷达“看到的地面”和参考雷达差几度。≤0.2° 可接受；0.2–1° 起步自检会自动修正；>1° 需要 ground 阶段重标（地面阶段会先用平面粗对齐，几度的安装变动也能收敛），再由 driven 阶段复核。",
               note="各雷达静止地面相对参考雷达（front）地面的倾角差；对应 SLAM 起步静止外参自检的 roll/pitch 修正量。",
               basis="config: max_rotation_deg 1.0 / min_apply 0.2°；truck05 原始外参 0.3° 由 driven 阶段闭合。",
               extra={k: {kk: (round(vv, 3) if isinstance(vv, float) else vv) for kk, vv in v.items()} for k, v in gc.items()})

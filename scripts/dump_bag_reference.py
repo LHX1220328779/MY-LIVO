@@ -30,6 +30,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bag", required=True)
     ap.add_argument("--output", required=True)
+    ap.add_argument("--span", nargs=2, type=float, default=None,
+                    help="absolute start/end time (s) of the round: only that part (+-10 s) of the recording is read")
     a = ap.parse_args()
     out = pathlib.Path(a.output)
     out.mkdir(parents=True, exist_ok=True)
@@ -43,7 +45,11 @@ def main():
     w_stat.writerow(["stamp", "ins_pos_mode", "gps_num_sats", "extra"])
     w_imu.writerow(["stamp", "gx", "gy", "gz", "ax", "ay", "az"])
     n = [0, 0, 0]
-    for topic, data, _ in dataset.iter_messages(topics):
+    start_ns = end_ns = None
+    if a.span:
+        start_ns = max(dataset.start_ns, int((a.span[0] - 10.0) * 1e9))
+        end_ns = int((a.span[1] + 10.0) * 1e9)
+    for topic, data, _ in dataset.iter_messages(topics, start_ns, end_ns):
         if topic == "imu_data/odometry":
             m = deserialize_message(data, Odometry)
             p, q = m.pose.pose.position, m.pose.pose.orientation

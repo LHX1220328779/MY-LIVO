@@ -28,10 +28,14 @@ DEFAULT_STATE = {
     "vehicle": {"mine": "wuhu", "truck": "truck29"},
     "data": {"dataset": DEFAULT_DATASET, "recent": [DEFAULT_DATASET]},
     "calibration": {"source_file": str(CAL_ROOT / "perception_truck29.json"), "parent_id": "", "run": "",
-                    "lidar_offset": -0.125, "camera_offset": -0.115, "auto_activate": True, "fast": True},
+                    "lidar_offset": -0.125, "camera_offset": -0.115, "auto_activate": True, "fast": True,
+                    "from_factory": True},
     "mapping": {"round_prefix": "studio", "mode": "livo", "use_rtk": True, "save_map": True, "rviz": False,
                 "rate": 1.0, "calibration_id": "", "precheck": True, "frame_divider": 1, "evaluate": True,
-                "extra_sets": "", "start_offset": 0, "duration": "", "map_range": 45.0, "rgb_range": 60.0},
+                "extra_sets": "", "start_offset": 0, "duration": "", "map_range": 45.0, "rgb_range": 60.0,
+                "skip_stationary": True, "stationary_min": 30, "stationary_lidar_interval": 1.0,
+                "map_export": True, "map_voxel": 0.05, "map_source": "all", "map_tile": 0, "map_keyframes": False,
+                "auto_cleanup": True, "auto_cleanup_free_gb": 50, "map_min_points": 1},
     "ui": {"page": "home"},
 }
 
@@ -172,6 +176,111 @@ def csv_rows(path, max_points=400, max_bytes=20_000_000):
         data = picked
     rows = [l.split(",") for l in data]
     return header, [r for r in rows if len(r) == len(header)]
+
+
+_SERIES_CACHE = {}
+SERIES_LADDER = (0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300, 600, 1200)
+
+
+def csv_all_rows(path):
+    """Header + ALL data rows of an append-only CSV, parsed incrementally (cached by path and size)."""
+    path = pathlib.Path(path)
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return [], []
+    key = str(path)
+    c = _SERIES_CACHE.get(key)
+    if c is None or size < c["pos"]:
+        c = {"pos": 0, "header": None, "rows": [], "partial": b""}
+    if size > c["pos"]:
+        try:
+            with path.open("rb") as f:
+                f.seek(c["pos"])
+                data = f.read(size - c["pos"])
+        except OSError:
+            return c["header"] or [], c["rows"]
+        c["pos"] += len(data)
+        lines = (c["partial"] + data).split(b"\n")
+        c["partial"] = lines.pop()
+        for raw in lines:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(",")
+            if c["header"] is None:
+                c["header"] = parts
+            elif parts[0] != c["header"][0] and len(parts) == len(c["header"]):
+                c["rows"].append(parts)
+    _SERIES_CACHE[key] = c
+    return c["header"] or [], c["rows"]
+
+
+def _num(x):
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return v if v == v and v not in (float("inf"), float("-inf")) else None
+
+
+def binned_series(path, time_col, columns, max_points=600, agg=None, rename=None):
+    """Stable time-binned series for live charts: [{"t": bin centre, <column>: aggregate, ...}].
+
+    Bins are aligned to the FIRST sample and their width comes from a fixed ladder (0.1 s ... 20 min), so a
+    completed bin never changes between polls; only the newest bin is still filling. The previous index
+    subsampling (csv_rows: every len/400-th row) changed its stride with every new row, so the plotted history
+    re-sampled a different subset of the noisy per-frame values at each refresh and appeared to keep changing.
+    agg: {column: "max" | "mean" | "last"} (default "max": an error curve must keep its peaks);
+    rename: {column: output key}."""
+    header, rows = csv_all_rows(path)
+    if not header or not rows or time_col not in header:
+        return []
+    col = {n: i for i, n in enumerate(header)}
+    ti = col[time_col]
+    idx = [(c, col[c], (agg or {}).get(c, "max"), (rename or {}).get(c, c)) for c in columns if c in col]
+    t0 = next((v for v in (_num(r[ti]) for r in rows) if v is not None), None)
+    t1 = next((v for v in (_num(r[ti]) for r in reversed(rows)) if v is not None), None)
+    if t0 is None or t1 is None:
+        return []
+    width = next((s for s in SERIES_LADDER if (t1 - t0) / s <= max_points), SERIES_LADDER[-1])
+    bins, order = {}, []
+    for r in rows:
+        t = _num(r[ti])
+        if t is None:
+            continue
+        k = int((t - t0) // width)
+        b = bins.get(k)
+        if b is None:
+            b = bins[k] = {}
+            order.append(k)
+        for name, i, mode, _out in idx:
+            v = _num(r[i])
+            if v is None:
+                continue
+            if mode == "mean":
+                s = b.setdefault(name, [0.0, 0])
+                s[0] += v
+                s[1] += 1
+            elif mode == "last" or name not in b:
+                b[name] = v
+            else:
+                b[name] = max(b[name], v)
+    out = []
+    for k in order:
+        b = bins[k]
+        p = {"t": t0 + (k + 0.5) * width}
+        for name, _i, mode, outkey in idx:
+            v = b.get(name)
+            p[outkey] = (v[0] / v[1] if v and v[1] else None) if mode == "mean" else v
+        out.append(p)
+    return out
+
+
+def csv_last(path):
+    """{column: value} of the newest row of an append-only CSV (shares the incremental cache)."""
+    header, rows = csv_all_rows(path)
+    return {n: rows[-1][i] for i, n in enumerate(header)} if header and rows else {}
 
 
 def count_lines(path):

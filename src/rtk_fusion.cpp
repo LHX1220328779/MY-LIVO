@@ -6,6 +6,7 @@
 #include <gtsam/navigation/GPSFactor.h>
 #include <gtsam/nonlinear/ISAM2UpdateParams.h>
 #include <gtsam/nonlinear/LevenbergMarquardtOptimizer.h>
+#include <gtsam/slam/BetweenFactor.h>
 #include <gtsam/slam/PriorFactor.h>
 #include <pcl/io/pcd_io.h>
 #include <pcl_conversions/pcl_conversions.h>
@@ -17,17 +18,19 @@
 namespace
 {
 
-gtsam::ISAM2Params fusionSolverParameters()
+gtsam::ISAM2Params fusionSolverParameters(double rotation = 0.0001, double translation = 0.002,
+                                          double misalignment = 0.0001)
 {
   gtsam::ISAM2Params params;
   params.relinearizeSkip = 1;
   params.findUnusedFactorSlots = true;
   gtsam::ISAM2ThresholdMap thresholds;
   gtsam::Vector6 threshold;
-  threshold << 0.0001, 0.0001, 0.0001, 0.002, 0.002, 0.002;
+  threshold << rotation, rotation, rotation, translation, translation, translation;
   thresholds['x'] = threshold;
-  // Installation misalignment (Rot3): relinearize on the same angular scale.
-  thresholds['m'] = gtsam::Vector3::Constant(0.0001);
+  // Installation misalignment (Rot3). It is shared by EVERY attitude factor, so each relinearization of it
+  // re-eliminates the whole Bayes tree; its threshold is configured separately (rtk/relinearize_misalignment_deg).
+  thresholds['m'] = gtsam::Vector3::Constant(misalignment);
   params.relinearizeThreshold = thresholds;
   params.optimizationParams = gtsam::ISAM2DoglegParams();
   params.factorization = gtsam::ISAM2Params::QR;
@@ -45,6 +48,7 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   Ros2ParameterReader parameters(node);
   parameters.param<bool>("rtk/require_status", require_status, true);
   parameters.param<bool>("rtk/save_map", save_map, false);
+  parameters.param<bool>("rtk/export_map_chunks", export_map_chunks, true);
   parameters.param<bool>("common/img_en", color_enabled, false);
   bool frontend_position_aiding = false;
   parameters.param<bool>("rtk/frontend_position_aiding", frontend_position_aiding, false);
@@ -127,6 +131,71 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
       "filtered, the archive and the estimator are not). Change with rtk.save_map_max_range / rtk.save_rgb_max_range, "
       "run_wuhu_round.sh --map-range M --rgb-range M, or launch save_map_max_range:=M save_rgb_max_range:=M",
       save_map_max_range, save_rgb_max_range);
+  {
+    parameters.param<double>("rtk/revisit_min_path_m", revisit_min_path, revisit_min_path);
+    parameters.param<double>("rtk/keyframe_stationary_interval_sec", key_stationary_interval, key_stationary_interval);
+    parameters.param<double>("rtk/stationary_translation_m", stationary_translation, stationary_translation);
+    parameters.param<double>("rtk/stationary_speed_mps", stationary_speed, stationary_speed);
+    double hold_rotation_deg = standstill_hold_rotation * 180 / M_PI;
+    parameters.param<double>("rtk/standstill_hold_rotation_deg", hold_rotation_deg, hold_rotation_deg);
+    parameters.param<double>("rtk/standstill_hold_translation_m", standstill_hold_translation,
+                             standstill_hold_translation);
+    standstill_hold_rotation = hold_rotation_deg * M_PI / 180;
+    double stationary_rotation_deg = stationary_rotation * 180 / M_PI;
+    parameters.param<double>("rtk/stationary_rotation_deg", stationary_rotation_deg, stationary_rotation_deg);
+    double relin_rotation_deg = relinearize_rotation * 180 / M_PI;
+    double relin_misalignment_deg = relinearize_misalignment * 180 / M_PI;
+    parameters.param<double>("rtk/relinearize_rotation_deg", relin_rotation_deg, relin_rotation_deg);
+    parameters.param<double>("rtk/relinearize_translation_m", relinearize_translation, relinearize_translation);
+    parameters.param<double>("rtk/relinearize_misalignment_deg", relin_misalignment_deg, relin_misalignment_deg);
+    parameters.param<int>("rtk/index_rebuild_keys", index_rebuild_keys, index_rebuild_keys);
+    parameters.param<int>("rtk/online_log_interval_keys", online_log_interval, online_log_interval);
+    for (double value : {revisit_min_path, key_stationary_interval, stationary_translation, stationary_speed,
+                         stationary_rotation_deg})
+      if (!std::isfinite(value) || value < 0)
+        throw std::runtime_error("rtk revisit/stationary parameters must be finite and nonnegative");
+    for (double value : {relin_rotation_deg, relinearize_translation, relin_misalignment_deg})
+      if (!std::isfinite(value) || value <= 0)
+        throw std::runtime_error("rtk/relinearize_* thresholds must be finite and positive");
+    if (index_rebuild_keys < 1 || online_log_interval < 1)
+      throw std::runtime_error("rtk/index_rebuild_keys and rtk/online_log_interval_keys must be >= 1");
+    if (key_stationary_interval > 0 && key_stationary_interval < key_interval)
+      throw std::runtime_error("rtk/keyframe_stationary_interval_sec must be 0 (off) or >= keyframe_interval_sec");
+    stationary_rotation = stationary_rotation_deg * M_PI / 180;
+    relinearize_rotation = relin_rotation_deg * M_PI / 180;
+    relinearize_misalignment = relin_misalignment_deg * M_PI / 180;
+    solver = gtsam::ISAM2(solverParameters());
+    RCLCPP_INFO(node->get_logger(),
+        "RTK graph budget: standstill knots every %.1f s (< %.2f m / %.2f deg / %.2f m/s, 0 = off), revisit >= %.0f s "
+        "and >= %.0f m driven, relinearize %.4f deg / %.4f m / misalignment %.4f deg, candidate index rebuild every %d "
+        "key(s), online cost log every %d key(s)",
+        key_stationary_interval, stationary_translation, stationary_rotation_deg, stationary_speed, revisit_age,
+        revisit_min_path, relin_rotation_deg, relinearize_translation, relin_misalignment_deg, index_rebuild_keys,
+        online_log_interval);
+  }
+  {
+    auto &L = loop_config;
+    parameters.param<bool>("rtk/loop_closure_enabled", L.enabled, L.enabled);
+    const std::pair<const char *, double *> loop_doubles[] = {
+        {"loop_radius_m", &L.radius}, {"loop_min_path_m", &L.min_path}, {"loop_min_age_sec", &L.min_age},
+        {"loop_spacing_m", &L.spacing}, {"loop_submap_half_path_m", &L.submap_half_path},
+        {"loop_scan_spacing_sec", &L.scan_spacing}, {"loop_voxel_m", &L.voxel}, {"loop_max_range_m", &L.max_range},
+        {"loop_max_correction_m", &L.max_correction}, {"loop_max_correction_deg", &L.max_correction_deg},
+        {"loop_max_rms_m", &L.max_rms}, {"loop_min_overlap", &L.min_overlap}, {"loop_point_sigma_m", &L.point_sigma},
+        {"loop_floor_translation_m", &L.floor_translation}, {"loop_floor_rotation_deg", &L.floor_rotation_deg},
+        {"loop_rtk_bound_m", &L.rtk_bound}};
+    for (const auto &item : loop_doubles)
+    {
+      parameters.param<double>(std::string("rtk/") + item.first, *item.second, *item.second);
+      if (!std::isfinite(*item.second) || *item.second <= 0)
+        throw std::runtime_error(std::string("rtk/") + item.first + " must be finite and positive");
+    }
+    parameters.param<int>("rtk/loop_effective_points", L.effective_points, L.effective_points);
+    parameters.param<int>("rtk/loop_max_pairs", L.max_pairs, L.max_pairs);
+    parameters.param<int>("rtk/loop_rtk_bound_keys", L.rtk_bound_keys, L.rtk_bound_keys);
+    if (L.effective_points < 1 || L.max_pairs < 0 || L.rtk_bound_keys < 0)
+      throw std::runtime_error("rtk/loop_effective_points must be >= 1 and rtk/loop_max_pairs >= 0");
+  }
   if (!require_status || accepted_modes != std::vector<int>{4})
     throw std::runtime_error("RTK fusion requires current quality mode 4; bypassing quality or accepting other modes is forbidden");
   if (!std::isfinite(time_offset) || horizontal_sigma > max_horizontal_sigma ||
@@ -190,7 +259,7 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
     throw std::runtime_error("Fusion run directory already exists");
   diagnostics.exceptions(std::ios::badbit | std::ios::failbit);
   diagnostics.open(directory / "diagnostics.csv");
-  diagnostics << "stamp,keyframes,position_factors,position_pending_attempts,planes,factors,rtk_residual_m,processing_ms,frontend_rtk_residual_m,frontend_speed_mps,reference_failure,global_aligned,prepare_ms,association_ms,solve_ms,refresh_ms,published_stamp,publish_lag_sec,latest_key_rtk_residual_m,unoptimized_tail_rtk_residual_m,refinement_steps,refinement_max_translation_m,refinement_max_rotation_deg,published_imu_reference_difference_m\n";
+  diagnostics << "stamp,keyframes,position_factors,position_pending_attempts,planes,factors,rtk_residual_m,processing_ms,frontend_rtk_residual_m,frontend_speed_mps,reference_failure,global_aligned,prepare_ms,association_ms,solve_ms,refresh_ms,published_stamp,publish_lag_sec,latest_key_rtk_residual_m,unoptimized_tail_rtk_residual_m,refinement_steps,refinement_max_translation_m,refinement_max_rotation_deg,published_imu_reference_difference_m,relinearized,reeliminated,cliques\n";
   path_log.exceptions(std::ios::badbit | std::ios::failbit);
   path_log.open(directory / "online_path.csv");
   path_log << "stamp,assessed_frames,latest_imu_difference_m,max_imu_difference_m,worst_stamp,mean_imu_difference_m,over_10cm_frames,over_20cm_frames\n";
@@ -314,6 +383,36 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
       rclcpp::shutdown();
     }
   });
+}
+
+gtsam::ISAM2Params RtkFusion::solverParameters() const
+{
+  return fusionSolverParameters(relinearize_rotation, relinearize_translation, relinearize_misalignment);
+}
+
+void RtkFusion::accumulateSolverStats(const gtsam::ISAM2Result &result)
+{
+  last_relinearized += result.variablesRelinearized;
+  last_reeliminated += result.variablesReeliminated;
+  last_cliques = std::max<std::size_t>(last_cliques, result.cliques);
+}
+
+void RtkFusion::indexAnchor(std::size_t i)
+{
+  const V3D p = keyframes[i].optimized.translation();
+  if (!p.allFinite()) throw std::runtime_error("Non-finite optimized pose");
+  spatial_keys[{static_cast<std::int64_t>(std::floor(p.x() / revisit_radius)),
+                static_cast<std::int64_t>(std::floor(p.y() / revisit_radius)),
+                static_cast<std::int64_t>(std::floor(p.z() / revisit_radius))}].push_back(i);
+  for (const auto &plane : keyframes[i].planes)
+  {
+    const V3D point = keyframes[i].optimized.transformFrom(plane.center) / (2 * plane_voxel);
+    auto &keys = surface_keys[{static_cast<std::int64_t>(std::floor(point.x())),
+        static_cast<std::int64_t>(std::floor(point.y())), static_cast<std::int64_t>(std::floor(point.z()))}];
+    // Each scan owns at most one vote per occupied cell, irrespective of
+    // how many extracted patches/returns it has in that cell.
+    if (keys.empty() || keys.back() != i) keys.push_back(i);
+  }
 }
 
 void RtkFusion::appendParameters(const std::vector<std::pair<std::string, std::string>> &items) const
@@ -574,28 +673,170 @@ void RtkFusion::finalizeOptimization()
   // objective and produced a two-cycle without any new sensor observations.
   // Keep verified correspondences and robust physical residuals; ALL poses
   // remain free. New scans supply new measurements through optimizeKeyframe.
-  auto graph = solver.getFactorsUnsafe();
-  const double before = graph.error(estimate);
+  const auto base = solver.getFactorsUnsafe();
+  const auto loops = collectLoopClosures();
+  std::vector<bool> keep(loops.size(), true);
+  const gtsam::Values initial = estimate;
+  gtsam::NonlinearFactorGraph graph;
+  double before = 0, after = 0;
+  std::size_t iterations = 0, dropped = 0;
   gtsam::LevenbergMarquardtParams parameters;
   parameters.maxIterations = 30;
   parameters.relativeErrorTol = 1e-7;
   parameters.absoluteErrorTol = 1e-8;
   parameters.linearSolverType = gtsam::NonlinearOptimizerParams::MULTIFRONTAL_QR;
-  gtsam::LevenbergMarquardtOptimizer optimizer(graph, estimate, parameters);
-  estimate = optimizer.optimize();
-  const double after = graph.error(estimate);
-  if (!std::isfinite(after) || after > before + 1e-7 * std::max(1.0, before))
-    throw std::runtime_error("Final optimizer did not preserve/decrease the fixed-graph objective");
-  solver = gtsam::ISAM2(fusionSolverParameters());
+  std::ofstream bound_log;
+  for (int pass = 0;; ++pass)
+  {
+    graph = base;
+    for (std::size_t i = 0; i < loops.size(); ++i)
+      if (keep[i]) graph.push_back(loops[i].factor);
+    before = graph.error(initial);
+    gtsam::LevenbergMarquardtOptimizer optimizer(graph, initial, parameters);
+    estimate = optimizer.optimize();
+    iterations = optimizer.iterations();
+    after = graph.error(estimate);
+    if (!std::isfinite(after) || after > before + 1e-7 * std::max(1.0, before))
+      throw std::runtime_error("Final optimizer did not preserve/decrease the fixed-graph objective");
+    if (loops.empty() || pass >= 3) break;
+    // RTK bound: loops redistribute the RTK error between passes, they must not move the route out of the budget.
+    std::vector<std::size_t> offending;
+    double worst = 0;
+    for (std::size_t k = 0; k < keyframes.size(); ++k)
+    {
+      if (!keyframes[k].has_position || !estimate.exists(gtsam::Symbol('x', k))) continue;
+      const double r =
+          (estimate.at<gtsam::Pose3>(gtsam::Symbol('x', k)).transformFrom(lever) - keyframes[k].reference).norm();
+      worst = std::max(worst, r);
+      if (r > loop_config.rtk_bound) offending.push_back(k);
+    }
+    if (offending.empty()) break;
+    bool changed = false;
+    for (std::size_t i = 0; i < loops.size(); ++i)
+    {
+      if (!keep[i]) continue;
+      for (std::size_t k : offending)
+      {
+        const auto near = [&](std::size_t end) {
+          return (end > k ? end - k : k - end) <= static_cast<std::size_t>(loop_config.rtk_bound_keys);
+        };
+        if (near(loops[i].a) || near(loops[i].b))
+        {
+          keep[i] = false;
+          changed = true;
+          ++dropped;
+          if (!bound_log.is_open())
+          {
+            bound_log.open(directory / "loops_rtk_bound.csv");
+            bound_log << "pass,a_stamp,b_stamp,offending_key_stamp,worst_residual_m\n";
+          }
+          bound_log << pass << ',' << std::setprecision(17) << keyframes[loops[i].a].stamp << ','
+                    << keyframes[loops[i].b].stamp << ',' << keyframes[k].stamp << ',' << std::setprecision(6)
+                    << worst << '\n';
+          break;
+        }
+      }
+    }
+    RCLCPP_INFO(node->get_logger(),
+        "Loop closure RTK bound pass %d: max keyframe residual %.3f m > %.3f m at %zu keyframe(s); %zu loop factor(s) "
+        "dropped so far%s", pass, worst, loop_config.rtk_bound, offending.size(), dropped,
+        changed ? ", re-solving" : " (no loop factor near them: residual not caused by loops, solution kept)");
+    if (!changed) break;
+  }
+  if (!loops.empty())
+    RCLCPP_INFO(node->get_logger(), "Loop closure: %zu of %zu loop factors kept in the final solve (RTK bound %.3f m)",
+                loops.size() - dropped, loops.size(), loop_config.rtk_bound);
+  solver = gtsam::ISAM2(solverParameters());
   const auto rebuilt = solver.update(graph, estimate);
   for (auto &link : geometry_links)
     link.factor_index = rebuilt.newFactorsIndices.at(link.factor_index);
   updatePoses();
-  logOptimization("final_fixed_graph", optimizer.iterations(), before, after);
+  logOptimization("final_fixed_graph", iterations, before, after);
   logOptimization("final", 0, solver.getFactorsUnsafe().error(estimate), solver.getFactorsUnsafe().error(estimate));
   optimization_log.flush();
   history_log.flush();
   geometry_history.flush();
+}
+
+std::vector<RtkFusion::LoopFactorRecord> RtkFusion::collectLoopClosures()
+{
+  std::vector<LoopFactorRecord> out;
+  if (!loop_config.enabled || !save_map || !observations_enabled || keyframes.size() < 20 || loop_config.max_pairs == 0)
+    return out;
+  const auto start = std::chrono::steady_clock::now();
+  archive.flush();
+  std::vector<LoopScanRef> scans(frames.size());
+  std::vector<gtsam::Pose3> delivered(frames.size());
+  double path = 0;
+  for (std::size_t i = 0; i < frames.size(); ++i)
+  {
+    if (i) path += (frames[i].raw.translation() - frames[i - 1].raw.translation()).norm();
+    scans[i] = {frames[i].offset, frames[i].count, frames[i].stamp, frames[i].raw, path};
+    delivered[i] = poseAt(frames[i]);
+  }
+  std::vector<std::size_t> keyframe_scan(keyframes.size());
+  std::vector<Eigen::Vector3d> positions(keyframes.size());
+  std::vector<double> paths(keyframes.size()), stamps(keyframes.size());
+  std::vector<bool> usable(keyframes.size());
+  std::vector<gtsam::Pose3> optimized(keyframes.size());
+  for (std::size_t k = 0; k < keyframes.size(); ++k)
+  {
+    const auto found = std::lower_bound(frames.begin(), frames.end(), keyframes[k].stamp - 1e-6,
+        [](const Frame &frame, double stamp) { return frame.stamp < stamp; });
+    usable[k] = found != frames.end() && std::abs(found->stamp - keyframes[k].stamp) < 1e-5;
+    keyframe_scan[k] = usable[k] ? static_cast<std::size_t>(found - frames.begin()) : 0;
+    optimized[k] = keyframes[k].optimized;
+    positions[k] = keyframes[k].optimized.translation();
+    paths[k] = usable[k] ? scans[keyframe_scan[k]].path : 0;
+    stamps[k] = keyframes[k].stamp;
+  }
+  const auto pairs = detectLoopPairs(loop_config, positions, paths, stamps, usable);
+  if (pairs.empty())
+  {
+    RCLCPP_INFO(node->get_logger(), "Loop closure: no revisited section (>= %.0f m driven, <= %.1f m apart)",
+                loop_config.min_path, loop_config.radius);
+    return out;
+  }
+  const auto results = registerLoopPairs(loop_config, (directory / "scans.bin").string(), lidar_rotation,
+                                         lidar_translation, scans, delivered, keyframe_scan, optimized, pairs);
+  std::ofstream log(directory / "loops.csv");
+  log << "a_stamp,b_stamp,path_gap_m,distance_m,correspondences,overlap,rms_before_m,rms_after_m,correction_m,"
+         "correction_deg,shift_x_m,shift_y_m,shift_z_m,min_eig_translation,min_eig_rotation,accepted,reason,"
+         "rot_x_deg,rot_y_deg,rot_z_deg\n";
+  std::size_t accepted = 0;
+  std::vector<double> before, after, moves;
+  for (const auto &pair : results)
+  {
+    log << std::setprecision(17) << keyframes[pair.a].stamp << ',' << keyframes[pair.b].stamp << ','
+        << std::setprecision(6) << paths[pair.b] - paths[pair.a] << ','
+        << (positions[pair.b] - positions[pair.a]).norm() << ',' << pair.correspondences << ',' << pair.overlap << ','
+        << pair.rms_before << ',' << pair.rms_after << ',' << pair.correction << ',' << pair.correction_deg << ','
+        << pair.shift.x() << ',' << pair.shift.y() << ',' << pair.shift.z() << ','
+        << pair.min_eigen_translation << ',' << pair.min_eigen_rotation << ',' << pair.accepted << ','
+        << pair.reason << ',' << pair.rotation_deg.x() << ',' << pair.rotation_deg.y() << ','
+        << pair.rotation_deg.z() << '\n';
+    if (!pair.accepted) continue;
+    // Robust (Huber, 3 sigma) relative-pose factor with the ICP information: observable directions only.
+    const auto noise = gtsam::noiseModel::Robust::Create(gtsam::noiseModel::mEstimator::Huber::Create(3.0),
+        gtsam::noiseModel::Gaussian::Information(pair.information));
+    out.push_back({pair.a, pair.b, std::make_shared<gtsam::BetweenFactor<gtsam::Pose3>>(
+                                       gtsam::Symbol('x', pair.a), gtsam::Symbol('x', pair.b), pair.measured, noise)});
+    ++accepted;
+    before.push_back(pair.rms_before);
+    after.push_back(pair.rms_after);
+    moves.push_back(pair.correction);
+  }
+  const auto median = [](std::vector<double> v) {
+    if (v.empty()) return std::numeric_limits<double>::quiet_NaN();
+    std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+    return v[v.size() / 2];
+  };
+  RCLCPP_INFO(node->get_logger(),
+      "Loop closure: %zu revisit pairs, %zu accepted factors (point-to-plane rms median %.3f -> %.3f m, correction "
+      "median %.3f m) in %.1f s; details in loops.csv",
+      results.size(), accepted, median(before), median(after), median(moves),
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+  return out;
 }
 
 gtsam::Pose3 RtkFusion::correctionAt(double stamp) const
@@ -789,8 +1030,11 @@ void RtkFusion::submit(double stamp, double begin, const StatesGroup &state,
                        const PointCloudXYZI::Ptr &cloud, const gtsam::Matrix6 &lidar_information,
                        const PointCloudXYZRGB::Ptr &colored_world_cloud)
 {
+  // Interval bound: a LIVO update spans the time between two images; inside a fast-forwarded standstill the
+  // player keeps only the camera key frames (GOP 2 s), so sanity-check at 5 s, not 2 s (which aborted the
+  // first LIVO round with standstill skipping on truck29raw 20261013).
   if (!std::isfinite(stamp) || !std::isfinite(begin) || begin > stamp ||
-      stamp - begin > 2 || !state.pos_end.allFinite() || !state.rot_end.allFinite())
+      stamp - begin > 5 || !state.pos_end.allFinite() || !state.rot_end.allFinite())
     throw std::runtime_error("Invalid LIO pose or scan interval submitted to fusion");
   if (color_enabled && colored_world_cloud == nullptr)
     throw std::runtime_error("Camera-enabled RTK fusion requires an RGB cloud for every submitted frame");
@@ -919,8 +1163,9 @@ std::vector<RtkFusion::Plane> RtkFusion::extractPlanes(const Frame &frame) const
     for (auto index : candidate.second->indices)
     {
       const auto &point = frame.cloud->points[index];
-      plane.support.push_back(lidar_rotation * V3D(point.x, point.y, point.z) + lidar_translation);
-      plane.extendSupport(plane.support.back());
+      const V3D support = lidar_rotation * V3D(point.x, point.y, point.z) + lidar_translation;
+      plane.support.push_back(support.cast<float>());
+      plane.extendSupport(support);
     }
     planes.push_back(std::move(plane));
   }
@@ -1067,8 +1312,9 @@ std::size_t RtkFusion::addGeometry(std::size_t a, std::size_t b,
     M3D scatter = M3D::Zero();
     std::size_t count = 0;
     source_count += source.support.size();
-    for (const auto &point : source.support)
+    for (const auto &stored : source.support)
     {
+      const V3D point = stored.cast<double>();
       if (!target.covers(source_to_target.transformFrom(point))) continue;
       sum += point;
       scatter.noalias() += point * point.transpose();
@@ -1297,7 +1543,7 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
         keyframes[i].optimized = alignment * keyframes[i].optimized;
         values.insert(gtsam::Symbol('x', i), keyframes[i].optimized);
       }
-      solver = gtsam::ISAM2(fusionSolverParameters());
+      solver = gtsam::ISAM2(solverParameters());
       const auto rebuilt = solver.update(graph, values);
       for (auto &link : geometry_links)
         if (link.factor_index != std::numeric_limits<std::size_t>::max())
@@ -1312,6 +1558,8 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
   Keyframe current;
   current.stamp = frame.stamp;
   current.raw = frame.raw;
+  current.path = keyframes.empty() ? 0.0 :
+      keyframes.back().path + (frame.raw.translation() - keyframes.back().raw.translation()).norm();
   current.angular_observability = nativeAngularObservability(frame.lidar_information);
   if (index == 0)
   {
@@ -1348,7 +1596,8 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
       const V3D &p = current.planes[i].center;
       current.cells[{static_cast<std::int64_t>(std::floor(p.x() / plane_voxel)),
                      static_cast<std::int64_t>(std::floor(p.y() / plane_voxel)),
-                     static_cast<std::int64_t>(std::floor(p.z() / plane_voxel))}].push_back(i);
+                     static_cast<std::int64_t>(std::floor(p.z() / plane_voxel))}].push_back(
+                         static_cast<std::uint32_t>(i));
     }
   }
   keyframes.push_back(std::move(current));
@@ -1456,6 +1705,13 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
 
     graph.emplace_shared<NativeMotionFactor>(gtsam::Symbol('x', index - 1), key,
         measured, sigmas, motion_huber_rate * std::sqrt(duration));
+    if (knot_parked && standstill_hold_rotation > 0 && standstill_hold_translation > 0)
+    {
+      gtsam::Vector6 hold;
+      hold << gtsam::Vector3::Constant(standstill_hold_rotation), gtsam::Vector3::Constant(standstill_hold_translation);
+      graph.emplace_shared<gtsam::BetweenFactor<gtsam::Pose3>>(gtsam::Symbol('x', index - 1), key, measured,
+          gtsam::noiseModel::Diagonal::Sigmas(hold));
+    }
   }
   initializePose(graph, initial);
   timing(key_timings[0]);
@@ -1480,7 +1736,8 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
       for (std::size_t previous : found->second)
       {
         if (frame.stamp - keyframes[previous].stamp < revisit_age ||
-            index - previous <= static_cast<std::size_t>(local_neighbors)) continue;
+            index - previous <= static_cast<std::size_t>(local_neighbors) ||
+            keyframes.back().path - keyframes[previous].path < revisit_min_path) continue;
         const double distance = (keyframes[previous].optimized.translation() - position).norm();
         if (distance <= revisit_radius) candidates.emplace_back(distance, previous);
       }
@@ -1540,13 +1797,15 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
 
   timing(key_timings[1]);
   const auto result = solver.update(graph, initial);
+  last_relinearized = last_reeliminated = last_cliques = 0;
+  accumulateSolverStats(result);
   for (auto &link : new_links)
   {
     link.factor_index = result.newFactorsIndices.at(link.factor_index);
     geometry_links.push_back(link);
   }
   new_links.clear();
-  solver.update();
+  accumulateSolverStats(solver.update());
   updatePoses();
   timing(key_timings[2]);
   // Refine the current fixed graph before publication, including history.
@@ -1556,7 +1815,7 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
   for (int iteration = 0; iteration < 6; ++iteration)
   {
     for (std::size_t i = 0; i < keyframes.size(); ++i) previous[i] = keyframes[i].optimized;
-    solver.update();
+    accumulateSolverStats(solver.update());
     updatePoses();
     refinement_translation = refinement_rotation = 0;
     for (std::size_t i = 0; i < keyframes.size(); ++i)
@@ -1569,29 +1828,27 @@ void RtkFusion::optimizeKeyframe(const Frame &frame)
     if (refinement_translation < .002 && refinement_rotation < .0001) break;
   }
   timing(key_timings[3]);
-  logOptimization("online", 0, std::numeric_limits<double>::quiet_NaN(), solver.getFactorsUnsafe().error(estimate));
-  spatial_keys.clear();
-  // Reuse cell/vector storage during reindexing rather than allocating all
-  // observed-surface postings at every knot. Empty old cells carry no votes.
-  for (auto &cell : surface_keys) cell.second.clear();
-  for (std::size_t i : geometry_anchors)
+  // The full-graph cost breakdown is O(factors): every online_log_interval keyframes only (the final
+  // fixed-graph phases are always logged).
+  if (online_log_interval <= 1 || index % static_cast<std::size_t>(online_log_interval) == 0)
+    logOptimization("online", 0, std::numeric_limits<double>::quiet_NaN(), solver.getFactorsUnsafe().error(estimate));
+  // Candidate indices only PROPOSE covisible/revisit partners (8 m / 4 m cells; every candidate is then
+  // verified by registration). Re-indexing every anchor and plane at every knot is O(keys x planes) and
+  // dominated long surveys; rebuild from the solved poses every index_rebuild_keys knots (or after a large
+  // refinement step) and insert new anchors immediately.
+  ++keys_since_index_rebuild;
+  if (index_rebuild_keys <= 1 || keys_since_index_rebuild >= static_cast<std::size_t>(index_rebuild_keys) ||
+      refinement_translation > 0.05 || refinement_rotation > 0.1 * M_PI / 180)
   {
-    keyframes[i].optimized = estimate.at<gtsam::Pose3>(gtsam::Symbol('x', i));
-    const V3D p = keyframes[i].optimized.translation();
-    if (!p.allFinite()) throw std::runtime_error("Non-finite optimized pose");
-    spatial_keys[{static_cast<std::int64_t>(std::floor(p.x() / revisit_radius)),
-                  static_cast<std::int64_t>(std::floor(p.y() / revisit_radius)),
-                  static_cast<std::int64_t>(std::floor(p.z() / revisit_radius))}].push_back(i);
-    for (const auto &plane : keyframes[i].planes)
-    {
-      const V3D point = keyframes[i].optimized.transformFrom(plane.center) / (2 * plane_voxel);
-      auto &keys = surface_keys[{static_cast<std::int64_t>(std::floor(point.x())),
-          static_cast<std::int64_t>(std::floor(point.y())), static_cast<std::int64_t>(std::floor(point.z()))}];
-      // Each scan owns at most one vote per occupied cell, irrespective of
-      // how many extracted patches/returns it has in that cell.
-      if (keys.empty() || keys.back() != i) keys.push_back(i);
-    }
+    keys_since_index_rebuild = 0;
+    spatial_keys.clear();
+    // Reuse cell/vector storage during reindexing rather than allocating all
+    // observed-surface postings at every knot. Empty old cells carry no votes.
+    for (auto &cell : surface_keys) cell.second.clear();
+    for (std::size_t i : geometry_anchors) indexAnchor(i);
   }
+  else if (geometry_anchor)
+    indexAnchor(index);
 }
 
 gtsam::Pose3 RtkFusion::poseAt(const Frame &frame) const
@@ -1649,6 +1906,7 @@ void RtkFusion::process(Frame frame)
 {
   const auto start = std::chrono::steady_clock::now();
   key_timings.fill(0);
+  last_relinearized = last_reeliminated = last_cliques = 0;
   refinement_steps = 0;
   refinement_translation = refinement_rotation = 0;
   if (!frames.empty() && frame.stamp <= frames.back().stamp)
@@ -1718,6 +1976,26 @@ void RtkFusion::process(Frame frame)
   metadata.cloud.reset();
   metadata.color_cloud.reset();
   frames.push_back(std::move(metadata));
+  if (frame.stamp - last_memory_log >= 30.0)
+  {
+    // Backend memory (keyframe planes with their float support returns dominate; every 30 s of data).
+    last_memory_log = frame.stamp;
+    std::size_t planes = 0, support = 0, cells = 0, postings = 0;
+    for (const auto &key : keyframes)
+    {
+      planes += key.planes.size();
+      for (const auto &plane : key.planes) support += plane.support.capacity();
+      cells += key.cells.size();
+      for (const auto &cell : key.cells) postings += cell.second.capacity();
+    }
+    const double megabytes = (static_cast<double>(planes) * sizeof(Plane) +
+                              static_cast<double>(support) * sizeof(Eigen::Vector3f) + static_cast<double>(cells) * 64.0 +
+                              static_cast<double>(postings) * 4.0 + static_cast<double>(frames.size()) * sizeof(Frame)) /
+                             1048576.0;
+    RCLCPP_INFO(node->get_logger(),
+        "[memory] backend: %zu frames, %zu keyframes, %zu planes, %zu support returns, %zu cells (~%.0f MB)",
+        frames.size(), keyframes.size(), planes, support, cells, megabytes);
+  }
   // One scan of latency lets same-stamp INS/status callbacks arrive before
   // matching. A late RTK seed must not leave permanently frozen wrong matches.
   const Frame &candidate = recent_frames.size() > 1 ? recent_frames[recent_frames.size() - 2] : frame;
@@ -1754,13 +2032,27 @@ void RtkFusion::process(Frame frame)
     }
   }
   bool keyframe = keyframes.empty();
+  knot_parked = false;
   if (!keyframe)
   {
     const double dt = candidate.stamp - keyframes.back().stamp;
     const auto relative = keyframes.back().raw.between(candidate.raw);
-    keyframe = dt >= key_min_interval && (dt >= key_interval ||
-        relative.translation().norm() >= key_translation ||
-        gtsam::Rot3::Logmap(relative.rotation()).norm() >= key_rotation);
+    const double moved = relative.translation().norm();
+    const double turned = gtsam::Rot3::Logmap(relative.rotation()).norm();
+    // Standstill: knots carry no new geometry and the INS fix is time-correlated, so dense knots only
+    // densify the graph (truck29raw 20261013: 720 of 1741 knots in two parkings). Space them by
+    // key_stationary_interval; the first native motion above the thresholds restores the normal spacing.
+    if (std::abs(candidate.frontend_speed) >= 0.5) motion_seen = true;
+    const bool parked = motion_seen && moved < stationary_translation && turned < stationary_rotation &&
+        std::abs(candidate.frontend_speed) < stationary_speed;
+    const bool standstill = key_stationary_interval > 0 && parked;
+    knot_parked = parked && !discontinuity_key;
+    // The published (newest solved) scan must stay in the recent cache: at full scan rate the cache spans
+    // local_map_frames scans (~3 s), so a standstill knot is also due when the last knot is about to leave it.
+    const bool cache_due = recent_frames.size() >= static_cast<std::size_t>(local_map_frames) &&
+        recent_frames.front().stamp >= keyframes.back().stamp - 1e-6;
+    keyframe = dt >= key_min_interval && (standstill ? (dt >= key_stationary_interval || cache_due) :
+        (dt >= key_interval || moved >= key_translation || turned >= key_rotation));
     if (discontinuity_key && dt > 1e-6) keyframe = true;
   }
   if (keyframe) optimizeKeyframe(candidate);
@@ -1800,6 +2092,7 @@ void RtkFusion::process(Frame frame)
   diagnostics << ',' << (graph_in_enu && published_reference.imu_position.allFinite() ?
       (poseAt(published).translation() - published_reference.imu_position).norm() :
       std::numeric_limits<double>::quiet_NaN());
+  diagnostics << ',' << last_relinearized << ',' << last_reeliminated << ',' << last_cliques;
   diagnostics << '\n';
   if (keyframe && (accepted_positions == 0 || (std::isfinite(residual) && residual > 0.10)))
     RCLCPP_WARN_THROTTLE(node->get_logger(), *node->get_clock(), 5000,
@@ -2111,10 +2404,10 @@ void RtkFusion::exportMap()
     std::size_t chunk_index = 0;
     // The colored cloud only contains returns inside the camera frustum, so it
     // is written as a separate product (rgb_map_*.pcd); the complete geometry
-    // map (map_*.pcd) is always exported and stays evaluable.
-    if (color_enabled)
+    // map (map_*.pcd) is exported with it unless export_map_chunks is false.
+    if (color_enabled) color_archive.flush();
+    if (color_enabled && export_map_chunks)
     {
-      color_archive.flush();
       std::ifstream input(directory / "colors.bin", std::ios::binary);
       input.exceptions(std::ios::failbit | std::ios::badbit);
       // Every frame recolors the surfaces inside its frustum, so the archive holds
@@ -2197,6 +2490,7 @@ void RtkFusion::exportMap()
       }
       chunk_index = 0;
     }
+    if (export_map_chunks)
     {
       std::ifstream input(directory / "scans.bin", std::ios::binary);
       input.exceptions(std::ios::failbit | std::ios::badbit);

@@ -70,7 +70,6 @@ typedef struct VoxelPlane
   Eigen::Vector3d normal_;
   Eigen::Vector3d y_normal_;
   Eigen::Vector3d x_normal_;
-  Eigen::Matrix3d covariance_;
   Eigen::Matrix<double, 6, 6> plane_var_;
   float radius_ = 0;
   float min_eigen_value_ = 1;
@@ -85,7 +84,6 @@ typedef struct VoxelPlane
   VoxelPlane()
   {
     plane_var_ = Eigen::Matrix<double, 6, 6>::Zero();
-    covariance_ = Eigen::Matrix3d::Zero();
     center_ = Eigen::Vector3d::Zero();
     normal_ = Eigen::Vector3d::Zero();
   }
@@ -124,18 +122,62 @@ struct DS_POINT
 
 void calcBodyCov(Eigen::Vector3d &pb, const float range_inc, const float degree_inc, Eigen::Matrix3d &cov);
 
+// A map return held inside a voxel until its plane is frozen. Plane fitting (init_plane) and the octree split
+// only read the world point and its covariance; storing the full pointWithVar (four vectors + four 3x3
+// matrices, 384 B) quadrupled the dominant LIO map memory (truck29raw 20261013: 9.7 GB RSS in 870 s).
+// Stored in float: the world point (|p| < 2 km -> < 0.12 mm rounding, far below the 2-3 cm range noise) and the
+// six distinct entries of its symmetric covariance. 36 B instead of 96 B (two double Eigen objects); the plane fit
+// still accumulates in double.
+struct VoxelPoint
+{
+  Eigen::Vector3f p;
+  float c[6];  // xx xy xz yy yz zz
+  VoxelPoint() = default;
+  VoxelPoint(const pointWithVar &pv)  // NOLINT: implicit by design
+      : p(pv.point_w.cast<float>()),
+        c{static_cast<float>(pv.var(0, 0)), static_cast<float>(pv.var(0, 1)), static_cast<float>(pv.var(0, 2)),
+          static_cast<float>(pv.var(1, 1)), static_cast<float>(pv.var(1, 2)), static_cast<float>(pv.var(2, 2))}
+  {
+  }
+  Eigen::Vector3d point() const { return p.cast<double>(); }
+  Eigen::Matrix3d cov() const
+  {
+    Eigen::Matrix3d m;
+    m << c[0], c[1], c[2], c[1], c[3], c[4], c[2], c[4], c[5];
+    return m;
+  }
+};
+
+// Live LIO map size (diagnostic status line): octree nodes each own a VoxelPlane; points are the not yet frozen
+// returns held in temp_points_ (capacity = allocated slots).
+struct MapMemoryStats
+{
+  std::size_t roots = 0, nodes = 0, planes = 0, plane_objects = 0, points = 0, point_capacity = 0;
+  double bytes = 0;
+};
+
 class VoxelOctoTree
 {
 
 public:
   VoxelOctoTree() = default;
-  std::vector<pointWithVar> temp_points_;
+  std::vector<VoxelPoint> temp_points_;
+  // Points at the shared read-only empty_plane_ (is_plane_ = false) until the node is first fitted
+  // (ensurePlane): about two thirds of the octree nodes never collect enough returns for a fit, and a VoxelPlane
+  // per node (~420 B) was the largest part of the LIO map after the returns.
   VoxelPlane *plane_ptr_;
+  static VoxelPlane empty_plane_;
+  VoxelPlane *ensurePlane()
+  {
+    if (plane_ptr_ == &empty_plane_) plane_ptr_ = new VoxelPlane;
+    return plane_ptr_;
+  }
   int layer_;
   int octo_state_; // 0 is end of tree, 1 is not
   VoxelOctoTree *leaves_[8];
   double voxel_center_[3]; // x, y, z
-  std::vector<int> layer_init_num_;
+  // Shared per-layer init thresholds (VoxelMapManager::config_setting_): a per-node vector copy cost ~60 B/node.
+  const std::vector<int> *layer_init_num_ = nullptr;
   float quater_length_;
   float planer_threshold_;
   int points_size_threshold_;
@@ -160,7 +202,7 @@ public:
     {
       leaves_[i] = nullptr;
     }
-    plane_ptr_ = new VoxelPlane;
+    plane_ptr_ = &empty_plane_;
   }
 
   ~VoxelOctoTree()
@@ -169,9 +211,9 @@ public:
     {
       delete leaves_[i];
     }
-    delete plane_ptr_;
+    if (plane_ptr_ != &empty_plane_) delete plane_ptr_;
   }
-  void init_plane(const std::vector<pointWithVar> &points, VoxelPlane *plane);
+  void init_plane(const std::vector<VoxelPoint> &points, VoxelPlane *plane);
   void init_octo_tree();
   void cut_octo_tree();
   void UpdateOctoTree(const pointWithVar &pv);
@@ -271,6 +313,7 @@ public:
   void pubVoxelMap();
 
   void mapSliding();
+  MapMemoryStats memoryStats() const;
   void clearMemOutOfMap(const int& x_max,const int& x_min,const int& y_max,const int& y_min,const int& z_max,const int& z_min );
 
 private:

@@ -182,7 +182,15 @@ public:
   // LIVO mapper grew by 25-35 MB per second of driving: the 1230 s truck28 round was OOM-killed at
   // t=977 s with 24 GB resident. Called together with the LiDAR map sliding (same cube), so nothing the
   // LiDAR map still holds is dropped from the visual map. Returns the number of released points.
-  std::size_t slideVisualMap(const V3D &center, double half_size);
+  // Releases visual voxels outside the +-half_size cube around center and, when behind_m > 0, the ones more than
+  // behind_m behind the camera along the horizontal heading `forward` (a forward camera never sees them again).
+  std::size_t slideVisualMap(const V3D &center, double half_size, const V3D &forward = V3D::Zero(), double behind_m = 0.0);
+  // New visual points are only generated after the camera moved (standstill frames add no geometry; in the
+  // 20261013 parking they doubled the visual map in 10 s). Thresholds: vio/new_points_min_move_m / _deg.
+  double new_points_min_move_m = 0.1, new_points_min_turn_deg = 0.5;
+  bool new_points_generated_ = false;
+  V3D last_generation_pos_ = V3D::Zero();
+  M3D last_generation_rot_ = M3D::Identity();
   void plotTrackedPoints();
   void updateFrameState(StatesGroup state);
   void projectPatchFromRefToCur(const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &plane_map);

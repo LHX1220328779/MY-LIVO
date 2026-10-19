@@ -14,6 +14,8 @@ _rosenv.ensure()
 from livo.dataset import Dataset  # noqa: E402
 
 import argparse
+import itertools
+import struct
 from pathlib import Path
 
 import numpy as np
@@ -108,15 +110,30 @@ def quality_at(query, quality, args):
             (query - fixed_since[np.maximum(qi, 0)] >= args.recovery_stable_sec))
 
 
-def load_reference(path, offset):
+def _cdr_header_stamp(data):
+    """Header stamp of a serialized ROS 2 message without deserializing its payload (little-endian CDR:
+    4-byte encapsulation, then std_msgs/Header.stamp {int32 sec, uint32 nanosec}); None if not LE CDR."""
+    if len(data) >= 12 and data[1] == 1:
+        sec, nsec = struct.unpack_from("<iI", data, 4)
+        return sec + nsec * 1e-9
+    return None
+
+
+def load_reference(path, offset, span=None):
     # Raw split recording, legacy prepared bag or any bag folder: the dataset layer merges all
     # segments in time order directly from the source MCAPs (no conversion step).
+    # span (absolute s, optional): only the round's time span (+-10 s) is read - a 60 s calibration round of a
+    # 15 min recording used to read (and deserialize every front LiDAR cloud of) the whole recording.
     dataset = Dataset.open(path)
     times, positions, quaternions, quality = [], [], [], []
     imu_header, imu_record, lidar_header, lidar_record = [], [], [], []
     topics = ["imu_data", "imu_data/odometry", "imu_data/ins_status", "front_lidar"]
+    start_ns = end_ns = None
+    if span is not None:
+        start_ns = max(dataset.start_ns, int((span[0] - 10.0) * 1e9))
+        end_ns = int((span[1] + 10.0) * 1e9)
     if True:
-        for topic, data, record_time in dataset.iter_messages(topics):
+        for topic, data, record_time in dataset.iter_messages(topics, start_ns, end_ns):
             if topic == "imu_data":
                 message = deserialize_message(data, Imu)
                 imu_header.append(stamp_seconds(message.header.stamp))
@@ -138,8 +155,10 @@ def load_reference(path, offset):
                 except ValueError:
                     continue
             elif topic == "front_lidar":
-                message = deserialize_message(data, PointCloud2)
-                lidar_header.append(stamp_seconds(message.header.stamp))
+                stamp = _cdr_header_stamp(data)
+                if stamp is None:
+                    stamp = stamp_seconds(deserialize_message(data, PointCloud2).header.stamp)
+                lidar_header.append(stamp)
                 lidar_record.append(record_time * 1e-9)
     if len(times) < 2:
         raise ValueError("At least two INS rear-axle observations are required")
@@ -444,43 +463,127 @@ def saved_map_range(directory):
     return 0.0
 
 
+class _PcdStream:
+    """Sequential reader over the map_N.pcd chunks: take(n) consumes rows, peek(n) looks ahead without consuming."""
+
+    def __init__(self, files):
+        self.files, self.file_number, self.row, self.cloud = files, 0, 0, read_pcd(files[0])
+        self.ahead = []  # chunks already loaded beyond file_number by peek()
+
+    def _advance(self):
+        self.file_number += 1
+        if self.file_number == len(self.files):
+            raise ValueError("Saved PCDs end before the indexed source returns")
+        self.cloud, self.row = (self.ahead.pop(0) if self.ahead else read_pcd(self.files[self.file_number])), 0
+
+    def take(self, n):
+        parts, remaining = [], int(n)
+        while remaining:
+            if self.row == len(self.cloud):
+                self._advance()
+            take = min(remaining, len(self.cloud) - self.row)
+            if take:
+                parts.append(self.cloud[self.row:self.row + take])
+                self.row += take
+                remaining -= take
+        return (parts[0] if len(parts) == 1 else np.concatenate(parts)) if parts else np.empty((0, 4), dtype="<f4")
+
+    def peek(self, n):
+        parts, remaining, cloud, row, k = [], int(n), self.cloud, self.row, 0
+        while remaining:
+            if row == len(cloud):
+                if self.file_number + k + 1 >= len(self.files):
+                    break
+                if k >= len(self.ahead):
+                    self.ahead.append(read_pcd(self.files[self.file_number + k + 1]))
+                cloud, row, k = self.ahead[k], 0, k + 1
+            take = min(remaining, len(cloud) - row)
+            parts.append(cloud[row:row + take])
+            row += take
+            remaining -= take
+        return np.concatenate(parts) if parts else np.empty((0, 4), dtype="<f4")
+
+    def exhausted(self):
+        return self.row == len(self.cloud) and self.file_number + 1 == len(self.files) and not self.ahead
+
+
+RANGE_CAP_TOL = 1e-3  # m; wider than any float32 rounding of a 50 m norm, narrower than the return spacing
+
+
+def _next_certain_intensities(archive, index, i, max_range, limit=8):
+    """Intensities of the first returns of frame i+1 that the exporter certainly kept (stops at the first
+    return within RANGE_CAP_TOL of the cap, whose fate is uncertain)."""
+    if i + 1 >= len(index):
+        return np.empty(0, dtype="<f4")
+    record = index[i + 1]
+    start = (int(record["offset_bytes"]) - 8) // 20
+    rows = archive[start:start + min(int(record["count"]), 4 * limit)]
+    ranges = np.linalg.norm(rows[:, :3], axis=1)
+    out = []
+    for distance, intensity in zip(ranges, rows[:, 3]):
+        if abs(distance - max_range) <= RANGE_CAP_TOL:
+            break
+        if distance <= max_range:
+            out.append(intensity)
+        if len(out) == limit:
+            break
+    return np.asarray(out, dtype="<f4")
+
+
 def actual_pcd_frames(directory, index, archive):
     """Stream unchanged saved returns, paired by archive order, one chunk at a time."""
     files = sorted(directory.glob("map_*.pcd"), key=lambda path: int(path.stem.split("_")[-1]))
     if not files or [int(p.stem.split("_")[-1]) for p in files] != list(range(len(files))):
         raise ValueError("Actual map PCD chunks must start at zero and be contiguous")
-    file_number, row, cloud = 0, 0, read_pcd(files[0])
+    stream = _PcdStream(files)
     max_range = saved_map_range(directory)
     expected_start = 0
-    for record in index:
+    for i, record in enumerate(index):
         count = int(record["count"])
         offset = int(record["offset_bytes"]) - 8
         if count < 0 or offset != expected_start * 20 or expected_start + count > len(archive):
             raise ValueError("Frame archive offsets/counts are not contiguous source returns")
         source = archive[expected_start:expected_start + count]
         source_ids = np.arange(count)
+        boundary = np.empty(0, dtype=np.int64)
         if max_range > 0:
-            # Match the exporter's float32 norm in the archived virtual-LiDAR frame.
-            keep = np.linalg.norm(source[:, :3], axis=1) <= max_range
-            source, source_ids = source[keep], source_ids[keep]
-        parts, remaining = [], len(source)
-        while remaining:
-            if row == len(cloud):
-                file_number += 1
-                if file_number == len(files):
-                    raise ValueError("Saved PCDs end before the indexed source returns")
-                cloud, row = read_pcd(files[file_number]), 0
-            take = min(remaining, len(cloud) - row)
-            if take:
-                parts.append(cloud[row:row + take])
-                row += take
-                remaining -= take
-        saved = (parts[0] if len(parts) == 1 else np.concatenate(parts)) if parts else np.empty((0, 4), dtype="<f4")
-        if not np.array_equal(saved[:, 3], source[:, 3], equal_nan=True):
-            raise ValueError(f"Actual PCD/source-return intensity order differs at {record['stamp']:.9f}")
+            # Match the exporter's float32 norm in the archived virtual-LiDAR frame. The exporter decides with
+            # Eigen's float32 norm, numpy with its own summation order: a return within rounding of the cap can
+            # land on the other side (one in 3.6e8 returns of a full-length wuhu round), so returns that close to
+            # the cap are paired by content below instead of by the comparison.
+            ranges = np.linalg.norm(source[:, :3], axis=1)
+            keep = ranges <= max_range + RANGE_CAP_TOL
+            source, source_ids, ranges = source[keep], source_ids[keep], ranges[keep]
+            boundary = np.flatnonzero(np.abs(ranges - max_range) <= RANGE_CAP_TOL)
+        if not len(boundary):
+            saved = stream.take(len(source))
+            if not np.array_equal(saved[:, 3], source[:, 3], equal_nan=True):
+                raise ValueError(f"Actual PCD/source-return intensity order differs at {record['stamp']:.9f}")
+        else:
+            if len(boundary) > 12:
+                raise ValueError(f"Too many returns at the range cap to pair at {record['stamp']:.9f}")
+            saved = stream.take(len(source) - len(boundary))
+            following = _next_certain_intensities(archive, index, i, max_range)
+            candidate = np.concatenate([saved, stream.peek(len(boundary) + len(following))])
+            nominal = frozenset(boundary[ranges[boundary] > max_range])  # what the plain comparison would drop
+            subsets = [frozenset(c) for n in range(len(boundary) + 1) for c in itertools.combinations(boundary, n)]
+            chosen = None
+            for drop in sorted(subsets, key=lambda d: (len(d ^ nominal), len(d))):
+                mask = np.ones(len(source), dtype=bool)
+                mask[list(drop)] = False
+                sequence = np.concatenate([source[mask, 3], following])
+                if len(sequence) <= len(candidate) and np.array_equal(candidate[:len(sequence), 3], sequence, equal_nan=True):
+                    chosen = (drop, mask)
+                    break
+            if chosen is None:
+                raise ValueError(f"Actual PCD/source-return intensity order differs at {record['stamp']:.9f}")
+            drop, mask = chosen
+            source, source_ids = source[mask], source_ids[mask]
+            if len(boundary) - len(drop):
+                saved = np.concatenate([saved, stream.take(len(boundary) - len(drop))])
         yield saved, source, source_ids
         expected_start += count
-    if expected_start != len(archive) or row != len(cloud) or file_number + 1 != len(files):
+    if expected_start != len(archive) or not stream.exhausted():
         raise ValueError("Actual PCD/archive contains returns outside the frame index")
 
 
@@ -1729,7 +1832,12 @@ def main():
         parser.error("Time bounds must be positive")
     if args.accepted_modes != [4]:
         parser.error("Only mode 4 may provide an accepted RTK reference")
-    reference = load_reference(args.bag, args.time_offset_sec)
+    span = None
+    if args.trajectory and not args.deskew_surface_audit_run and not args.quality_log:
+        stamps = [np.loadtxt(t, ndmin=2, usecols=0) for t in args.trajectory if Path(t).is_file()]
+        if stamps and all(len(s) for s in stamps):
+            span = (min(float(s.min()) for s in stamps), max(float(s.max()) for s in stamps))
+    reference = load_reference(args.bag, args.time_offset_sec, span)
     if args.deskew_surface_audit_run:
         audit_deskew_surfaces(args.deskew_surface_audit_run, reference, args.imu_to_rear_axle, args.analysis_output, args)
         return
