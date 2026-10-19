@@ -11,6 +11,7 @@
 #include <pcl/io/pcd_io.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <charconv>
+#include <future>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -323,6 +324,8 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   odom_publisher = node->create_publisher<nav_msgs::Odometry>("/rtk/odometry", 10);
   map_publisher = node->create_publisher<sensor_msgs::PointCloud2>("/rtk/map", rclcpp::QoS(1).transient_local());
   current_publisher = node->create_publisher<sensor_msgs::PointCloud2>("/rtk/cloud_current", 1);
+  graph_publisher = node->create_publisher<visualization_msgs::MarkerArray>("/rtk/graph", rclcpp::QoS(1).transient_local());
+  final_map_publisher = node->create_publisher<sensor_msgs::PointCloud2>("/rtk/map_final", rclcpp::QoS(1).transient_local());
   RCLCPP_INFO(node->get_logger(),
       "LIO RTK geometry fusion: rear-axle lever [%.3f %.3f %.3f], nominal sigma %.3f/%.3f m, RGB map=%s, results %s",
       lever.x(), lever.y(), lever.z(), horizontal_sigma, vertical_sigma,
@@ -743,6 +746,9 @@ void RtkFusion::finalizeOptimization()
         changed ? ", re-solving" : " (no loop factor near them: residual not caused by loops, solution kept)");
     if (!changed) break;
   }
+  for (std::size_t i = 0; i < loops.size(); ++i)
+    if (!keep[i]) loop_display[loops[i].display].state = 2;
+  finalized = true;
   if (!loops.empty())
     RCLCPP_INFO(node->get_logger(), "Loop closure: %zu of %zu loop factors kept in the final solve (RTK bound %.3f m)",
                 loops.size() - dropped, loops.size(), loop_config.rtk_bound);
@@ -815,12 +821,14 @@ std::vector<RtkFusion::LoopFactorRecord> RtkFusion::collectLoopClosures()
         << pair.min_eigen_translation << ',' << pair.min_eigen_rotation << ',' << pair.accepted << ','
         << pair.reason << ',' << pair.rotation_deg.x() << ',' << pair.rotation_deg.y() << ','
         << pair.rotation_deg.z() << '\n';
+    loop_display.push_back({pair.a, pair.b, pair.accepted ? 0 : 1});
     if (!pair.accepted) continue;
     // Robust (Huber, 3 sigma) relative-pose factor with the ICP information: observable directions only.
     const auto noise = gtsam::noiseModel::Robust::Create(gtsam::noiseModel::mEstimator::Huber::Create(3.0),
         gtsam::noiseModel::Gaussian::Information(pair.information));
     out.push_back({pair.a, pair.b, std::make_shared<gtsam::BetweenFactor<gtsam::Pose3>>(
-                                       gtsam::Symbol('x', pair.a), gtsam::Symbol('x', pair.b), pair.measured, noise)});
+                                       gtsam::Symbol('x', pair.a), gtsam::Symbol('x', pair.b), pair.measured, noise),
+                   loop_display.size() - 1});
     ++accepted;
     before.push_back(pair.rms_before);
     after.push_back(pair.rms_after);
@@ -1858,7 +1866,10 @@ gtsam::Pose3 RtkFusion::poseAt(const Frame &frame) const
 
 void RtkFusion::appendCloud(const Frame &frame, pcl::PointCloud<pcl::PointXYZI> &output) const
 {
-  output.reserve(output.size() + frame.cloud->size());
+  // Callers append up to local_map_frames scans: grow geometrically (an exact reserve per scan re-copied the
+  // whole snapshot for every appended scan, ~0.5 GB of copies per RViz local-map publish).
+  if (output.points.capacity() < output.size() + frame.cloud->size())
+    output.reserve(std::max(output.size() + frame.cloud->size(), 2 * output.points.capacity()));
   const M3D native_rotation = frame.raw.rotation().matrix() * lidar_rotation;
   const V3D native_translation = frame.raw.transformFrom(lidar_translation);
   // FAST-LIVO has already deskewed each return to the scan-end body frame.
@@ -1869,6 +1880,10 @@ void RtkFusion::appendCloud(const Frame &frame, pcl::PointCloud<pcl::PointXYZI> 
   // remain immutable. A scan-end-only correction is invalid after native LIO
   // velocity degenerates, because it preserves the resulting metre-scale
   // intra-scan world error in the final map.
+  // Returns of one firing share their time offset, hence their correction (as in exportFrame): the per-return
+  // correctionAt made the RViz local-map snapshot cost up to ~1 s of backend time per publish.
+  std::unordered_map<float, gtsam::Pose3> corrections;
+  corrections.reserve(4096);
   for (const PointType &point : *frame.cloud)
   {
     double point_stamp = frame.begin + point.curvature / 1000.0;
@@ -1877,7 +1892,9 @@ void RtkFusion::appendCloud(const Frame &frame, pcl::PointCloud<pcl::PointXYZI> 
       throw std::runtime_error("Archived LiDAR point timestamp is outside its submitted frame interval");
     point_stamp = std::max(frame.begin, std::min(frame.stamp, point_stamp));
     const V3D native = native_rotation * V3D(point.x, point.y, point.z) + native_translation;
-    const V3D p = correctionAt(point_stamp).transformFrom(native);
+    auto found = corrections.find(point.curvature);
+    if (found == corrections.end()) found = corrections.emplace(point.curvature, correctionAt(point_stamp)).first;
+    const V3D p = found->second.transformFrom(native);
     pcl::PointXYZI result;
     result.x = p.x(); result.y = p.y(); result.z = p.z(); result.intensity = point.intensity;
     output.push_back(result);
@@ -1888,7 +1905,8 @@ void RtkFusion::appendDisplayCloud(const Frame &frame, PointCloudXYZRGB &output)
 {
   if (!frame.color_cloud)
     throw std::runtime_error("RGB frame data missing from camera-enabled RTK cache");
-  output.reserve(output.size() + frame.color_cloud->size());
+  if (output.points.capacity() < output.size() + frame.color_cloud->size())
+    output.reserve(std::max(output.size() + frame.color_cloud->size(), 2 * output.points.capacity()));
   // color_cloud is already in the native frontend world frame. Applying
   // C(t)=X_global*X_frontend^-1 preserves the exact camera association while
   // moving the colored surface with the same global correction as geometry.
@@ -2212,6 +2230,129 @@ void RtkFusion::publish(double stamp, bool force)
     message.header = path.header;
     map_publisher->publish(message);
   }
+  if (observations_enabled) publishGraph(latest, assessed ? maximum : std::numeric_limits<double>::quiet_NaN());
+}
+
+void RtkFusion::publishGraph(double latest_error, double max_error)
+{
+  if (keyframes.empty() || !rclcpp::ok() || graph_publisher->get_subscription_count() == 0) return;
+  using visualization_msgs::Marker;
+  visualization_msgs::MarkerArray array;
+  const auto stamp = stampFromSec(keyframes.back().stamp);
+  const auto marker = [&](const char *ns, int type, double scale, std::array<float, 4> rgba) {
+    Marker m;
+    m.header.frame_id = graph_in_enu ? "mine" : "lio_local";
+    m.header.stamp = stamp;
+    m.ns = ns;
+    m.type = type;
+    m.action = Marker::ADD;
+    m.pose.orientation.w = 1;
+    m.scale.x = m.scale.y = m.scale.z = scale;
+    m.color.r = rgba[0]; m.color.g = rgba[1]; m.color.b = rgba[2]; m.color.a = rgba[3];
+    return m;
+  };
+  const auto point = [](const V3D &p) {
+    geometry_msgs::msg::Point q;
+    q.x = p.x(); q.y = p.y(); q.z = p.z();
+    return q;
+  };
+  // An empty point list is invalid for LINE/SPHERE lists: clear that namespace instead.
+  const auto push = [&](Marker &m) {
+    if (m.type != Marker::TEXT_VIEW_FACING && m.points.empty()) m.action = Marker::DELETE;
+    array.markers.push_back(m);
+  };
+  // Keyframes (correction knots) coloured by their final/online RTK residual: green < 5 cm, yellow < 8 cm
+  // (loop RTK bound), orange < 10 cm (acceptance), red above; grey = no RTK factor (quality/time rejected).
+  auto keys = marker("keyframes", Marker::SPHERE_LIST, 0.6, {1, 1, 1, 1});
+  std::size_t over8 = 0;
+  for (const auto &key : keyframes)
+  {
+    keys.points.push_back(point(key.optimized.translation()));
+    std_msgs::msg::ColorRGBA color;
+    color.a = 1;
+    if (!key.has_position) { color.r = color.g = color.b = .55f; }
+    else
+    {
+      const double r = (key.optimized.transformFrom(lever) - key.reference).norm();
+      over8 += r >= .08;
+      if (r < .05) { color.r = .1f; color.g = .85f; color.b = .2f; }
+      else if (r < .08) { color.r = 1; color.g = .85f; }
+      else if (r < .10) { color.r = 1; color.g = .45f; }
+      else { color.r = 1; color.g = .1f; color.b = .1f; }
+    }
+    keys.colors.push_back(color);
+  }
+  push(keys);
+  // Online revisit links: scan-plane factors between keyframes that came back to a place (>= revisit_min_path).
+  auto revisits = marker("revisit_links", Marker::LINE_LIST, 0.06, {.1f, .8f, 1, .85f});
+  for (const auto &link : geometry_links)
+    if (link.kind == GeometryKind::Revisit && link.a < keyframes.size() && link.b < keyframes.size())
+    {
+      revisits.points.push_back(point(keyframes[link.a].optimized.translation()));
+      revisits.points.push_back(point(keyframes[link.b].optimized.translation()));
+    }
+  push(revisits);
+  // Final submap loop closures (loops.csv): kept, rejected by registration, dropped by the RTK bound.
+  auto kept = marker("loop_closures", Marker::LINE_LIST, 0.18, {.15f, 1, .3f, 1});
+  auto rejected = marker("loops_rejected", Marker::LINE_LIST, 0.06, {1, .15f, .15f, .7f});
+  auto dropped = marker("loops_rtk_dropped", Marker::LINE_LIST, 0.12, {1, .55f, 0, 1});
+  for (const auto &loop : loop_display)
+  {
+    auto &target = loop.state == 0 ? kept : loop.state == 2 ? dropped : rejected;
+    target.points.push_back(point(keyframes[loop.a].optimized.translation()));
+    target.points.push_back(point(keyframes[loop.b].optimized.translation()));
+  }
+  push(kept); push(rejected); push(dropped);
+  auto text = marker("status", Marker::TEXT_VIEW_FACING, 2.0, {1, 1, 1, 1});
+  // Beside the vehicle (top-down views would put it on the vehicle marker and the current scan).
+  text.pose.position = point(keyframes.back().optimized.translation() + V3D(0, 12, 6));
+  char buffer[256];
+  if (finalized)
+    std::snprintf(buffer, sizeof(buffer), "FINAL  %zu keyframes, %zu >= 8 cm RTK residual\nloops kept %zu / rejected %zu / RTK-dropped %zu",
+                  keyframes.size(), over8,
+                  static_cast<std::size_t>(std::count_if(loop_display.begin(), loop_display.end(), [](const LoopDisplay &l) { return l.state == 0; })),
+                  static_cast<std::size_t>(std::count_if(loop_display.begin(), loop_display.end(), [](const LoopDisplay &l) { return l.state == 1; })),
+                  static_cast<std::size_t>(std::count_if(loop_display.begin(), loop_display.end(), [](const LoopDisplay &l) { return l.state == 2; })));
+  else
+    std::snprintf(buffer, sizeof(buffer), "RTK fusion  err %.1f cm (max %.1f)\n%zu keyframes, %zu revisit links%s",
+                  latest_error * 100, max_error * 100, keyframes.size(), revisits.points.size() / 2,
+                  knot_parked ? ", parked (hold)" : "");
+  text.text = buffer;
+  push(text);
+  graph_publisher->publish(array);
+}
+
+void RtkFusion::exportFrame(const Frame &frame, std::ifstream &input, std::vector<float> &packed,
+                            pcl::PointCloud<pcl::PointXYZI> &output) const
+{
+  packed.resize(static_cast<std::size_t>(frame.count) * 5);
+  input.seekg(static_cast<std::streamoff>(frame.offset));
+  input.read(reinterpret_cast<char *>(packed.data()), static_cast<std::streamsize>(packed.size() * sizeof(float)));
+  if (!input) throw std::runtime_error("Cannot read the scan archive for the map export");
+  const M3D native_rotation = frame.raw.rotation().matrix() * lidar_rotation;
+  const V3D native_translation = frame.raw.transformFrom(lidar_translation);
+  // Same arithmetic as appendCloud. Returns of one firing share their offset, hence their correction:
+  // evaluate correctionAt once per distinct offset (it dominated the export at ~350 M returns).
+  std::unordered_map<float, gtsam::Pose3> corrections;
+  corrections.reserve(4096);
+  output.clear();
+  output.reserve(frame.count);
+  for (std::size_t i = 0; i < frame.count; ++i)
+  {
+    const float *v = &packed[5 * i];
+    if (save_map_max_range > 0.0 && Eigen::Vector3f(v[0], v[1], v[2]).norm() > save_map_max_range) continue;
+    double point_stamp = frame.begin + v[4] / 1000.0;
+    if (!std::isfinite(point_stamp) || point_stamp < frame.begin - 1e-3 || point_stamp > frame.stamp + 1e-3)
+      throw std::runtime_error("Archived LiDAR point timestamp is outside its submitted frame interval");
+    point_stamp = std::max(frame.begin, std::min(frame.stamp, point_stamp));
+    auto found = corrections.find(v[4]);
+    if (found == corrections.end()) found = corrections.emplace(v[4], correctionAt(point_stamp)).first;
+    const V3D native = native_rotation * V3D(v[0], v[1], v[2]) + native_translation;
+    const V3D p = found->second.transformFrom(native);
+    pcl::PointXYZI result;
+    result.x = p.x(); result.y = p.y(); result.z = p.z(); result.intensity = v[3];
+    output.push_back(result);
+  }
 }
 
 void RtkFusion::exportMap()
@@ -2406,10 +2547,11 @@ void RtkFusion::exportMap()
     // is written as a separate product (rgb_map_*.pcd); the complete geometry
     // map (map_*.pcd) is exported with it unless export_map_chunks is false.
     if (color_enabled) color_archive.flush();
+    // Both products: scans are transformed in parallel batches and consumed in frame order, so every row,
+    // tie-break and chunk boundary is the one of the former sequential loop (export 90 s -> ~15 s at 8.7k scans).
+    const std::size_t export_batch = 128;
     if (color_enabled && export_map_chunks)
     {
-      std::ifstream input(directory / "colors.bin", std::ios::binary);
-      input.exceptions(std::ios::failbit | std::ios::badbit);
       // Every frame recolors the surfaces inside its frustum, so the archive holds
       // many color instances of the same physical spot. Instances taken while the
       // camera swept fast (close pass, turning: motion blur + residual time skew)
@@ -2418,58 +2560,84 @@ void RtkFusion::exportMap()
       // only the instance with the slowest image-plane motion (rad/s + lateral
       // translation rate over range as a pixel-rate proxy).
       struct ScoredRGB { PointTypeRGB point; float score; };
+      struct Candidate { std::uint64_t key; ScoredRGB value; };
       std::unordered_map<std::uint64_t, ScoredRGB> best;
       best.reserve(1 << 22);
-      for (std::size_t fi = 0; fi < frames.size(); ++fi)
+      std::vector<std::vector<Candidate>> scored(export_batch);
+      for (std::size_t first = 0; first < frames.size(); first += export_batch)
       {
-        const Frame &metadata = frames[fi];
-        if (metadata.color_count == 0) continue;
-        Frame frame = metadata;
-        auto cloud = std::make_shared<PointCloudXYZRGB>();
-        cloud->resize(frame.color_count);
-        std::vector<float> packed(static_cast<std::size_t>(frame.color_count) * 6);
-        input.seekg(frame.color_offset);
-        input.read(reinterpret_cast<char *>(packed.data()), packed.size() * sizeof(float));
-        for (std::size_t i = 0; i < frame.color_count; ++i)
+        const std::size_t count = std::min(export_batch, frames.size() - first);
+        std::exception_ptr error;
+#pragma omp parallel
         {
-          PointTypeRGB &point = cloud->points[i];
-          point.x = packed[6 * i]; point.y = packed[6 * i + 1]; point.z = packed[6 * i + 2];
-          point.r = static_cast<std::uint8_t>(packed[6 * i + 3]);
-          point.g = static_cast<std::uint8_t>(packed[6 * i + 4]);
-          point.b = static_cast<std::uint8_t>(packed[6 * i + 5]);
+          std::ifstream input(directory / "colors.bin", std::ios::binary);
+          std::vector<float> packed;
+#pragma omp for schedule(dynamic, 4)
+          for (int n = 0; n < static_cast<int>(count); ++n)
+          {
+            const std::size_t fi = first + static_cast<std::size_t>(n);
+            auto &out = scored[n];
+            out.clear();
+            try
+            {
+              const Frame &frame = frames[fi];
+              if (frame.color_count == 0) continue;
+              packed.resize(static_cast<std::size_t>(frame.color_count) * 6);
+              input.seekg(static_cast<std::streamoff>(frame.color_offset));
+              input.read(reinterpret_cast<char *>(packed.data()), static_cast<std::streamsize>(packed.size() * sizeof(float)));
+              if (!input) throw std::runtime_error("Cannot read the colour archive for the map export");
+              double omega = 0.0;
+              if (fi + 1 < frames.size())
+              {
+                const double dt = std::max(frames[fi + 1].stamp - frames[fi].stamp, 1e-3);
+                const auto delta = frames[fi].raw.between(frames[fi + 1].raw);
+                omega = gtsam::Rot3::Logmap(delta.rotation()).norm() / dt;
+              }
+              const auto correction = correctionAt(frame.stamp);
+              const V3D origin = frame.raw.transformFrom(lidar_translation);
+              out.reserve(frame.color_count);
+              for (std::size_t i = 0; i < frame.color_count; ++i)
+              {
+                PointTypeRGB point;
+                point.x = packed[6 * i]; point.y = packed[6 * i + 1]; point.z = packed[6 * i + 2];
+                point.r = static_cast<std::uint8_t>(packed[6 * i + 3]);
+                point.g = static_cast<std::uint8_t>(packed[6 * i + 4]);
+                point.b = static_cast<std::uint8_t>(packed[6 * i + 5]);
+                const V3D native(point.x, point.y, point.z);
+                const double range = (native - origin).norm();
+                if (save_rgb_max_range > 0.0 && range > save_rgb_max_range) continue;
+                // One colour per 3 cm voxel: the NEAREST observation wins. The pixel footprint grows
+                // linearly with range, while the metric colour displacement from a residual camera time
+                // error (speed * dt) does not shrink with range, so far observations only lose detail.
+                // Fast rotation is penalised (20 m per rad/s): its time sensitivity scales with omega*range.
+                const float score = static_cast<float>(range + 20.0 * omega);
+                const V3D p = correction.transformFrom(native);
+                PointTypeRGB result = point;
+                result.x = static_cast<float>(p.x());
+                result.y = static_cast<float>(p.y());
+                result.z = static_cast<float>(p.z());
+                const auto cell = [](double v) {
+                  return static_cast<std::uint64_t>(static_cast<std::int64_t>(std::floor(v / 0.03)) & 0x1FFFFF);
+                };
+                out.push_back({(cell(p.x()) << 42) | (cell(p.y()) << 21) | cell(p.z()), {result, score}});
+              }
+            }
+            catch (...)
+            {
+#pragma omp critical(rgb_export_error)
+              if (!error) error = std::current_exception();
+            }
+          }
         }
-        double omega = 0.0;
-        if (fi + 1 < frames.size())
-        {
-          const double dt = std::max(frames[fi + 1].stamp - frames[fi].stamp, 1e-3);
-          const auto delta = frames[fi].raw.between(frames[fi + 1].raw);
-          omega = gtsam::Rot3::Logmap(delta.rotation()).norm() / dt;
-        }
-        const auto correction = correctionAt(frame.stamp);
-        const V3D origin = frame.raw.transformFrom(lidar_translation);
-        for (const PointTypeRGB &point : *cloud)
-        {
-          const V3D native(point.x, point.y, point.z);
-          const double range = (native - origin).norm();
-          if (save_rgb_max_range > 0.0 && range > save_rgb_max_range) continue;
-          // One colour per 3 cm voxel: the NEAREST observation wins. The pixel footprint grows
-          // linearly with range, while the metric colour displacement from a residual camera time
-          // error (speed * dt) does not shrink with range, so far observations only lose detail.
-          // Fast rotation is penalised (20 m per rad/s): its time sensitivity scales with omega*range.
-          const float score = static_cast<float>(range + 20.0 * omega);
-          const V3D p = correction.transformFrom(native);
-          PointTypeRGB out = point;
-          out.x = static_cast<float>(p.x());
-          out.y = static_cast<float>(p.y());
-          out.z = static_cast<float>(p.z());
-          const auto cell = [](double v) {
-            return static_cast<std::uint64_t>(static_cast<std::int64_t>(std::floor(v / 0.03)) & 0x1FFFFF);
-          };
-          const std::uint64_t key = (cell(p.x()) << 42) | (cell(p.y()) << 21) | cell(p.z());
-          const auto it = best.find(key);
-          if (it == best.end() || score < it->second.score) best[key] = {out, score};
-        }
+        if (error) std::rethrow_exception(error);
+        for (std::size_t n = 0; n < count; ++n)
+          for (const auto &candidate : scored[n])
+          {
+            const auto it = best.find(candidate.key);
+            if (it == best.end() || candidate.value.score < it->second.score) best[candidate.key] = candidate.value;
+          }
       }
+      scored.clear();
       PointCloudXYZRGB chunk;
       for (const auto &entry : best)
       {
@@ -2492,46 +2660,82 @@ void RtkFusion::exportMap()
     }
     if (export_map_chunks)
     {
-      std::ifstream input(directory / "scans.bin", std::ios::binary);
-      input.exceptions(std::ios::failbit | std::ios::badbit);
+      // RViz subscribed: also publish a 0.25 m voxel map of the delivered cloud (every 16th row) on /rtk/map_final.
+      const bool display = rclcpp::ok() && final_map_publisher->get_subscription_count() > 0;
+      std::unordered_map<std::uint64_t, std::array<float, 5>> display_cells;
       pcl::PointCloud<pcl::PointXYZI> chunk;
-      for (const Frame &metadata : frames)
-      {
-        Frame frame = metadata;
-        auto cloud = std::make_shared<PointCloudXYZI>();
-        cloud->resize(frame.count);
-        std::vector<float> packed(static_cast<std::size_t>(frame.count) * 5);
-        input.seekg(frame.offset);
-        input.read(reinterpret_cast<char *>(packed.data()), packed.size() * sizeof(float));
-        for (std::size_t i = 0; i < frame.count; ++i)
-        {
-          PointType &point = cloud->points[i];
-          point.x = packed[5 * i]; point.y = packed[5 * i + 1]; point.z = packed[5 * i + 2];
-          point.intensity = packed[5 * i + 3]; point.curvature = packed[5 * i + 4];
-        }
-        if (save_map_max_range > 0.0)
-        {
-          auto kept = std::make_shared<PointCloudXYZI>();
-          kept->reserve(cloud->size());
-          for (const PointType &point : cloud->points)
-            if (point.getVector3fMap().norm() <= save_map_max_range) kept->push_back(point);
-          cloud = kept;
-        }
-        frame.cloud = cloud;
-        appendCloud(frame, chunk);
-        if (chunk.size() >= static_cast<std::size_t>(export_chunk_points))
-        {
-          const auto file = directory / ("map_" + std::to_string(chunk_index++) + ".pcd");
-          if (pcl::io::savePCDFileBinary(file.string(), chunk) != 0)
+      std::future<void> writing;  // the previous chunk is written while the next batch is transformed
+      const auto write = [&](pcl::PointCloud<pcl::PointXYZI> &&cloud) {
+        if (writing.valid()) writing.get();
+        const auto file = directory / ("map_" + std::to_string(chunk_index++) + ".pcd");
+        writing = std::async(std::launch::async, [file, cloud = std::move(cloud)]() {
+          if (pcl::io::savePCDFileBinary(file.string(), cloud) != 0)
             throw std::runtime_error("Cannot write optimized point cloud " + file.string());
-          chunk.clear();
+        });
+      };
+      std::vector<pcl::PointCloud<pcl::PointXYZI>> outputs(export_batch);
+      for (std::size_t first = 0; first < frames.size(); first += export_batch)
+      {
+        const std::size_t count = std::min(export_batch, frames.size() - first);
+        std::exception_ptr error;
+#pragma omp parallel
+        {
+          std::ifstream input(directory / "scans.bin", std::ios::binary);
+          std::vector<float> packed;
+#pragma omp for schedule(dynamic, 4)
+          for (int n = 0; n < static_cast<int>(count); ++n)
+          {
+            try
+            {
+              exportFrame(frames[first + static_cast<std::size_t>(n)], input, packed, outputs[n]);
+            }
+            catch (...)
+            {
+#pragma omp critical(map_export_error)
+              if (!error) error = std::current_exception();
+            }
+          }
+        }
+        if (error) std::rethrow_exception(error);
+        for (std::size_t n = 0; n < count; ++n)
+        {
+          if (display)
+            for (std::size_t i = 0; i < outputs[n].size(); i += 16)
+            {
+              const auto &q = outputs[n].points[i];
+              const auto cell = [](float v) {
+                return static_cast<std::uint64_t>(static_cast<std::int64_t>(std::floor(v / 0.25f)) & 0x1FFFFF);
+              };
+              auto &sum = display_cells[(cell(q.x) << 42) | (cell(q.y) << 21) | cell(q.z)];
+              sum[0] += q.x; sum[1] += q.y; sum[2] += q.z; sum[3] += q.intensity; sum[4] += 1;
+            }
+          chunk.insert(chunk.end(), outputs[n].begin(), outputs[n].end());
+          if (chunk.size() >= static_cast<std::size_t>(export_chunk_points))
+          {
+            write(std::move(chunk));
+            chunk = pcl::PointCloud<pcl::PointXYZI>();
+          }
         }
       }
-      if (!chunk.empty())
+      if (!chunk.empty()) write(std::move(chunk));
+      if (writing.valid()) writing.get();
+      if (display && !display_cells.empty())
       {
-        const auto file = directory / ("map_" + std::to_string(chunk_index) + ".pcd");
-        if (pcl::io::savePCDFileBinary(file.string(), chunk) != 0)
-          throw std::runtime_error("Cannot write optimized point cloud " + file.string());
+        pcl::PointCloud<pcl::PointXYZI> cloud;
+        cloud.reserve(display_cells.size());
+        for (const auto &entry : display_cells)
+        {
+          const auto &sum = entry.second;
+          pcl::PointXYZI q;
+          q.x = sum[0] / sum[4]; q.y = sum[1] / sum[4]; q.z = sum[2] / sum[4]; q.intensity = sum[3] / sum[4];
+          cloud.push_back(q);
+        }
+        sensor_msgs::PointCloud2 message;
+        pcl::toROSMsg(cloud, message);
+        message.header.frame_id = graph_in_enu ? "mine" : "lio_local";
+        message.header.stamp = stampFromSec(frames.back().stamp);
+        final_map_publisher->publish(message);
+        RCLCPP_INFO(node->get_logger(), "RViz: final map published on /rtk/map_final (%zu cells of 0.25 m)", cloud.size());
       }
     }
   }

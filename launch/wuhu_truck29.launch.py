@@ -17,7 +17,9 @@ def launch_rviz(context, config, current_cloud):
         with open(config, encoding="utf-8") as stream:
             settings = yaml.safe_load(stream)
         for display in settings["Visualization Manager"]["Displays"]:
-            if display.get("Class") == "rviz_default_plugins/PointCloud2":
+            # /rtk/map_final is the intensity (XYZI) voxel map in both modes.
+            if (display.get("Class") == "rviz_default_plugins/PointCloud2" and
+                    display.get("Topic", {}).get("Value") != "/rtk/map_final"):
                 display["Color Transformer"] = "RGB8"
                 display["Channel Name"] = "rgb"
         output = os.path.realpath(LaunchConfiguration("output_directory").perform(context))

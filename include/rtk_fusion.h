@@ -237,8 +237,18 @@ struct RtkFusion
   {
     std::size_t a = 0, b = 0;
     gtsam::NonlinearFactor::shared_ptr factor;
+    std::size_t display = 0;  // index into loop_display
   };
   std::vector<LoopFactorRecord> collectLoopClosures();
+  // RViz /rtk/graph: every registered revisit pair of the final loop closure. state 0 = kept in the final
+  // solve, 1 = rejected by registration (loops.csv reason), 2 = accepted but dropped by the RTK bound.
+  struct LoopDisplay
+  {
+    std::size_t a = 0, b = 0;
+    int state = 1;
+  };
+  std::vector<LoopDisplay> loop_display;
+  bool finalized = false;
   std::size_t last_relinearized = 0, last_reeliminated = 0, last_cliques = 0;
   gtsam::ISAM2Params solverParameters() const;
   void indexAnchor(std::size_t i);
@@ -304,6 +314,15 @@ struct RtkFusion
   rclcpp::Publisher<nav_msgs::Path>::SharedPtr path_publisher;
   rclcpp::Publisher<nav_msgs::Odometry>::SharedPtr odom_publisher;
   rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr map_publisher, current_publisher;
+  // /rtk/graph (MarkerArray, transient local): keyframes coloured by RTK residual, online revisit links,
+  // final loop closures and a status text. /rtk/map_final: 0.25 m voxel map of the delivered cloud,
+  // published once by the map export when RViz is subscribed.
+  rclcpp::Publisher<visualization_msgs::MarkerArray>::SharedPtr graph_publisher;
+  rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr final_map_publisher;
+  void publishGraph(double latest_error, double max_error);
+  // One archived scan -> delivered points (map_N.pcd rows), identical to appendCloud on the range-capped scan.
+  void exportFrame(const Frame &frame, std::ifstream &input, std::vector<float> &packed,
+                   pcl::PointCloud<pcl::PointXYZI> &output) const;
 
   RtkFusion(const rclcpp::Node::SharedPtr &node_in, const M3D &rotation,
             const V3D &translation, const V3D &reference_lever,

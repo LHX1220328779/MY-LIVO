@@ -150,6 +150,57 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /rtk/path
       Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: RTK Graph (keyframes by RTK residual, revisits, loop closures)
+      Namespaces:
+        keyframes: true
+        loop_closures: true
+        loops_rejected: false
+        loops_rtk_dropped: true
+        revisit_links: true
+        status: true
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /rtk/graph
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: false
+      Autocompute Value Bounds:
+        Max Value: 10
+        Min Value: -10
+        Value: true
+      Axis: Z
+      Channel Name: intensity
+      Class: rviz_default_plugins/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: AxisColor
+      Decay Time: 0
+      Enabled: true
+      Invert Rainbow: false
+      Max Color: 255; 255; 255
+      Max Intensity: 120
+      Min Color: 40; 40; 40
+      Min Intensity: 0
+      Name: Optimized Final Map (0.25 m, at finish, height colour)
+      Position Transformer: XYZ
+      Selectable: false
+      Size (Pixels): 2
+      Size (m): 0.009999999776482582
+      Style: Points
+      Topic:
+        Depth: 1
+        Durability Policy: Transient Local
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /rtk/map_final
+      Use Fixed Frame: true
+      Use rainbow: false
+      Value: true
     - Angle Tolerance: 0.10000000149011612
       Class: rviz_default_plugins/Odometry
       Covariance:
@@ -328,11 +379,11 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Scale: 8.593348503112793
-      Target Frame: <Fixed Frame>
+      Scale: 5
+      Target Frame: aft_mapped
       Value: TopDownOrtho (rviz_default_plugins)
-      X: 160.84104919433594
-      Y: -450.8837585449219
+      X: 0
+      Y: 0
     Saved: ~
 Window Geometry:
   Displays:

@@ -329,11 +329,41 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"error": f"unknown path {path}"})
 
 
+def run_as_repo_owner():
+    """Started as root (the docker exec default): hand root-owned outputs back to the repository owner and drop to
+    that account, so rounds, calibration versions, exports and job logs created from the console stay editable and
+    removable by the operator on the host (2026-10-19: 2.8k root-owned files under results/ and config/carlibration/)."""
+    owner = REPO.stat()
+    if os.geteuid() != 0 or owner.st_uid == 0:
+        return
+    handed = 0
+    for top in (RESULTS, CAL_ROOT):
+        for dirpath, dirnames, filenames in os.walk(top):
+            for path in [dirpath, *(os.path.join(dirpath, n) for n in dirnames + filenames)]:
+                try:
+                    if os.lstat(path).st_uid == 0:
+                        os.lchown(path, owner.st_uid, owner.st_gid)
+                        handed += 1
+                except OSError:
+                    pass
+    os.setgroups([])
+    os.setgid(owner.st_gid)
+    os.setuid(owner.st_uid)
+    try:
+        import pwd
+        entry = pwd.getpwuid(owner.st_uid)
+        os.environ.update(HOME=entry.pw_dir, USER=entry.pw_name, LOGNAME=entry.pw_name)
+    except KeyError:
+        os.environ["HOME"] = str(STUDIO_DIR)
+    print(f"running as uid {owner.st_uid} (repository owner); {handed} root-owned file(s) handed over", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=8765)
     a = ap.parse_args()
+    run_as_repo_owner()
     CAL_ROOT.mkdir(parents=True, exist_ok=True)
     STUDIO_DIR.mkdir(parents=True, exist_ok=True)
     common.save_state(load_state())  # normalise/migrate persisted settings

@@ -1595,10 +1595,13 @@ def compare_map(directory, frame_stride, point_stride, reference, lever):
         if not len(previous):
             continue
         distance = np.linalg.norm(seed_p[previous] - seed_p[b], axis=1)
-        nearest = np.argmin(abs(distance - 30))
-        if abs(distance[nearest] - 30) > 10:
+        # Rotate over every earlier scan 20..40 m away. Picking the one closest
+        # to 30 m made all scans of a parked stretch share a single approach
+        # scan, so the score swung 4.5..12.2% on one map with the subsample phase.
+        within = np.flatnonzero(abs(distance - 30) <= 10)
+        if not len(within):
             continue
-        a = previous[nearest]
+        a = previous[within[pair_count % len(within)]]
         ca_world, na_world = cache[a][0]; cb_world, nb_world = cache[b][0]
         ca = raw_r[a].inv().apply(ca_world - raw[a, 1:4])
         cb = raw_r[b].inv().apply(cb_world - raw[b, 1:4])

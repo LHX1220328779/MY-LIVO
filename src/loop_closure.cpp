@@ -25,9 +25,10 @@ struct Submap
 
 // Scans within +-half path of the anchor scan, at least scan_spacing apart, expressed in the anchor's IMU frame
 // with the DELIVERED poses (the geometry the loop factors must make consistent), voxel-averaged.
+// Only the registration target needs the KD-tree and the plane normals.
 bool buildSubmap(const LoopClosureConfig &config, std::ifstream &archive, const Eigen::Matrix3d &lidar_rotation,
                  const Eigen::Vector3d &lidar_translation, const std::vector<LoopScanRef> &scans,
-                 const std::vector<gtsam::Pose3> &delivered, std::size_t anchor, Submap &out)
+                 const std::vector<gtsam::Pose3> &delivered, std::size_t anchor, Submap &out, bool target)
 {
   const gtsam::Pose3 anchor_inverse = delivered[anchor].inverse();
   std::vector<std::size_t> chosen{anchor};
@@ -82,6 +83,7 @@ bool buildSubmap(const LoopClosureConfig &config, std::ifstream &archive, const 
     out.cloud->push_back(pcl::PointXYZ(static_cast<float>(c.x()), static_cast<float>(c.y()), static_cast<float>(c.z())));
   }
   if (out.cloud->size() < 500) return false;
+  if (!target) return true;
   out.tree.setInputCloud(out.cloud);
   out.normals.assign(out.cloud->size(), Eigen::Vector3f::Zero());
   std::vector<int> ids;
@@ -120,6 +122,14 @@ void registerPair(const LoopClosureConfig &config, const Submap &target, const S
   std::vector<int> ids(1);
   std::vector<float> d2(1);
   const double huber = 2.0 * config.point_sigma;
+  // Source returns that can still reach a target return within the current gate. The nearest-neighbour
+  // queries dominate the loop closure (up to 40 iterations over every source return); returns farther than
+  // gate + kActiveMargin from any target at the start of a gate stage cannot become correspondences unless the
+  // stage moves them by more than the margin (> the loop_max_correction_m / _deg acceptance). The first and
+  // the final evaluation (rms, information, overlap) still use every source return.
+  constexpr double kActiveMargin = 0.25;
+  std::vector<int> active;
+  bool use_active = false;
   auto evaluate = [&](const gtsam::Pose3 &pose, double gate, Eigen::Matrix<double, 6, 6> *H, Eigen::Matrix<double, 6, 1> *g,
                       double &rms, int &inliers) {
     const Eigen::Matrix3d R = pose.rotation().matrix();
@@ -127,8 +137,10 @@ void registerPair(const LoopClosureConfig &config, const Submap &target, const S
     double sum_w = 0, sum_wr2 = 0;
     inliers = 0;
     if (H) { H->setZero(); g->setZero(); }
-    for (const auto &point : source.cloud->points)
+    const std::size_t count = use_active ? active.size() : source.cloud->size();
+    for (std::size_t k = 0; k < count; ++k)
     {
+      const auto &point = source.cloud->points[use_active ? static_cast<std::size_t>(active[k]) : k];
       const Eigen::Vector3d s = point.getVector3fMap().cast<double>();
       const Eigen::Vector3d q = R * s + t;
       pcl::PointXYZ qp(static_cast<float>(q.x()), static_cast<float>(q.y()), static_cast<float>(q.z()));
@@ -159,7 +171,25 @@ void registerPair(const LoopClosureConfig &config, const Submap &target, const S
   pair.rms_before = rms;
   Eigen::Matrix<double, 6, 6> H;
   Eigen::Matrix<double, 6, 1> g;
+  const auto select = [&](const gtsam::Pose3 &pose, double radius) {
+    const Eigen::Matrix3f R = pose.rotation().matrix().cast<float>();
+    const Eigen::Vector3f t = pose.translation().cast<float>();
+    std::vector<int> kept;
+    const std::size_t count = use_active ? active.size() : source.cloud->size();
+    kept.reserve(count);
+    for (std::size_t k = 0; k < count; ++k)
+    {
+      const int index = use_active ? active[k] : static_cast<int>(k);
+      pcl::PointXYZ q;
+      q.getVector3fMap() = R * source.cloud->points[index].getVector3fMap() + t;
+      if (target.tree.nearestKSearch(q, 1, ids, d2) >= 1 && d2[0] <= radius * radius) kept.push_back(index);
+    }
+    active.swap(kept);
+    use_active = true;
+  };
   for (double gate : {1.0, 0.5, 0.3, 0.2})
+  {
+    select(T, gate + kActiveMargin);
     for (int iteration = 0; iteration < 10; ++iteration)
     {
       evaluate(T, gate, &H, &g, rms, inliers);
@@ -169,6 +199,8 @@ void registerPair(const LoopClosureConfig &config, const Submap &target, const S
       T = T * gtsam::Pose3::Expmap(step);
       if (step.head<3>().norm() < 1e-5 && step.tail<3>().norm() < 1e-4) break;
     }
+  }
+  use_active = false;
   evaluate(T, 0.2, &H, &g, rms, inliers);
   pair.measured = T;
   pair.rms_after = rms;
@@ -262,9 +294,9 @@ std::vector<LoopPair> registerLoopPairs(
     std::ifstream archive(archive_path, std::ios::binary);
     Submap target, source;
     if (!archive || !buildSubmap(config, archive, lidar_rotation, lidar_translation, scans, delivered,
-                                 keyframe_scan[pair.a], target) ||
+                                 keyframe_scan[pair.a], target, true) ||
         !buildSubmap(config, archive, lidar_rotation, lidar_translation, scans, delivered,
-                     keyframe_scan[pair.b], source))
+                     keyframe_scan[pair.b], source, false))
     {
       pair.reason = "submap unavailable";
       continue;

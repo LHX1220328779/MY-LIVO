@@ -345,6 +345,13 @@ function pageHome() {
     <div class="card"><div class="card-h"><h2>最近任务</h2><a data-act="go" data-page="system">历史</a></div>${jobsTable(S.jobs.slice(0, 6))}</div>
   </div>`;
 }
+function loopsKv(l) {
+  const x = l.loops;
+  const off = [].concat(l.record?.overrides || []).join(" ").includes("rtk.loop_closure_enabled=false");
+  if (!x) return off ? `<div class="k">回环</div><div class="muted">已关闭</div>` : "";
+  const rej = Object.entries(x.rejected || {}).map(([k, n]) => `${esc(k)} ${n}`).join("，");
+  return `<div class="k">回环</div><div>${x.pairs} 对回访候选 · 配准接受 ${x.accepted}${x.rtk_dropped ? ` · RTK 约束剔除 ${x.rtk_dropped}` : ""} · <b>最终保留 ${x.kept}</b>${x.correction_median_m != null ? ` · 修正中位 ${(x.correction_median_m * 100).toFixed(1)} cm` : ""}${rej ? `<div class="small muted">未接受：${rej}</div>` : ""}</div>`;
+}
 function toggle(key, label, on, section = "mapping") {
   return `<label class="check"><input type="checkbox" data-act="toggle" data-section="${section}" data-key="${key}" ${on ? "checked" : ""}><span class="switch"></span><span>${label}</span></label>`;
 }
@@ -660,7 +667,7 @@ function pageMap() {
       <div class="field wide"><label>额外参数覆盖（空格分隔 key=value，例如 vio.img_point_cov=100 time_offset.img_time_offset=-0.115）</label><input type="text" class="mono" data-act="field" data-section="mapping" data-key="extra_sets" value="${esc(m.extra_sets || "")}"></div>
     </div>
     <div class="small muted" style="margin-top:10px">截取距离仅控制导出的 PCD 范围，0 表示不限距离。几何和彩色点云可分别设置；彩色点云只在 LIVO 模式生成，在 LIO 模式下也可以预先设置。</div>
-    <div class="row" style="margin-top:14px;gap:22px">${toggle("use_rtk", "RTK / INS 融合", m.use_rtk)}${toggle("save_map", "保存地图 (PCD/扫描存档)", m.save_map)}${toggle("rviz", "RViz", m.rviz)}${toggle("precheck", "起步静止外参自检", m.precheck)}${toggle("evaluate", "自动评估", m.evaluate)}${toggle("skip_stationary", "长时间静止跳过（仅 LIO）", m.skip_stationary)}${toggle("map_export", "导出标准地图", m.map_export !== false)}${toggle("map_keyframes", "导出关键帧点云", m.map_keyframes)}${toggle("auto_cleanup", "磁盘不足时自动精简旧轮次", m.auto_cleanup !== false)}</div>
+    <div class="row" style="margin-top:14px;gap:22px">${toggle("use_rtk", "RTK / INS 融合", m.use_rtk)}${toggle("save_map", "保存地图 (PCD/扫描存档)", m.save_map)}${toggle("rviz", "RViz", m.rviz)}${toggle("precheck", "起步静止外参自检", m.precheck)}${toggle("evaluate", "自动评估", m.evaluate)}${toggle("skip_stationary", "长时间静止跳过（仅 LIO）", m.skip_stationary)}${toggle("loop_closure", "回环检测（收尾，需保存地图）", m.loop_closure !== false)}${toggle("map_export", "导出标准地图", m.map_export !== false)}${toggle("map_keyframes", "导出关键帧点云", m.map_keyframes)}${toggle("auto_cleanup", "磁盘不足时自动精简旧轮次", m.auto_cleanup !== false)}</div>
     <div class="row" style="margin-top:8px;gap:10px"><label class="small">自动精简阈值：可用空间低于 <input type="number" min="15" step="5" style="width:70px" data-act="field" data-section="mapping" data-key="auto_cleanup_free_gb" value="${esc(m.auto_cleanup_free_gb ?? 50)}" ${m.auto_cleanup !== false ? "" : "disabled"}> GB 时，开跑前按时间从旧到新精简未保护的历史轮次（见 系统 › 磁盘与历史数据）</label></div>
     <div class="small muted" style="margin-top:6px">地图产品（保存地图时生成，<code>Log/fusion/&lt;运行&gt;/map/</code>）：<b>global_map.pcd</b> 体素滤波整图（全部扫描或仅关键帧）、LIVO 另有 <b>global_map_rgb.pcd</b>；可选分块 tiles/ 与关键帧点云 keyframes/（机体系点云 + poses.txt）；<b>map_info.json</b> 记录坐标系、体素、范围、点数与输入。原始时间序分块 map_N.pcd（评估用）与扫描存档始终保留，可在结果页按其他体素/来源重新导出而无需重新建图。</div>
     <div class="small muted" style="margin-top:6px">长时间静止跳过（仅 LIO）：起步后的长静止段（停车等待）只快进中段——前 3 s 与重新起步前 5 s 照常回放，快进期间 IMU/INS 全量连续、激光按间隔抽稀；状态估计与 RTK/INS 关联保持连续，地图不重复累积静止帧。LIVO 轮次忽略此选项、照常回放（相机硬解码输出有延迟，快进后视觉更新会中断）。</div>
@@ -864,7 +871,7 @@ function drawerRun() {
   return `<div class="drawer-h"><div><h2>${esc(r.round)} <span class="badge">${esc(modeLabel(r))}</span></h2><div class="small muted">${fmtT(r.start)} → ${fmtT(r.end)} · ${esc(r.status)}${r.phase ? ` / ${esc(r.phase)}` : ""} · 提交 ${esc(r.commit || "")}</div></div>
     <div class="row"><button class="btn" data-act="evaluate" data-round="${esc(r.round)}" ${r.status === "running" ? "disabled" : ""}>${l.evaluated ? "重新评估" : "运行评估"}</button><button class="btn sm" data-act="close">关闭</button></div></div>
     ${r.error ? `<div class="callout bad">${esc(r.error)}</div>` : ""}
-    <div class="kv small" style="margin:10px 0"><div class="k">数据源</div><div class="mono">${esc(r.dataset)}</div><div class="k">标定</div><div class="mono">${esc(r.calibration || "config yaml 内置")}</div><div class="k">参数</div><div class="mono">${esc(JSON.stringify(r.options || {}))} ${esc(Array.isArray(r.overrides) ? r.overrides.join(" ") : r.overrides || "")}</div><div class="k">fusion</div><div class="mono">${esc(l.fusion_dir || "")}</div><div class="k">地图</div><div>${l.map_chunks ?? 0} 块 · ${l.map_size_mb ?? 0} MB${l.rgb_map_chunks ? ` · RGB ${l.rgb_map_chunks} 块` : ""}</div></div>
+    <div class="kv small" style="margin:10px 0"><div class="k">数据源</div><div class="mono">${esc(r.dataset)}</div><div class="k">标定</div><div class="mono">${esc(r.calibration || "config yaml 内置")}</div><div class="k">参数</div><div class="mono">${esc(JSON.stringify(r.options || {}))} ${esc(Array.isArray(r.overrides) ? r.overrides.join(" ") : r.overrides || "")}</div><div class="k">fusion</div><div class="mono">${esc(l.fusion_dir || "")}</div><div class="k">地图</div><div>${l.map_chunks ?? 0} 块 · ${l.map_size_mb ?? 0} MB${l.rgb_map_chunks ? ` · RGB ${l.rgb_map_chunks} 块` : ""}</div>${loopsKv(l)}</div>
     ${metricsPanel(l)}
     <div class="grid g2" style="margin:12px 0"><div><h4>前端 RTK 残差 (m)</h4>${chart(l.diagnostics, "frontend_rtk_residual_m", "#0071e3", 0.1)}</div><div><h4>${l.record?.options?.use_rtk === false ? `在线轨迹 vs INS (m)　<span class="small muted">无 RTK/INS 融合</span>` : `优化后轨迹 vs RTK (m)　<span class="small muted">虚线：在线轨迹 vs INS</span>`}</h4>${trajectoryChart(l, l.record?.options?.use_rtk === false)}</div></div>
     ${mapProductsPanel(r, l)}

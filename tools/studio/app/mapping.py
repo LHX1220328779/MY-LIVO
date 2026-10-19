@@ -75,7 +75,7 @@ def map_products(fusion):
 PLAYER_RE = re.compile(r"\[player\] t=([\d.]+)/([\d.]+) s (\d+)% msgs=(\d+) lag=(-?\d+) ms")
 EVENT_KEYS = ("Extrinsic precheck", "[WARN]", "[ERROR]", "[FATAL]", "RTK finalized", "Final keyframe",
               "INS attitude factors", "Loaded", "Time offsets", "Camera model", "IMU Initials",
-              "Merged Multi-LiDAR", "process has died", "Exported", "map_")
+              "Merged Multi-LiDAR", "process has died", "Exported", "map_", "Loop closure", "Released")
 _EVENT_CACHE = {}
 
 
@@ -114,6 +114,9 @@ def round_cmd(round_name, mode, calibration_file, body, *, force_save_map=False,
         if not (smin >= 10 and 0.2 <= slidar <= 5):
             raise StudioError("静止跳过：最短静止时长 >= 10 s，快进期激光间隔 0.2–5 s")
         cmd += ["--stationary-min", f"{smin:g}", "--stationary-lidar-interval", f"{slidar:g}"]
+    if body.get("loop_closure", True) is False:
+        # finalize-time submap loop closure over revisited sections (on by default)
+        cmd += ["--set", "rtk.loop_closure_enabled=false"]
     if body.get("save_map", True) or force_save_map:
         voxel, source, tile, kf, min_points = _map_export_args(body, "map_")
         if body.get("map_export", True) is False:
@@ -247,6 +250,7 @@ def start(body):
             "options": {k: body.get(k) for k in ("use_rtk", "save_map", "rviz", "rate", "precheck", "frame_divider",
                                                   "evaluate", "extra_sets", "start_offset", "duration", "map_range", "rgb_range",
                                                   "skip_stationary", "stationary_min", "stationary_lidar_interval",
+                                                  "loop_closure",
                                                   "map_export", "map_voxel", "map_source", "map_tile", "map_keyframes")}}
     title = f"{'LIVO' if mode == 'livo' else 'LIO'} 建图 · {round_name}"
     return jobs.start("mapping", title, [{"title": title, "cmd": cmd}], meta=meta)
@@ -336,6 +340,25 @@ def round_record(p, budget=None):
             "metrics_complete": complete, "evaluation_error": bool(evaluated and not complete),
             "precheck": (p / "Log" / "extrinsic_precheck.json").exists(),
             "mtime": dt.datetime.fromtimestamp(p.stat().st_mtime).isoformat(timespec="seconds")}
+
+
+def loop_summary(fusion_dir):
+    """Finalize-time loop closure of a round from loops.csv (+ loops_rtk_bound.csv); None when it did not run."""
+    hdr, rows = csv_rows(fusion_dir / "loops.csv", max_points=100_000)
+    col = {n: i for i, n in enumerate(hdr)}
+    if not {"accepted", "reason", "correction_m"} <= col.keys():
+        return None
+    rows = [r for r in rows if len(r) == len(hdr)]
+    accepted = [r for r in rows if r[col["accepted"]] == "1"]
+    _, dropped = csv_rows(fusion_dir / "loops_rtk_bound.csv", max_points=100_000)
+    rejected = {}
+    for r in rows:
+        if r[col["accepted"]] != "1":
+            rejected[r[col["reason"]]] = rejected.get(r[col["reason"]], 0) + 1
+    moves = sorted(float(r[col["correction_m"]]) for r in accepted)
+    return {"pairs": len(rows), "accepted": len(accepted), "rtk_dropped": len(dropped),
+            "kept": len(accepted) - len(dropped), "correction_median_m": moves[len(moves) // 2] if moves else None,
+            "rejected": dict(sorted(rejected.items(), key=lambda kv: -kv[1]))}
 
 
 def list_runs(limit=100):
@@ -436,8 +459,11 @@ def live(round_name):
             out["online_series"] = online
         maps = sorted(f.glob("map_*.pcd"))
         out["map_chunks"] = len(maps)
+        out["map_size_mb"] = round(sum(m.stat().st_size for m in maps) / 1e6, 1)
+        out["rgb_map_chunks"] = len(list(f.glob("rgb_map_*.pcd")))
         out["map_products"] = map_products(f)
         out["has_archive"] = (f / "scans.bin").exists()
+        out["loops"] = loop_summary(f)
     # per-frame rear-axle error of the optimized (delivered) and native trajectories vs RTK, written by
     # scripts/analysis/round_summary.py at evaluation time (already downsampled to <= 600 rows)
     hdr, rows = csv_rows(p / "evaluation" / "error_series.csv")
@@ -451,8 +477,6 @@ def live(round_name):
             except (ValueError, KeyError, IndexError):
                 continue
         out["error_series"] = series
-        out["rgb_map_chunks"] = len(list(f.glob("rgb_map_*.pcd")))
-        out["map_size_mb"] = round(sum(m.stat().st_size for m in maps) / 1e6, 1)
     # Throughput / resources (tools/livo/resmon.py): processed frames per second, real-time factor, backend time,
     # RSS/CPU of the mapper, camera decoder and player, host memory and swap.
     res = p / "resources.csv"
