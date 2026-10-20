@@ -54,10 +54,9 @@ struct RtkFusion
     double stamp, begin;
     gtsam::Pose3 raw;
     PointCloudXYZI::ConstPtr cloud;
-    // Camera-colored points are already in the native frontend world frame.
-    // The RTK backend applies only C(t) to them; geometry continues to use the
-    // immutable native deskewed LiDAR cloud above.
-    PointCloudXYZRGB::ConstPtr color_cloud;
+    // Camera colour of every return of `cloud` (LIVMapper::colourScan): 0 = none, else
+    // (view distance m, 1..255) << 24 | R << 16 | G << 8 | B.
+    std::shared_ptr<const std::vector<std::uint32_t>> colours;
     std::uint64_t offset = 0;
     std::uint32_t count = 0;
     std::uint64_t color_offset = 0;
@@ -272,11 +271,10 @@ struct RtkFusion
   // Saved-map product filter only (archive and estimator untouched): returns farther than this many
   // metres from the virtual LiDAR origin are not written to map_N.pcd / rgb_map_N.pcd. 0 = keep all.
   double save_map_max_range = 0.0;
-  // Cap of the COLOUR SOURCES of rgb_map_N.pcd (coloured returns of colors.bin used to colour the geometry
-  // rows). The camera looks forward (60 x 32 deg), so tall objects and anything beside the road are coloured
-  // only from far away; a separate (larger) cap keeps that coverage while nearest-observation selection still
-  // picks the sharpest colour. The rows themselves are geometry rows (save_map_max_range, range priority).
-  // <0 = same as save_map_max_range, 0 = keep all coloured returns.
+  // rgb_map_N.pcd = the rows of map_N.pcd whose camera colour (colors.bin, one per archived return) comes from a
+  // view at most this many metres away from the return. The camera looks forward (60 x 32 deg): tall objects
+  // and anything far beside the road are seen only from 40-60 m behind them. <0 = same as save_map_max_range,
+  // 0 = no cap.
   double save_rgb_max_range = -1.0;
   // Saved geometry map (map_N.pcd): range priority. Per save_map_priority_voxel cell the nearest supported
   // observation r_min (a scan with >= 2 returns in the cell) is found first; returns of that cell farther than
@@ -367,28 +365,16 @@ struct RtkFusion
   // with `priority` the range-priority rule is applied, `ranges` receives the range of every written row,
   // `written` one bit per archived return of the scan (LSB first, 1 = written; map_rows.bin) and `origins` the
   // world position of every written row's physical beam origin (mount of its sources.bin LiDAR; `sources` =
-  // open sources.bin, null = virtual LiDAR origin). Returns the number of returns inside the range cap.
+  // open sources.bin, null = virtual LiDAR origin), `rows` the archive index of every written row (its colour in
+  // colors.bin). Returns the number of returns inside the range cap.
   std::size_t exportFrame(const Frame &frame, std::ifstream &input, std::vector<float> &packed,
                           pcl::PointCloud<pcl::PointXYZI> &output, const PriorityCells *priority = nullptr,
                           std::vector<float> *ranges = nullptr, std::vector<std::uint8_t> *written = nullptr,
                           std::ifstream *sources = nullptr, std::vector<Eigen::Vector3f> *origins = nullptr,
-                          std::size_t *filled = nullptr) const;
+                          std::size_t *filled = nullptr, std::vector<std::uint32_t> *rows = nullptr) const;
   PriorityCells nearestObservation() const;
   void detailFill(PriorityCells &priority) const;
   bool fillsGap(const PriorityCells &priority, std::uint64_t key, bool ground_layer, const pcl::PointXYZI &p) const;
-  // Colours of the RGB products: per 3 cm voxel the best camera observation in colors.bin (lowest range + 20 m
-  // per rad/s of rotation). A point takes the colour of its own voxel, else of the nearest of those observations
-  // within 6 cm. rgb_map_N.pcd = the geometry rows of map_N.pcd that find a colour, i.e. exactly the geometry of
-  // map_N.
-  struct ColorLookup
-  {
-    std::vector<std::uint64_t> keys;        // sorted 3 cm voxel keys
-    std::vector<std::uint32_t> rgb;         // colour of the voxel's best observation
-    std::vector<Eigen::Vector3f> position;  // its position
-    bool empty() const { return keys.empty(); }
-    bool find(double x, double y, double z, std::uint32_t &value) const;
-  };
-  ColorLookup colorLookup(std::size_t batch) const;
 
   RtkFusion(const rclcpp::Node::SharedPtr &node_in, const M3D &rotation,
             const V3D &translation, const V3D &reference_lever,
@@ -405,7 +391,7 @@ struct RtkFusion
   void submit(double stamp, double begin, const StatesGroup &state,
               const PointCloudXYZI::Ptr &deskewed_cloud,
               const gtsam::Matrix6 &lidar_information,
-              const PointCloudXYZRGB::Ptr &colored_world_cloud = nullptr);
+              const std::vector<std::uint32_t> *colours = nullptr);
   void finish();
   void process(Frame frame);
   void optimizeKeyframe(const Frame &frame);

@@ -10,9 +10,10 @@ point = native scan-end pose * LiDAR extrinsic * p, delivered point = C(t) * nat
 Products (default <fusion_run>/map/):
   global_map.pcd          voxel-filtered geometry map (centroid of every voxel; x y z intensity), binary PCD
   global_map_rgb.pcd      LIVO only: the global_map.pcd points that a camera observation colours (colour of the
-                          nearest / slowest observation in the point's 3 cm voxel, else of the nearest such
-                          observation within 6 cm) - the same geometry as global_map.pcd, like the mapper's
-                          rgb_map_N.pcd vs map_N.pcd
+                          nearest observation in the point's 3 cm voxel, else of the nearest such observation
+                          within 6 cm; observations = the kept returns with their own camera colour, colors.bin
+                          LIVORGB2, or the coloured returns of older rounds, LIVORGB1) - the same geometry as
+                          global_map.pcd, like the mapper's rgb_map_N.pcd vs map_N.pcd
   tiles/tile_<i>_<j>.pcd  optional square tiles (--tile M) of the same products for large sites
   keyframes/              optional (--keyframe-clouds): per-keyframe body-frame clouds + poses.txt (TUM)
   map_info.json           frame, voxel size, source, ranges, counts, bounds, time span, inputs, calibration
@@ -43,7 +44,8 @@ import numpy as np
 from scipy.spatial import cKDTree
 
 HEADER_SCANS = b"LIVORTK3"
-HEADER_COLORS = b"LIVORGB1"
+HEADER_COLORS = b"LIVORGB1"       # older rounds: float32 x,y,z,r,g,b per coloured return (native world)
+HEADER_COLOUR_ROWS = b"LIVORGB2"  # uint32 per scans.bin return: view distance m << 24 | rgb, 0 = none
 
 
 # ----------------------------------------------------------------------------------------------- SE(3) helpers
@@ -416,6 +418,20 @@ def _project_frames(job):
                 rec["r"], rec["f"] = rng[keep], i
                 geo.add(tile_key(world[:, :2], c["tile"], a.voxel), rec)
                 st["returns_kept"] += len(rec)
+                if rgbbuf is not None and c["colour_rows"] and int(fr["color_count"][i]) == cnt:
+                    # the kept returns' own camera colours (nearest view wins in the colour lookup)
+                    colors.seek(int(fr["color_offset_bytes"][i]))
+                    code = np.frombuffer(colors.read(cnt * 4), dtype="<u4")[keep]
+                    metres = code >> 24
+                    m = metres > 0
+                    if c["rgb_range"] > 0:
+                        m &= metres <= c["rgb_range"]
+                    if m.any():
+                        rr = np.empty(int(m.sum()), RGBREC)
+                        rr["x"], rr["y"], rr["z"] = world[m, 0], world[m, 1], world[m, 2]
+                        rr["rgb"] = code[m] & 0xFFFFFF
+                        rr["s"] = metres[m]
+                        rgbbuf.add(tile_key(world[m, :2], c["tile"], a.voxel), rr)
                 st["t0"] = stamp if st["t0"] is None else min(st["t0"], stamp)
                 st["t1"] = stamp if st["t1"] is None else max(st["t1"], stamp)
                 ordinal = c["kf_ordinal"].get(round(float(stamp), 6)) if a.keyframe_clouds else None
@@ -430,7 +446,7 @@ def _project_frames(job):
                     Rc, tc = correction_at(corr, stamp)
                     Rw, tw = Rc @ raw_R[i], Rc @ raw_t[i] + tc
                     st["kf"].append((ordinal, float(stamp), *map(float, tw), *rot_to_quat(Rw), name))
-            if rgbbuf is not None and int(fr["color_count"][i]) > 0:
+            if rgbbuf is not None and not c["colour_rows"] and int(fr["color_count"][i]) > 0:
                 cc = int(fr["color_count"][i])
                 colors.seek(int(fr["color_offset_bytes"][i]))
                 col = np.frombuffer(colors.read(cc * 24), dtype="<f4").reshape(cc, 6).astype(np.float64)
@@ -519,6 +535,10 @@ def export(a):
         except ValueError:
             max_range = 0.0
     rgb_wanted = bool(a.rgb and (run / "colors.bin").exists() and "color_count" in fr and fr["color_count"].sum() > 0)
+    colour_rows = False
+    if rgb_wanted:
+        with open(run / "colors.bin", "rb") as f:
+            colour_rows = f.read(8) == HEADER_COLOUR_ROWS
     rgb_range = a.rgb_max_range
     if rgb_wanted and rgb_range is None:
         try:
@@ -567,6 +587,7 @@ def export(a):
                 priority=(0.0, priority[1], priority[2]) if rows_start is not None else tuple(priority),
                 rows=str(rows_path) if rows_start is not None else None, rows_start=rows_start,
                 rgb_wanted=rgb_wanted, rgb_range=(rgb_range or 0.0) if rgb_wanted else 0.0, kf_dir=kf_dir,
+                colour_rows=colour_rows,
                 raw_R=quat_to_rot(np.stack([fr["qx"], fr["qy"], fr["qz"], fr["qw"]], 1)),
                 raw_t=np.stack([fr["tx"], fr["ty"], fr["tz"]], 1),
                 kf_ordinal={round(float(s), 6): k for k, s in enumerate(kf_stamps)} if kf_stamps is not None else {})

@@ -341,15 +341,13 @@ laser_mapping:
       # Production default 45 m (operator asked for more coverage than 30 m): pole shell P90 ~5.5 cm at
       # <=35 m, ~5.9 cm at <=50 m. Console: run_wuhu_round.sh --map-range M / launch save_map_max_range:=M.
       save_map_max_range: 45.0
-      # rgb_map_N.pcd = the rows of map_N.pcd that a camera observation colours (per 3 cm voxel the colour
-      # of the nearest / slowest observation; a row with none in its voxel takes the nearest of those within
-      # 6 cm), so the RGB map has exactly the geometry of
-      # map_N.pcd. (Until 10-20 it was the coloured returns themselves: for roadside poles only the 16-60 m
-      # views ahead of the camera, P10-P90 shell 18 cm against 3-5 cm of map_N with range priority = the
-      # "LIVO ghost".) This cap only limits the colour SOURCES (-1 = same as save_map_max_range, 0 = none):
-      # the camera looks forward (60 x 32 deg), so pole tops, trees and anything beside the road are seen
-      # only while 20-45 m ahead; at 45 m one 1080p pixel covers ~2.5 cm, at 60 m ~3.3 cm (= voxel).
-      # Console: run_wuhu_round.sh --rgb-range M / launch save_rgb_max_range:=M.
+      # rgb_map_N.pcd = the rows of map_N.pcd with a camera colour, so the RGB map has exactly the geometry of
+      # map_N.pcd. Every archived return carries its own colour from the nearest camera view that sees it
+      # (publish.rgb_view_*, colors.bin LIVORGB2). This cap drops colours whose view was farther than M m from
+      # the return (-1 = same as save_map_max_range, 0 = none): the camera looks forward (60 x 32 deg), so pole
+      # tops, trees and anything far beside the road are seen only from 40-60 m behind them; at 45 m one 1080p
+      # pixel covers ~2.5 cm, at 60 m ~3.3 cm. Console: run_wuhu_round.sh --rgb-range M / launch
+      # save_rgb_max_range:=M.
       save_rgb_max_range: 60.0
       # Range priority of map_N.pcd (and of the standard global_map.pcd): per 0.5 m cell the nearest scan that
       # put >= 2 returns into it sets r_min; returns of that cell farther than max(ratio * r_min, r_min + margin)
@@ -510,15 +508,26 @@ laser_mapping:
       gravity_align_en: false
 
     publish:
-      # true: the coloured LIVO cloud (colors.bin -> rgb_map_N.pcd) is the FULL undistorted scan.
-      # false colours only the 0.30 m voxel-downsampled registration cloud (feats_down_body), i.e.
-      # ~3.6 k coloured points per frame against ~50 k geometry points: the RGB product is then 13x
-      # sparser than map_N.pcd and looks blurred/coarse however good the camera registration is.
+      # true: the LIVO colours are those of the FULL undistorted scan, one per archived return (required with
+      # RTK fusion). false colours only the 0.30 m voxel-downsampled registration cloud (display only).
       dense_map_en: true
       pub_effect_point_en: false
       pub_plane_en: false
       pub_scan_num: 1
       blind_rgb_points: 2.0
+      # Look-back colouring (LIVMapper::colourScan): a return takes the colour of the newest camera view that
+      # sees it - the current image, else one of the views kept every rgb_view_spacing m of camera travel over
+      # the last rgb_view_span m (0 = current image only) - sampled rgb_view_margin px inside the image border,
+      # unless the view's own scan saw a nearer surface in that direction. Range priority keeps the nearest
+      # returns of every surface, taken beside the truck, where the 60 x 32 deg front camera does not look:
+      # 20261013, only 3 % of the kept returns were in the image of their own scan (former RGB map: the rest
+      # borrowed colours of far returns displaced 10-20 cm; road signs 2-60 % coloured, nothing legible).
+      # Prototype on 6.1 M kept returns: 93 % coloured from views 9-34 m away (P10-P90), sign plates 100 %;
+      # span 50 m: 91 %; spacing 1 m: same as 2 m at twice the memory (6.2 MB per buffered full-HD view);
+      # margin 3 -> 60 px: returns whose colour disagrees with the median of their other views 27 -> 19 %.
+      rgb_view_spacing: 2.0
+      rgb_view_span: 80.0
+      rgb_view_margin: 60
 
     evo:
       seq_name: "wuhu_truck29"

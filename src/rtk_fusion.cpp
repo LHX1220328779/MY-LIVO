@@ -345,7 +345,8 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
     {
       color_archive.exceptions(std::ios::badbit | std::ios::failbit);
       color_archive.open(directory / "colors.bin", std::ios::binary);
-      color_archive.write("LIVORGB1", 8);
+      // colors.bin LIVORGB2: one little-endian uint32 per scans.bin return, same order (Frame::colours).
+      color_archive.write("LIVORGB2", 8);
     }
     frame_index.open(directory / "frames.csv");
     frame_index << std::setprecision(17);
@@ -1072,7 +1073,7 @@ void RtkFusion::initializeGravity(double stamp, const V3D &gravity, const M3D &c
 
 void RtkFusion::submit(double stamp, double begin, const StatesGroup &state,
                        const PointCloudXYZI::Ptr &cloud, const gtsam::Matrix6 &lidar_information,
-                       const PointCloudXYZRGB::Ptr &colored_world_cloud)
+                       const std::vector<std::uint32_t> *colours)
 {
   // Interval bound: a LIVO update spans the time between two images; inside a fast-forwarded standstill the
   // player keeps only the camera key frames (GOP 2 s), so sanity-check at 5 s, not 2 s (which aborted the
@@ -1080,15 +1081,15 @@ void RtkFusion::submit(double stamp, double begin, const StatesGroup &state,
   if (!std::isfinite(stamp) || !std::isfinite(begin) || begin > stamp ||
       stamp - begin > 5 || !state.pos_end.allFinite() || !state.rot_end.allFinite())
     throw std::runtime_error("Invalid LIO pose or scan interval submitted to fusion");
-  if (color_enabled && colored_world_cloud == nullptr)
-    throw std::runtime_error("Camera-enabled RTK fusion requires an RGB cloud for every submitted frame");
+  if (color_enabled && (colours == nullptr || colours->size() != cloud->size()))
+    throw std::runtime_error("Camera-enabled RTK fusion requires the camera colour of every submitted return");
   Frame frame;
   frame.stamp = stamp;
   frame.begin = begin;
   frame.raw = gtsam::Pose3(gtsam::Rot3(state.rot_end), state.pos_end);
   frame.cloud = std::make_shared<PointCloudXYZI>(*cloud);
   if (color_enabled)
-    frame.color_cloud = std::make_shared<PointCloudXYZRGB>(*colored_world_cloud);
+    frame.colours = std::make_shared<const std::vector<std::uint32_t>>(*colours);
   frame.gravity = state.gravity;
   if (!lidar_information.allFinite()) throw std::runtime_error("Nonfinite native LiDAR information");
   frame.lidar_information = lidar_information;
@@ -1939,20 +1940,23 @@ void RtkFusion::appendCloud(const Frame &frame, pcl::PointCloud<pcl::PointXYZI> 
 
 void RtkFusion::appendDisplayCloud(const Frame &frame, PointCloudXYZRGB &output) const
 {
-  if (!frame.color_cloud)
+  if (!frame.colours || frame.colours->size() != frame.cloud->size())
     throw std::runtime_error("RGB frame data missing from camera-enabled RTK cache");
-  if (output.points.capacity() < output.size() + frame.color_cloud->size())
-    output.reserve(std::max(output.size() + frame.color_cloud->size(), 2 * output.points.capacity()));
-  // color_cloud is already in the native frontend world frame. Applying
-  // C(t)=X_global*X_frontend^-1 preserves the exact camera association while
-  // moving the colored surface with the same global correction as geometry.
-  const auto correction = correctionAt(frame.stamp);
-  for (const PointTypeRGB &point : *frame.color_cloud)
+  // the coloured returns, placed exactly like appendCloud places the geometry (same order)
+  pcl::PointCloud<pcl::PointXYZI> geometry;
+  appendCloud(frame, geometry);
+  if (output.points.capacity() < output.size() + geometry.size())
+    output.reserve(std::max(output.size() + geometry.size(), 2 * output.points.capacity()));
+  for (std::size_t i = 0; i < geometry.size(); ++i)
   {
-    const V3D p = correction.transformFrom(V3D(point.x, point.y, point.z));
-    PointTypeRGB result = point;
-    result.x = p.x(); result.y = p.y(); result.z = p.z();
-    output.push_back(result);
+    const std::uint32_t colour = (*frame.colours)[i];
+    if (colour == 0) continue;
+    PointTypeRGB point;
+    point.x = geometry[i].x; point.y = geometry[i].y; point.z = geometry[i].z;
+    point.r = static_cast<std::uint8_t>((colour >> 16) & 0xFF);
+    point.g = static_cast<std::uint8_t>((colour >> 8) & 0xFF);
+    point.b = static_cast<std::uint8_t>(colour & 0xFF);
+    output.push_back(point);
   }
 }
 
@@ -1971,7 +1975,7 @@ void RtkFusion::process(Frame frame)
       referenceAt(frames.back().stamp, display_reference))
     frames.back().reference_imu = display_reference.imu_position;
   frame.count = frame.cloud->size();
-  frame.color_count = frame.color_cloud ? frame.color_cloud->size() : 0;
+  frame.color_count = frame.colours ? frame.colours->size() : 0;
   if (save_map)
   {
     frame.offset = static_cast<std::uint64_t>(archive.tellp());
@@ -2008,14 +2012,8 @@ void RtkFusion::process(Frame frame)
     if (color_enabled)
     {
       frame.color_offset = static_cast<std::uint64_t>(color_archive.tellp());
-      std::vector<float> colors;
-      colors.reserve(static_cast<std::size_t>(frame.color_count) * 6);
-      for (const PointTypeRGB &point : *frame.color_cloud)
-        colors.insert(colors.end(), {point.x, point.y, point.z,
-            static_cast<float>(point.r), static_cast<float>(point.g),
-            static_cast<float>(point.b)});
-      color_archive.write(reinterpret_cast<const char *>(colors.data()),
-                          colors.size() * sizeof(float));
+      color_archive.write(reinterpret_cast<const char *>(frame.colours->data()),
+                          static_cast<std::streamsize>(frame.colours->size() * sizeof(std::uint32_t)));
     }
     const auto q = frame.raw.rotation().toQuaternion();
     const auto p = frame.raw.translation();
@@ -2028,7 +2026,7 @@ void RtkFusion::process(Frame frame)
   while (recent_frames.size() > static_cast<std::size_t>(local_map_frames)) recent_frames.pop_front();
   Frame metadata = frame;
   metadata.cloud.reset();
-  metadata.color_cloud.reset();
+  metadata.colours.reset();
   frames.push_back(std::move(metadata));
   if (frame.stamp - last_memory_log >= 30.0)
   {
@@ -2362,7 +2360,7 @@ std::size_t RtkFusion::exportFrame(const Frame &frame, std::ifstream &input, std
                                    pcl::PointCloud<pcl::PointXYZI> &output, const PriorityCells *priority,
                                    std::vector<float> *ranges, std::vector<std::uint8_t> *written,
                                    std::ifstream *sources, std::vector<Eigen::Vector3f> *origins,
-                                   std::size_t *filled) const
+                                   std::size_t *filled, std::vector<std::uint32_t> *rows) const
 {
   packed.resize(static_cast<std::size_t>(frame.count) * 5);
   input.seekg(static_cast<std::streamoff>(frame.offset));
@@ -2397,6 +2395,11 @@ std::size_t RtkFusion::exportFrame(const Frame &frame, std::ifstream &input, std
     ranges->reserve(frame.count);
   }
   if (written) written->assign((frame.count + 7) / 8, 0);
+  if (rows)
+  {
+    rows->clear();
+    rows->reserve(frame.count);
+  }
   std::size_t in_cap = 0;
   for (std::size_t i = 0; i < frame.count; ++i)
   {
@@ -2450,6 +2453,7 @@ std::size_t RtkFusion::exportFrame(const Frame &frame, std::ifstream &input, std
       origins->push_back(found->second.transformFrom(V3D(native_rotation * mount + native_translation)).cast<float>());
     }
     if (written) (*written)[i / 8] |= static_cast<std::uint8_t>(1U << (i % 8));
+    if (rows) rows->push_back(static_cast<std::uint32_t>(i));
   }
   return in_cap;
 }
@@ -2626,158 +2630,6 @@ void RtkFusion::detailFill(PriorityCells &priority) const
   // set only now: both passes see the rows of range priority alone (a column whose refit kept < 10 rows: no plane)
   priority.ground_planes = std::move(planes);
   priority.vegetation = std::move(vegetation);
-}
-
-namespace
-{
-// 3 cm colour voxel: cell index and key (21 bits per axis, offset so that within +-31 km of the origin the keys
-// ascend with x, then y, then z - ColorLookup::find walks the neighbour voxels in that order).
-std::int64_t colourCell(double v) { return static_cast<std::int64_t>(std::floor(v / 0.03)); }
-std::uint64_t colourKey(std::int64_t ix, std::int64_t iy, std::int64_t iz)
-{
-  const auto field = [](std::int64_t c) { return static_cast<std::uint64_t>(c + (1 << 20)) & 0x1FFFFF; };
-  return (field(ix) << 42) | (field(iy) << 21) | field(iz);
-}
-}  // namespace
-
-bool RtkFusion::ColorLookup::find(double x, double y, double z, std::uint32_t &value) const
-{
-  // The point's own 3 cm voxel, else the nearest kept observation within 6 cm. A ball: the former fallback (own
-  // 6 cm voxel) missed observations 1 mm across a voxel border but took others 10 cm away (20261013, 4 areas:
-  // 32-45 % -> 50-68 % of the geometry rows coloured; rows coloured from their own voxel keep exactly that colour).
-  const std::uint64_t key = colourKey(colourCell(x), colourCell(y), colourCell(z));
-  const auto own = std::lower_bound(keys.begin(), keys.end(), key);
-  if (own != keys.end() && *own == key)
-  {
-    value = rgb[static_cast<std::size_t>(own - keys.begin())];
-    return true;
-  }
-  constexpr double radius = 0.06;
-  const Eigen::Vector3f point(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
-  const std::int64_t y0 = colourCell(y - radius), y1 = colourCell(y + radius);
-  const std::int64_t z0 = colourCell(z - radius), z1 = colourCell(z + radius);
-  float best = static_cast<float>(radius * radius);
-  std::size_t found = keys.size();
-  for (std::int64_t ix = colourCell(x - radius); ix <= colourCell(x + radius); ++ix)
-  {
-    auto k = std::lower_bound(keys.begin(), keys.end(), colourKey(ix, y0, z0));
-    const auto end = std::upper_bound(k, keys.end(), colourKey(ix, y1, z1));
-    for (std::int64_t iy = y0; iy <= y1 && k != end; ++iy)
-    {
-      const std::uint64_t last = colourKey(ix, iy, z1);
-      for (k = std::lower_bound(k, end, colourKey(ix, iy, z0)); k != end && *k <= last; ++k)
-      {
-        const auto i = static_cast<std::size_t>(k - keys.begin());
-        const float squared = (position[i] - point).squaredNorm();
-        if (squared <= best)
-        {
-          best = squared;
-          found = i;
-        }
-      }
-    }
-  }
-  if (found == keys.size()) return false;
-  value = rgb[found];
-  return true;
-}
-
-RtkFusion::ColorLookup RtkFusion::colorLookup(std::size_t batch) const
-{
-  // Every frame recolors the surfaces inside its frustum, so the archive holds many color instances of the same
-  // physical spot. Keep, per voxel, only the instance with the lowest score: range (the pixel footprint grows
-  // linearly with range, while the metric colour displacement from a residual camera time error, speed * dt, does
-  // not shrink with it) + 20 m per rad/s of rotation (motion blur / time skew scale with omega * range).
-  // The coloured returns are the camera-frustum returns of each scan: for roadside poles only the 16-60 m views
-  // ahead (20261013: no pole return closer than 15.7 m). Exporting them as the RGB map gave poles the far-range
-  // shell (P10-P90 18 cm vs 3-5 cm of map_N with range priority); they now only lend their colours to the
-  // geometry rows, so rgb_map_N has the geometry of map_N.
-  struct Scored { float score; std::uint32_t rgb; float x, y, z; };
-  struct Candidate { std::uint64_t key; Scored value; };
-  std::unordered_map<std::uint64_t, Scored> best;
-  best.reserve(1 << 22);
-  std::vector<std::vector<Candidate>> scored(batch);
-  for (std::size_t first = 0; first < frames.size(); first += batch)
-  {
-    const std::size_t count = std::min(batch, frames.size() - first);
-    std::exception_ptr error;
-#pragma omp parallel
-    {
-      std::ifstream input(directory / "colors.bin", std::ios::binary);
-      std::vector<float> packed;
-#pragma omp for schedule(dynamic, 4)
-      for (int n = 0; n < static_cast<int>(count); ++n)
-      {
-        const std::size_t fi = first + static_cast<std::size_t>(n);
-        auto &out = scored[n];
-        out.clear();
-        try
-        {
-          const Frame &frame = frames[fi];
-          if (frame.color_count == 0) continue;
-          packed.resize(static_cast<std::size_t>(frame.color_count) * 6);
-          input.seekg(static_cast<std::streamoff>(frame.color_offset));
-          input.read(reinterpret_cast<char *>(packed.data()), static_cast<std::streamsize>(packed.size() * sizeof(float)));
-          if (!input) throw std::runtime_error("Cannot read the colour archive for the map export");
-          double omega = 0.0;
-          if (fi + 1 < frames.size())
-          {
-            const double dt = std::max(frames[fi + 1].stamp - frames[fi].stamp, 1e-3);
-            const auto delta = frames[fi].raw.between(frames[fi + 1].raw);
-            omega = gtsam::Rot3::Logmap(delta.rotation()).norm() / dt;
-          }
-          const auto correction = correctionAt(frame.stamp);
-          const V3D origin = frame.raw.transformFrom(lidar_translation);
-          out.reserve(frame.color_count);
-          for (std::size_t i = 0; i < frame.color_count; ++i)
-          {
-            const V3D native(packed[6 * i], packed[6 * i + 1], packed[6 * i + 2]);
-            const double range = (native - origin).norm();
-            if (save_rgb_max_range > 0.0 && range > save_rgb_max_range) continue;
-            const V3D p = correction.transformFrom(native);
-            const std::uint32_t rgb = (static_cast<std::uint32_t>(static_cast<std::uint8_t>(packed[6 * i + 3])) << 16) |
-                                      (static_cast<std::uint32_t>(static_cast<std::uint8_t>(packed[6 * i + 4])) << 8) |
-                                      static_cast<std::uint32_t>(static_cast<std::uint8_t>(packed[6 * i + 5]));
-            out.push_back({colourKey(colourCell(p.x()), colourCell(p.y()), colourCell(p.z())),
-                           {static_cast<float>(range + 20.0 * omega), rgb, static_cast<float>(p.x()),
-                            static_cast<float>(p.y()), static_cast<float>(p.z())}});
-          }
-        }
-        catch (...)
-        {
-#pragma omp critical(rgb_export_error)
-          if (!error) error = std::current_exception();
-        }
-      }
-    }
-    if (error) std::rethrow_exception(error);
-    for (std::size_t n = 0; n < count; ++n)
-      for (const auto &candidate : scored[n])
-      {
-        const auto it = best.find(candidate.key);
-        if (it == best.end()) best.emplace(candidate.key, candidate.value);
-        else if (candidate.value.score < it->second.score) it->second = candidate.value;
-      }
-  }
-  scored.clear();
-  // Compact sorted arrays (binary search during the geometry export, 24 bytes per voxel).
-  struct Item { std::uint64_t key; float x, y, z; std::uint32_t rgb; };
-  std::vector<Item> items;
-  items.reserve(best.size());
-  for (const auto &[key, value] : best) items.push_back({key, value.x, value.y, value.z, value.rgb});
-  std::unordered_map<std::uint64_t, Scored>().swap(best);
-  std::sort(items.begin(), items.end(), [](const Item &a, const Item &b) { return a.key < b.key; });
-  ColorLookup lookup;
-  lookup.keys.reserve(items.size());
-  lookup.rgb.reserve(items.size());
-  lookup.position.reserve(items.size());
-  for (const auto &item : items)
-  {
-    lookup.keys.push_back(item.key);
-    lookup.rgb.push_back(item.rgb);
-    lookup.position.emplace_back(item.x, item.y, item.z);
-  }
-  return lookup;
 }
 
 RtkFusion::PriorityCells RtkFusion::nearestObservation() const
@@ -3075,8 +2927,8 @@ void RtkFusion::exportMap()
     source_archive.flush();
     frame_index.flush();
     std::size_t chunk_index = 0;
-    // rgb_map_*.pcd = the geometry rows of map_*.pcd that a camera observation colours (colorLookup), written
-    // chunk by chunk with the same index; both only when export_map_chunks.
+    // rgb_map_*.pcd = the rows of map_*.pcd with a camera colour (colors.bin, view within save_rgb_max_range),
+    // written chunk by chunk with the same index; both only when export_map_chunks.
     if (color_enabled) color_archive.flush();
     // Both products: scans are transformed in parallel batches and consumed in frame order, so every row,
     // tie-break and chunk boundary is the one of the former sequential loop (export 90 s -> ~15 s at 8.7k scans).
@@ -3111,9 +2963,7 @@ void RtkFusion::exportMap()
         rows_file.open(directory / "map_rows.bin", std::ios::binary | std::ios::trunc);
         rows_file.write("LIVOMSK1", 8);
       }
-      const auto colour_start = std::chrono::steady_clock::now();
-      const ColorLookup colours = color_enabled ? colorLookup(export_batch) : ColorLookup();
-      const double colour_sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - colour_start).count();
+      std::vector<std::vector<std::uint32_t>> rows(export_batch);  // archive index of every written row
       pcl::PointCloud<pcl::PointXYZI> chunk;
       PointCloudXYZRGB rgb_chunk;
       std::size_t rgb_written = 0;
@@ -3150,21 +3000,31 @@ void RtkFusion::exportMap()
               in_cap[static_cast<std::size_t>(n)] = exportFrame(
                   frames[first + static_cast<std::size_t>(n)], input, packed, outputs[n],
                   prioritized ? &priority : nullptr, nullptr, prioritized ? &written[n] : nullptr, nullptr, nullptr,
-                  &filled[static_cast<std::size_t>(n)]);
+                  &filled[static_cast<std::size_t>(n)], color_enabled ? &rows[n] : nullptr);
               auto &rgb = rgb_outputs[n];
               rgb.clear();
-              if (!colours.empty())
+              const Frame &frame = frames[first + static_cast<std::size_t>(n)];
+              if (color_enabled && frame.count > 0 && frame.color_count == frame.count && !outputs[n].empty())
               {
+                // the written rows' own camera colours (colourScan), view distance within save_rgb_max_range
+                std::vector<std::uint32_t> colours(frame.count);
+                std::ifstream colour_input(directory / "colors.bin", std::ios::binary);
+                colour_input.seekg(static_cast<std::streamoff>(frame.color_offset));
+                colour_input.read(reinterpret_cast<char *>(colours.data()),
+                                  static_cast<std::streamsize>(colours.size() * sizeof(std::uint32_t)));
+                if (!colour_input) throw std::runtime_error("Cannot read the colour archive for the map export");
                 rgb.reserve(outputs[n].size());
-                for (const auto &q : outputs[n])
+                for (std::size_t k = 0; k < outputs[n].size(); ++k)
                 {
-                  std::uint32_t value = 0;
-                  if (!colours.find(q.x, q.y, q.z, value)) continue;
+                  const std::uint32_t colour = colours[rows[n][k]];
+                  const std::uint32_t metres = colour >> 24;
+                  if (metres == 0 || (save_rgb_max_range > 0.0 && metres > save_rgb_max_range)) continue;
+                  const auto &q = outputs[n][k];
                   PointTypeRGB point;
                   point.x = q.x; point.y = q.y; point.z = q.z;
-                  point.r = static_cast<std::uint8_t>((value >> 16) & 0xFF);
-                  point.g = static_cast<std::uint8_t>((value >> 8) & 0xFF);
-                  point.b = static_cast<std::uint8_t>(value & 0xFF);
+                  point.r = static_cast<std::uint8_t>((colour >> 16) & 0xFF);
+                  point.g = static_cast<std::uint8_t>((colour >> 8) & 0xFF);
+                  point.b = static_cast<std::uint8_t>(colour & 0xFF);
                   rgb.push_back(point);
                 }
               }
@@ -3208,14 +3068,13 @@ void RtkFusion::exportMap()
       }
       if (!chunk.empty()) write(std::move(chunk), std::move(rgb_chunk));
       if (writing.valid()) writing.get();
-      if (!colours.empty())
+      if (color_enabled)
         RCLCPP_INFO(node->get_logger(),
-            "Saved RGB map: %zu of %zu geometry rows coloured (%.1f %%; %zu colour voxels of 3 cm from coloured "
-            "returns within %.1f m, own voxel else nearest within 6 cm, %.1f s): rgb_map_N.pcd = coloured rows of "
-            "map_N.pcd",
+            "Saved RGB map: %zu of %zu geometry rows coloured (%.1f %%; own camera colour from a view within "
+            "%.1f m): rgb_map_N.pcd = coloured rows of map_N.pcd",
             rgb_written, returns_written,
             returns_written ? 100.0 * static_cast<double>(rgb_written) / static_cast<double>(returns_written) : 0.0,
-            colours.keys.size(), save_rgb_max_range, colour_sec);
+            save_rgb_max_range);
       RCLCPP_INFO(node->get_logger(),
           "Saved geometry map: %zu of %zu returns within the %.1f m cap written (%.1f %%; range priority %s: ratio %.2f, "
           "margin %.1f m, %zu cells of %.2f m, %zu seen-free cells of %.2f m from returns within %.1f m, pass 1 %.1f s; "

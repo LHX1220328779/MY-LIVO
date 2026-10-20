@@ -25,6 +25,7 @@ which is included as part of this source code package.
 #include <limits>
 #include <sstream>
 #include <memory>
+#include <deque>
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include "extrinsic_precheck.h"
 
@@ -107,6 +108,23 @@ public:
   double gyr_bias_rw_sigma = 0.001, acc_bias_rw_sigma = 0.001;
   double initial_gyr_bias_sigma = std::sqrt(1e-5);
   double blind_rgb_points = 0.0;
+  // Look-back colouring of the LIVO RGB map (colourScan): camera views buffered every rgb_view_spacing m of camera
+  // travel over the last rgb_view_span m (0 = current image only), colours sampled rgb_view_margin px inside the
+  // image border.
+  double rgb_view_spacing = 2.0, rgb_view_span = 80.0;
+  int rgb_view_margin = 60;
+  struct ColourView
+  {
+    SE3 T_f_w;                 // camera from world (native frontend frame)
+    V3D centre;                // camera centre
+    cv::Mat image;             // BGR; the VIO clones a new image per frame, the buffer only keeps a reference
+    std::vector<float> depth;  // nearest depth of the view's own scan per 8 px cell
+  };
+  std::deque<ColourView> colour_views_;
+  std::vector<std::uint32_t> scan_colours_;  // colours of the current frame's returns (pcl_w_wait_pub order)
+  double colour_seconds_ = 0.0;
+  std::size_t colour_frames_ = 0, colour_returns_ = 0, colour_coloured_ = 0;
+  std::vector<std::uint32_t> colourScan(const PointCloudXYZI &world);
   double last_timestamp_lidar = -1.0, last_timestamp_imu = -1.0, last_timestamp_img = -1.0;
   std::size_t imu_stale_dropped_ = 0;
   double filter_size_surf_min = 0;

@@ -470,6 +470,11 @@ void LIVMapper::readParameters()
   nh.param<int>("debug/frame_cnt", frame_cnt, 6);
 
   nh.param<double>("publish/blind_rgb_points", blind_rgb_points, 0.01);
+  nh.param<double>("publish/rgb_view_spacing", rgb_view_spacing, 2.0);
+  nh.param<double>("publish/rgb_view_span", rgb_view_span, 80.0);
+  nh.param<int>("publish/rgb_view_margin", rgb_view_margin, 60);
+  if (!(rgb_view_spacing > 0.0) || !(rgb_view_span >= 0.0) || rgb_view_margin < 1)
+    throw std::runtime_error("publish/rgb_view_spacing must be > 0, rgb_view_span >= 0, rgb_view_margin >= 1");
   nh.param<int>("publish/pub_scan_num", pub_scan_num, 1);
   nh.param<bool>("publish/pub_effect_point_en", pub_effect_point_en, false);
   nh.param<bool>("publish/dense_map_en", dense_map_en, false);
@@ -1220,16 +1225,17 @@ void LIVMapper::handleVIO()
   //   visual_sub_map->push_back(temp_map);
   // }
 
-  PointCloudXYZRGB::Ptr colored_world_cloud =
-      publish_frame_world(pubLaserCloudFullRes, vio_manager);
+  publish_frame_world(pubLaserCloudFullRes, vio_manager);
   if (rtk_fusion_ && slam_mode_ == LIVO && pending_rtk_livo_frame_.valid)
   {
-    if (!colored_world_cloud)
-      throw std::runtime_error("LIVO RGB publication did not produce a color cloud for RTK fusion");
+    // scan_colours_ follow pcl_w_wait_pub, i.e. the pending cloud in the world frame (dense_map_en)
+    if (scan_colours_.size() != pending_rtk_livo_frame_.cloud->size())
+      throw std::runtime_error("LIVO colours are not aligned with the archived scan (RTK fusion needs publish/dense_map_en: true)");
     rtk_fusion_->submit(
         pending_rtk_livo_frame_.stamp, pending_rtk_livo_frame_.begin,
         pending_rtk_livo_frame_.state, pending_rtk_livo_frame_.cloud,
-        pending_rtk_livo_frame_.lidar_information, colored_world_cloud);
+        pending_rtk_livo_frame_.lidar_information, &scan_colours_);
+    scan_colours_.clear();
     pending_rtk_livo_frame_.valid = false;
     pending_rtk_livo_frame_.cloud.reset();
   }
@@ -3137,48 +3143,120 @@ void LIVMapper::publish_img_rgb(const image_transport::Publisher &pubImage, VIOM
   pubImage.publish(out_msg.toImageMsg());
 }
 
+std::vector<std::uint32_t> LIVMapper::colourScan(const PointCloudXYZI &world)
+{
+  // Look-back colouring of the RGB map. The front camera (60 x 32 deg) sees a return at scan time only if it lies
+  // ahead, while range priority keeps the nearest returns of every surface, taken when the truck is beside it:
+  // on truck29 20261013 only 3 % of the kept returns were inside the image of their own scan, and the former
+  // colour lookup (own 3 cm voxel, else the nearest coloured return within 6 cm) painted the rest from far-range
+  // returns displaced 10-20 cm (sign plates 2-60 % coloured, nothing legible on them). Every return now takes
+  // the colour of the NEWEST camera view that sees it: the current image, else the views buffered every
+  // rgb_view_spacing m of camera travel over the last rgb_view_span m (driving forward, newest = nearest).
+  // Sees = in front of the camera, farther than blind_rgb_points, rgb_view_margin px inside the image (border
+  // pixels disagreed with the other views of the same return 1.5x more often) and not behind the nearest return
+  // the view's OWN scan put into the same 8 px cell (+ max(0.3 m, 4 %)): that scan was taken with the image, so
+  // it holds the image's occluders, vehicles gone since included (the scans of later frames would also hide
+  // grazing ground: 93 % -> 65 % coloured). Per return: 0 = no view, else
+  // (view distance m, 1..255) << 24 | R << 16 | G << 8 | B.
+  const auto start = std::chrono::steady_clock::now();
+  constexpr int cell = 8;
+  const auto &frame = vio_manager->new_frame_;
+  const vk::AbstractCamera &cam = *frame->cam_;
+  const int columns = cam.width() / cell + 1;
+  const auto cellOf = [columns](const V2D &px) {
+    return static_cast<std::size_t>(static_cast<int>(px.y()) / cell * columns + static_cast<int>(px.x()) / cell);
+  };
+  ColourView current;
+  current.T_f_w = frame->T_f_w_;
+  current.centre = frame->pos();
+  current.image = vio_manager->img_rgb;
+  current.depth.assign(static_cast<std::size_t>(columns) * (cam.height() / cell + 1),
+                       std::numeric_limits<float>::infinity());
+  for (const PointType &q : world.points)
+  {
+    const V3D pf = current.T_f_w * V3D(q.x, q.y, q.z);
+    if (pf.z() <= 0.1) continue;
+    const V2D px = cam.world2cam(pf);
+    if (!cam.isInFrame(px.cast<int>(), 1)) continue;
+    float &depth = current.depth[cellOf(px)];
+    depth = std::min(depth, static_cast<float>(pf.z()));
+  }
+  std::vector<const ColourView *> views{&current};
+  for (auto view = colour_views_.rbegin(); view != colour_views_.rend(); ++view) views.push_back(&*view);
+  const auto channel = [](float v) { return static_cast<std::uint32_t>(std::min(255.f, std::max(0.f, v + 0.5f))); };
+  std::vector<std::uint32_t> colours(world.size(), 0);
+  std::size_t coloured = 0;
+  // Returns are independent. A return behind a view (all returns behind the truck, for every buffered view) is
+  // rejected by the depth row alone (first full round: 7.2 ms per frame single-threaded, +78 s of player pacing).
+#ifdef MP_EN
+#pragma omp parallel for num_threads(MP_PROC_NUM) schedule(dynamic, 1024) reduction(+ : coloured)
+#endif
+  for (std::size_t i = 0; i < world.size(); ++i)
+  {
+    const V3D pw(world.points[i].x, world.points[i].y, world.points[i].z);
+    for (const ColourView *view : views)
+    {
+      if (view->T_f_w.rotation_matrix().row(2).dot(pw) + view->T_f_w.translation().z() <= 0.1) continue;
+      const V3D pf = view->T_f_w * pw;
+      const double distance = pf.norm();
+      if (distance <= blind_rgb_points) continue;
+      const V2D px = cam.world2cam(pf);
+      if (!cam.isInFrame(px.cast<int>(), rgb_view_margin)) continue;
+      if (pf.z() > view->depth[cellOf(px)] + std::max(0.3, 0.04 * pf.z())) continue;
+      const V3F bgr = vio_manager->getInterpolatedPixel(view->image, px);
+      const auto metres = static_cast<std::uint32_t>(std::min(255.0, std::max(1.0, std::ceil(distance))));
+      colours[i] = metres << 24 | channel(bgr[2]) << 16 | channel(bgr[1]) << 8 | channel(bgr[0]);
+      ++coloured;
+      break;
+    }
+  }
+  const V3D centre = current.centre;
+  if (rgb_view_span > 0.0 &&
+      (colour_views_.empty() || (centre - colour_views_.back().centre).norm() >= rgb_view_spacing))
+    colour_views_.push_back(std::move(current));
+  while (!colour_views_.empty() && (colour_views_.front().centre - centre).norm() > rgb_view_span)
+    colour_views_.pop_front();
+  colour_seconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+  colour_returns_ += world.size();
+  colour_coloured_ += coloured;
+  if (++colour_frames_ % 600 == 0)
+  {
+    RCLCPP_INFO(node_->get_logger(),
+                "RGB look-back colouring: %.1f ms per frame, %.1f %% of the returns coloured, %zu views buffered",
+                1e3 * colour_seconds_ / static_cast<double>(colour_frames_),
+                100.0 * static_cast<double>(colour_coloured_) / static_cast<double>(std::max<std::size_t>(colour_returns_, 1)),
+                colour_views_.size());
+  }
+  return colours;
+}
+
 // Provide output format for LiDAR-visual BA
 PointCloudXYZRGB::Ptr LIVMapper::publish_frame_world(const rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr &pubLaserCloudFullRes,
                                     VIOManagerPtr vio_manager)
 {
   PointCloudXYZRGB::Ptr laserCloudWorldRGB(new PointCloudXYZRGB());
   if (pcl_w_wait_pub->empty()) return laserCloudWorldRGB;
-  static int pub_num = 1;
-  pub_num++;
 
   if (LidarMeasures.lio_vio_flg == VIO)
   {
-    *pcl_wait_pub += *pcl_w_wait_pub;
-    if(pub_num >= pub_scan_num)
+    // Camera colour of every return of this frame (colourScan; the RTK archive stores them per return). The
+    // coloured returns form the display / legacy PCD cloud.
+    scan_colours_ = colourScan(*pcl_w_wait_pub);
+    if (pubLaserCloudFullRes->get_subscription_count() > 0 || pcd_save_en)
     {
-      pub_num = 1;
-      size_t size = pcl_wait_pub->points.size();
-      laserCloudWorldRGB->reserve(size);
-      // double inv_expo = _state.inv_expo_time;
-      cv::Mat img_rgb = vio_manager->img_rgb;
-      for (size_t i = 0; i < size; i++)
+      laserCloudWorldRGB->reserve(pcl_w_wait_pub->size());
+      for (std::size_t i = 0; i < pcl_w_wait_pub->size(); ++i)
       {
+        const std::uint32_t colour = scan_colours_[i];
+        if (colour == 0) continue;
         PointTypeRGB pointRGB;
-        pointRGB.x = pcl_wait_pub->points[i].x;
-        pointRGB.y = pcl_wait_pub->points[i].y;
-        pointRGB.z = pcl_wait_pub->points[i].z;
-
-        V3D p_w(pcl_wait_pub->points[i].x, pcl_wait_pub->points[i].y, pcl_wait_pub->points[i].z);
-        V3D pf(vio_manager->new_frame_->w2f(p_w)); if (pf[2] < 0) continue;
-        V2D pc(vio_manager->new_frame_->w2c(p_w));
-
-        if (vio_manager->new_frame_->cam_->isInFrame(pc.cast<int>(), 3)) // 100
-        {
-          V3F pixel = vio_manager->getInterpolatedPixel(img_rgb, pc);
-          pointRGB.r = pixel[2];
-          pointRGB.g = pixel[1];
-          pointRGB.b = pixel[0];
-          // pointRGB.r = pixel[2] * inv_expo; pointRGB.g = pixel[1] * inv_expo; pointRGB.b = pixel[0] * inv_expo;
-          // if (pointRGB.r > 255) pointRGB.r = 255; else if (pointRGB.r < 0) pointRGB.r = 0;
-          // if (pointRGB.g > 255) pointRGB.g = 255; else if (pointRGB.g < 0) pointRGB.g = 0;
-          // if (pointRGB.b > 255) pointRGB.b = 255; else if (pointRGB.b < 0) pointRGB.b = 0;
-          if (pf.norm() > blind_rgb_points) laserCloudWorldRGB->push_back(pointRGB);
-        }
+        pointRGB.x = pcl_w_wait_pub->points[i].x;
+        pointRGB.y = pcl_w_wait_pub->points[i].y;
+        pointRGB.z = pcl_w_wait_pub->points[i].z;
+        pointRGB.r = static_cast<std::uint8_t>((colour >> 16) & 0xFF);
+        pointRGB.g = static_cast<std::uint8_t>((colour >> 8) & 0xFF);
+        pointRGB.b = static_cast<std::uint8_t>(colour & 0xFF);
+        laserCloudWorldRGB->push_back(pointRGB);
       }
     }
   }
