@@ -537,6 +537,13 @@ def actual_pcd_frames(directory, index, archive):
         raise ValueError("Actual map PCD chunks must start at zero and be contiguous")
     stream = _PcdStream(files)
     max_range = saved_map_range(directory)
+    # Range-priority rounds: map_rows.bin holds one bit per archived return (LSB first, frames.csv order,
+    # each scan padded to whole bytes), 1 = written to map_N.pcd. The rows are then paired exactly.
+    rows_mask, mask_at = None, 8
+    if (directory / "map_rows.bin").exists():
+        rows_mask = np.fromfile(directory / "map_rows.bin", dtype=np.uint8)
+        if bytes(rows_mask[:8]) != b"LIVOMSK1":
+            raise ValueError("map_rows.bin has no LIVOMSK1 header")
     expected_start = 0
     for i, record in enumerate(index):
         count = int(record["count"])
@@ -545,6 +552,19 @@ def actual_pcd_frames(directory, index, archive):
             raise ValueError("Frame archive offsets/counts are not contiguous source returns")
         source = archive[expected_start:expected_start + count]
         source_ids = np.arange(count)
+        if rows_mask is not None:
+            size = (count + 7) // 8
+            if mask_at + size > len(rows_mask):
+                raise ValueError("map_rows.bin ends before the indexed source returns")
+            bits = np.unpackbits(rows_mask[mask_at:mask_at + size], bitorder="little")[:count].astype(bool)
+            mask_at += size
+            source, source_ids = source[bits], source_ids[bits]
+            saved = stream.take(len(source))
+            if not np.array_equal(saved[:, 3], source[:, 3], equal_nan=True):
+                raise ValueError(f"Actual PCD/source-return intensity order differs at {record['stamp']:.9f}")
+            yield saved, source, source_ids
+            expected_start += count
+            continue
         boundary = np.empty(0, dtype=np.int64)
         if max_range > 0:
             # Match the exporter's float32 norm in the archived virtual-LiDAR frame. The exporter decides with
@@ -585,6 +605,8 @@ def actual_pcd_frames(directory, index, archive):
         expected_start += count
     if expected_start != len(archive) or not stream.exhausted():
         raise ValueError("Actual PCD/archive contains returns outside the frame index")
+    if rows_mask is not None and mask_at != len(rows_mask):
+        raise ValueError("map_rows.bin holds bits beyond the frame index")
 
 
 def pcd_sections(directory, selection=None, reference=None, lever=(.904, -4.679, -1.699), output=None):
@@ -1483,6 +1505,16 @@ def compare_map(directory, frame_stride, point_stride, reference, lever):
     is_key = np.isin(np.round(raw[:, 0], 6), np.round(keys["stamp"], 6))
     candidates = np.flatnonzero(~is_key)[::10]
     candidate_set = set(candidates)
+    # Range-priority rounds (map_rows.bin) write only part of each scan. The cross-scan check below compares
+    # surfaces two scans 20-40 m apart both saw - exactly the far copies the priority drops - so its candidate
+    # scans are scored on ALL in-cap returns, projected with the mapper's own correction C(t) (map_export,
+    # < 1e-5 m from the rows the mapper would write) and stay comparable with earlier rounds. The same-point
+    # thickness keeps using the written rows.
+    priority = (directory / "map_rows.bin").exists()
+    if priority:
+        from livo import map_export as _map_export
+        corrections = _map_export.read_corrections(directory)
+        cap = saved_map_range(directory)
     raw_r = Rotation.from_quat(raw[:, 4:8])
     cache, scan_points = {}, {}
 
@@ -1524,7 +1556,17 @@ def compare_map(directory, frame_stride, point_stride, reference, lever):
     before, after, stamps, ranges = [], [], [], []
     for i, (saved, scan, _source_ids) in enumerate(actual_pcd_frames(directory, index, points)):
         record = index[i]
-        if i in candidate_set:
+        if i in candidate_set and priority:
+            start = (int(record["offset_bytes"]) - 8) // 20
+            full = np.asarray(points[start:start + int(record["count"])])
+            if cap > 0:
+                full = full[np.linalg.norm(full[:, :3], axis=1) <= cap]
+            local, world = native_points(i, record, full)
+            times = np.clip(record["begin"] + full[:, 4].astype(np.float64) / 1000.0, record["begin"], record["stamp"])
+            native = Rotation.from_quat([record["qx"], record["qy"], record["qz"], record["qw"]]).apply(local) + \
+                np.array([record["tx"], record["ty"], record["tz"]])
+            retain_surface_summary(i, local, world, _map_export.apply_correction(native, times, corrections))
+        elif i in candidate_set:
             local, world = native_points(i, record, scan)
             retain_surface_summary(i, local, world, np.asarray(saved[:, :3], dtype=float))
         if i % frame_stride:
@@ -1562,6 +1604,9 @@ def compare_map(directory, frame_stride, point_stride, reference, lever):
           f"planar cells={len(measurements)}, frame/point strides={frame_stride}/{point_stride}")
     print("Cells selected in native LIO map; this is a regression diagnostic, NOT independent geometry truth.")
     print("Optimized samples are ACTUAL saved map_*.pcd rows; all frame counts and source intensity order verified, no map reconstruction.")
+    if priority:
+        print("Range priority (map_rows.bin): same-point thickness on the written rows; cross-scan candidates on all "
+              "in-cap returns with the mapper's correction C(t).")
     if continuous is not None:
         print("LIVORTK2 stores raw returns: native comparison uses endpoint pose interpolation, NOT exact native IMU deskew.")
     for low, high in [(5, 20), (20, 40), (40, 70)]:

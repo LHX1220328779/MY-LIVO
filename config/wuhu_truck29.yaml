@@ -348,6 +348,23 @@ laser_mapping:
       # sharpest colour per voxel; at 45 m one 1080p pixel covers ~2.5 cm, at 60 m ~3.3 cm (= voxel).
       # Console: run_wuhu_round.sh --rgb-range M / launch save_rgb_max_range:=M.
       save_rgb_max_range: 60.0
+      # Range priority of map_N.pcd (and of the standard global_map.pcd): per 0.5 m cell the nearest scan that
+      # put >= 2 returns into it sets r_min; returns of that cell farther than max(ratio * r_min, r_min + margin)
+      # are not written. Coverage of the 45 m cap stays (a cell seen only from far keeps its far returns); a
+      # surface seen from both lanes keeps only the near-lane copy. 20261013 livo_11 lamp poles: inter-pass ring
+      # offset with near returns 2.0-3.4 cm, but the far-lane returns (17-40 m) are pulled 2-4 cm toward the
+      # sensor and spread to a 12-20 cm shell (P10-P90) = the visible "ghost"; ratio 1.5 / margin 2 m: shell
+      # 12-20 -> 5-12 cm, road ground P10-P90 52 -> 38 mm. ratio 0 = off (every return within the cap).
+      save_map_priority_ratio: 1.5
+      save_map_priority_margin_m: 2.0
+      save_map_priority_voxel_m: 0.5
+      # Seen-free check of the same rule: a return within this many metres of its LiDAR marks the 0.25 m cells
+      # 0.3 / 0.6 m in front of it along its physical beam as seen free at its range; a much farther return
+      # (beyond the ratio / margin rule) inside such a cell is not written. Removes the far-lane smear that lands
+      # BESIDE a pole (empty cells the occupied rule cannot judge; straight-edged cell-border fringes). Skipped in
+      # the two lowest occupied 0.5 m cells of each column (grazing beams would trim the ground band). 20261013
+      # LIVO: pole shell (P10-P90) median 7.2 -> ~3 cm, ground unchanged. 0 = off.
+      save_map_priority_free_range_m: 25.0
 
     reference_frame_conversion:
       # The Odometry child frame is vehicle_rear_axle_rfu. When enabled,

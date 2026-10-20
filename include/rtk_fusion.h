@@ -277,6 +277,23 @@ struct RtkFusion
   // coverage while nearest-observation selection still picks the sharpest colour. <0 = same as
   // save_map_max_range, 0 = keep all coloured returns.
   double save_rgb_max_range = -1.0;
+  // Saved geometry map (map_N.pcd): range priority. Per save_map_priority_voxel cell the nearest supported
+  // observation r_min (a scan with >= 2 returns in the cell) is found first; returns of that cell farther than
+  // max(save_map_priority_ratio * r_min, r_min + save_map_priority_margin) are not written. A far scan therefore
+  // only contributes where no nearer scan saw the surface (the coverage of save_map_max_range is kept), and the
+  // far-lane copy of a surface no longer blurs the near-lane copy. ratio 0 = off (every return within the cap).
+  double save_map_priority_ratio = 1.5;
+  double save_map_priority_margin = 2.0;
+  double save_map_priority_voxel = 0.5;
+  // Seen-free part of the same rule: a return within save_map_priority_free_range metres of its LiDAR marks the
+  // half-voxel cells 0.6 and 1.2 voxels in front of it along its physical beam (mount from sources.bin) as seen
+  // free at its range r_f; a row in such a cell farther than max(ratio * r_f, r_f + margin) is not written. It
+  // removes the far-range smear of thin objects that lands in the empty cells beside them (no near scan put
+  // returns there, so the occupied rule kept it); a static surface is never seen through. Not applied in the
+  // two lowest occupied cells of each column: a grazing beam's "front" lies inside the ground's own cell and
+  // would trim the upper half of the far scans' ground band (20261013: lowered > 5 mm on 8 % of the rough
+  // columns). 0 = off.
+  double save_map_priority_free_range = 25.0;
   std::vector<int> accepted_modes;
   std::filesystem::path directory;
   std::ofstream archive, color_archive, frame_index, diagnostics, optimization_log, history_log, association_log, geometry_history, path_log;
@@ -320,9 +337,24 @@ struct RtkFusion
   rclcpp::Publisher<visualization_msgs::MarkerArray>::SharedPtr graph_publisher;
   rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr final_map_publisher;
   void publishGraph(double latest_error, double max_error);
-  // One archived scan -> delivered points (map_N.pcd rows), identical to appendCloud on the range-capped scan.
-  void exportFrame(const Frame &frame, std::ifstream &input, std::vector<float> &packed,
-                   pcl::PointCloud<pcl::PointXYZI> &output) const;
+  // Range-priority cells of the saved geometry map: key -> nearest supported range, sharded by key; `free`:
+  // half-voxel cells seen free -> nearest range of a scan that looked through them (empty = check off).
+  using NearestCells = std::vector<std::unordered_map<std::uint64_t, float>>;
+  struct PriorityCells
+  {
+    NearestCells occupied, free;
+    std::unordered_map<std::uint64_t, std::int64_t> ground;  // column (x,y cell) -> lowest occupied z cell
+  };
+  // One archived scan -> delivered points (map_N.pcd rows), identical to appendCloud on the range-capped scan;
+  // with `priority` the range-priority rule is applied, `ranges` receives the range of every written row,
+  // `written` one bit per archived return of the scan (LSB first, 1 = written; map_rows.bin) and `origins` the
+  // world position of every written row's physical beam origin (mount of its sources.bin LiDAR; `sources` =
+  // open sources.bin, null = virtual LiDAR origin). Returns the number of returns inside the range cap.
+  std::size_t exportFrame(const Frame &frame, std::ifstream &input, std::vector<float> &packed,
+                          pcl::PointCloud<pcl::PointXYZI> &output, const PriorityCells *priority = nullptr,
+                          std::vector<float> *ranges = nullptr, std::vector<std::uint8_t> *written = nullptr,
+                          std::ifstream *sources = nullptr, std::vector<Eigen::Vector3f> *origins = nullptr) const;
+  PriorityCells nearestObservation() const;
 
   RtkFusion(const rclcpp::Node::SharedPtr &node_in, const M3D &rotation,
             const V3D &translation, const V3D &reference_lever,

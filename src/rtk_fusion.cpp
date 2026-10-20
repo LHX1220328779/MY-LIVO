@@ -11,6 +11,7 @@
 #include <pcl/io/pcd_io.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <charconv>
+#include <chrono>
 #include <future>
 #include <set>
 #include <unordered_map>
@@ -36,6 +37,21 @@ gtsam::ISAM2Params fusionSolverParameters(double rotation = 0.0001, double trans
   params.optimizationParams = gtsam::ISAM2DoglegParams();
   params.factorization = gtsam::ISAM2Params::QR;
   return params;
+}
+
+// Range-priority cell of a saved-map row (float coordinates, as written).
+std::uint64_t priorityCell(float x, float y, float z, double voxel)
+{
+  const auto cell = [voxel](float v) {
+    return static_cast<std::uint64_t>(static_cast<std::int64_t>(std::floor(static_cast<double>(v) / voxel)) & 0x1FFFFF);
+  };
+  return (cell(x) << 42) | (cell(y) << 21) | cell(z);
+}
+
+// Signed z cell index of a priorityCell key (21-bit two's complement field).
+std::int64_t priorityCellZ(std::uint64_t key)
+{
+  return static_cast<std::int64_t>((key & 0x1FFFFF) ^ 0x100000) - 0x100000;
 }
 }  // namespace
 
@@ -127,6 +143,21 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   if (!std::isfinite(save_rgb_max_range))
     throw std::runtime_error("rtk/save_rgb_max_range must be finite (<0 = same as save_map_max_range, 0 = no cap)");
   if (save_rgb_max_range < 0.0) save_rgb_max_range = save_map_max_range;
+  parameters.param<double>("rtk/save_map_priority_ratio", save_map_priority_ratio, save_map_priority_ratio);
+  parameters.param<double>("rtk/save_map_priority_margin_m", save_map_priority_margin, save_map_priority_margin);
+  parameters.param<double>("rtk/save_map_priority_voxel_m", save_map_priority_voxel, save_map_priority_voxel);
+  parameters.param<double>("rtk/save_map_priority_free_range_m", save_map_priority_free_range,
+                           save_map_priority_free_range);
+  if (!std::isfinite(save_map_priority_ratio) || (save_map_priority_ratio != 0.0 && save_map_priority_ratio < 1.0) ||
+      !std::isfinite(save_map_priority_margin) || save_map_priority_margin < 0.0 ||
+      !std::isfinite(save_map_priority_voxel) || save_map_priority_voxel <= 0.0 ||
+      !std::isfinite(save_map_priority_free_range) || save_map_priority_free_range < 0.0)
+    throw std::runtime_error(
+        "rtk/save_map_priority_*: ratio must be 0 (off) or >= 1, margin >= 0, voxel > 0, free range >= 0");
+  RCLCPP_INFO(node->get_logger(),
+      "Saved geometry map range priority: ratio %.2f, margin %.1f m, cell %.2f m, seen-free cells from returns "
+      "within %.1f m (0 ratio = off, 0 free range = no seen-free check)",
+      save_map_priority_ratio, save_map_priority_margin, save_map_priority_voxel, save_map_priority_free_range);
   RCLCPP_INFO(node->get_logger(),
       "Saved-map product range cap: geometry %.1f m, colour %.1f m (0 = keep every return; only map_N.pcd / rgb_map_N.pcd are "
       "filtered, the archive and the estimator are not). Change with rtk.save_map_max_range / rtk.save_rgb_max_range, "
@@ -2322,13 +2353,30 @@ void RtkFusion::publishGraph(double latest_error, double max_error)
   graph_publisher->publish(array);
 }
 
-void RtkFusion::exportFrame(const Frame &frame, std::ifstream &input, std::vector<float> &packed,
-                            pcl::PointCloud<pcl::PointXYZI> &output) const
+std::size_t RtkFusion::exportFrame(const Frame &frame, std::ifstream &input, std::vector<float> &packed,
+                                   pcl::PointCloud<pcl::PointXYZI> &output, const PriorityCells *priority,
+                                   std::vector<float> *ranges, std::vector<std::uint8_t> *written,
+                                   std::ifstream *sources, std::vector<Eigen::Vector3f> *origins) const
 {
   packed.resize(static_cast<std::size_t>(frame.count) * 5);
   input.seekg(static_cast<std::streamoff>(frame.offset));
   input.read(reinterpret_cast<char *>(packed.data()), static_cast<std::streamsize>(packed.size() * sizeof(float)));
   if (!input) throw std::runtime_error("Cannot read the scan archive for the map export");
+  // sources.bin (LIVOSRC1): 8-byte header, then one byte per scans.bin return = index of its LiDAR mount.
+  std::vector<std::uint8_t> source;
+  if (origins)
+  {
+    origins->clear();
+    origins->reserve(frame.count);
+    if (sources)
+    {
+      source.resize(frame.count);
+      sources->seekg(static_cast<std::streamoff>(8 + (frame.offset - 8) / 20));
+      sources->read(reinterpret_cast<char *>(source.data()), static_cast<std::streamsize>(source.size()));
+      if (!*sources) throw std::runtime_error("Cannot read sources.bin for the map export");
+    }
+  }
+  const double free_voxel = 0.5 * save_map_priority_voxel;
   const M3D native_rotation = frame.raw.rotation().matrix() * lidar_rotation;
   const V3D native_translation = frame.raw.transformFrom(lidar_translation);
   // Same arithmetic as appendCloud. Returns of one firing share their offset, hence their correction:
@@ -2337,10 +2385,19 @@ void RtkFusion::exportFrame(const Frame &frame, std::ifstream &input, std::vecto
   corrections.reserve(4096);
   output.clear();
   output.reserve(frame.count);
+  if (ranges)
+  {
+    ranges->clear();
+    ranges->reserve(frame.count);
+  }
+  if (written) written->assign((frame.count + 7) / 8, 0);
+  std::size_t in_cap = 0;
   for (std::size_t i = 0; i < frame.count; ++i)
   {
     const float *v = &packed[5 * i];
-    if (save_map_max_range > 0.0 && Eigen::Vector3f(v[0], v[1], v[2]).norm() > save_map_max_range) continue;
+    const float range = Eigen::Vector3f(v[0], v[1], v[2]).norm();
+    if (save_map_max_range > 0.0 && range > save_map_max_range) continue;
+    ++in_cap;
     double point_stamp = frame.begin + v[4] / 1000.0;
     if (!std::isfinite(point_stamp) || point_stamp < frame.begin - 1e-3 || point_stamp > frame.stamp + 1e-3)
       throw std::runtime_error("Archived LiDAR point timestamp is outside its submitted frame interval");
@@ -2351,8 +2408,145 @@ void RtkFusion::exportFrame(const Frame &frame, std::ifstream &input, std::vecto
     const V3D p = found->second.transformFrom(native);
     pcl::PointXYZI result;
     result.x = p.x(); result.y = p.y(); result.z = p.z(); result.intensity = v[3];
+    if (priority)
+    {
+      const std::uint64_t key = priorityCell(result.x, result.y, result.z, save_map_priority_voxel);
+      const auto &shard = priority->occupied[key % priority->occupied.size()];
+      const auto cell = shard.find(key);
+      if (cell != shard.end() &&
+          range > std::max(save_map_priority_ratio * cell->second, cell->second + save_map_priority_margin))
+        continue;
+      if (!priority->free.empty())
+      {
+        const std::uint64_t free_key = priorityCell(result.x, result.y, result.z, free_voxel);
+        const auto &free_shard = priority->free[free_key % priority->free.size()];
+        const auto seen = free_shard.find(free_key);
+        if (seen != free_shard.end() &&
+            range > std::max(save_map_priority_ratio * seen->second, seen->second + save_map_priority_margin))
+        {
+          // not in the column's two lowest occupied cells (ground band, see save_map_priority_free_range)
+          const auto ground = priority->ground.find(key >> 21);
+          if (ground == priority->ground.end() || priorityCellZ(key) > ground->second + 1) continue;
+        }
+      }
+    }
     output.push_back(result);
+    if (ranges) ranges->push_back(range);
+    if (origins)
+    {
+      const V3D mount = !source.empty() && source[i] < lidar_origins.size() ? lidar_origins[source[i]] : V3D::Zero();
+      origins->push_back(found->second.transformFrom(V3D(native_rotation * mount + native_translation)).cast<float>());
+    }
+    if (written) (*written)[i / 8] |= static_cast<std::uint8_t>(1U << (i % 8));
   }
+  return in_cap;
+}
+
+RtkFusion::PriorityCells RtkFusion::nearestObservation() const
+{
+  // Range priority, pass 1: per cell the nearest range of a scan that put >= 2 returns into it (one stray
+  // return - dust, multipath - cannot claim a cell). Far returns of thin objects are displaced toward the
+  // sensor and spread along the beam (truck29 20261013 lamp poles: shell P10-P90 12-20 cm with every return
+  // within 45 m, ~2-4 cm from the near lane), so the copy seen from the far lane read as a 10-20 cm ghost.
+  // Seen-free cells: part of that smear lands beside the pole, in cells no near scan put returns into, so the
+  // occupied rule keeps it (straight-edged fringes along the cell borders, 3-10 % of a pole's rows). A near
+  // return proves the space just in front of it empty: the half-voxel cells 0.6 and 1.2 voxels before it along
+  // its physical beam get its range, and exportFrame drops the much farther returns found there.
+  constexpr std::size_t shards = 32;
+  PriorityCells priority;
+  priority.occupied.resize(shards);
+  const bool carve = save_map_priority_free_range > 0.0;
+  if (carve) priority.free.resize(shards);
+  const bool have_sources = std::filesystem::exists(directory / "sources.bin");
+  const double free_voxel = 0.5 * save_map_priority_voxel;
+  const std::array<float, 2> depths{static_cast<float>(0.6 * save_map_priority_voxel),
+                                    static_cast<float>(1.2 * save_map_priority_voxel)};
+  const std::size_t batch = 128;
+  std::vector<std::vector<std::pair<std::uint64_t, float>>> cells(batch), free_cells(batch);
+  for (std::size_t first = 0; first < frames.size(); first += batch)
+  {
+    const std::size_t count = std::min(batch, frames.size() - first);
+    std::exception_ptr error;
+#pragma omp parallel
+    {
+      std::ifstream input(directory / "scans.bin", std::ios::binary);
+      std::ifstream sources;
+      if (carve && have_sources) sources.open(directory / "sources.bin", std::ios::binary);
+      std::vector<float> packed, ranges;
+      std::vector<Eigen::Vector3f> origins;
+      pcl::PointCloud<pcl::PointXYZI> cloud;
+      std::unordered_map<std::uint64_t, std::pair<float, int>> local;
+      std::unordered_map<std::uint64_t, float> local_free;
+#pragma omp for schedule(dynamic, 4)
+      for (int n = 0; n < static_cast<int>(count); ++n)
+      {
+        try
+        {
+          exportFrame(frames[first + static_cast<std::size_t>(n)], input, packed, cloud, nullptr, &ranges, nullptr,
+                      sources.is_open() ? &sources : nullptr, carve ? &origins : nullptr);
+          local.clear();
+          local_free.clear();
+          for (std::size_t i = 0; i < cloud.size(); ++i)
+          {
+            const auto &q = cloud.points[i];
+            auto &entry = local.try_emplace(priorityCell(q.x, q.y, q.z, save_map_priority_voxel),
+                                            std::make_pair(ranges[i], 0)).first->second;
+            entry.first = std::min(entry.first, ranges[i]);
+            ++entry.second;
+            if (!carve) continue;
+            const Eigen::Vector3f point(q.x, q.y, q.z);
+            const Eigen::Vector3f beam = point - origins[i];
+            const float length = beam.norm();
+            if (!(length > depths[1]) || length >= save_map_priority_free_range) continue;
+            for (const float depth : depths)
+            {
+              const Eigen::Vector3f sample = point - (depth / length) * beam;
+              auto &seen = local_free.try_emplace(priorityCell(sample.x(), sample.y(), sample.z(), free_voxel),
+                                                  ranges[i]).first->second;
+              seen = std::min(seen, ranges[i]);
+            }
+          }
+          auto &out = cells[static_cast<std::size_t>(n)];
+          out.clear();
+          for (const auto &entry : local)
+            if (entry.second.second >= 2) out.emplace_back(entry.first, entry.second.first);
+          free_cells[static_cast<std::size_t>(n)].assign(local_free.begin(), local_free.end());
+        }
+        catch (...)
+        {
+#pragma omp critical(map_priority_error)
+          if (!error) error = std::current_exception();
+        }
+      }
+    }
+    if (error) std::rethrow_exception(error);
+#pragma omp parallel for schedule(static, 1)
+    for (int s = 0; s < static_cast<int>(shards); ++s)
+      for (std::size_t n = 0; n < count; ++n)
+      {
+        for (const auto &cell : cells[n])
+          if (cell.first % shards == static_cast<std::size_t>(s))
+          {
+            const auto it = priority.occupied[static_cast<std::size_t>(s)].try_emplace(cell.first, cell.second).first;
+            it->second = std::min(it->second, cell.second);
+          }
+        if (carve)
+          for (const auto &cell : free_cells[n])
+            if (cell.first % shards == static_cast<std::size_t>(s))
+            {
+              const auto it = priority.free[static_cast<std::size_t>(s)].try_emplace(cell.first, cell.second).first;
+              it->second = std::min(it->second, cell.second);
+            }
+      }
+  }
+  if (carve)
+    for (const auto &shard : priority.occupied)
+      for (const auto &cell : shard)
+      {
+        const auto it = priority.ground.try_emplace(cell.first >> 21, priorityCellZ(cell.first)).first;
+        it->second = std::min(it->second, priorityCellZ(cell.first));
+      }
+  return priority;
 }
 
 void RtkFusion::exportMap()
@@ -2663,6 +2857,26 @@ void RtkFusion::exportMap()
       // RViz subscribed: also publish a 0.25 m voxel map of the delivered cloud (every 16th row) on /rtk/map_final.
       const bool display = rclcpp::ok() && final_map_publisher->get_subscription_count() > 0;
       std::unordered_map<std::uint64_t, std::array<float, 5>> display_cells;
+      // Range priority (pass 1): nearest supported observation per cell; exportFrame drops the farther returns.
+      const auto priority_start = std::chrono::steady_clock::now();
+      const PriorityCells priority = save_map_priority_ratio > 0.0 ? nearestObservation() : PriorityCells();
+      const bool prioritized = !priority.occupied.empty();
+      const double priority_sec =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - priority_start).count();
+      std::size_t priority_cells = 0, seen_free_cells = 0, returns_in_cap = 0, returns_written = 0;
+      for (const auto &shard : priority.occupied) priority_cells += shard.size();
+      for (const auto &shard : priority.free) seen_free_cells += shard.size();
+      std::vector<std::size_t> in_cap(export_batch, 0);
+      // With range priority the rows of a scan are a subset of its in-cap returns: map_rows.bin records which
+      // (one bit per archived return, frames.csv order) so the evaluation still pairs every row with its return.
+      std::vector<std::vector<std::uint8_t>> written(export_batch);
+      std::ofstream rows_file;
+      if (prioritized)
+      {
+        rows_file.exceptions(std::ios::badbit | std::ios::failbit);
+        rows_file.open(directory / "map_rows.bin", std::ios::binary | std::ios::trunc);
+        rows_file.write("LIVOMSK1", 8);
+      }
       pcl::PointCloud<pcl::PointXYZI> chunk;
       std::future<void> writing;  // the previous chunk is written while the next batch is transformed
       const auto write = [&](pcl::PointCloud<pcl::PointXYZI> &&cloud) {
@@ -2687,7 +2901,9 @@ void RtkFusion::exportMap()
           {
             try
             {
-              exportFrame(frames[first + static_cast<std::size_t>(n)], input, packed, outputs[n]);
+              in_cap[static_cast<std::size_t>(n)] = exportFrame(
+                  frames[first + static_cast<std::size_t>(n)], input, packed, outputs[n],
+                  prioritized ? &priority : nullptr, nullptr, prioritized ? &written[n] : nullptr);
             }
             catch (...)
             {
@@ -2699,6 +2915,11 @@ void RtkFusion::exportMap()
         if (error) std::rethrow_exception(error);
         for (std::size_t n = 0; n < count; ++n)
         {
+          returns_in_cap += in_cap[n];
+          returns_written += outputs[n].size();
+          if (rows_file.is_open())
+            rows_file.write(reinterpret_cast<const char *>(written[n].data()),
+                            static_cast<std::streamsize>(written[n].size()));
           if (display)
             for (std::size_t i = 0; i < outputs[n].size(); i += 16)
             {
@@ -2719,6 +2940,13 @@ void RtkFusion::exportMap()
       }
       if (!chunk.empty()) write(std::move(chunk));
       if (writing.valid()) writing.get();
+      RCLCPP_INFO(node->get_logger(),
+          "Saved geometry map: %zu of %zu returns within the %.1f m cap written (%.1f %%; range priority ratio %.2f, "
+          "margin %.1f m, %zu cells of %.2f m, %zu seen-free cells of %.2f m from returns within %.1f m, pass 1 %.1f s)",
+          returns_written, returns_in_cap, save_map_max_range,
+          returns_in_cap ? 100.0 * static_cast<double>(returns_written) / static_cast<double>(returns_in_cap) : 0.0,
+          save_map_priority_ratio, save_map_priority_margin, priority_cells, save_map_priority_voxel, seen_free_cells,
+          0.5 * save_map_priority_voxel, save_map_priority_free_range, priority_sec);
       if (display && !display_cells.empty())
       {
         pcl::PointCloud<pcl::PointXYZI> cloud;

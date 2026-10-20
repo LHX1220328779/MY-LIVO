@@ -16,6 +16,11 @@ Products (default <fusion_run>/map/):
 
 Source: --source all (every scan, densest) | keyframes (only the scans at backend keyframes: ~5x lighter,
 same surfaces). --voxel 0 keeps every return (no filtering).
+Range priority (same rule as the mapper's map_N.pcd, default from the round's rtk.save_map_priority_*): per
+0.5 m cell the nearest scan with >= 2 returns there sets r_min; returns farther than max(ratio * r_min,
+r_min + margin) are dropped before the voxel filter (--priority-ratio 0 = off). With the round's settings
+(no --max-range / --min-range / --priority-*) and its map_rows.bin, the rows are taken from map_rows.bin, i.e.
+exactly the mapper's decision including its seen-free cells (rtk.save_map_priority_free_range_m).
 
     /usr/bin/python3 tools/livo/map_export.py results/<round> [--voxel 0.05] [--source all] [--tile 100]
 """
@@ -220,6 +225,8 @@ class PcdWriter:
 
 XYZI = np.dtype([("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("intensity", "<f4")])
 XYZRGB = np.dtype([("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("rgb", "<u4")])
+# Projection spill record of the geometry map: + sensor range and scan index for the range-priority rule.
+GEOREC = np.dtype([("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("intensity", "<f4"), ("r", "<f4"), ("f", "<i4")])
 
 
 # ----------------------------------------------------------------------------------------------- tiling buffers
@@ -309,6 +316,35 @@ def voxel_select_rgb(rec, score, voxel):
     return rec[order[first]]
 
 
+def range_priority(rec, ratio, margin, cell):
+    """Range priority of the geometry map (the mapper's exportFrame rule): per `cell` the nearest range of a scan
+    with >= 2 returns there is r_min; keep returns with r <= max(ratio * r_min, r_min + margin). Cells without
+    such a scan keep everything. Tiles are whole numbers of 0.05 m voxels and multiples of the cell, so a cell
+    never straddles two tiles."""
+    if ratio <= 0 or not len(rec):
+        return rec
+    xyz = np.stack([rec["x"], rec["y"], rec["z"]], 1).astype(np.float64)
+    v = np.floor(xyz / cell).astype(np.int64)
+    v -= v.min(0)
+    key = (v[:, 0] << 42) | (v[:, 1] << 21) | v[:, 2]
+    order = np.lexsort((rec["f"], key))
+    k, f, r = key[order], rec["f"][order], rec["r"][order]
+    starts = np.flatnonzero(np.r_[True, (k[1:] != k[:-1]) | (f[1:] != f[:-1])])   # (cell, scan) groups
+    gmin = np.minimum.reduceat(r, starts)
+    supported = np.diff(np.r_[starts, len(k)]) >= 2
+    sk, sm = k[starts][supported], gmin[supported]
+    if not len(sk):
+        return rec
+    first = np.flatnonzero(np.r_[True, sk[1:] != sk[:-1]])
+    cells, rmin = sk[first], np.minimum.reduceat(sm, first)
+    pos = np.minimum(np.searchsorted(cells, k), len(cells) - 1)
+    found = cells[pos] == k
+    limit = np.where(found, np.maximum(ratio * rmin[pos], rmin[pos] + margin), np.inf)
+    keep = np.empty(len(rec), bool)
+    keep[order] = r <= limit
+    return rec[keep]
+
+
 # ----------------------------------------------------------------------------------------------- main export
 RGBREC = np.dtype([("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("rgb", "<u4"), ("s", "<f4")])
 _CTX = {}
@@ -320,10 +356,11 @@ def _project_frames(job):
     c = _CTX
     a, run, fr, lt, lr, corr = c["a"], c["run"], c["fr"], c["lt"], c["lr"], c["corr"]
     raw_R, raw_t, tmp = c["raw_R"], c["raw_t"], c["tmp"]
-    geo = TileBuffer(tmp / "geo", XYZI, limit=6_000_000, prefix=f"w{wid}_")
+    geo = TileBuffer(tmp / "geo", GEOREC, limit=6_000_000, prefix=f"w{wid}_")
     rgbbuf = TileBuffer(tmp / "rgb", RGBREC, limit=6_000_000, prefix=f"w{wid}_") if c["rgb_wanted"] else None
-    st = {"returns_in": 0, "returns_kept": 0, "t0": None, "t1": None, "kf": []}
+    st = {"returns_in": 0, "returns_kept": 0, "returns_in_cap": 0, "t0": None, "t1": None, "kf": []}
     n_frames = len(fr["stamp"])
+    rows = np.memmap(c["rows"], dtype=np.uint8, mode="r") if c["rows"] else None
     with open(run / "scans.bin", "rb") as scans:
         colors = open(run / "colors.bin", "rb") if rgbbuf is not None else None
         for i in frame_ids:
@@ -336,8 +373,13 @@ def _project_frames(job):
             p = pts[:, :3].astype(np.float64)
             keep = np.isfinite(p).all(1)
             rng = np.linalg.norm(p, axis=1)
-            if c["max_range"] > 0:
-                keep &= rng <= c["max_range"]
+            in_cap = keep & (rng <= c["max_range"]) if c["max_range"] > 0 else keep
+            st["returns_in_cap"] += int(np.count_nonzero(in_cap))
+            if rows is not None:   # the mapper's decision (its float32 cap, range priority, seen-free cells)
+                s0 = int(c["rows_start"][i])
+                keep &= np.unpackbits(rows[s0:s0 + (cnt + 7) // 8], bitorder="little")[:cnt].astype(bool)
+            else:
+                keep = in_cap
             if a.min_range > 0:
                 keep &= rng >= a.min_range
             begin, stamp = fr["begin"][i], fr["stamp"][i]
@@ -346,8 +388,9 @@ def _project_frames(job):
                 times = np.clip(begin + off / 1000.0, begin, stamp)
                 native = p @ (raw_R[i] @ lr).T + (raw_R[i] @ lt + raw_t[i])
                 world = apply_correction(native, times, corr)
-                rec = np.empty(len(world), XYZI)
+                rec = np.empty(len(world), GEOREC)
                 rec["x"], rec["y"], rec["z"], rec["intensity"] = world[:, 0], world[:, 1], world[:, 2], inten
+                rec["r"], rec["f"] = rng[keep], i
                 geo.add(tile_key(world[:, :2], c["tile"], a.voxel), rec)
                 st["returns_kept"] += len(rec)
                 st["t0"] = stamp if st["t0"] is None else min(st["t0"], stamp)
@@ -396,8 +439,12 @@ def _reduce_tile(job):
     kind, tile_id = job
     c = _CTX
     tmp, a = c["tmp"], c["a"]
+    n_in = n_prio = 0
     if kind == "geo":
-        rec = TileBuffer.load_all(tmp / "geo", tile_id, XYZI)
+        rec = TileBuffer.load_all(tmp / "geo", tile_id, GEOREC)
+        n_in = len(rec)
+        rec = range_priority(rec, *c["priority"])
+        n_prio = len(rec)
         out = voxel_reduce_xyzi(rec, a.voxel, a.min_points)
     else:
         rr = TileBuffer.load_all(tmp / "rgb", tile_id, RGBREC)
@@ -409,8 +456,8 @@ def _reduce_tile(job):
     out.tofile(path)
     if len(out):
         xyz = np.stack([out["x"], out["y"], out["z"]], 1)
-        return kind, tile_id, len(out), xyz.min(0).tolist(), xyz.max(0).tolist()
-    return kind, tile_id, 0, None, None
+        return kind, tile_id, len(out), xyz.min(0).tolist(), xyz.max(0).tolist(), n_in, n_prio
+    return kind, tile_id, 0, None, None, n_in, n_prio
 
 
 def export(a):
@@ -447,7 +494,31 @@ def export(a):
             rgb_range = -1.0
         if rgb_range < 0:
             rgb_range = max_range
+    priority = []
+    for name, key, default in (("priority_ratio", "rtk.save_map_priority_ratio", 1.5),
+                               ("priority_margin", "rtk.save_map_priority_margin_m", 2.0),
+                               ("priority_cell", "rtk.save_map_priority_voxel_m", 0.5)):
+        value = getattr(a, name)
+        if value is None:
+            try:
+                value = float(prm.get(key, default))
+            except ValueError:
+                value = default
+        priority.append(float(value))
+    if priority[0] != 0 and (priority[0] < 1 or priority[1] < 0 or priority[2] <= 0):
+        raise SystemExit("range priority: ratio 0 (off) or >= 1, margin >= 0, cell > 0")
+    # The round's settings + map_rows.bin: take the mapper's own row decision (incl. its seen-free cells).
+    rows_path, rows_start = run / "map_rows.bin", None
+    if (rows_path.exists() and a.max_range is None and a.min_range <= 0 and a.priority_ratio is None
+            and a.priority_margin is None and a.priority_cell is None):
+        counts = fr["count"].astype(np.int64)
+        rows_start = 8 + np.concatenate([[0], np.cumsum((counts + 7) // 8)[:-1]])
+        head = np.fromfile(rows_path, dtype=np.uint8, count=8)
+        if bytes(head) != b"LIVOMSK1" or rows_path.stat().st_size != int(rows_start[-1] + (counts[-1] + 7) // 8):
+            raise SystemExit(f"{rows_path} does not match frames.csv")
     tile = a.tile if a.tile > 0 else 50.0
+    if priority[0] > 0 and a.voxel > 0 and abs(tile / priority[2] - round(tile / priority[2])) > 1e-9:
+        raise SystemExit("range priority: the tile size must be a multiple of the priority cell")
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="map_export_", dir=out))
     for d in ("geo", "rgb", "red"):
         (tmp / d).mkdir()
@@ -455,6 +526,8 @@ def export(a):
     if a.keyframe_clouds:
         kf_dir.mkdir(exist_ok=True)
     _CTX.update(a=a, run=run, fr=fr, lt=lt, lr=lr, corr=corr, tmp=tmp, tile=tile, max_range=max_range or 0.0,
+                priority=(0.0, priority[1], priority[2]) if rows_start is not None else tuple(priority),
+                rows=str(rows_path) if rows_start is not None else None, rows_start=rows_start,
                 rgb_wanted=rgb_wanted, rgb_range=(rgb_range or 0.0) if rgb_wanted else 0.0, kf_dir=kf_dir,
                 raw_R=quat_to_rot(np.stack([fr["qx"], fr["qy"], fr["qz"], fr["qw"]], 1)),
                 raw_t=np.stack([fr["tx"], fr["ty"], fr["tz"]], 1),
@@ -466,7 +539,8 @@ def export(a):
     with ctx.Pool(workers) as pool:
         parts = pool.map(_project_frames, chunks)
     stats = {"frames_total": int(n_frames), "frames_used": int(len(frames_sel)),
-             "returns_in": int(sum(p["returns_in"] for p in parts)), "returns_kept": int(sum(p["returns_kept"] for p in parts))}
+             "returns_in": int(sum(p["returns_in"] for p in parts)), "returns_kept": int(sum(p["returns_kept"] for p in parts)),
+             "returns_in_cap": int(sum(p["returns_in_cap"] for p in parts))}
     t0s = [p["t0"] for p in parts if p["t0"] is not None]
     t1s = [p["t1"] for p in parts if p["t1"] is not None]
     t_span = [min(t0s) if t0s else None, max(t1s) if t1s else None]
@@ -478,6 +552,7 @@ def export(a):
         jobs += [("rgb", t) for t in TileBuffer.tiles_on_disk(tmp / "rgb")]
     with ctx.Pool(max(1, min(a.jobs, 6))) as pool:
         reduced = pool.map(_reduce_tile, jobs, chunksize=1)
+    stats["returns_range_priority"] = int(sum(r[6] for r in reduced if r[0] == "geo"))
     files, tile_counts = {}, {}
     bounds = [np.full(3, np.inf), np.full(3, -np.inf)]
     tile_dir = out / "tiles"
@@ -489,7 +564,7 @@ def export(a):
         if not items:
             continue
         w = PcdWriter(out / fname, fields, dtype)
-        for _k, tid, n, lo, hi in items:
+        for _k, tid, n, lo, hi, _n_in, _n_prio in items:
             if not n:
                 continue
             data = np.fromfile(tmp / "red" / f"{kind}_{tid}.bin", dtype=dtype)
@@ -529,6 +604,11 @@ def export(a):
         "source": a.source, "voxel_m": a.voxel, "min_points_per_voxel": a.min_points,
         "rgb_voxel_m": a.rgb_voxel if rgb_wanted else None,
         "range_m": {"min": a.min_range, "max": max_range or 0.0, "rgb_max": rgb_range if rgb_wanted else None},
+        "range_priority": {"ratio": priority[0], "margin_m": priority[1], "cell_m": priority[2],
+                           "rows": "map_rows.bin (mapper decision incl. seen-free cells)" if rows_start is not None
+                           else "recomputed here (occupied-cell rule)",
+                           "returns_in": stats["returns_in_cap"] if rows_start is not None else stats["returns_kept"],
+                           "returns_kept": stats["returns_range_priority"]},
         "tile_m": a.tile if a.tile > 0 else None, "tiles": tile_counts or None,
         "points": files, "frames": stats,
         "time_span": {"first": t_span[0], "last": t_span[1]},
@@ -572,6 +652,10 @@ def build_parser():
     ap.add_argument("--min-range", type=float, default=0.0, help="drop returns closer than this to the LiDAR (m)")
     ap.add_argument("--max-range", type=float, default=None,
                     help="drop returns farther than this (m, 0 = none; default: the round's rtk.save_map_max_range)")
+    ap.add_argument("--priority-ratio", type=float, default=None,
+                    help="range priority: keep r <= max(ratio*r_min, r_min+margin) per cell (0 = off; default: the round's)")
+    ap.add_argument("--priority-margin", type=float, default=None, help="range priority margin (m; default: the round's)")
+    ap.add_argument("--priority-cell", type=float, default=None, help="range priority cell (m; default: the round's)")
     ap.add_argument("--tile", type=float, default=0.0, help="also write square tiles of this size (m, 0 = global file only)")
     ap.add_argument("--min-points", type=int, default=1,
                     help="drop geometry voxels with fewer returns (noise / briefly seen moving objects; 1 = keep all)")
