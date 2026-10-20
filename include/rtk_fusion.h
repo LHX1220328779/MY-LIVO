@@ -298,6 +298,14 @@ struct RtkFusion
   // would trim the upper half of the far scans' ground band (20261013: lowered > 5 mm on 8 % of the rough
   // columns). 0 = off.
   double save_map_priority_free_range = 25.0;
+  // Detail fill, part of range priority: a return the rule above drops is still written where it adds coverage
+  // without blur. Ground (the column's two lowest occupied cells): within 1 cm of the plane of the column's written
+  // ground rows, in a 0.1 m sub-column none of them hits (the near scans' rings leave 14-19 % of the 0.1 m ground
+  // columns empty; far ground returns sit 1-5 cm off the near plane, only the ones on it fill the gaps).
+  // Vegetation (cells whose written rows are volumetric): in a 0.1 m sub-voxel none of them hits (a porous canopy
+  // has no surface a far return could blur; 20261013: 0.2 m cells above ground lost to range priority 18-30 % ->
+  // 15-26 %, poles and walls unchanged). false = off.
+  bool save_map_priority_fill = true;
   std::vector<int> accepted_modes;
   std::filesystem::path directory;
   std::ofstream archive, color_archive, frame_index, diagnostics, optimization_log, history_log, association_log, geometry_history, path_log;
@@ -348,6 +356,12 @@ struct RtkFusion
   {
     NearestCells occupied, free;
     std::unordered_map<std::uint64_t, std::int64_t> ground;  // column (x,y cell) -> lowest occupied z cell
+    // detail fill (save_map_priority_fill, detailFill): ground column -> plane z = z0 + gx dx + gy dy of its written
+    // ground rows (dx, dy from the column corner) and its 5x5 sub-columns holding one; volumetric cell -> its
+    // 5x5x5 sub-voxels holding a written row
+    struct GroundPlane { float z0, gx, gy; std::uint32_t occupied; };
+    std::unordered_map<std::uint64_t, GroundPlane> ground_planes;
+    std::unordered_map<std::uint64_t, std::array<std::uint64_t, 2>> vegetation;
   };
   // One archived scan -> delivered points (map_N.pcd rows), identical to appendCloud on the range-capped scan;
   // with `priority` the range-priority rule is applied, `ranges` receives the range of every written row,
@@ -357,8 +371,11 @@ struct RtkFusion
   std::size_t exportFrame(const Frame &frame, std::ifstream &input, std::vector<float> &packed,
                           pcl::PointCloud<pcl::PointXYZI> &output, const PriorityCells *priority = nullptr,
                           std::vector<float> *ranges = nullptr, std::vector<std::uint8_t> *written = nullptr,
-                          std::ifstream *sources = nullptr, std::vector<Eigen::Vector3f> *origins = nullptr) const;
+                          std::ifstream *sources = nullptr, std::vector<Eigen::Vector3f> *origins = nullptr,
+                          std::size_t *filled = nullptr) const;
   PriorityCells nearestObservation() const;
+  void detailFill(PriorityCells &priority) const;
+  bool fillsGap(const PriorityCells &priority, std::uint64_t key, bool ground_layer, const pcl::PointXYZI &p) const;
   // Colours of the RGB products: per 3 cm voxel the best camera observation in colors.bin (lowest range + 20 m
   // per rad/s of rotation). A point takes the colour of its own voxel, else of the nearest of those observations
   // within 6 cm. rgb_map_N.pcd = the geometry rows of map_N.pcd that find a colour, i.e. exactly the geometry of

@@ -375,6 +375,14 @@ laser_mapping:
       # the two lowest occupied 0.5 m cells of each column (grazing beams would trim the ground band). 20261013
       # LIVO: pole shell (P10-P90) median 7.2 -> ~3 cm, ground unchanged. 0 = off.
       save_map_priority_free_range_m: 25.0
+      # Detail fill (pass 2 of the rule): a dropped return is still written where it adds coverage without blur.
+      # Ground (two lowest occupied cells of a column): within 1 cm of the plane of the column's written ground
+      # rows and in a 0.1 m sub-column none of them hits - the near scans' rings left 14-19 % of the 0.1 m
+      # ground columns empty (stripes), while the far ground returns sit 1-5 cm off the near plane (20261013).
+      # Vegetation (cells whose written rows are volumetric): in a 0.1 m sub-voxel none of them hits - a porous
+      # canopy has no surface to blur. Poles, signs and walls keep the plain rule (far returns there spread
+      # 9-15 cm against 2-4 cm near). false = off.
+      save_map_priority_fill: true
 
     reference_frame_conversion:
       # The Odometry child frame is vehicle_rear_axle_rfu. When enabled,

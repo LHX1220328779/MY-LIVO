@@ -149,6 +149,7 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   parameters.param<double>("rtk/save_map_priority_voxel_m", save_map_priority_voxel, save_map_priority_voxel);
   parameters.param<double>("rtk/save_map_priority_free_range_m", save_map_priority_free_range,
                            save_map_priority_free_range);
+  parameters.param<bool>("rtk/save_map_priority_fill", save_map_priority_fill, save_map_priority_fill);
   if (!std::isfinite(save_map_priority_ratio) || (save_map_priority_ratio != 0.0 && save_map_priority_ratio < 1.0) ||
       !std::isfinite(save_map_priority_margin) || save_map_priority_margin < 0.0 ||
       !std::isfinite(save_map_priority_voxel) || save_map_priority_voxel <= 0.0 ||
@@ -157,9 +158,11 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
         "rtk/save_map_priority_*: ratio must be 0 (off) or >= 1, margin >= 0, voxel > 0, free range >= 0");
   RCLCPP_INFO(node->get_logger(),
       "Saved geometry map range priority: %s (ratio %.2f, margin %.1f m, cell %.2f m, seen-free cells from returns "
-      "within %.1f m; rtk.save_map_priority_enabled, 0 ratio = off, 0 free range = no seen-free check)",
+      "within %.1f m, detail fill %s; rtk.save_map_priority_enabled, 0 ratio = off, 0 free range = no seen-free "
+      "check, rtk.save_map_priority_fill)",
       save_map_priority_enabled && save_map_priority_ratio > 0.0 ? "ON" : "off (every return within the cap)",
-      save_map_priority_ratio, save_map_priority_margin, save_map_priority_voxel, save_map_priority_free_range);
+      save_map_priority_ratio, save_map_priority_margin, save_map_priority_voxel, save_map_priority_free_range,
+      save_map_priority_fill ? "on" : "off");
   RCLCPP_INFO(node->get_logger(),
       "Saved-map product range cap: geometry %.1f m, colour %.1f m (0 = keep every return; only map_N.pcd / rgb_map_N.pcd are "
       "filtered, the archive and the estimator are not). Change with rtk.save_map_max_range / rtk.save_rgb_max_range, "
@@ -2358,7 +2361,8 @@ void RtkFusion::publishGraph(double latest_error, double max_error)
 std::size_t RtkFusion::exportFrame(const Frame &frame, std::ifstream &input, std::vector<float> &packed,
                                    pcl::PointCloud<pcl::PointXYZI> &output, const PriorityCells *priority,
                                    std::vector<float> *ranges, std::vector<std::uint8_t> *written,
-                                   std::ifstream *sources, std::vector<Eigen::Vector3f> *origins) const
+                                   std::ifstream *sources, std::vector<Eigen::Vector3f> *origins,
+                                   std::size_t *filled) const
 {
   packed.resize(static_cast<std::size_t>(frame.count) * 5);
   input.seekg(static_cast<std::streamoff>(frame.offset));
@@ -2415,21 +2419,27 @@ std::size_t RtkFusion::exportFrame(const Frame &frame, std::ifstream &input, std
       const std::uint64_t key = priorityCell(result.x, result.y, result.z, save_map_priority_voxel);
       const auto &shard = priority->occupied[key % priority->occupied.size()];
       const auto cell = shard.find(key);
-      if (cell != shard.end() &&
-          range > std::max(save_map_priority_ratio * cell->second, cell->second + save_map_priority_margin))
-        continue;
-      if (!priority->free.empty())
+      bool drop = cell != shard.end() &&
+                  range > std::max(save_map_priority_ratio * cell->second, cell->second + save_map_priority_margin);
+      // the column's two lowest occupied cells (ground band): no seen-free check, ground fill
+      const auto ground_layer = [&]() {
+        const auto ground = priority->ground.find(key >> 21);
+        return ground != priority->ground.end() && priorityCellZ(key) <= ground->second + 1;
+      };
+      if (!drop && !priority->free.empty())
       {
         const std::uint64_t free_key = priorityCell(result.x, result.y, result.z, free_voxel);
         const auto &free_shard = priority->free[free_key % priority->free.size()];
         const auto seen = free_shard.find(free_key);
-        if (seen != free_shard.end() &&
-            range > std::max(save_map_priority_ratio * seen->second, seen->second + save_map_priority_margin))
-        {
-          // not in the column's two lowest occupied cells (ground band, see save_map_priority_free_range)
-          const auto ground = priority->ground.find(key >> 21);
-          if (ground == priority->ground.end() || priorityCellZ(key) > ground->second + 1) continue;
-        }
+        drop = seen != free_shard.end() &&
+               range > std::max(save_map_priority_ratio * seen->second, seen->second + save_map_priority_margin) &&
+               !ground_layer();
+      }
+      if (drop)
+      {
+        if (priority->ground_planes.empty() && priority->vegetation.empty()) continue;
+        if (!fillsGap(*priority, key, ground_layer(), result)) continue;
+        if (filled) ++*filled;
       }
     }
     output.push_back(result);
@@ -2442,6 +2452,180 @@ std::size_t RtkFusion::exportFrame(const Frame &frame, std::ifstream &input, std
     if (written) (*written)[i / 8] |= static_cast<std::uint8_t>(1U << (i % 8));
   }
   return in_cap;
+}
+
+bool RtkFusion::fillsGap(const PriorityCells &priority, std::uint64_t key, bool ground_layer,
+                         const pcl::PointXYZI &p) const
+{
+  // Detail fill (see save_map_priority_fill / detailFill): 0.1 m sub-cells (a fifth of the cell) of the cell.
+  const double voxel = save_map_priority_voxel, sub = 0.2 * voxel;
+  const double x0 = std::floor(static_cast<double>(p.x) / voxel) * voxel;
+  const double y0 = std::floor(static_cast<double>(p.y) / voxel) * voxel;
+  const auto index = [sub](double offset) { return std::min(4, std::max(0, static_cast<int>(offset / sub))); };
+  const int ix = index(p.x - x0), iy = index(p.y - y0);
+  if (ground_layer)
+  {
+    const auto plane = priority.ground_planes.find(key >> 21);
+    if (plane == priority.ground_planes.end() || ((plane->second.occupied >> (iy * 5 + ix)) & 1U)) return false;
+    const auto &g = plane->second;
+    return std::abs(p.z - (g.z0 + g.gx * (p.x - x0) + g.gy * (p.y - y0))) <= 0.01;
+  }
+  const auto cell = priority.vegetation.find(key);
+  if (cell == priority.vegetation.end()) return false;
+  const double z0 = std::floor(static_cast<double>(p.z) / voxel) * voxel;
+  const int bit = (index(p.z - z0) * 5 + iy) * 5 + ix;
+  return ((cell->second[bit >> 6] >> (bit & 63)) & 1U) == 0;
+}
+
+void RtkFusion::detailFill(PriorityCells &priority) const
+{
+  // Range priority, pass 2 (save_map_priority_fill): over the rows pass 1 writes, per ground column (two lowest
+  // occupied cells) a least-squares plane, refit on the rows within max(2 sigma, 2 cm) of the first fit, and the
+  // 0.1 m sub-columns holding a row; per cell above, the second moments of its rows (volumetric = vegetation:
+  // smallest spread >= 0.35 x the largest and >= 8 cm, >= 15 rows) and the 0.1 m sub-voxels holding a row.
+  struct Sums
+  {
+    double n = 0, x = 0, y = 0, z = 0, xx = 0, xy = 0, xz = 0, yy = 0, yz = 0, zz = 0;
+    std::uint64_t bits[2] = {0, 0};
+    void add(double a, double b, double c)
+    {
+      n += 1; x += a; y += b; z += c; xx += a * a; xy += a * b; xz += a * c; yy += b * b; yz += b * c; zz += c * c;
+    }
+    void merge(const Sums &o)
+    {
+      n += o.n; x += o.x; y += o.y; z += o.z; xx += o.xx; xy += o.xy; xz += o.xz; yy += o.yy; yz += o.yz;
+      zz += o.zz; bits[0] |= o.bits[0]; bits[1] |= o.bits[1];
+    }
+  };
+  struct Fit { double z0, gx, gy, sigma; };
+  const auto plane = [](const Sums &s, Fit &fit) {   // z = z0 + gx dx + gy dy
+    Eigen::Matrix3d a;
+    a << s.n, s.x, s.y, s.x, s.xx, s.xy, s.y, s.xy, s.yy;
+    const Eigen::Vector3d b(s.z, s.xz, s.yz);
+    const Eigen::FullPivLU<Eigen::Matrix3d> lu(a);
+    if (s.n < 10 || lu.rank() < 3) return false;
+    const Eigen::Vector3d sol = lu.solve(b);
+    fit = {sol[0], sol[1], sol[2], std::sqrt(std::max(0.0, (s.zz - sol.dot(b)) / s.n))};
+    return true;
+  };
+  constexpr std::size_t shards = 32;
+  const double voxel = save_map_priority_voxel, sub = 0.2 * voxel;
+  const auto index = [sub](double offset) { return std::min(4, std::max(0, static_cast<int>(offset / sub))); };
+  std::unordered_map<std::uint64_t, Fit> first_fit;
+  std::unordered_map<std::uint64_t, std::uint32_t> occupied;
+  std::unordered_map<std::uint64_t, PriorityCells::GroundPlane> planes;
+  std::unordered_map<std::uint64_t, std::array<std::uint64_t, 2>> vegetation;
+  const std::size_t batch = 128;
+  for (int pass = 0; pass < 2; ++pass)
+  {
+    std::vector<std::unordered_map<std::uint64_t, Sums>> columns(shards), cells(shards);
+    std::vector<std::vector<std::pair<std::uint64_t, Sums>>> local_columns(batch), local_cells(batch);
+    for (std::size_t first = 0; first < frames.size(); first += batch)
+    {
+      const std::size_t count = std::min(batch, frames.size() - first);
+      std::exception_ptr error;
+#pragma omp parallel
+      {
+        std::ifstream input(directory / "scans.bin", std::ios::binary);
+        std::vector<float> packed;
+        pcl::PointCloud<pcl::PointXYZI> cloud;
+        std::unordered_map<std::uint64_t, Sums> column_sums, cell_sums;
+#pragma omp for schedule(dynamic, 4)
+        for (int n = 0; n < static_cast<int>(count); ++n)
+        {
+          try
+          {
+            exportFrame(frames[first + static_cast<std::size_t>(n)], input, packed, cloud, &priority);
+            column_sums.clear();
+            cell_sums.clear();
+            for (const auto &q : cloud)
+            {
+              const std::uint64_t key = priorityCell(q.x, q.y, q.z, voxel);
+              const auto ground = priority.ground.find(key >> 21);
+              const double x0 = std::floor(static_cast<double>(q.x) / voxel) * voxel;
+              const double y0 = std::floor(static_cast<double>(q.y) / voxel) * voxel;
+              const double dx = q.x - x0, dy = q.y - y0;
+              if (ground != priority.ground.end() && priorityCellZ(key) <= ground->second + 1)
+              {
+                if (pass == 1)
+                {
+                  const auto fit = first_fit.find(key >> 21);
+                  if (fit == first_fit.end() || std::abs(q.z - (fit->second.z0 + fit->second.gx * dx +
+                                                                fit->second.gy * dy)) >
+                                                    std::max(2.0 * fit->second.sigma, 0.02))
+                    continue;
+                }
+                auto &s = column_sums[key >> 21];
+                s.add(dx, dy, q.z);
+                s.bits[0] |= 1ULL << (index(dy) * 5 + index(dx));
+              }
+              else if (pass == 0)
+              {
+                const double dz = q.z - std::floor(static_cast<double>(q.z) / voxel) * voxel;
+                auto &s = cell_sums[key];
+                s.add(dx, dy, dz);
+                const int bit = (index(dz) * 5 + index(dy)) * 5 + index(dx);
+                s.bits[bit >> 6] |= 1ULL << (bit & 63);
+              }
+            }
+            local_columns[static_cast<std::size_t>(n)].assign(column_sums.begin(), column_sums.end());
+            local_cells[static_cast<std::size_t>(n)].assign(cell_sums.begin(), cell_sums.end());
+          }
+          catch (...)
+          {
+#pragma omp critical(map_fill_error)
+            if (!error) error = std::current_exception();
+          }
+        }
+      }
+      if (error) std::rethrow_exception(error);
+#pragma omp parallel for schedule(static, 1)
+      for (int s = 0; s < static_cast<int>(shards); ++s)
+        for (std::size_t n = 0; n < count; ++n)
+        {
+          for (const auto &entry : local_columns[n])
+            if (entry.first % shards == static_cast<std::size_t>(s))
+              columns[static_cast<std::size_t>(s)][entry.first].merge(entry.second);
+          for (const auto &entry : local_cells[n])
+            if (entry.first % shards == static_cast<std::size_t>(s))
+              cells[static_cast<std::size_t>(s)][entry.first].merge(entry.second);
+        }
+    }
+    for (const auto &shard : columns)
+      for (const auto &entry : shard)
+      {
+        Fit fit;
+        if (!plane(entry.second, fit)) continue;
+        if (pass == 0)
+        {
+          first_fit.emplace(entry.first, fit);
+          occupied.emplace(entry.first, static_cast<std::uint32_t>(entry.second.bits[0]));
+        }
+        else
+        {
+          planes.emplace(entry.first, PriorityCells::GroundPlane{static_cast<float>(fit.z0), static_cast<float>(fit.gx),
+                                                                 static_cast<float>(fit.gy), occupied.at(entry.first)});
+        }
+      }
+    if (pass == 0)
+      for (const auto &shard : cells)
+        for (const auto &entry : shard)
+        {
+          const Sums &s = entry.second;
+          if (s.n < 15) continue;
+          const Eigen::Vector3d mean(s.x / s.n, s.y / s.n, s.z / s.n);
+          Eigen::Matrix3d c;
+          c << s.xx, s.xy, s.xz, s.xy, s.yy, s.yz, s.xz, s.yz, s.zz;
+          c = c / s.n - mean * mean.transpose();
+          const Eigen::Vector3d spread =
+              Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(c).eigenvalues().cwiseMax(0.0).cwiseSqrt();
+          if (spread[0] >= 0.35 * spread[2] && spread[0] >= 0.08)
+            vegetation.emplace(entry.first, std::array<std::uint64_t, 2>{s.bits[0], s.bits[1]});
+        }
+  }
+  // set only now: both passes see the rows of range priority alone (a column whose refit kept < 10 rows: no plane)
+  priority.ground_planes = std::move(planes);
+  priority.vegetation = std::move(vegetation);
 }
 
 namespace
@@ -2693,7 +2877,7 @@ RtkFusion::PriorityCells RtkFusion::nearestObservation() const
             }
       }
   }
-  if (carve)
+  if (carve || save_map_priority_fill)
     for (const auto &shard : priority.occupied)
       for (const auto &cell : shard)
       {
@@ -2904,15 +3088,19 @@ void RtkFusion::exportMap()
       std::unordered_map<std::uint64_t, std::array<float, 5>> display_cells;
       // Range priority (pass 1): nearest supported observation per cell; exportFrame drops the farther returns.
       const auto priority_start = std::chrono::steady_clock::now();
-      const PriorityCells priority =
+      PriorityCells priority =
           save_map_priority_enabled && save_map_priority_ratio > 0.0 ? nearestObservation() : PriorityCells();
       const bool prioritized = !priority.occupied.empty();
       const double priority_sec =
           std::chrono::duration<double>(std::chrono::steady_clock::now() - priority_start).count();
-      std::size_t priority_cells = 0, seen_free_cells = 0, returns_in_cap = 0, returns_written = 0;
+      // pass 2: detail fill (ground planes / vegetation cells of the rows pass 1 writes)
+      const auto fill_start = std::chrono::steady_clock::now();
+      if (prioritized && save_map_priority_fill) detailFill(priority);
+      const double fill_sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - fill_start).count();
+      std::size_t priority_cells = 0, seen_free_cells = 0, returns_in_cap = 0, returns_written = 0, rows_filled = 0;
       for (const auto &shard : priority.occupied) priority_cells += shard.size();
       for (const auto &shard : priority.free) seen_free_cells += shard.size();
-      std::vector<std::size_t> in_cap(export_batch, 0);
+      std::vector<std::size_t> in_cap(export_batch, 0), filled(export_batch, 0);
       // With range priority the rows of a scan are a subset of its in-cap returns: map_rows.bin records which
       // (one bit per archived return, frames.csv order) so the evaluation still pairs every row with its return.
       std::vector<std::vector<std::uint8_t>> written(export_batch);
@@ -2958,9 +3146,11 @@ void RtkFusion::exportMap()
           {
             try
             {
+              filled[static_cast<std::size_t>(n)] = 0;
               in_cap[static_cast<std::size_t>(n)] = exportFrame(
                   frames[first + static_cast<std::size_t>(n)], input, packed, outputs[n],
-                  prioritized ? &priority : nullptr, nullptr, prioritized ? &written[n] : nullptr);
+                  prioritized ? &priority : nullptr, nullptr, prioritized ? &written[n] : nullptr, nullptr, nullptr,
+                  &filled[static_cast<std::size_t>(n)]);
               auto &rgb = rgb_outputs[n];
               rgb.clear();
               if (!colours.empty())
@@ -2991,6 +3181,7 @@ void RtkFusion::exportMap()
         {
           returns_in_cap += in_cap[n];
           returns_written += outputs[n].size();
+          rows_filled += filled[n];
           if (rows_file.is_open())
             rows_file.write(reinterpret_cast<const char *>(written[n].data()),
                             static_cast<std::streamsize>(written[n].size()));
@@ -3027,12 +3218,14 @@ void RtkFusion::exportMap()
             colours.keys.size(), save_rgb_max_range, colour_sec);
       RCLCPP_INFO(node->get_logger(),
           "Saved geometry map: %zu of %zu returns within the %.1f m cap written (%.1f %%; range priority %s: ratio %.2f, "
-          "margin %.1f m, %zu cells of %.2f m, %zu seen-free cells of %.2f m from returns within %.1f m, pass 1 %.1f s)",
+          "margin %.1f m, %zu cells of %.2f m, %zu seen-free cells of %.2f m from returns within %.1f m, pass 1 %.1f s; "
+          "detail fill %zu rows: %zu ground planes, %zu vegetation cells, pass 2 %.1f s)",
           returns_written, returns_in_cap, save_map_max_range,
           returns_in_cap ? 100.0 * static_cast<double>(returns_written) / static_cast<double>(returns_in_cap) : 0.0,
           prioritized ? "on" : "off", save_map_priority_ratio, save_map_priority_margin, priority_cells,
           save_map_priority_voxel, seen_free_cells,
-          0.5 * save_map_priority_voxel, save_map_priority_free_range, priority_sec);
+          0.5 * save_map_priority_voxel, save_map_priority_free_range, priority_sec, rows_filled,
+          priority.ground_planes.size(), priority.vegetation.size(), fill_sec);
       if (display && !display_cells.empty())
       {
         pcl::PointCloud<pcl::PointXYZI> cloud;
