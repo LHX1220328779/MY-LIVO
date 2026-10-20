@@ -297,9 +297,11 @@ struct RtkFusion
   // columns). 0 = off.
   double save_map_priority_free_range = 25.0;
   // Detail fill, part of range priority: a return the rule above drops is still written where it adds coverage
-  // without blur. Ground (the column's two lowest occupied cells): within 1 cm of the plane of the column's written
-  // ground rows, in a 0.1 m sub-column none of them hits (the near scans' rings leave 14-19 % of the 0.1 m ground
-  // columns empty; far ground returns sit 1-5 cm off the near plane, only the ones on it fill the gaps).
+  // without blur. Ground (the column's two lowest occupied cells): in a 0.05 m sub-column none of the column's
+  // written ground rows hits, the rows of the nearest scan with a return there within 3 cm of their plane (the near
+  // scans' rings leave 65-75 % of the 0.05 m driving-band ground cells empty, as transverse stripes one scan apart -
+  // 20261013: 0.47 m at 4.8 m/s; far ground returns sit 1-5 cm off the near plane, only the ones on it fill, and
+  // only the nearest scan's: one scan per gap instead of every far scan's).
   // Vegetation (cells whose written rows are volumetric): in a 0.1 m sub-voxel none of them hits (a porous canopy
   // has no surface a far return could blur; 20261013: 0.2 m cells above ground lost to range priority 18-30 % ->
   // 15-26 %, poles and walls unchanged). false = off.
@@ -355,9 +357,15 @@ struct RtkFusion
     NearestCells occupied, free;
     std::unordered_map<std::uint64_t, std::int64_t> ground;  // column (x,y cell) -> lowest occupied z cell
     // detail fill (save_map_priority_fill, detailFill): ground column -> plane z = z0 + gx dx + gy dy of its written
-    // ground rows (dx, dy from the column corner) and its 5x5 sub-columns holding one; volumetric cell -> its
-    // 5x5x5 sub-voxels holding a written row
-    struct GroundPlane { float z0, gx, gy; std::uint32_t occupied; };
+    // ground rows (dx, dy from the column corner), its 10x10 sub-columns holding one (bit iy * 10 + ix) and per
+    // empty sub-column the range code of the nearest dropped ground row on the plane (0 = none); volumetric cell ->
+    // its 5x5x5 sub-voxels holding a written row
+    struct GroundPlane
+    {
+      float z0, gx, gy;
+      std::array<std::uint64_t, 2> occupied;
+      std::array<std::uint8_t, 100> nearest;
+    };
     std::unordered_map<std::uint64_t, GroundPlane> ground_planes;
     std::unordered_map<std::uint64_t, std::array<std::uint64_t, 2>> vegetation;
   };
@@ -366,15 +374,18 @@ struct RtkFusion
   // `written` one bit per archived return of the scan (LSB first, 1 = written; map_rows.bin) and `origins` the
   // world position of every written row's physical beam origin (mount of its sources.bin LiDAR; `sources` =
   // open sources.bin, null = virtual LiDAR origin), `rows` the archive index of every written row (its colour in
-  // colors.bin). Returns the number of returns inside the range cap.
+  // colors.bin), `dropped` the rows the rule drops in the ground layer with their range (detail fill candidates).
+  // Returns the number of returns inside the range cap.
   std::size_t exportFrame(const Frame &frame, std::ifstream &input, std::vector<float> &packed,
                           pcl::PointCloud<pcl::PointXYZI> &output, const PriorityCells *priority = nullptr,
                           std::vector<float> *ranges = nullptr, std::vector<std::uint8_t> *written = nullptr,
                           std::ifstream *sources = nullptr, std::vector<Eigen::Vector3f> *origins = nullptr,
-                          std::size_t *filled = nullptr, std::vector<std::uint32_t> *rows = nullptr) const;
+                          std::size_t *filled = nullptr, std::vector<std::uint32_t> *rows = nullptr,
+                          std::vector<std::pair<pcl::PointXYZI, float>> *dropped = nullptr) const;
   PriorityCells nearestObservation() const;
   void detailFill(PriorityCells &priority) const;
-  bool fillsGap(const PriorityCells &priority, std::uint64_t key, bool ground_layer, const pcl::PointXYZI &p) const;
+  bool fillsGap(const PriorityCells &priority, std::uint64_t key, bool ground_layer, const pcl::PointXYZI &p,
+                float range) const;
 
   RtkFusion(const rclcpp::Node::SharedPtr &node_in, const M3D &rotation,
             const V3D &translation, const V3D &reference_lever,

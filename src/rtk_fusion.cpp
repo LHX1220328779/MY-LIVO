@@ -53,6 +53,25 @@ std::int64_t priorityCellZ(std::uint64_t key)
 {
   return static_cast<std::int64_t>((key & 0x1FFFFF) ^ 0x100000) - 0x100000;
 }
+
+// Ground detail fill: 10x10 sub-columns of a range-priority column (0.05 m at the 0.5 m cell), bit iy * 10 + ix.
+int groundSubColumn(double dx, double dy, double voxel)
+{
+  const double sub = 0.1 * voxel;
+  const int ix = std::min(9, std::max(0, static_cast<int>(dx / sub)));
+  const int iy = std::min(9, std::max(0, static_cast<int>(dy / sub)));
+  return iy * 10 + ix;
+}
+
+// Range of a ground fill candidate in 0.25 m steps, 1..255 (0 = no candidate).
+std::uint8_t fillRangeCode(float range)
+{
+  return static_cast<std::uint8_t>(std::min(254, std::max(0, static_cast<int>(range / 0.25f))) + 1);
+}
+
+// A dropped ground row fills only within this distance of its column's ground plane: the band holding ~90 % of the
+// written (near-scan) ground rows (20261013: their |dz| P90 2.7-3.4 cm).
+constexpr double kGroundFillTolerance = 0.03;
 }  // namespace
 
 RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
@@ -2360,7 +2379,8 @@ std::size_t RtkFusion::exportFrame(const Frame &frame, std::ifstream &input, std
                                    pcl::PointCloud<pcl::PointXYZI> &output, const PriorityCells *priority,
                                    std::vector<float> *ranges, std::vector<std::uint8_t> *written,
                                    std::ifstream *sources, std::vector<Eigen::Vector3f> *origins,
-                                   std::size_t *filled, std::vector<std::uint32_t> *rows) const
+                                   std::size_t *filled, std::vector<std::uint32_t> *rows,
+                                   std::vector<std::pair<pcl::PointXYZI, float>> *dropped) const
 {
   packed.resize(static_cast<std::size_t>(frame.count) * 5);
   input.seekg(static_cast<std::streamoff>(frame.offset));
@@ -2440,8 +2460,9 @@ std::size_t RtkFusion::exportFrame(const Frame &frame, std::ifstream &input, std
       }
       if (drop)
       {
+        if (dropped && ground_layer()) dropped->emplace_back(result, range);
         if (priority->ground_planes.empty() && priority->vegetation.empty()) continue;
-        if (!fillsGap(*priority, key, ground_layer(), result)) continue;
+        if (!fillsGap(*priority, key, ground_layer(), result, range)) continue;
         if (filled) ++*filled;
       }
     }
@@ -2459,21 +2480,27 @@ std::size_t RtkFusion::exportFrame(const Frame &frame, std::ifstream &input, std
 }
 
 bool RtkFusion::fillsGap(const PriorityCells &priority, std::uint64_t key, bool ground_layer,
-                         const pcl::PointXYZI &p) const
+                         const pcl::PointXYZI &p, float range) const
 {
-  // Detail fill (see save_map_priority_fill / detailFill): 0.1 m sub-cells (a fifth of the cell) of the cell.
-  const double voxel = save_map_priority_voxel, sub = 0.2 * voxel;
+  // Detail fill (see save_map_priority_fill / detailFill).
+  const double voxel = save_map_priority_voxel;
   const double x0 = std::floor(static_cast<double>(p.x) / voxel) * voxel;
   const double y0 = std::floor(static_cast<double>(p.y) / voxel) * voxel;
-  const auto index = [sub](double offset) { return std::min(4, std::max(0, static_cast<int>(offset / sub))); };
-  const int ix = index(p.x - x0), iy = index(p.y - y0);
   if (ground_layer)
   {
+    // ground: an empty 0.05 m sub-column takes the rows of its nearest candidate on the column plane
     const auto plane = priority.ground_planes.find(key >> 21);
-    if (plane == priority.ground_planes.end() || ((plane->second.occupied >> (iy * 5 + ix)) & 1U)) return false;
+    if (plane == priority.ground_planes.end()) return false;
     const auto &g = plane->second;
-    return std::abs(p.z - (g.z0 + g.gx * (p.x - x0) + g.gy * (p.y - y0))) <= 0.01;
+    const int bit = groundSubColumn(p.x - x0, p.y - y0, voxel);
+    if (((g.occupied[bit >> 6] >> (bit & 63)) & 1U) || g.nearest[bit] == 0 || fillRangeCode(range) > g.nearest[bit])
+      return false;
+    return std::abs(p.z - (g.z0 + g.gx * (p.x - x0) + g.gy * (p.y - y0))) <= kGroundFillTolerance;
   }
+  // vegetation: 0.1 m sub-voxels (a fifth of the cell)
+  const double sub = 0.2 * voxel;
+  const auto index = [sub](double offset) { return std::min(4, std::max(0, static_cast<int>(offset / sub))); };
+  const int ix = index(p.x - x0), iy = index(p.y - y0);
   const auto cell = priority.vegetation.find(key);
   if (cell == priority.vegetation.end()) return false;
   const double z0 = std::floor(static_cast<double>(p.z) / voxel) * voxel;
@@ -2483,10 +2510,14 @@ bool RtkFusion::fillsGap(const PriorityCells &priority, std::uint64_t key, bool 
 
 void RtkFusion::detailFill(PriorityCells &priority) const
 {
-  // Range priority, pass 2 (save_map_priority_fill): over the rows pass 1 writes, per ground column (two lowest
-  // occupied cells) a least-squares plane, refit on the rows within max(2 sigma, 2 cm) of the first fit, and the
-  // 0.1 m sub-columns holding a row; per cell above, the second moments of its rows (volumetric = vegetation:
-  // smallest spread >= 0.35 x the largest and >= 8 cm, >= 15 rows) and the 0.1 m sub-voxels holding a row.
+  // Range priority, pass 2 (save_map_priority_fill). First sweep, over the rows pass 1 writes: per ground column
+  // (two lowest occupied cells) a least-squares plane and the 0.05 m sub-columns holding a row; per cell above, the
+  // second moments of its rows (volumetric = vegetation: smallest spread >= 0.35 x the largest and >= 8 cm, >= 15
+  // rows) and the 0.1 m sub-voxels holding a row. Second sweep, over the ground-layer rows pass 1 drops: per empty
+  // sub-column the range code of the nearest one within kGroundFillTolerance of the plane - the fill admits that
+  // scan's rows only, not every far scan's. Candidates and fill use the same plane: with candidates taken against a
+  // first fit and the fill checked against its refit, the chosen candidate often failed the second check (20261013:
+  // a quarter of the driving-band 0.05 m cells stayed empty, in 0.5 m blocks).
   struct Sums
   {
     double n = 0, x = 0, y = 0, z = 0, xx = 0, xy = 0, xz = 0, yy = 0, yz = 0, zz = 0;
@@ -2501,7 +2532,7 @@ void RtkFusion::detailFill(PriorityCells &priority) const
       zz += o.zz; bits[0] |= o.bits[0]; bits[1] |= o.bits[1];
     }
   };
-  struct Fit { double z0, gx, gy, sigma; };
+  struct Fit { double z0, gx, gy; };
   const auto plane = [](const Sums &s, Fit &fit) {   // z = z0 + gx dx + gy dy
     Eigen::Matrix3d a;
     a << s.n, s.x, s.y, s.x, s.xx, s.xy, s.y, s.xy, s.yy;
@@ -2509,21 +2540,28 @@ void RtkFusion::detailFill(PriorityCells &priority) const
     const Eigen::FullPivLU<Eigen::Matrix3d> lu(a);
     if (s.n < 10 || lu.rank() < 3) return false;
     const Eigen::Vector3d sol = lu.solve(b);
-    fit = {sol[0], sol[1], sol[2], std::sqrt(std::max(0.0, (s.zz - sol.dot(b)) / s.n))};
+    fit = {sol[0], sol[1], sol[2]};
     return true;
   };
   constexpr std::size_t shards = 32;
   const double voxel = save_map_priority_voxel, sub = 0.2 * voxel;
   const auto index = [sub](double offset) { return std::min(4, std::max(0, static_cast<int>(offset / sub))); };
+  using Nearest = std::array<std::uint8_t, 100>;   // per sub-column fillRangeCode of the nearest candidate, 0 = none
   std::unordered_map<std::uint64_t, Fit> first_fit;
-  std::unordered_map<std::uint64_t, std::uint32_t> occupied;
+  std::unordered_map<std::uint64_t, std::array<std::uint64_t, 2>> occupied;
   std::unordered_map<std::uint64_t, PriorityCells::GroundPlane> planes;
   std::unordered_map<std::uint64_t, std::array<std::uint64_t, 2>> vegetation;
+  std::vector<std::unordered_map<std::uint64_t, Nearest>> nearest(shards);
+  const auto lower = [](Nearest &best, const Nearest &other) {
+    for (std::size_t b = 0; b < best.size(); ++b)
+      if (other[b] != 0 && (best[b] == 0 || other[b] < best[b])) best[b] = other[b];
+  };
   const std::size_t batch = 128;
   for (int pass = 0; pass < 2; ++pass)
   {
     std::vector<std::unordered_map<std::uint64_t, Sums>> columns(shards), cells(shards);
     std::vector<std::vector<std::pair<std::uint64_t, Sums>>> local_columns(batch), local_cells(batch);
+    std::vector<std::vector<std::pair<std::uint64_t, Nearest>>> local_nearest(batch);
     for (std::size_t first = 0; first < frames.size(); first += batch)
     {
       const std::size_t count = std::min(batch, frames.size() - first);
@@ -2533,47 +2571,64 @@ void RtkFusion::detailFill(PriorityCells &priority) const
         std::ifstream input(directory / "scans.bin", std::ios::binary);
         std::vector<float> packed;
         pcl::PointCloud<pcl::PointXYZI> cloud;
+        std::vector<std::pair<pcl::PointXYZI, float>> dropped;
         std::unordered_map<std::uint64_t, Sums> column_sums, cell_sums;
+        std::unordered_map<std::uint64_t, Nearest> column_nearest;
 #pragma omp for schedule(dynamic, 4)
         for (int n = 0; n < static_cast<int>(count); ++n)
         {
           try
           {
-            exportFrame(frames[first + static_cast<std::size_t>(n)], input, packed, cloud, &priority);
+            dropped.clear();
+            exportFrame(frames[first + static_cast<std::size_t>(n)], input, packed, cloud, &priority, nullptr,
+                        nullptr, nullptr, nullptr, nullptr, nullptr, pass == 1 ? &dropped : nullptr);
             column_sums.clear();
             cell_sums.clear();
-            for (const auto &q : cloud)
-            {
-              const std::uint64_t key = priorityCell(q.x, q.y, q.z, voxel);
-              const auto ground = priority.ground.find(key >> 21);
-              const double x0 = std::floor(static_cast<double>(q.x) / voxel) * voxel;
-              const double y0 = std::floor(static_cast<double>(q.y) / voxel) * voxel;
-              const double dx = q.x - x0, dy = q.y - y0;
-              if (ground != priority.ground.end() && priorityCellZ(key) <= ground->second + 1)
+            column_nearest.clear();
+            if (pass == 0)   // the second sweep only takes the dropped rows
+              for (const auto &q : cloud)
               {
-                if (pass == 1)
+                const std::uint64_t key = priorityCell(q.x, q.y, q.z, voxel);
+                const auto ground = priority.ground.find(key >> 21);
+                const double x0 = std::floor(static_cast<double>(q.x) / voxel) * voxel;
+                const double y0 = std::floor(static_cast<double>(q.y) / voxel) * voxel;
+                const double dx = q.x - x0, dy = q.y - y0;
+                if (ground != priority.ground.end() && priorityCellZ(key) <= ground->second + 1)
                 {
-                  const auto fit = first_fit.find(key >> 21);
-                  if (fit == first_fit.end() || std::abs(q.z - (fit->second.z0 + fit->second.gx * dx +
-                                                                fit->second.gy * dy)) >
-                                                    std::max(2.0 * fit->second.sigma, 0.02))
-                    continue;
+                  auto &s = column_sums[key >> 21];
+                  s.add(dx, dy, q.z);
+                  const int bit = groundSubColumn(dx, dy, voxel);
+                  s.bits[bit >> 6] |= 1ULL << (bit & 63);
                 }
-                auto &s = column_sums[key >> 21];
-                s.add(dx, dy, q.z);
-                s.bits[0] |= 1ULL << (index(dy) * 5 + index(dx));
+                else
+                {
+                  const double dz = q.z - std::floor(static_cast<double>(q.z) / voxel) * voxel;
+                  auto &s = cell_sums[key];
+                  s.add(dx, dy, dz);
+                  const int bit = (index(dz) * 5 + index(dy)) * 5 + index(dx);
+                  s.bits[bit >> 6] |= 1ULL << (bit & 63);
+                }
               }
-              else if (pass == 0)
-              {
-                const double dz = q.z - std::floor(static_cast<double>(q.z) / voxel) * voxel;
-                auto &s = cell_sums[key];
-                s.add(dx, dy, dz);
-                const int bit = (index(dz) * 5 + index(dy)) * 5 + index(dx);
-                s.bits[bit >> 6] |= 1ULL << (bit & 63);
-              }
+            for (const auto &entry : dropped)
+            {
+              const auto &q = entry.first;
+              const std::uint64_t column = priorityCell(q.x, q.y, q.z, voxel) >> 21;
+              const auto fit = first_fit.find(column);
+              if (fit == first_fit.end()) continue;
+              const double dx = q.x - std::floor(static_cast<double>(q.x) / voxel) * voxel;
+              const double dy = q.y - std::floor(static_cast<double>(q.y) / voxel) * voxel;
+              if (std::abs(q.z - (fit->second.z0 + fit->second.gx * dx + fit->second.gy * dy)) > kGroundFillTolerance)
+                continue;
+              const int bit = groundSubColumn(dx, dy, voxel);
+              const auto &occ = occupied.at(column);
+              if ((occ[bit >> 6] >> (bit & 63)) & 1U) continue;
+              std::uint8_t &best = column_nearest[column][bit];
+              const std::uint8_t code = fillRangeCode(entry.second);
+              if (best == 0 || code < best) best = code;
             }
             local_columns[static_cast<std::size_t>(n)].assign(column_sums.begin(), column_sums.end());
             local_cells[static_cast<std::size_t>(n)].assign(cell_sums.begin(), cell_sums.end());
+            local_nearest[static_cast<std::size_t>(n)].assign(column_nearest.begin(), column_nearest.end());
           }
           catch (...)
           {
@@ -2593,23 +2648,18 @@ void RtkFusion::detailFill(PriorityCells &priority) const
           for (const auto &entry : local_cells[n])
             if (entry.first % shards == static_cast<std::size_t>(s))
               cells[static_cast<std::size_t>(s)][entry.first].merge(entry.second);
+          for (const auto &entry : local_nearest[n])
+            if (entry.first % shards == static_cast<std::size_t>(s))
+              lower(nearest[static_cast<std::size_t>(s)][entry.first], entry.second);
         }
     }
-    for (const auto &shard : columns)
+    for (const auto &shard : columns)   // first sweep only (the second fills no column sums)
       for (const auto &entry : shard)
       {
         Fit fit;
         if (!plane(entry.second, fit)) continue;
-        if (pass == 0)
-        {
-          first_fit.emplace(entry.first, fit);
-          occupied.emplace(entry.first, static_cast<std::uint32_t>(entry.second.bits[0]));
-        }
-        else
-        {
-          planes.emplace(entry.first, PriorityCells::GroundPlane{static_cast<float>(fit.z0), static_cast<float>(fit.gx),
-                                                                 static_cast<float>(fit.gy), occupied.at(entry.first)});
-        }
+        first_fit.emplace(entry.first, fit);
+        occupied.emplace(entry.first, std::array<std::uint64_t, 2>{entry.second.bits[0], entry.second.bits[1]});
       }
     if (pass == 0)
       for (const auto &shard : cells)
@@ -2627,7 +2677,16 @@ void RtkFusion::detailFill(PriorityCells &priority) const
             vegetation.emplace(entry.first, std::array<std::uint64_t, 2>{s.bits[0], s.bits[1]});
         }
   }
-  // set only now: both passes see the rows of range priority alone (a column whose refit kept < 10 rows: no plane)
+  for (const auto &entry : first_fit)
+  {
+    PriorityCells::GroundPlane g{static_cast<float>(entry.second.z0), static_cast<float>(entry.second.gx),
+                                 static_cast<float>(entry.second.gy), occupied.at(entry.first), {}};
+    const auto &shard = nearest[entry.first % shards];
+    const auto found = shard.find(entry.first);
+    if (found != shard.end()) g.nearest = found->second;
+    planes.emplace(entry.first, g);
+  }
+  // set only now: both sweeps see the rows of range priority alone (a column with < 10 ground rows: no plane)
   priority.ground_planes = std::move(planes);
   priority.vegetation = std::move(vegetation);
 }
