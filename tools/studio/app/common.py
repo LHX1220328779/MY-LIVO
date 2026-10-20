@@ -33,7 +33,7 @@ DEFAULT_STATE = {
     "mapping": {"round_prefix": "studio", "mode": "livo", "use_rtk": True, "save_map": True, "rviz": False,
                 "rate": 1.0, "calibration_id": "", "precheck": True, "frame_divider": 1, "evaluate": True,
                 "extra_sets": "", "start_offset": 0, "duration": "", "map_range": 45.0, "rgb_range": 60.0,
-                "skip_stationary": True, "stationary_min": 30, "stationary_lidar_interval": 1.0, "loop_closure": True, "map_priority": False,
+                "skip_stationary": True, "stationary_min": 30, "stationary_lidar_interval": 1.0, "loop_closure": True, "map_priority": True,
                 "map_export": True, "map_voxel": 0.05, "map_source": "all", "map_tile": 0, "map_keyframes": False,
                 "auto_cleanup": True, "auto_cleanup_free_gb": 50, "map_min_points": 1},
     "ui": {"page": "home"},

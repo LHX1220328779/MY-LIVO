@@ -10,8 +10,9 @@ point = native scan-end pose * LiDAR extrinsic * p, delivered point = C(t) * nat
 Products (default <fusion_run>/map/):
   global_map.pcd          voxel-filtered geometry map (centroid of every voxel; x y z intensity), binary PCD
   global_map_rgb.pcd      LIVO only: the global_map.pcd points that a camera observation colours (colour of the
-                          nearest / slowest observation in the point's 3 cm voxel, else its 6 cm voxel) - the
-                          same geometry as global_map.pcd, like the mapper's rgb_map_N.pcd vs map_N.pcd
+                          nearest / slowest observation in the point's 3 cm voxel, else of the nearest such
+                          observation within 6 cm) - the same geometry as global_map.pcd, like the mapper's
+                          rgb_map_N.pcd vs map_N.pcd
   tiles/tile_<i>_<j>.pcd  optional square tiles (--tile M) of the same products for large sites
   keyframes/              optional (--keyframe-clouds): per-keyframe body-frame clouds + poses.txt (TUM)
   map_info.json           frame, voxel size, source, ranges, counts, bounds, time span, inputs, calibration
@@ -39,6 +40,7 @@ import tempfile
 import time
 
 import numpy as np
+from scipy.spatial import cKDTree
 
 HEADER_SCANS = b"LIVORTK3"
 HEADER_COLORS = b"LIVORGB1"
@@ -312,22 +314,28 @@ def voxel_keys(xyz, voxel):
 
 
 def colour_points(xyz, rr, voxel):
-    """Packed rgb of every point from the colour returns `rr` (RGBREC): the lowest score (nearest / slowest
-    observation) in the point's voxel, else in its 2x voxel; -1 = no colour observation there."""
+    """Packed rgb of every point from the colour returns `rr` (RGBREC): per voxel the lowest score (nearest /
+    slowest observation) is kept; a point takes the colour of its own voxel, else of the nearest kept observation
+    within 2x voxel (a ball: no miss 1 mm across a voxel border, unlike a coarser voxel); -1 = none there."""
     out = np.full(len(xyz), -1, np.int64)
     if not len(rr) or not len(xyz):
         return out
     cxyz = np.stack([rr["x"], rr["y"], rr["z"]], 1)
-    for size in (voxel, 2.0 * voxel):
-        ck = voxel_keys(cxyz, size)
-        order = np.lexsort((rr["s"], ck))
-        ck = ck[order]
-        first = np.r_[True, ck[1:] != ck[:-1]]
-        keys, rgb = ck[first], rr["rgb"][order[first]].astype(np.int64)
-        q = voxel_keys(xyz, size)
-        pos = np.minimum(np.searchsorted(keys, q), len(keys) - 1)
-        hit = (keys[pos] == q) & (out < 0)
-        out[hit] = rgb[pos[hit]]
+    ck = voxel_keys(cxyz, voxel)
+    order = np.lexsort((rr["s"], ck))
+    ck = ck[order]
+    first = np.r_[True, ck[1:] != ck[:-1]]
+    best = order[first]
+    keys, rgb = ck[first], rr["rgb"][best].astype(np.int64)
+    q = voxel_keys(xyz, voxel)
+    pos = np.minimum(np.searchsorted(keys, q), len(keys) - 1)
+    hit = keys[pos] == q
+    out[hit] = rgb[pos[hit]]
+    rest = np.flatnonzero(~hit)
+    if len(rest):
+        dist, j = cKDTree(cxyz[best].astype(np.float64)).query(xyz[rest], k=1, distance_upper_bound=2.0 * voxel)
+        found = np.isfinite(dist)
+        out[rest[found]] = rgb[j[found]]
     return out
 
 
@@ -647,7 +655,8 @@ def export(a):
         "keyframe_clouds": len(kf_poses) if a.keyframe_clouds else None,
         "fields": {"global_map.pcd": "x y z intensity (float32; voxel centroid and mean intensity)",
                    "global_map_rgb.pcd": "x y z rgb (packed uint32 0x00RRGGBB): the global_map.pcd points with a colour "
-                                         "observation in their rgb_voxel_m voxel (else 2x voxel); nearest/slowest observation"},
+                                         "observation in their rgb_voxel_m voxel (nearest/slowest observation), else the "
+                                         "nearest such observation within 2x rgb_voxel_m"},
         "elapsed_s": round(time.time() - t_start, 1), "project_s": round(t_project, 1), "jobs": a.jobs,
     }
     (out / "map_info.json").write_text(json.dumps(info, indent=2, ensure_ascii=False) + "\n")
@@ -693,7 +702,8 @@ def build_parser():
     ap.add_argument("--rgb", dest="rgb", action="store_true", default=True)
     ap.add_argument("--no-rgb", dest="rgb", action="store_false", help="skip the colour map (LIVO rounds)")
     ap.add_argument("--rgb-voxel", type=float, default=0.03,
-                    help="colour lookup voxel (m): a point takes the nearest/slowest colour observation of its voxel, else of the 2x voxel")
+                    help="colour lookup voxel (m): a point takes the nearest/slowest colour observation of its voxel, "
+                         "else the nearest such observation within 2x voxel")
     ap.add_argument("--rgb-max-range", type=float, default=None, help="colour range cap (m; default: the round's)")
     ap.add_argument("--jobs", type=int, default=min(8, max(1, (os.cpu_count() or 2) // 3)),
                     help="parallel worker processes (projection and per-tile reduction)")

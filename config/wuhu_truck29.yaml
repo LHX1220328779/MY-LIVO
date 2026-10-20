@@ -342,7 +342,8 @@ laser_mapping:
       # <=35 m, ~5.9 cm at <=50 m. Console: run_wuhu_round.sh --map-range M / launch save_map_max_range:=M.
       save_map_max_range: 45.0
       # rgb_map_N.pcd = the rows of map_N.pcd that a camera observation colours (per 3 cm voxel the colour
-      # of the nearest / slowest observation, else per 6 cm voxel), so the RGB map has exactly the geometry of
+      # of the nearest / slowest observation; a row with none in its voxel takes the nearest of those within
+      # 6 cm), so the RGB map has exactly the geometry of
       # map_N.pcd. (Until 10-20 it was the coloured returns themselves: for roadside poles only the 16-60 m
       # views ahead of the camera, P10-P90 shell 18 cm against 3-5 cm of map_N with range priority = the
       # "LIVO ghost".) This cap only limits the colour SOURCES (-1 = same as save_map_max_range, 0 = none):
@@ -357,13 +358,13 @@ laser_mapping:
       # offset with near returns 2.0-3.4 cm, but the far-lane returns (17-40 m) are pulled 2-4 cm toward the
       # sensor and spread to a 12-20 cm shell (P10-P90) = the visible "ghost"; ratio 1.5 / margin 2 m: shell
       # 12-20 -> 5-12 cm, road ground P10-P90 52 -> 38 mm. ratio 0 = off (every return within the cap).
-      # Switch of the whole rule (this + the seen-free check below), default OFF: with it on, each chunk keeps
-      # only the returns whose nearest observation lies in that chunk, so the chunk of the far pass loses the
-      # poles and the opposite lane (the union keeps the coverage: 1 m columns -0.05 %). A consistency variant
-      # (keep far returns within 3/5/8 cm of a near return) still dropped 34-79 % of each scan's rows at pole
-      # shells 3.4-8.5 cm, so it is no better trade-off. Console: run_wuhu_round.sh --map-priority; Studio
-      # mapping page "地图距离优先".
-      save_map_priority_enabled: false
+      # Switch of the whole rule (this + the seen-free check below), default ON (best map). Side effect: each
+      # chunk keeps only the returns whose nearest observation lies in that chunk, so the chunk of the far pass
+      # lacks the poles and the opposite lane (the union keeps the coverage: 1 m columns -0.05 %). A consistency
+      # variant (keep far returns within 3/5/8 cm of a near return) still dropped 34-79 % of each scan's rows at
+      # pole shells 3.4-8.5 cm, so it is no better trade-off. Off (every return per chunk): run_wuhu_round.sh
+      # --no-map-priority; Studio mapping page "地图距离优先".
+      save_map_priority_enabled: true
       save_map_priority_ratio: 1.5
       save_map_priority_margin_m: 2.0
       save_map_priority_voxel_m: 0.5

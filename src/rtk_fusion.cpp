@@ -2444,24 +2444,58 @@ std::size_t RtkFusion::exportFrame(const Frame &frame, std::ifstream &input, std
   return in_cap;
 }
 
-bool RtkFusion::ColorLookup::find(double x, double y, double z, std::uint32_t &rgb) const
+namespace
 {
-  for (int level = 0; level < 2; ++level)
+// 3 cm colour voxel: cell index and key (21 bits per axis, offset so that within +-31 km of the origin the keys
+// ascend with x, then y, then z - ColorLookup::find walks the neighbour voxels in that order).
+std::int64_t colourCell(double v) { return static_cast<std::int64_t>(std::floor(v / 0.03)); }
+std::uint64_t colourKey(std::int64_t ix, std::int64_t iy, std::int64_t iz)
+{
+  const auto field = [](std::int64_t c) { return static_cast<std::uint64_t>(c + (1 << 20)) & 0x1FFFFF; };
+  return (field(ix) << 42) | (field(iy) << 21) | field(iz);
+}
+}  // namespace
+
+bool RtkFusion::ColorLookup::find(double x, double y, double z, std::uint32_t &value) const
+{
+  // The point's own 3 cm voxel, else the nearest kept observation within 6 cm. A ball: the former fallback (own
+  // 6 cm voxel) missed observations 1 mm across a voxel border but took others 10 cm away (20261013, 4 areas:
+  // 32-45 % -> 50-68 % of the geometry rows coloured; rows coloured from their own voxel keep exactly that colour).
+  const std::uint64_t key = colourKey(colourCell(x), colourCell(y), colourCell(z));
+  const auto own = std::lower_bound(keys.begin(), keys.end(), key);
+  if (own != keys.end() && *own == key)
   {
-    const double voxel = level == 0 ? 0.03 : 0.06;
-    const auto cell = [voxel](double v) {
-      return static_cast<std::uint64_t>(static_cast<std::int64_t>(std::floor(v / voxel)) & 0x1FFFFF);
-    };
-    const std::uint64_t key = (cell(x) << 42) | (cell(y) << 21) | cell(z);
-    const auto &keys = level == 0 ? fine_keys : coarse_keys;
-    const auto it = std::lower_bound(keys.begin(), keys.end(), key);
-    if (it != keys.end() && *it == key)
+    value = rgb[static_cast<std::size_t>(own - keys.begin())];
+    return true;
+  }
+  constexpr double radius = 0.06;
+  const Eigen::Vector3f point(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
+  const std::int64_t y0 = colourCell(y - radius), y1 = colourCell(y + radius);
+  const std::int64_t z0 = colourCell(z - radius), z1 = colourCell(z + radius);
+  float best = static_cast<float>(radius * radius);
+  std::size_t found = keys.size();
+  for (std::int64_t ix = colourCell(x - radius); ix <= colourCell(x + radius); ++ix)
+  {
+    auto k = std::lower_bound(keys.begin(), keys.end(), colourKey(ix, y0, z0));
+    const auto end = std::upper_bound(k, keys.end(), colourKey(ix, y1, z1));
+    for (std::int64_t iy = y0; iy <= y1 && k != end; ++iy)
     {
-      rgb = (level == 0 ? fine_rgb : coarse_rgb)[static_cast<std::size_t>(it - keys.begin())];
-      return true;
+      const std::uint64_t last = colourKey(ix, iy, z1);
+      for (k = std::lower_bound(k, end, colourKey(ix, iy, z0)); k != end && *k <= last; ++k)
+      {
+        const auto i = static_cast<std::size_t>(k - keys.begin());
+        const float squared = (position[i] - point).squaredNorm();
+        if (squared <= best)
+        {
+          best = squared;
+          found = i;
+        }
+      }
     }
   }
-  return false;
+  if (found == keys.size()) return false;
+  value = rgb[found];
+  return true;
 }
 
 RtkFusion::ColorLookup RtkFusion::colorLookup(std::size_t batch) const
@@ -2474,18 +2508,11 @@ RtkFusion::ColorLookup RtkFusion::colorLookup(std::size_t batch) const
   // ahead (20261013: no pole return closer than 15.7 m). Exporting them as the RGB map gave poles the far-range
   // shell (P10-P90 18 cm vs 3-5 cm of map_N with range priority); they now only lend their colours to the
   // geometry rows, so rgb_map_N has the geometry of map_N.
-  struct Scored { float score; std::uint32_t rgb; };
-  struct Candidate { std::uint64_t fine, coarse; Scored value; };
-  std::unordered_map<std::uint64_t, Scored> fine, coarse;
-  fine.reserve(1 << 22);
-  coarse.reserve(1 << 20);
+  struct Scored { float score; std::uint32_t rgb; float x, y, z; };
+  struct Candidate { std::uint64_t key; Scored value; };
+  std::unordered_map<std::uint64_t, Scored> best;
+  best.reserve(1 << 22);
   std::vector<std::vector<Candidate>> scored(batch);
-  const auto key = [](const V3D &p, double voxel) {
-    const auto cell = [voxel](double v) {
-      return static_cast<std::uint64_t>(static_cast<std::int64_t>(std::floor(v / voxel)) & 0x1FFFFF);
-    };
-    return (cell(p.x()) << 42) | (cell(p.y()) << 21) | cell(p.z());
-  };
   for (std::size_t first = 0; first < frames.size(); first += batch)
   {
     const std::size_t count = std::min(batch, frames.size() - first);
@@ -2527,7 +2554,9 @@ RtkFusion::ColorLookup RtkFusion::colorLookup(std::size_t batch) const
             const std::uint32_t rgb = (static_cast<std::uint32_t>(static_cast<std::uint8_t>(packed[6 * i + 3])) << 16) |
                                       (static_cast<std::uint32_t>(static_cast<std::uint8_t>(packed[6 * i + 4])) << 8) |
                                       static_cast<std::uint32_t>(static_cast<std::uint8_t>(packed[6 * i + 5]));
-            out.push_back({key(p, 0.03), key(p, 0.06), {static_cast<float>(range + 20.0 * omega), rgb}});
+            out.push_back({colourKey(colourCell(p.x()), colourCell(p.y()), colourCell(p.z())),
+                           {static_cast<float>(range + 20.0 * omega), rgb, static_cast<float>(p.x()),
+                            static_cast<float>(p.y()), static_cast<float>(p.z())}});
           }
         }
         catch (...)
@@ -2541,34 +2570,29 @@ RtkFusion::ColorLookup RtkFusion::colorLookup(std::size_t batch) const
     for (std::size_t n = 0; n < count; ++n)
       for (const auto &candidate : scored[n])
       {
-        auto it = fine.find(candidate.fine);
-        if (it == fine.end()) fine.emplace(candidate.fine, candidate.value);
-        else if (candidate.value.score < it->second.score) it->second = candidate.value;
-        it = coarse.find(candidate.coarse);
-        if (it == coarse.end()) coarse.emplace(candidate.coarse, candidate.value);
+        const auto it = best.find(candidate.key);
+        if (it == best.end()) best.emplace(candidate.key, candidate.value);
         else if (candidate.value.score < it->second.score) it->second = candidate.value;
       }
   }
   scored.clear();
-  // Compact sorted arrays (binary search during the geometry export, ~12 bytes per voxel).
+  // Compact sorted arrays (binary search during the geometry export, 24 bytes per voxel).
+  struct Item { std::uint64_t key; float x, y, z; std::uint32_t rgb; };
+  std::vector<Item> items;
+  items.reserve(best.size());
+  for (const auto &[key, value] : best) items.push_back({key, value.x, value.y, value.z, value.rgb});
+  std::unordered_map<std::uint64_t, Scored>().swap(best);
+  std::sort(items.begin(), items.end(), [](const Item &a, const Item &b) { return a.key < b.key; });
   ColorLookup lookup;
-  const auto compact = [](std::unordered_map<std::uint64_t, Scored> &map, std::vector<std::uint64_t> &keys,
-                          std::vector<std::uint32_t> &rgb) {
-    std::vector<std::pair<std::uint64_t, std::uint32_t>> items;
-    items.reserve(map.size());
-    for (const auto &entry : map) items.emplace_back(entry.first, entry.second.rgb);
-    std::unordered_map<std::uint64_t, Scored>().swap(map);
-    std::sort(items.begin(), items.end());
-    keys.resize(items.size());
-    rgb.resize(items.size());
-    for (std::size_t i = 0; i < items.size(); ++i)
-    {
-      keys[i] = items[i].first;
-      rgb[i] = items[i].second;
-    }
-  };
-  compact(fine, lookup.fine_keys, lookup.fine_rgb);
-  compact(coarse, lookup.coarse_keys, lookup.coarse_rgb);
+  lookup.keys.reserve(items.size());
+  lookup.rgb.reserve(items.size());
+  lookup.position.reserve(items.size());
+  for (const auto &item : items)
+  {
+    lookup.keys.push_back(item.key);
+    lookup.rgb.push_back(item.rgb);
+    lookup.position.emplace_back(item.x, item.y, item.z);
+  }
   return lookup;
 }
 
@@ -2995,11 +3019,12 @@ void RtkFusion::exportMap()
       if (writing.valid()) writing.get();
       if (!colours.empty())
         RCLCPP_INFO(node->get_logger(),
-            "Saved RGB map: %zu of %zu geometry rows coloured (%.1f %%; colour voxels %zu of 3 cm / %zu of 6 cm from "
-            "coloured returns within %.1f m, %.1f s): rgb_map_N.pcd = coloured rows of map_N.pcd",
+            "Saved RGB map: %zu of %zu geometry rows coloured (%.1f %%; %zu colour voxels of 3 cm from coloured "
+            "returns within %.1f m, own voxel else nearest within 6 cm, %.1f s): rgb_map_N.pcd = coloured rows of "
+            "map_N.pcd",
             rgb_written, returns_written,
             returns_written ? 100.0 * static_cast<double>(rgb_written) / static_cast<double>(returns_written) : 0.0,
-            colours.fine_keys.size(), colours.coarse_keys.size(), save_rgb_max_range, colour_sec);
+            colours.keys.size(), save_rgb_max_range, colour_sec);
       RCLCPP_INFO(node->get_logger(),
           "Saved geometry map: %zu of %zu returns within the %.1f m cap written (%.1f %%; range priority %s: ratio %.2f, "
           "margin %.1f m, %zu cells of %.2f m, %zu seen-free cells of %.2f m from returns within %.1f m, pass 1 %.1f s)",

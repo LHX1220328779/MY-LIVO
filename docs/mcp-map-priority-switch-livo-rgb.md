@@ -3,6 +3,8 @@
 日期：2026-10-20 · 分支 `fusion/56c6896-ins-attitude`（基线 `b4282d5`）
 数据：`/home/project/data/haibo/wuhu/29/20261013/ros2bag`；标定 truck29raw `v042_camloop`（LIVO）、`v039_gcons`（LIO）
 
+> 10-20 夜更新：按用户要求开关改为**默认开**（`--no-map-priority` / Studio 取消勾选关闭）；彩色着色改为“本 3 cm 体素，否则 6 cm 以内最近的观测”。见 `docs/mcp-rp-default-on-recheck.md`。本文其余部分是当时（默认关）的记录。
+
 ## 0. 结论速览
 
 | 问题 | 结论 | 处理 |

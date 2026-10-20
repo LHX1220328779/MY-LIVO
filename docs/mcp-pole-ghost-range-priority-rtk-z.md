@@ -54,7 +54,7 @@
 - 第 1 遍：每帧把截断内的回波投到 0.5 m 格；一帧在某格 ≥2 个回波才算"有效观测"（单个灰尘/多径点不能占格）；各格取有效观测的最近距离 r_min（距离 = 到虚拟雷达原点，即存档坐标系原点）。
 - 第 2 遍：照常导出，格内距离 > max(1.5·r_min, r_min + 2 m) 的回波不写。没有有效观测的格子全保留（45 m 覆盖不变）。
 - `map_rows.bin`：每个存档回波 1 bit（1 = 写入 map_N.pcd），评估据此逐行配对、逐行校验强度顺序；评估的跨扫描平面偏移改用"全部截断内回波 + 建图同款 C(t)"，与以往轮次可比；同点厚度用实际写入行。
-- 配置：`rtk.save_map_priority_ratio: 1.5`、`save_map_priority_margin_m: 2.0`、`save_map_priority_voxel_m: 0.5`（ratio 0 = 关闭）。RGB 地图本来就是"每 3 cm 取最近观测"，不变。（10-20 晚更正：距离优先已改为开关 `rtk.save_map_priority_enabled`，默认关；旧彩色地图只收相机视锥内 16–60 m 的回波，正是 LIVO 灯柱比 LIO 粗的原因，已改为几何行着色，见 `docs/mcp-map-priority-switch-livo-rgb.md`。）
+- 配置：`rtk.save_map_priority_ratio: 1.5`、`save_map_priority_margin_m: 2.0`、`save_map_priority_voxel_m: 0.5`（ratio 0 = 关闭）。RGB 地图本来就是"每 3 cm 取最近观测"，不变。（10-20 晚更正：距离优先已改为开关 `rtk.save_map_priority_enabled`，10-20 夜起默认开；旧彩色地图只收相机视锥内 16–60 m 的回波，正是 LIVO 灯柱比 LIO 粗的原因，已改为几何行着色，见 `docs/mcp-map-priority-switch-livo-rgb.md`。）
 
 结果（LIVO，mcp16_livo_rp 对 wuhu_29_livo_11，同标定、同数据）：灯柱壳宽中位 12.6 → 7.2 cm（0/1/4/8 号 4.0–4.8 cm），轨迹不变（0.96 / 3.51 / 6.88 cm），global_map 53.2 M → 26.7 M 点，1 m 平面列覆盖只少 0.05 %。剩下 6/7 号 9 cm 左右、5 号 7 cm，原因见第 4 节。
 

@@ -117,9 +117,8 @@ def round_cmd(round_name, mode, calibration_file, body, *, force_save_map=False,
     if body.get("loop_closure", True) is False:
         # finalize-time submap loop closure over revisited sections (on by default)
         cmd += ["--set", "rtk.loop_closure_enabled=false"]
-    if body.get("map_priority"):
-        # saved map: drop far duplicate returns of surfaces another pass saw nearer (off by default)
-        cmd.append("--map-priority")
+    # saved map: drop far duplicate returns of surfaces another pass saw nearer (on by default)
+    cmd.append("--no-map-priority" if body.get("map_priority", True) is False else "--map-priority")
     if body.get("save_map", True) or force_save_map:
         voxel, source, tile, kf, min_points = _map_export_args(body, "map_")
         if body.get("map_export", True) is False:

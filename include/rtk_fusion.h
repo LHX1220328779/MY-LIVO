@@ -283,9 +283,9 @@ struct RtkFusion
   // max(save_map_priority_ratio * r_min, r_min + save_map_priority_margin) are not written. A far scan therefore
   // only contributes where no nearer scan saw the surface (the coverage of save_map_max_range is kept), and the
   // far-lane copy of a surface no longer blurs the near-lane copy. ratio 0 = off (every return within the cap).
-  // Switch of the whole rule (occupied + seen-free), default off: a chunk then keeps every return of its own
-  // scans (with the rule on, a far scan's chunk loses the poles / opposite lane that another pass saw nearer).
-  bool save_map_priority_enabled = false;
+  // Switch of the whole rule (occupied + seen-free), default on. Off: a chunk keeps every return of its own
+  // scans (on: a far scan's chunk lacks the poles / opposite lane that another pass saw nearer).
+  bool save_map_priority_enabled = true;
   double save_map_priority_ratio = 1.5;
   double save_map_priority_margin = 2.0;
   double save_map_priority_voxel = 0.5;
@@ -359,15 +359,17 @@ struct RtkFusion
                           std::vector<float> *ranges = nullptr, std::vector<std::uint8_t> *written = nullptr,
                           std::ifstream *sources = nullptr, std::vector<Eigen::Vector3f> *origins = nullptr) const;
   PriorityCells nearestObservation() const;
-  // Colours of the RGB products: per 3 cm voxel the colour of the best camera observation in colors.bin (lowest
-  // range + 20 m per rad/s of rotation), per 6 cm voxel the same as fallback. rgb_map_N.pcd = the geometry rows
-  // of map_N.pcd that find a colour (own 3 cm voxel, else own 6 cm voxel), i.e. exactly the geometry of map_N.
+  // Colours of the RGB products: per 3 cm voxel the best camera observation in colors.bin (lowest range + 20 m
+  // per rad/s of rotation). A point takes the colour of its own voxel, else of the nearest of those observations
+  // within 6 cm. rgb_map_N.pcd = the geometry rows of map_N.pcd that find a colour, i.e. exactly the geometry of
+  // map_N.
   struct ColorLookup
   {
-    std::vector<std::uint64_t> fine_keys, coarse_keys;
-    std::vector<std::uint32_t> fine_rgb, coarse_rgb;
-    bool empty() const { return fine_keys.empty() && coarse_keys.empty(); }
-    bool find(double x, double y, double z, std::uint32_t &rgb) const;
+    std::vector<std::uint64_t> keys;        // sorted 3 cm voxel keys
+    std::vector<std::uint32_t> rgb;         // colour of the voxel's best observation
+    std::vector<Eigen::Vector3f> position;  // its position
+    bool empty() const { return keys.empty(); }
+    bool find(double x, double y, double z, std::uint32_t &value) const;
   };
   ColorLookup colorLookup(std::size_t batch) const;
 
