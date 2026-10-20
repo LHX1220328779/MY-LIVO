@@ -143,6 +143,7 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   if (!std::isfinite(save_rgb_max_range))
     throw std::runtime_error("rtk/save_rgb_max_range must be finite (<0 = same as save_map_max_range, 0 = no cap)");
   if (save_rgb_max_range < 0.0) save_rgb_max_range = save_map_max_range;
+  parameters.param<bool>("rtk/save_map_priority_enabled", save_map_priority_enabled, save_map_priority_enabled);
   parameters.param<double>("rtk/save_map_priority_ratio", save_map_priority_ratio, save_map_priority_ratio);
   parameters.param<double>("rtk/save_map_priority_margin_m", save_map_priority_margin, save_map_priority_margin);
   parameters.param<double>("rtk/save_map_priority_voxel_m", save_map_priority_voxel, save_map_priority_voxel);
@@ -155,8 +156,9 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
     throw std::runtime_error(
         "rtk/save_map_priority_*: ratio must be 0 (off) or >= 1, margin >= 0, voxel > 0, free range >= 0");
   RCLCPP_INFO(node->get_logger(),
-      "Saved geometry map range priority: ratio %.2f, margin %.1f m, cell %.2f m, seen-free cells from returns "
-      "within %.1f m (0 ratio = off, 0 free range = no seen-free check)",
+      "Saved geometry map range priority: %s (ratio %.2f, margin %.1f m, cell %.2f m, seen-free cells from returns "
+      "within %.1f m; rtk.save_map_priority_enabled, 0 ratio = off, 0 free range = no seen-free check)",
+      save_map_priority_enabled && save_map_priority_ratio > 0.0 ? "ON" : "off (every return within the cap)",
       save_map_priority_ratio, save_map_priority_margin, save_map_priority_voxel, save_map_priority_free_range);
   RCLCPP_INFO(node->get_logger(),
       "Saved-map product range cap: geometry %.1f m, colour %.1f m (0 = keep every return; only map_N.pcd / rgb_map_N.pcd are "
@@ -2442,6 +2444,134 @@ std::size_t RtkFusion::exportFrame(const Frame &frame, std::ifstream &input, std
   return in_cap;
 }
 
+bool RtkFusion::ColorLookup::find(double x, double y, double z, std::uint32_t &rgb) const
+{
+  for (int level = 0; level < 2; ++level)
+  {
+    const double voxel = level == 0 ? 0.03 : 0.06;
+    const auto cell = [voxel](double v) {
+      return static_cast<std::uint64_t>(static_cast<std::int64_t>(std::floor(v / voxel)) & 0x1FFFFF);
+    };
+    const std::uint64_t key = (cell(x) << 42) | (cell(y) << 21) | cell(z);
+    const auto &keys = level == 0 ? fine_keys : coarse_keys;
+    const auto it = std::lower_bound(keys.begin(), keys.end(), key);
+    if (it != keys.end() && *it == key)
+    {
+      rgb = (level == 0 ? fine_rgb : coarse_rgb)[static_cast<std::size_t>(it - keys.begin())];
+      return true;
+    }
+  }
+  return false;
+}
+
+RtkFusion::ColorLookup RtkFusion::colorLookup(std::size_t batch) const
+{
+  // Every frame recolors the surfaces inside its frustum, so the archive holds many color instances of the same
+  // physical spot. Keep, per voxel, only the instance with the lowest score: range (the pixel footprint grows
+  // linearly with range, while the metric colour displacement from a residual camera time error, speed * dt, does
+  // not shrink with it) + 20 m per rad/s of rotation (motion blur / time skew scale with omega * range).
+  // The coloured returns are the camera-frustum returns of each scan: for roadside poles only the 16-60 m views
+  // ahead (20261013: no pole return closer than 15.7 m). Exporting them as the RGB map gave poles the far-range
+  // shell (P10-P90 18 cm vs 3-5 cm of map_N with range priority); they now only lend their colours to the
+  // geometry rows, so rgb_map_N has the geometry of map_N.
+  struct Scored { float score; std::uint32_t rgb; };
+  struct Candidate { std::uint64_t fine, coarse; Scored value; };
+  std::unordered_map<std::uint64_t, Scored> fine, coarse;
+  fine.reserve(1 << 22);
+  coarse.reserve(1 << 20);
+  std::vector<std::vector<Candidate>> scored(batch);
+  const auto key = [](const V3D &p, double voxel) {
+    const auto cell = [voxel](double v) {
+      return static_cast<std::uint64_t>(static_cast<std::int64_t>(std::floor(v / voxel)) & 0x1FFFFF);
+    };
+    return (cell(p.x()) << 42) | (cell(p.y()) << 21) | cell(p.z());
+  };
+  for (std::size_t first = 0; first < frames.size(); first += batch)
+  {
+    const std::size_t count = std::min(batch, frames.size() - first);
+    std::exception_ptr error;
+#pragma omp parallel
+    {
+      std::ifstream input(directory / "colors.bin", std::ios::binary);
+      std::vector<float> packed;
+#pragma omp for schedule(dynamic, 4)
+      for (int n = 0; n < static_cast<int>(count); ++n)
+      {
+        const std::size_t fi = first + static_cast<std::size_t>(n);
+        auto &out = scored[n];
+        out.clear();
+        try
+        {
+          const Frame &frame = frames[fi];
+          if (frame.color_count == 0) continue;
+          packed.resize(static_cast<std::size_t>(frame.color_count) * 6);
+          input.seekg(static_cast<std::streamoff>(frame.color_offset));
+          input.read(reinterpret_cast<char *>(packed.data()), static_cast<std::streamsize>(packed.size() * sizeof(float)));
+          if (!input) throw std::runtime_error("Cannot read the colour archive for the map export");
+          double omega = 0.0;
+          if (fi + 1 < frames.size())
+          {
+            const double dt = std::max(frames[fi + 1].stamp - frames[fi].stamp, 1e-3);
+            const auto delta = frames[fi].raw.between(frames[fi + 1].raw);
+            omega = gtsam::Rot3::Logmap(delta.rotation()).norm() / dt;
+          }
+          const auto correction = correctionAt(frame.stamp);
+          const V3D origin = frame.raw.transformFrom(lidar_translation);
+          out.reserve(frame.color_count);
+          for (std::size_t i = 0; i < frame.color_count; ++i)
+          {
+            const V3D native(packed[6 * i], packed[6 * i + 1], packed[6 * i + 2]);
+            const double range = (native - origin).norm();
+            if (save_rgb_max_range > 0.0 && range > save_rgb_max_range) continue;
+            const V3D p = correction.transformFrom(native);
+            const std::uint32_t rgb = (static_cast<std::uint32_t>(static_cast<std::uint8_t>(packed[6 * i + 3])) << 16) |
+                                      (static_cast<std::uint32_t>(static_cast<std::uint8_t>(packed[6 * i + 4])) << 8) |
+                                      static_cast<std::uint32_t>(static_cast<std::uint8_t>(packed[6 * i + 5]));
+            out.push_back({key(p, 0.03), key(p, 0.06), {static_cast<float>(range + 20.0 * omega), rgb}});
+          }
+        }
+        catch (...)
+        {
+#pragma omp critical(rgb_export_error)
+          if (!error) error = std::current_exception();
+        }
+      }
+    }
+    if (error) std::rethrow_exception(error);
+    for (std::size_t n = 0; n < count; ++n)
+      for (const auto &candidate : scored[n])
+      {
+        auto it = fine.find(candidate.fine);
+        if (it == fine.end()) fine.emplace(candidate.fine, candidate.value);
+        else if (candidate.value.score < it->second.score) it->second = candidate.value;
+        it = coarse.find(candidate.coarse);
+        if (it == coarse.end()) coarse.emplace(candidate.coarse, candidate.value);
+        else if (candidate.value.score < it->second.score) it->second = candidate.value;
+      }
+  }
+  scored.clear();
+  // Compact sorted arrays (binary search during the geometry export, ~12 bytes per voxel).
+  ColorLookup lookup;
+  const auto compact = [](std::unordered_map<std::uint64_t, Scored> &map, std::vector<std::uint64_t> &keys,
+                          std::vector<std::uint32_t> &rgb) {
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> items;
+    items.reserve(map.size());
+    for (const auto &entry : map) items.emplace_back(entry.first, entry.second.rgb);
+    std::unordered_map<std::uint64_t, Scored>().swap(map);
+    std::sort(items.begin(), items.end());
+    keys.resize(items.size());
+    rgb.resize(items.size());
+    for (std::size_t i = 0; i < items.size(); ++i)
+    {
+      keys[i] = items[i].first;
+      rgb[i] = items[i].second;
+    }
+  };
+  compact(fine, lookup.fine_keys, lookup.fine_rgb);
+  compact(coarse, lookup.coarse_keys, lookup.coarse_rgb);
+  return lookup;
+}
+
 RtkFusion::PriorityCells RtkFusion::nearestObservation() const
 {
   // Range priority, pass 1: per cell the nearest range of a scan that put >= 2 returns into it (one stray
@@ -2737,121 +2867,12 @@ void RtkFusion::exportMap()
     source_archive.flush();
     frame_index.flush();
     std::size_t chunk_index = 0;
-    // The colored cloud only contains returns inside the camera frustum, so it
-    // is written as a separate product (rgb_map_*.pcd); the complete geometry
-    // map (map_*.pcd) is exported with it unless export_map_chunks is false.
+    // rgb_map_*.pcd = the geometry rows of map_*.pcd that a camera observation colours (colorLookup), written
+    // chunk by chunk with the same index; both only when export_map_chunks.
     if (color_enabled) color_archive.flush();
     // Both products: scans are transformed in parallel batches and consumed in frame order, so every row,
     // tie-break and chunk boundary is the one of the former sequential loop (export 90 s -> ~15 s at 8.7k scans).
     const std::size_t export_batch = 128;
-    if (color_enabled && export_map_chunks)
-    {
-      // Every frame recolors the surfaces inside its frustum, so the archive holds
-      // many color instances of the same physical spot. Instances taken while the
-      // camera swept fast (close pass, turning: motion blur + residual time skew)
-      // used to be aggregated together with the clean far/slow observations, which
-      // turned white poles gray and smeared sign patterns. Keep, per 3 cm voxel,
-      // only the instance with the slowest image-plane motion (rad/s + lateral
-      // translation rate over range as a pixel-rate proxy).
-      struct ScoredRGB { PointTypeRGB point; float score; };
-      struct Candidate { std::uint64_t key; ScoredRGB value; };
-      std::unordered_map<std::uint64_t, ScoredRGB> best;
-      best.reserve(1 << 22);
-      std::vector<std::vector<Candidate>> scored(export_batch);
-      for (std::size_t first = 0; first < frames.size(); first += export_batch)
-      {
-        const std::size_t count = std::min(export_batch, frames.size() - first);
-        std::exception_ptr error;
-#pragma omp parallel
-        {
-          std::ifstream input(directory / "colors.bin", std::ios::binary);
-          std::vector<float> packed;
-#pragma omp for schedule(dynamic, 4)
-          for (int n = 0; n < static_cast<int>(count); ++n)
-          {
-            const std::size_t fi = first + static_cast<std::size_t>(n);
-            auto &out = scored[n];
-            out.clear();
-            try
-            {
-              const Frame &frame = frames[fi];
-              if (frame.color_count == 0) continue;
-              packed.resize(static_cast<std::size_t>(frame.color_count) * 6);
-              input.seekg(static_cast<std::streamoff>(frame.color_offset));
-              input.read(reinterpret_cast<char *>(packed.data()), static_cast<std::streamsize>(packed.size() * sizeof(float)));
-              if (!input) throw std::runtime_error("Cannot read the colour archive for the map export");
-              double omega = 0.0;
-              if (fi + 1 < frames.size())
-              {
-                const double dt = std::max(frames[fi + 1].stamp - frames[fi].stamp, 1e-3);
-                const auto delta = frames[fi].raw.between(frames[fi + 1].raw);
-                omega = gtsam::Rot3::Logmap(delta.rotation()).norm() / dt;
-              }
-              const auto correction = correctionAt(frame.stamp);
-              const V3D origin = frame.raw.transformFrom(lidar_translation);
-              out.reserve(frame.color_count);
-              for (std::size_t i = 0; i < frame.color_count; ++i)
-              {
-                PointTypeRGB point;
-                point.x = packed[6 * i]; point.y = packed[6 * i + 1]; point.z = packed[6 * i + 2];
-                point.r = static_cast<std::uint8_t>(packed[6 * i + 3]);
-                point.g = static_cast<std::uint8_t>(packed[6 * i + 4]);
-                point.b = static_cast<std::uint8_t>(packed[6 * i + 5]);
-                const V3D native(point.x, point.y, point.z);
-                const double range = (native - origin).norm();
-                if (save_rgb_max_range > 0.0 && range > save_rgb_max_range) continue;
-                // One colour per 3 cm voxel: the NEAREST observation wins. The pixel footprint grows
-                // linearly with range, while the metric colour displacement from a residual camera time
-                // error (speed * dt) does not shrink with range, so far observations only lose detail.
-                // Fast rotation is penalised (20 m per rad/s): its time sensitivity scales with omega*range.
-                const float score = static_cast<float>(range + 20.0 * omega);
-                const V3D p = correction.transformFrom(native);
-                PointTypeRGB result = point;
-                result.x = static_cast<float>(p.x());
-                result.y = static_cast<float>(p.y());
-                result.z = static_cast<float>(p.z());
-                const auto cell = [](double v) {
-                  return static_cast<std::uint64_t>(static_cast<std::int64_t>(std::floor(v / 0.03)) & 0x1FFFFF);
-                };
-                out.push_back({(cell(p.x()) << 42) | (cell(p.y()) << 21) | cell(p.z()), {result, score}});
-              }
-            }
-            catch (...)
-            {
-#pragma omp critical(rgb_export_error)
-              if (!error) error = std::current_exception();
-            }
-          }
-        }
-        if (error) std::rethrow_exception(error);
-        for (std::size_t n = 0; n < count; ++n)
-          for (const auto &candidate : scored[n])
-          {
-            const auto it = best.find(candidate.key);
-            if (it == best.end() || candidate.value.score < it->second.score) best[candidate.key] = candidate.value;
-          }
-      }
-      scored.clear();
-      PointCloudXYZRGB chunk;
-      for (const auto &entry : best)
-      {
-        chunk.push_back(entry.second.point);
-        if (chunk.size() >= static_cast<std::size_t>(export_chunk_points))
-        {
-          const auto file = directory / ("rgb_map_" + std::to_string(chunk_index++) + ".pcd");
-          if (pcl::io::savePCDFileBinary(file.string(), chunk) != 0)
-            throw std::runtime_error("Cannot write optimized RGB point cloud " + file.string());
-          chunk.clear();
-        }
-      }
-      if (!chunk.empty())
-      {
-        const auto file = directory / ("rgb_map_" + std::to_string(chunk_index) + ".pcd");
-        if (pcl::io::savePCDFileBinary(file.string(), chunk) != 0)
-          throw std::runtime_error("Cannot write optimized RGB point cloud " + file.string());
-      }
-      chunk_index = 0;
-    }
     if (export_map_chunks)
     {
       // RViz subscribed: also publish a 0.25 m voxel map of the delivered cloud (every 16th row) on /rtk/map_final.
@@ -2859,7 +2880,8 @@ void RtkFusion::exportMap()
       std::unordered_map<std::uint64_t, std::array<float, 5>> display_cells;
       // Range priority (pass 1): nearest supported observation per cell; exportFrame drops the farther returns.
       const auto priority_start = std::chrono::steady_clock::now();
-      const PriorityCells priority = save_map_priority_ratio > 0.0 ? nearestObservation() : PriorityCells();
+      const PriorityCells priority =
+          save_map_priority_enabled && save_map_priority_ratio > 0.0 ? nearestObservation() : PriorityCells();
       const bool prioritized = !priority.occupied.empty();
       const double priority_sec =
           std::chrono::duration<double>(std::chrono::steady_clock::now() - priority_start).count();
@@ -2877,17 +2899,28 @@ void RtkFusion::exportMap()
         rows_file.open(directory / "map_rows.bin", std::ios::binary | std::ios::trunc);
         rows_file.write("LIVOMSK1", 8);
       }
+      const auto colour_start = std::chrono::steady_clock::now();
+      const ColorLookup colours = color_enabled ? colorLookup(export_batch) : ColorLookup();
+      const double colour_sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - colour_start).count();
       pcl::PointCloud<pcl::PointXYZI> chunk;
+      PointCloudXYZRGB rgb_chunk;
+      std::size_t rgb_written = 0;
       std::future<void> writing;  // the previous chunk is written while the next batch is transformed
-      const auto write = [&](pcl::PointCloud<pcl::PointXYZI> &&cloud) {
+      const auto write = [&](pcl::PointCloud<pcl::PointXYZI> &&cloud, PointCloudXYZRGB &&rgb) {
         if (writing.valid()) writing.get();
-        const auto file = directory / ("map_" + std::to_string(chunk_index++) + ".pcd");
-        writing = std::async(std::launch::async, [file, cloud = std::move(cloud)]() {
+        const std::size_t index = chunk_index++;
+        writing = std::async(std::launch::async, [this, index, cloud = std::move(cloud), rgb = std::move(rgb)]() {
+          const auto file = directory / ("map_" + std::to_string(index) + ".pcd");
           if (pcl::io::savePCDFileBinary(file.string(), cloud) != 0)
             throw std::runtime_error("Cannot write optimized point cloud " + file.string());
+          if (rgb.empty()) return;  // rgb_map_<index>.pcd = coloured rows of map_<index>.pcd
+          const auto rgb_file = directory / ("rgb_map_" + std::to_string(index) + ".pcd");
+          if (pcl::io::savePCDFileBinary(rgb_file.string(), rgb) != 0)
+            throw std::runtime_error("Cannot write optimized RGB point cloud " + rgb_file.string());
         });
       };
       std::vector<pcl::PointCloud<pcl::PointXYZI>> outputs(export_batch);
+      std::vector<PointCloudXYZRGB> rgb_outputs(export_batch);
       for (std::size_t first = 0; first < frames.size(); first += export_batch)
       {
         const std::size_t count = std::min(export_batch, frames.size() - first);
@@ -2904,6 +2937,23 @@ void RtkFusion::exportMap()
               in_cap[static_cast<std::size_t>(n)] = exportFrame(
                   frames[first + static_cast<std::size_t>(n)], input, packed, outputs[n],
                   prioritized ? &priority : nullptr, nullptr, prioritized ? &written[n] : nullptr);
+              auto &rgb = rgb_outputs[n];
+              rgb.clear();
+              if (!colours.empty())
+              {
+                rgb.reserve(outputs[n].size());
+                for (const auto &q : outputs[n])
+                {
+                  std::uint32_t value = 0;
+                  if (!colours.find(q.x, q.y, q.z, value)) continue;
+                  PointTypeRGB point;
+                  point.x = q.x; point.y = q.y; point.z = q.z;
+                  point.r = static_cast<std::uint8_t>((value >> 16) & 0xFF);
+                  point.g = static_cast<std::uint8_t>((value >> 8) & 0xFF);
+                  point.b = static_cast<std::uint8_t>(value & 0xFF);
+                  rgb.push_back(point);
+                }
+              }
             }
             catch (...)
             {
@@ -2931,21 +2981,32 @@ void RtkFusion::exportMap()
               sum[0] += q.x; sum[1] += q.y; sum[2] += q.z; sum[3] += q.intensity; sum[4] += 1;
             }
           chunk.insert(chunk.end(), outputs[n].begin(), outputs[n].end());
+          rgb_chunk.insert(rgb_chunk.end(), rgb_outputs[n].begin(), rgb_outputs[n].end());
+          rgb_written += rgb_outputs[n].size();
           if (chunk.size() >= static_cast<std::size_t>(export_chunk_points))
           {
-            write(std::move(chunk));
+            write(std::move(chunk), std::move(rgb_chunk));
             chunk = pcl::PointCloud<pcl::PointXYZI>();
+            rgb_chunk = PointCloudXYZRGB();
           }
         }
       }
-      if (!chunk.empty()) write(std::move(chunk));
+      if (!chunk.empty()) write(std::move(chunk), std::move(rgb_chunk));
       if (writing.valid()) writing.get();
+      if (!colours.empty())
+        RCLCPP_INFO(node->get_logger(),
+            "Saved RGB map: %zu of %zu geometry rows coloured (%.1f %%; colour voxels %zu of 3 cm / %zu of 6 cm from "
+            "coloured returns within %.1f m, %.1f s): rgb_map_N.pcd = coloured rows of map_N.pcd",
+            rgb_written, returns_written,
+            returns_written ? 100.0 * static_cast<double>(rgb_written) / static_cast<double>(returns_written) : 0.0,
+            colours.fine_keys.size(), colours.coarse_keys.size(), save_rgb_max_range, colour_sec);
       RCLCPP_INFO(node->get_logger(),
-          "Saved geometry map: %zu of %zu returns within the %.1f m cap written (%.1f %%; range priority ratio %.2f, "
+          "Saved geometry map: %zu of %zu returns within the %.1f m cap written (%.1f %%; range priority %s: ratio %.2f, "
           "margin %.1f m, %zu cells of %.2f m, %zu seen-free cells of %.2f m from returns within %.1f m, pass 1 %.1f s)",
           returns_written, returns_in_cap, save_map_max_range,
           returns_in_cap ? 100.0 * static_cast<double>(returns_written) / static_cast<double>(returns_in_cap) : 0.0,
-          save_map_priority_ratio, save_map_priority_margin, priority_cells, save_map_priority_voxel, seen_free_cells,
+          prioritized ? "on" : "off", save_map_priority_ratio, save_map_priority_margin, priority_cells,
+          save_map_priority_voxel, seen_free_cells,
           0.5 * save_map_priority_voxel, save_map_priority_free_range, priority_sec);
       if (display && !display_cells.empty())
       {

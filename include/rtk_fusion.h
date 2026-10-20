@@ -272,16 +272,20 @@ struct RtkFusion
   // Saved-map product filter only (archive and estimator untouched): returns farther than this many
   // metres from the virtual LiDAR origin are not written to map_N.pcd / rgb_map_N.pcd. 0 = keep all.
   double save_map_max_range = 0.0;
-  // Same filter for rgb_map_N.pcd only. The camera looks forward (60 x 32 deg), so tall objects and
-  // anything beside the road are coloured only from far away; a separate (larger) cap keeps that
-  // coverage while nearest-observation selection still picks the sharpest colour. <0 = same as
-  // save_map_max_range, 0 = keep all coloured returns.
+  // Cap of the COLOUR SOURCES of rgb_map_N.pcd (coloured returns of colors.bin used to colour the geometry
+  // rows). The camera looks forward (60 x 32 deg), so tall objects and anything beside the road are coloured
+  // only from far away; a separate (larger) cap keeps that coverage while nearest-observation selection still
+  // picks the sharpest colour. The rows themselves are geometry rows (save_map_max_range, range priority).
+  // <0 = same as save_map_max_range, 0 = keep all coloured returns.
   double save_rgb_max_range = -1.0;
   // Saved geometry map (map_N.pcd): range priority. Per save_map_priority_voxel cell the nearest supported
   // observation r_min (a scan with >= 2 returns in the cell) is found first; returns of that cell farther than
   // max(save_map_priority_ratio * r_min, r_min + save_map_priority_margin) are not written. A far scan therefore
   // only contributes where no nearer scan saw the surface (the coverage of save_map_max_range is kept), and the
   // far-lane copy of a surface no longer blurs the near-lane copy. ratio 0 = off (every return within the cap).
+  // Switch of the whole rule (occupied + seen-free), default off: a chunk then keeps every return of its own
+  // scans (with the rule on, a far scan's chunk loses the poles / opposite lane that another pass saw nearer).
+  bool save_map_priority_enabled = false;
   double save_map_priority_ratio = 1.5;
   double save_map_priority_margin = 2.0;
   double save_map_priority_voxel = 0.5;
@@ -355,6 +359,17 @@ struct RtkFusion
                           std::vector<float> *ranges = nullptr, std::vector<std::uint8_t> *written = nullptr,
                           std::ifstream *sources = nullptr, std::vector<Eigen::Vector3f> *origins = nullptr) const;
   PriorityCells nearestObservation() const;
+  // Colours of the RGB products: per 3 cm voxel the colour of the best camera observation in colors.bin (lowest
+  // range + 20 m per rad/s of rotation), per 6 cm voxel the same as fallback. rgb_map_N.pcd = the geometry rows
+  // of map_N.pcd that find a colour (own 3 cm voxel, else own 6 cm voxel), i.e. exactly the geometry of map_N.
+  struct ColorLookup
+  {
+    std::vector<std::uint64_t> fine_keys, coarse_keys;
+    std::vector<std::uint32_t> fine_rgb, coarse_rgb;
+    bool empty() const { return fine_keys.empty() && coarse_keys.empty(); }
+    bool find(double x, double y, double z, std::uint32_t &rgb) const;
+  };
+  ColorLookup colorLookup(std::size_t batch) const;
 
   RtkFusion(const rclcpp::Node::SharedPtr &node_in, const M3D &rotation,
             const V3D &translation, const V3D &reference_lever,

@@ -117,6 +117,9 @@ def round_cmd(round_name, mode, calibration_file, body, *, force_save_map=False,
     if body.get("loop_closure", True) is False:
         # finalize-time submap loop closure over revisited sections (on by default)
         cmd += ["--set", "rtk.loop_closure_enabled=false"]
+    if body.get("map_priority"):
+        # saved map: drop far duplicate returns of surfaces another pass saw nearer (off by default)
+        cmd.append("--map-priority")
     if body.get("save_map", True) or force_save_map:
         voxel, source, tile, kf, min_points = _map_export_args(body, "map_")
         if body.get("map_export", True) is False:
@@ -250,7 +253,7 @@ def start(body):
             "options": {k: body.get(k) for k in ("use_rtk", "save_map", "rviz", "rate", "precheck", "frame_divider",
                                                   "evaluate", "extra_sets", "start_offset", "duration", "map_range", "rgb_range",
                                                   "skip_stationary", "stationary_min", "stationary_lidar_interval",
-                                                  "loop_closure",
+                                                  "loop_closure", "map_priority",
                                                   "map_export", "map_voxel", "map_source", "map_tile", "map_keyframes")}}
     title = f"{'LIVO' if mode == 'livo' else 'LIO'} 建图 · {round_name}"
     return jobs.start("mapping", title, [{"title": title, "cmd": cmd}], meta=meta)

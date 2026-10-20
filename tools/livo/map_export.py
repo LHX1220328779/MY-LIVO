@@ -9,14 +9,17 @@ point = native scan-end pose * LiDAR extrinsic * p, delivered point = C(t) * nat
 
 Products (default <fusion_run>/map/):
   global_map.pcd          voxel-filtered geometry map (centroid of every voxel; x y z intensity), binary PCD
-  global_map_rgb.pcd      LIVO only: per voxel the colour of the nearest / slowest observation (rgb_map logic)
+  global_map_rgb.pcd      LIVO only: the global_map.pcd points that a camera observation colours (colour of the
+                          nearest / slowest observation in the point's 3 cm voxel, else its 6 cm voxel) - the
+                          same geometry as global_map.pcd, like the mapper's rgb_map_N.pcd vs map_N.pcd
   tiles/tile_<i>_<j>.pcd  optional square tiles (--tile M) of the same products for large sites
   keyframes/              optional (--keyframe-clouds): per-keyframe body-frame clouds + poses.txt (TUM)
   map_info.json           frame, voxel size, source, ranges, counts, bounds, time span, inputs, calibration
 
 Source: --source all (every scan, densest) | keyframes (only the scans at backend keyframes: ~5x lighter,
 same surfaces). --voxel 0 keeps every return (no filtering).
-Range priority (same rule as the mapper's map_N.pcd, default from the round's rtk.save_map_priority_*): per
+Range priority (same rule as the mapper's map_N.pcd, default from the round's rtk.save_map_priority_*, off when
+the round's rtk.save_map_priority_enabled is false): per
 0.5 m cell the nearest scan with >= 2 returns there sets r_min; returns farther than max(ratio * r_min,
 r_min + margin) are dropped before the voxel filter (--priority-ratio 0 = off). With the round's settings
 (no --max-range / --min-range / --priority-*) and its map_rows.bin, the rows are taken from map_rows.bin, i.e.
@@ -302,18 +305,30 @@ def voxel_reduce_xyzi(rec, voxel, min_points=1):
     return out[cnt >= min_points] if min_points > 1 else out
 
 
-def voxel_select_rgb(rec, score, voxel):
-    """Per voxel keep the record with the lowest score (nearest / slowest observation)."""
-    if not len(rec):
-        return rec
-    xyz = np.stack([rec["x"], rec["y"], rec["z"]], 1).astype(np.float64)
-    v = np.floor(xyz / voxel).astype(np.int64)
-    v -= v.min(0)
-    key = (v[:, 0] << 42) | (v[:, 1] << 21) | v[:, 2]
-    order = np.lexsort((score, key))
-    k = key[order]
-    first = np.r_[True, k[1:] != k[:-1]]
-    return rec[order[first]]
+def voxel_keys(xyz, voxel):
+    """Global 3 x 21-bit voxel key (same wrap-around as the mapper's colour voxels)."""
+    v = np.floor(np.asarray(xyz, np.float64) / voxel).astype(np.int64) & 0x1FFFFF
+    return (v[:, 0] << 42) | (v[:, 1] << 21) | v[:, 2]
+
+
+def colour_points(xyz, rr, voxel):
+    """Packed rgb of every point from the colour returns `rr` (RGBREC): the lowest score (nearest / slowest
+    observation) in the point's voxel, else in its 2x voxel; -1 = no colour observation there."""
+    out = np.full(len(xyz), -1, np.int64)
+    if not len(rr) or not len(xyz):
+        return out
+    cxyz = np.stack([rr["x"], rr["y"], rr["z"]], 1)
+    for size in (voxel, 2.0 * voxel):
+        ck = voxel_keys(cxyz, size)
+        order = np.lexsort((rr["s"], ck))
+        ck = ck[order]
+        first = np.r_[True, ck[1:] != ck[:-1]]
+        keys, rgb = ck[first], rr["rgb"][order[first]].astype(np.int64)
+        q = voxel_keys(xyz, size)
+        pos = np.minimum(np.searchsorted(keys, q), len(keys) - 1)
+        hit = (keys[pos] == q) & (out < 0)
+        out[hit] = rgb[pos[hit]]
+    return out
 
 
 def range_priority(rec, ratio, margin, cell):
@@ -425,7 +440,7 @@ def _project_frames(job):
                     rr["x"], rr["y"], rr["z"] = cw[:, 0], cw[:, 1], cw[:, 2]
                     rr["rgb"] = (r8 << 16) | (g8 << 8) | b8
                     rr["s"] = rng_c[m] + 20.0 * omega  # nearest observation wins; fast rotation penalised
-                    rgbbuf.add(tile_key(cw[:, :2], c["tile"], a.rgb_voxel), rr)
+                    rgbbuf.add(tile_key(cw[:, :2], c["tile"], a.voxel), rr)   # the geometry tiles: colour lookup per tile
         if colors:
             colors.close()
     geo.spill()
@@ -434,30 +449,40 @@ def _project_frames(job):
     return st
 
 
-def _reduce_tile(job):
-    """Worker: merge one tile from every projection worker, voxel-reduce it, write <tmp>/red/<kind>_<tile>.bin."""
-    kind, tile_id = job
+def _tile_result(kind, tile_id, data, n_in=0, n_prio=0):
+    data.tofile(_CTX["tmp"] / "red" / f"{kind}_{tile_id}.bin")
+    if len(data):
+        xyz = np.stack([data["x"], data["y"], data["z"]], 1)
+        return kind, tile_id, len(data), xyz.min(0).tolist(), xyz.max(0).tolist(), n_in, n_prio
+    return kind, tile_id, 0, None, None, n_in, n_prio
+
+
+def _reduce_tile(tile_id):
+    """Worker: merge one tile from every projection worker, voxel-reduce it, write <tmp>/red/geo_<tile>.bin."""
     c = _CTX
     tmp, a = c["tmp"], c["a"]
-    n_in = n_prio = 0
-    if kind == "geo":
-        rec = TileBuffer.load_all(tmp / "geo", tile_id, GEOREC)
-        n_in = len(rec)
-        rec = range_priority(rec, *c["priority"])
-        n_prio = len(rec)
-        out = voxel_reduce_xyzi(rec, a.voxel, a.min_points)
-    else:
-        rr = TileBuffer.load_all(tmp / "rgb", tile_id, RGBREC)
-        sel = voxel_select_rgb(rr, rr["s"], a.rgb_voxel)
-        out = np.empty(len(sel), XYZRGB)
-        for k in ("x", "y", "z", "rgb"):
-            out[k] = sel[k]
-    path = tmp / "red" / f"{kind}_{tile_id}.bin"
-    out.tofile(path)
-    if len(out):
-        xyz = np.stack([out["x"], out["y"], out["z"]], 1)
-        return kind, tile_id, len(out), xyz.min(0).tolist(), xyz.max(0).tolist(), n_in, n_prio
-    return kind, tile_id, 0, None, None, n_in, n_prio
+    rec = TileBuffer.load_all(tmp / "geo", tile_id, GEOREC)
+    n_in = len(rec)
+    rec = range_priority(rec, *c["priority"])
+    n_prio = len(rec)
+    return _tile_result("geo", tile_id, voxel_reduce_xyzi(rec, a.voxel, a.min_points), n_in, n_prio)
+
+
+def _colour_tile(tile_id):
+    """Worker (LIVO, after every geometry tile is reduced): <tmp>/red/rgb_<tile>.bin = the reduced geometry points of
+    the tile that a colour return of the tile colours (separate pass: a job never holds the raw geometry and the
+    colour returns of a tile at once)."""
+    c = _CTX
+    tmp, a = c["tmp"], c["a"]
+    geo = np.fromfile(tmp / "red" / f"geo_{tile_id}.bin", dtype=XYZI)
+    xyz = np.stack([geo["x"], geo["y"], geo["z"]], 1).astype(np.float64) if len(geo) else np.zeros((0, 3))
+    rgb = colour_points(xyz, TileBuffer.load_all(tmp / "rgb", tile_id, RGBREC), a.rgb_voxel)
+    hit = rgb >= 0
+    col = np.empty(int(hit.sum()), XYZRGB)
+    for k in ("x", "y", "z"):
+        col[k] = geo[k][hit]
+    col["rgb"] = rgb[hit].astype(np.uint32)
+    return _tile_result("rgb", tile_id, col)
 
 
 def export(a):
@@ -505,6 +530,11 @@ def export(a):
             except ValueError:
                 value = default
         priority.append(float(value))
+    # The round's switch rtk.save_map_priority_enabled (off = every return, as its map_N.pcd). Rounds without the
+    # switch: on if they had the rule's parameters (0aee860 .. 10-20, rule on by default), else off (older rounds).
+    enabled = prm.get("rtk.save_map_priority_enabled", "true" if "rtk.save_map_priority_ratio" in prm else "false")
+    if a.priority_ratio is None and str(enabled).lower() in ("false", "0"):
+        priority[0] = 0.0
     if priority[0] != 0 and (priority[0] < 1 or priority[1] < 0 or priority[2] <= 0):
         raise SystemExit("range priority: ratio 0 (off) or >= 1, margin >= 0, cell > 0")
     # The round's settings + map_rows.bin: take the mapper's own row decision (incl. its seen-free cells).
@@ -547,11 +577,11 @@ def export(a):
     kf_poses = sorted(row for p in parts for row in p["kf"])
     t_project = time.time() - t_start
     # ---------------------------------------------------------------- reduce per tile (parallel), assemble products
-    jobs = [("geo", t) for t in TileBuffer.tiles_on_disk(tmp / "geo")]
-    if rgb_wanted:
-        jobs += [("rgb", t) for t in TileBuffer.tiles_on_disk(tmp / "rgb")]
+    jobs = TileBuffer.tiles_on_disk(tmp / "geo")
     with ctx.Pool(max(1, min(a.jobs, 6))) as pool:
         reduced = pool.map(_reduce_tile, jobs, chunksize=1)
+        if rgb_wanted:
+            reduced += pool.map(_colour_tile, jobs, chunksize=1)
     stats["returns_range_priority"] = int(sum(r[6] for r in reduced if r[0] == "geo"))
     files, tile_counts = {}, {}
     bounds = [np.full(3, np.inf), np.full(3, -np.inf)]
@@ -616,7 +646,8 @@ def export(a):
         if np.isfinite(bounds[0]).all() else None,
         "keyframe_clouds": len(kf_poses) if a.keyframe_clouds else None,
         "fields": {"global_map.pcd": "x y z intensity (float32; voxel centroid and mean intensity)",
-                   "global_map_rgb.pcd": "x y z rgb (packed uint32 0x00RRGGBB; nearest/slowest observation per voxel)"},
+                   "global_map_rgb.pcd": "x y z rgb (packed uint32 0x00RRGGBB): the global_map.pcd points with a colour "
+                                         "observation in their rgb_voxel_m voxel (else 2x voxel); nearest/slowest observation"},
         "elapsed_s": round(time.time() - t_start, 1), "project_s": round(t_project, 1), "jobs": a.jobs,
     }
     (out / "map_info.json").write_text(json.dumps(info, indent=2, ensure_ascii=False) + "\n")
@@ -661,7 +692,8 @@ def build_parser():
                     help="drop geometry voxels with fewer returns (noise / briefly seen moving objects; 1 = keep all)")
     ap.add_argument("--rgb", dest="rgb", action="store_true", default=True)
     ap.add_argument("--no-rgb", dest="rgb", action="store_false", help="skip the colour map (LIVO rounds)")
-    ap.add_argument("--rgb-voxel", type=float, default=0.03, help="colour map voxel (m)")
+    ap.add_argument("--rgb-voxel", type=float, default=0.03,
+                    help="colour lookup voxel (m): a point takes the nearest/slowest colour observation of its voxel, else of the 2x voxel")
     ap.add_argument("--rgb-max-range", type=float, default=None, help="colour range cap (m; default: the round's)")
     ap.add_argument("--jobs", type=int, default=min(8, max(1, (os.cpu_count() or 2) // 3)),
                     help="parallel worker processes (projection and per-tile reduction)")

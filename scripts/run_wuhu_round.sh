@@ -12,6 +12,8 @@
 #        [--no-rtk] [--no-save-map] [--rviz] [--rate R] [--start-offset S] [--duration D]
 #        [--map-range M] [--rgb-range M]   (saved-map product caps in metres, 0 = keep every return;
 #                                           defaults come from the yaml: rtk.save_map_max_range / save_rgb_max_range)
+#        [--map-priority]                  (map_N.pcd range priority + seen-free check ON; default off: every return
+#                                           within the cap; rtk.save_map_priority_enabled)
 #        [--skip-stationary] [--stationary-min S] [--stationary-lidar-interval S]
 #                                          (LIO only: fast-forward standstills >= S s after the first drive, IMU/INS
 #                                           complete, LiDAR thinned; see tools/livo/motion.py)
@@ -52,6 +54,7 @@ while (($#)); do
     --set) sets+=("$2"); shift 2 ;;
     --map-range) sets+=("rtk.save_map_max_range=$2"); shift 2 ;;   # geometry product cap [m], 0 = all
     --rgb-range) sets+=("rtk.save_rgb_max_range=$2"); shift 2 ;;   # colour product cap [m], 0 = all, -1 = same as geometry
+    --map-priority) sets+=("rtk.save_map_priority_enabled=true"); shift ;;   # far duplicate returns not written
     --no-eval) do_eval=0; shift ;;
     --quick-eval) quick_eval=1; shift ;;   # trajectory + summary only (scan rounds of the closed loop)
     --skip-stationary) skip_stationary=1; shift ;;
