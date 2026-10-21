@@ -19,6 +19,8 @@ inputs. Stages (version suffix = stage; see STAGES for the operator-facing catal
   camera-time   camera->IMU time offset from optical flow vs gyro
   camera-lidar  camera->rear-axle extrinsic refinement by LiDAR depth-edge / image-edge alignment
                 (advisory: writes overlays/ images, activate only after inspecting them)
+  camera-photo  camera rotation + camera time offset from the multi-view photo-consistency of a LIVO round's
+                returns, with an intrinsics check (scripts/refine_camera_photometric.py); needs a LIVO run
   from-precheck adopt the corrections reported by the SLAM static-start self-check
   windows       motion profile of a recording (INS odometry) -> stationary / driving windows for the stages and
                 calibration rounds (a recording that starts with a long standstill must not be calibrated on it)
@@ -97,6 +99,10 @@ STAGES = {
     "camfocus": {"order": 6, "label": "相机内参/畸变（光流×深度）", "command": "camera-focus",
                  "input": "原始录制（含相机）+ 一次 LIVO 建图结果", "output": "camera.intrinsics 的 fx/fy 与畸变 k1（连续帧光流 vs LiDAR 深度预测流；外参/时间偏移/卷帘一阶抵消）",
                  "needs": ["dataset", "camera", "run"], "mapping": "livo", "advisory": False, "seconds": 240},
+    "camphoto": {"order": 7.5, "label": "相机光度标定（内参复核 + 外参/时间精修）", "command": "camera-photo",
+                 "input": "原始录制（含相机）+ 一次 LIVO 建图结果（父版本）",
+                 "output": "相机→后轴旋转与 time_offsets.camera（同一回波在多帧图像里纹理一致；两半交叉验证）；内参仅在留出数据显著改善时才改",
+                 "needs": ["dataset", "camera", "run"], "mapping": "livo", "advisory": False, "seconds": 300},
     "camloop": {"order": 7, "label": "相机外参闭环标定", "command": "set",
                 "input": "俯仰扫描的 2–3 次 LIVO 建图（原生里程尺度 vs RTK）", "output": "相机→后轴外参的俯仰角（尺度过零点，闭环验证）",
                 "needs": [], "mapping": "livo", "advisory": False, "seconds": 900, "internal": True},
@@ -2238,6 +2244,38 @@ def cmd_camera_focus(a):
                      metrics=metrics, activate=a.activate and bool(applied))
 
 
+def cmd_camera_photo(a):
+    pdir, parent_calib, mine, truck = parent_info(a.id)
+    _, ds_info = require_dataset(a.bag, camera=True, what="camera-photo")
+    run = _fusion_run(a.run)
+    out_dir = next_version_dir(mine, truck, "camphoto")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cmd = ["/usr/bin/python3", str(SCRIPTS / "refine_camera_photometric.py"), "--calibration", str(pdir / "calibration.json"),
+           "--bag", a.bag, "--run", str(run), "--output", str(out_dir / "calibration.json"),
+           "--report", str(out_dir / "stage_report.txt"), "--json", str(out_dir / "photo_metrics.json")]
+    lines = run_script(cmd, out_dir / "stage.log")
+    if not (out_dir / "calibration.json").exists():
+        # no significant / consistent correction: the parent stays the result (the pipeline continues with it)
+        metrics_file = out_dir / "photo_metrics.json"
+        metrics = json.loads(metrics_file.read_text()) if metrics_file.exists() else {}
+        shutil.rmtree(out_dir, ignore_errors=True)
+        if out_dir in CREATED_DIRS:
+            CREATED_DIRS.remove(out_dir)
+        print(json.dumps({"id": a.id, "kept": True, "reason": "no significant / consistent photo-consistency correction",
+                          "metrics": metrics}, ensure_ascii=False))
+        return
+    calib = json.loads((out_dir / "calibration.json").read_text())
+    applied = calib.get("refinement", {}).get("camera_photometric", {}).get("applied", {})
+    rot = applied.get("rot_delta_deg_cam_xyz", [0, 0, 0])
+    note = (f"相机光度标定：旋转 (相机系 x/y/z) {rot[0]:+.3f} / {rot[1]:+.3f} / {rot[2]:+.3f}°，时间偏移 "
+            f"{applied.get('camera_time_offset_s', 0):+.4f} s，内参{'修正' if applied.get('intrinsics') else '复核不变'}"
+            f"（光度一致性 {100 * applied.get('cost_gain_all', 0):+.1f} %）")
+    finalize_version(out_dir, calib, mine=mine, truck=truck, stage="camphoto", parent=a.id, note=a.note or note,
+                     inputs={"bag": a.bag, "dataset": ds_info, "run": str(run)},
+                     metrics={"camera_photometric": calib.get("refinement", {}).get("camera_photometric", {})},
+                     report_lines=lines, activate=a.activate)
+
+
 def cmd_camera_lidar(a):
     pdir, parent_calib, mine, truck = parent_info(a.id)
     _, ds_info = require_dataset(a.bag, camera=True, what="camera-lidar")
@@ -2815,6 +2853,13 @@ def main():
                         "cross-check fx with camera-lidar --method poles u_px first)")
     common(p)
     p.set_defaults(func=cmd_camera_focus)
+
+    p = sub.add_parser("camera-photo", help="camera rotation + time offset (intrinsics check) from multi-view "
+                                            "photo-consistency of a LIVO round")
+    p.add_argument("--bag", required=True, help="recording containing midrange_camera/ffmpeg (raw root)")
+    p.add_argument("--run", required=True, help="fusion run (or round) directory of a LIVO round mapped with the parent")
+    common(p)
+    p.set_defaults(func=cmd_camera_photo)
 
     p = sub.add_parser("set")
     p.add_argument("--camera-rot-delta", nargs=3, type=float, metavar=("RX", "RY", "RZ"),

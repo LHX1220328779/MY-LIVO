@@ -276,6 +276,10 @@ struct RtkFusion
   // and anything far beside the road are seen only from 40-60 m behind them. <0 = same as save_map_max_range,
   // 0 = no cap.
   double save_rgb_max_range = -1.0;
+  // rgb_map_N.pcd keeps one point per save_rgb_voxel cube of each chunk's coloured rows (centroid, mean colour);
+  // while the truck stands (moved < save_rgb_voxel, turned < 1 deg) its frames only fill voxels not yet written
+  // since it stopped. 0 = every coloured row of every frame.
+  double save_rgb_voxel = 0.03;
   // Saved geometry map (map_N.pcd): range priority. Per save_map_priority_voxel cell the nearest supported
   // observation r_min (a scan with >= 2 returns in the cell) is found first; returns of that cell farther than
   // max(save_map_priority_ratio * r_min, r_min + save_map_priority_margin) are not written. A far scan therefore

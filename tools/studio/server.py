@@ -276,7 +276,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise StudioError("已有建图/流水线任务在运行，请先等待其结束")
             kind = body.get("kind") or "lidar"
             steps, info = calibration.pipeline_steps(kind, body, mapping.pipeline_round_cmd)
-            title = {"lidar": "LiDAR 标定流水线", "camera": "相机标定流水线", "camloop": "相机外参闭环微调"}.get(kind, kind) + f" · {info['truck']}"
+            title = {"lidar": "LiDAR 标定流水线", "camera": "相机标定流水线", "camloop": "相机外参闭环微调",
+                     "camphoto": "相机光度标定"}.get(kind, kind) + f" · {info['truck']}"
             job = jobs.start("pipeline", title, steps, meta={"kind": kind, **info, "options": body})
             return self._send(200, job.to_json())
         if path == "/api/calibrations/overlay":

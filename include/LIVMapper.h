@@ -110,8 +110,8 @@ public:
   double blind_rgb_points = 0.0;
   // Look-back colouring of the LIVO RGB map (colourScan): camera views buffered every rgb_view_spacing m of camera
   // travel over the last rgb_view_span m (0 = current image only), colours sampled rgb_view_margin px inside the
-  // image border.
-  double rgb_view_spacing = 2.0, rgb_view_span = 80.0;
+  // image border; a view's weight ramps up over the next rgb_view_feather px (0 = the newest view alone).
+  double rgb_view_spacing = 2.0, rgb_view_span = 80.0, rgb_view_feather = 90.0;
   int rgb_view_margin = 60;
   struct ColourView
   {

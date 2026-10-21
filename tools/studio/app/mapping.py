@@ -105,6 +105,14 @@ def round_cmd(round_name, mode, calibration_file, body, *, force_save_map=False,
             if not math.isfinite(distance) or distance < 0:
                 raise StudioError("点云截取距离必须是有限非负数（0 表示不限距离）")
             cmd += [flag, str(distance)]
+    if body.get("rgb_voxel") not in (None, ""):
+        try:
+            voxel = float(body["rgb_voxel"])
+        except (TypeError, ValueError):
+            raise StudioError("彩色点云体素必须是 0 到 0.5 m 之间的数（0 表示保留每一行）") from None
+        if not math.isfinite(voxel) or not 0 <= voxel <= 0.5:
+            raise StudioError("彩色点云体素必须是 0 到 0.5 m 之间的数（0 表示保留每一行）")
+        cmd += ["--rgb-voxel", str(voxel)]
     if body.get("skip_stationary"):
         try:
             smin = float(body.get("stationary_min") or 30)
@@ -251,6 +259,7 @@ def start(body):
     meta = {"round": round_name, "mode": mode, "dataset": dataset, "calibration_id": cid,
             "options": {k: body.get(k) for k in ("use_rtk", "save_map", "rviz", "rate", "precheck", "frame_divider",
                                                   "evaluate", "extra_sets", "start_offset", "duration", "map_range", "rgb_range",
+                                                  "rgb_voxel",
                                                   "skip_stationary", "stationary_min", "stationary_lidar_interval",
                                                   "loop_closure", "map_priority",
                                                   "map_export", "map_voxel", "map_source", "map_tile", "map_keyframes")}}

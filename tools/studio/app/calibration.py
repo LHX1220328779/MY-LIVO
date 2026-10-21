@@ -23,6 +23,7 @@ STAGE_FALLBACK = {
     "camtime": {"order": 5, "label": "相机时间偏移", "command": "camera-time", "advisory": False, "mapping": None},
     "camlidar": {"order": 6, "label": "相机-LiDAR 偏航/横滚复核", "command": "camera-lidar", "advisory": True, "mapping": "livo"},
     "camloop": {"order": 7, "label": "相机外参闭环标定", "command": "set", "advisory": False, "mapping": "livo", "internal": True},
+    "camphoto": {"order": 7.5, "label": "相机光度标定（内参复核 + 外参/时间精修）", "command": "camera-photo", "advisory": False, "mapping": "livo"},
     "precheck": {"order": 8, "label": "采纳建图自检修正", "command": "from-precheck", "advisory": False, "mapping": "any"},
     "manual": {"order": 9, "label": "手动设置", "command": "set", "advisory": False, "mapping": None},
     "scan": {"order": 10, "label": "闭环扫描点（临时）", "command": "set", "advisory": True, "mapping": None, "internal": True},
@@ -290,7 +291,8 @@ def _parent(body):
 
 
 # Stages whose tool command reads a saved-map fusion run (--run) and the mapping mode that run must have.
-RUN_STAGES = {"driven": "lio", "gcons": "lio", "rtk-time": "lio", "camera-lidar": "livo", "camera-focus": "livo"}
+RUN_STAGES = {"driven": "lio", "gcons": "lio", "rtk-time": "lio", "camera-lidar": "livo", "camera-focus": "livo",
+              "camera-photo": "livo"}
 
 
 def _run_dir(raw):
@@ -315,9 +317,9 @@ def stage_cmd(stage, body):
         return import_cmd(body)
     parent = _parent(body)
     cmd = [PY, str(CALIB_TOOL), command, "--id", parent]
-    if command in ("axle", "ground", "driven", "gcons", "camera-time", "camera-lidar", "camera-focus"):
+    if command in ("axle", "ground", "driven", "gcons", "camera-time", "camera-lidar", "camera-focus", "camera-photo"):
         dataset = str(safe_path(body.get("dataset") or ""))
-        datasets.require(dataset, camera=command in ("camera-time", "camera-lidar", "camera-focus"))
+        datasets.require(dataset, camera=command in ("camera-time", "camera-lidar", "camera-focus", "camera-photo"))
         cmd += ["--bag", dataset]
     if command in RUN_STAGES:
         # Every run-based stage gets its --run here; an empty selection (the UI lists no finished round of the
@@ -762,6 +764,52 @@ def _rtk_time_steps(steps, body, mapping_cmd, *, truck, stamp, auto_activate):
     steps.append({"title": "校验最终版本", "build": lambda ctx: [PY, str(CALIB_TOOL), "validate", "--id", ctx["result_id"]]})
 
 
+def _camphoto_steps(steps, body, mapping_cmd, *, truck, stamp, auto_activate, parent):
+    """Camera photometric calibration starting from `parent` (the active version), appended to `steps`:
+    LIVO round with the parent (the data of the stage and the A side of the verdict) -> camera-photo (camera rotation
+    + time offset from the multi-view photo-consistency of the round's returns; intrinsics checked, changed only on a
+    significant held-out gain) -> LIVO verify round with the new version -> closed-loop verdict on the native front
+    end (odometry scale, rear-axle error, yaw: the camera also drives the LIVO photometric update) -> validate
+    [-> activate]. No significant / consistent correction: the parent is the result, verify and verdict skipped."""
+    round_duration = body.get("_cam_round_duration")
+    if round_duration is not None:
+        round_duration = float(round_duration) or None
+    rb, rv = f"calib_{truck}_livo_{stamp}_photo", f"calib_{truck}_livo_{stamp}_photo_verify"
+    changed = lambda ctx: ctx.get("photo_id") not in (None, parent)  # noqa: E731
+    steps.append({"title": f"LIVO 建图 {rb}（当前版本：光度标定的数据，也是判定的基线）", "retry": 1, "round": rb,
+                  "build": lambda ctx: mapping_cmd(rb, "livo", str(calibration_file(parent)), body,
+                                                   duration=_cam_round_duration(ctx, body, round_duration),
+                                                   start_offset=_round_start(ctx, body)),
+                  "after": lambda ctx, lines: ctx.update(photo_round=rb, photo_fusion=latest_fusion_dir(rb))})
+    steps.append({"title": "相机光度标定 (camera-photo：多视角光度一致性 → 相机旋转 + 时间偏移，内参复核；无显著改善则沿用父版本)",
+                  "build": lambda ctx: stage_cmd("camera-photo", {"id": parent, "dataset": body.get("dataset"),
+                                                                    "run": ctx["photo_fusion"], "note": body.get("note") or ""}),
+                  "after": lambda ctx, lines: ctx.__setitem__("photo_id", parse_version_id(lines))})
+    steps.append({"title": f"LIVO 验证建图 {rv}（光度标定版本；沿用父版本时跳过）", "retry": 1, "round": rv,
+                  "build": lambda ctx: mapping_cmd(rv, "livo", str(calibration_file(ctx["photo_id"])), body,
+                                                   duration=_cam_round_duration(ctx, body, round_duration),
+                                                   start_offset=_round_start(ctx, body))
+                  if changed(ctx) else ["/bin/echo", "camera kept: verify round skipped"],
+                  "after": lambda ctx, lines: ctx.__setitem__("verify_round", rv if changed(ctx) else None)})
+    steps.append({"title": "判定：基线轮次 vs 光度标定版本（原生里程尺度 / 后轴误差 / 偏航不变差）",
+                  "build": lambda ctx: [PY, str(REPO / "scripts" / "analysis" / "closed_loop_verdict.py"), ctx["photo_round"],
+                                        ctx["verify_round"], "--version-dir", str(CAL_ROOT.joinpath(*ctx["photo_id"].split("/"))),
+                                        "--scale-margin", "0.002", "--exit-zero"]
+                  if changed(ctx) else ["/bin/echo", "camera kept: no verdict needed"],
+                  "after": lambda ctx, lines: ctx.update(closed_loop=_verdict(lines) if changed(ctx) else "kept",
+                                                         result_id=ctx["photo_id"] if changed(ctx) else parent)})
+    steps.append({"title": "校验结果版本", "build": lambda ctx: [PY, str(CALIB_TOOL), "validate", "--id", ctx["result_id"], "--strict"]})
+
+    def activate_cmd(ctx):
+        if auto_activate and changed(ctx) and ctx.get("closed_loop") == "pass":
+            return [PY, str(CALIB_TOOL), "activate", "--id", ctx["photo_id"]]
+        why = ("未勾选自动激活" if not auto_activate else "相机沿用父版本" if not changed(ctx) else "判定未通过")
+        return [PY, "-c", f"print('not activated: {why}; active version unchanged')"]
+    steps.append({"title": "激活光度标定版本（判定通过且勾选自动激活）", "build": activate_cmd,
+                  "after": lambda ctx, lines: ctx.__setitem__("activated", auto_activate and changed(ctx)
+                                                              and ctx.get("closed_loop") == "pass")})
+
+
 RESUME_PREFIX = "续跑："
 
 
@@ -856,6 +904,8 @@ def pipeline_steps(kind, body, mapping_cmd):
              -> pitch scan (2 temporary versions, 2 LIVO rounds) -> zero crossing -> camloop version
              -> LIVO verify round -> closed-loop verdict A vs verify -> validate [-> activate if pass]
     camloop: same pitch closed loop starting from the parent version (its own LIVO round is the 0 point)
+    camphoto: LIVO round with the parent -> camera-photo (camera rotation + time offset from the multi-view
+             photo-consistency, intrinsics check) -> LIVO verify round -> closed-loop verdict -> validate [-> activate]
     The native odometry scale reacts with ~11 %/deg of camera pitch error and is repeatable to ~0.03 %,
     so it is the acceptance test; edge/pole alignment alone cannot resolve pitch (36-line ring spacing).
     """
@@ -985,6 +1035,11 @@ def pipeline_steps(kind, body, mapping_cmd):
             "after": lambda ctx, lines: ctx.update(camlidar_id=parse_version_id(lines), result_id=ctx["camtime_id"])})
         _camloop_steps(steps, body, mapping_cmd, truck=truck, stamp=stamp, auto_activate=auto_activate,
                        base_key="camlidar_id", round0_key="round", baseline_key="round", standard=standard)
+    elif kind == "camphoto":
+        datasets.require(dataset, camera=True)
+        cam_dur_eff = _round_duration(body, cam_dur or 60)
+        _windows_step(steps, dataset, cam_dur_eff or 60, body)
+        _camphoto_steps(steps, body, mapping_cmd, truck=truck, stamp=stamp, auto_activate=auto_activate, parent=parent)
     elif kind == "camloop":
         datasets.require(dataset, camera=True)
         cam_dur_eff = _round_duration(body, cam_dur or 60)

@@ -473,8 +473,10 @@ void LIVMapper::readParameters()
   nh.param<double>("publish/rgb_view_spacing", rgb_view_spacing, 2.0);
   nh.param<double>("publish/rgb_view_span", rgb_view_span, 80.0);
   nh.param<int>("publish/rgb_view_margin", rgb_view_margin, 60);
-  if (!(rgb_view_spacing > 0.0) || !(rgb_view_span >= 0.0) || rgb_view_margin < 1)
-    throw std::runtime_error("publish/rgb_view_spacing must be > 0, rgb_view_span >= 0, rgb_view_margin >= 1");
+  nh.param<double>("publish/rgb_view_feather", rgb_view_feather, 90.0);
+  if (!(rgb_view_spacing > 0.0) || !(rgb_view_span >= 0.0) || rgb_view_margin < 1 || !(rgb_view_feather >= 0.0))
+    throw std::runtime_error("publish/rgb_view_spacing must be > 0, rgb_view_span >= 0, rgb_view_margin >= 1, "
+                             "rgb_view_feather >= 0");
   nh.param<int>("publish/pub_scan_num", pub_scan_num, 1);
   nh.param<bool>("publish/pub_effect_point_en", pub_effect_point_en, false);
   nh.param<bool>("publish/dense_map_en", dense_map_en, false);
@@ -3150,19 +3152,25 @@ std::vector<std::uint32_t> LIVMapper::colourScan(const PointCloudXYZI &world)
   // on truck29 20261013 only 3 % of the kept returns were inside the image of their own scan, and the former
   // colour lookup (own 3 cm voxel, else the nearest coloured return within 6 cm) painted the rest from far-range
   // returns displaced 10-20 cm (sign plates 2-60 % coloured, nothing legible on them). Every return now takes
-  // the colour of the NEWEST camera view that sees it: the current image, else the views buffered every
+  // its colour from the NEWEST camera views that see it: the current image, else the views buffered every
   // rgb_view_spacing m of camera travel over the last rgb_view_span m (driving forward, newest = nearest).
+  // Hand-over: a view's weight ramps from 0 at rgb_view_margin to 1 at rgb_view_margin + rgb_view_feather px
+  // inside its border and the older views fill the remaining weight. The newest view alone coloured every return
+  // where it was about to leave that image (bottom rows / side columns: ~20 % vignetting, the fastest image
+  // motion), so each 2 m band of views drew a camera-frustum-shaped ripple on the ground (neighbour colour jumps
+  // across bands 4.5-5.6x those within one; 90 px hand-over: 2.0x, local texture -7..-11 %).
   // Sees = in front of the camera, farther than blind_rgb_points, rgb_view_margin px inside the image (border
   // pixels disagreed with the other views of the same return 1.5x more often) and not behind the nearest return
   // the view's OWN scan put into the same 8 px cell (+ max(0.3 m, 4 %)): that scan was taken with the image, so
   // it holds the image's occluders, vehicles gone since included (the scans of later frames would also hide
   // grazing ground: 93 % -> 65 % coloured). Per return: 0 = no view, else
-  // (view distance m, 1..255) << 24 | R << 16 | G << 8 | B.
+  // (distance of the newest view that sees it, m, 1..255) << 24 | R << 16 | G << 8 | B.
   const auto start = std::chrono::steady_clock::now();
   constexpr int cell = 8;
   const auto &frame = vio_manager->new_frame_;
   const vk::AbstractCamera &cam = *frame->cam_;
   const int columns = cam.width() / cell + 1;
+  const double right = cam.width() - 1.0, bottom = cam.height() - 1.0;
   const auto cellOf = [columns](const V2D &px) {
     return static_cast<std::size_t>(static_cast<int>(px.y()) / cell * columns + static_cast<int>(px.x()) / cell);
   };
@@ -3194,6 +3202,9 @@ std::vector<std::uint32_t> LIVMapper::colourScan(const PointCloudXYZI &world)
   for (std::size_t i = 0; i < world.size(); ++i)
   {
     const V3D pw(world.points[i].x, world.points[i].y, world.points[i].z);
+    V3F sum(0.f, 0.f, 0.f);
+    float weight = 0.f;
+    double source = 0.0;  // distance of the newest view that sees the return
     for (const ColourView *view : views)
     {
       if (view->T_f_w.rotation_matrix().row(2).dot(pw) + view->T_f_w.translation().z() <= 0.1) continue;
@@ -3203,12 +3214,21 @@ std::vector<std::uint32_t> LIVMapper::colourScan(const PointCloudXYZI &world)
       const V2D px = cam.world2cam(pf);
       if (!cam.isInFrame(px.cast<int>(), rgb_view_margin)) continue;
       if (pf.z() > view->depth[cellOf(px)] + std::max(0.3, 0.04 * pf.z())) continue;
-      const V3F bgr = vio_manager->getInterpolatedPixel(view->image, px);
-      const auto metres = static_cast<std::uint32_t>(std::min(255.0, std::max(1.0, std::ceil(distance))));
-      colours[i] = metres << 24 | channel(bgr[2]) << 16 | channel(bgr[1]) << 8 | channel(bgr[0]);
-      ++coloured;
-      break;
+      const double border = std::min(std::min(px.x(), right - px.x()), std::min(px.y(), bottom - px.y()));
+      const float ramp = rgb_view_feather > 0.0
+          ? static_cast<float>(std::min(1.0, std::max(1e-3, (border - rgb_view_margin) / rgb_view_feather)))
+          : 1.f;
+      const float w = std::min(ramp, 1.f - weight);
+      if (weight == 0.f) source = distance;
+      sum += w * vio_manager->getInterpolatedPixel(view->image, px);
+      weight += w;
+      if (weight >= 0.9999f) break;
     }
+    if (weight <= 0.f) continue;
+    const V3F bgr = sum / weight;
+    const auto metres = static_cast<std::uint32_t>(std::min(255.0, std::max(1.0, std::ceil(source))));
+    colours[i] = metres << 24 | channel(bgr[2]) << 16 | channel(bgr[1]) << 8 | channel(bgr[0]);
+    ++coloured;
   }
   const V3D centre = current.centre;
   if (rgb_view_span > 0.0 &&

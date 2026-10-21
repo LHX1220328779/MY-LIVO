@@ -10,8 +10,10 @@
 #include <gtsam/slam/PriorFactor.h>
 #include <pcl/io/pcd_io.h>
 #include <pcl_conversions/pcl_conversions.h>
+#include <atomic>
 #include <charconv>
 #include <chrono>
+#include <deque>
 #include <future>
 #include <set>
 #include <unordered_map>
@@ -72,6 +74,68 @@ std::uint8_t fillRangeCode(float range)
 // A dropped ground row fills only within this distance of its column's ground plane: the band holding ~90 % of the
 // written (near-scan) ground rows (20261013: their |dz| P90 2.7-3.4 cm).
 constexpr double kGroundFillTolerance = 0.03;
+
+// One point per voxel of a chunk's coloured rows: centroid and mean colour (rgb_map_N.pcd, rtk.save_rgb_voxel);
+// `voxels` receives the voxel of every output point, ascending.
+PointCloudXYZRGB voxelMean(const PointCloudXYZRGB &cloud, double voxel, std::vector<std::uint64_t> &voxels)
+{
+  const double inverse = 1.0 / voxel;
+  const auto cell = [inverse](float v) {
+    return static_cast<std::uint64_t>(static_cast<std::int64_t>(std::floor(v * inverse)) & 0x1FFFFF);
+  };
+  std::vector<std::pair<std::uint64_t, std::uint32_t>> keys(cloud.size());
+  for (std::size_t i = 0; i < cloud.size(); ++i)
+  {
+    const auto &p = cloud.points[i];
+    keys[i] = {cell(p.x) << 42 | cell(p.y) << 21 | cell(p.z), static_cast<std::uint32_t>(i)};
+  }
+  std::sort(keys.begin(), keys.end());
+  PointCloudXYZRGB out;
+  out.reserve(cloud.size() / 2);
+  voxels.clear();
+  voxels.reserve(cloud.size() / 2);
+  for (std::size_t a = 0; a < keys.size();)
+  {
+    double x = 0.0, y = 0.0, z = 0.0;
+    std::uint32_t r = 0, g = 0, b = 0;
+    std::size_t e = a;
+    for (; e < keys.size() && keys[e].first == keys[a].first; ++e)
+    {
+      const auto &p = cloud.points[keys[e].second];
+      x += p.x; y += p.y; z += p.z;
+      r += p.r; g += p.g; b += p.b;
+    }
+    const auto n = static_cast<std::uint32_t>(e - a);
+    PointTypeRGB point;
+    point.x = static_cast<float>(x / n); point.y = static_cast<float>(y / n); point.z = static_cast<float>(z / n);
+    point.r = static_cast<std::uint8_t>((r + n / 2) / n);
+    point.g = static_cast<std::uint8_t>((g + n / 2) / n);
+    point.b = static_cast<std::uint8_t>((b + n / 2) / n);
+    out.push_back(point);
+    voxels.push_back(keys[a].first);
+    a = e;
+  }
+  return out;
+}
+
+// Standing truck: drops the points whose voxel is already in `written` (ascending: the voxels written since the
+// truck stopped) and adds the voxels of the others to it.
+void dropWritten(PointCloudXYZRGB &cloud, std::vector<std::uint64_t> &voxels, std::vector<std::uint64_t> &written)
+{
+  std::size_t kept = 0, w = 0;
+  for (std::size_t i = 0; i < voxels.size(); ++i)
+  {
+    while (w < written.size() && written[w] < voxels[i]) ++w;
+    if (w < written.size() && written[w] == voxels[i]) continue;
+    cloud.points[kept] = cloud.points[i];
+    voxels[kept++] = voxels[i];
+  }
+  cloud.resize(kept);
+  voxels.resize(kept);
+  std::vector<std::uint64_t> merged(written.size() + kept);
+  std::merge(written.begin(), written.end(), voxels.begin(), voxels.end(), merged.begin());
+  written.swap(merged);
+}
 }  // namespace
 
 RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
@@ -162,6 +226,9 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   if (!std::isfinite(save_rgb_max_range))
     throw std::runtime_error("rtk/save_rgb_max_range must be finite (<0 = same as save_map_max_range, 0 = no cap)");
   if (save_rgb_max_range < 0.0) save_rgb_max_range = save_map_max_range;
+  parameters.param<double>("rtk/save_rgb_voxel", save_rgb_voxel, save_rgb_voxel);
+  if (!std::isfinite(save_rgb_voxel) || save_rgb_voxel < 0.0)
+    throw std::runtime_error("rtk/save_rgb_voxel must be finite and nonnegative (0 = every coloured row)");
   parameters.param<bool>("rtk/save_map_priority_enabled", save_map_priority_enabled, save_map_priority_enabled);
   parameters.param<double>("rtk/save_map_priority_ratio", save_map_priority_ratio, save_map_priority_ratio);
   parameters.param<double>("rtk/save_map_priority_margin_m", save_map_priority_margin, save_map_priority_margin);
@@ -185,8 +252,9 @@ RtkFusion::RtkFusion(const rclcpp::Node::SharedPtr &node_in,
   RCLCPP_INFO(node->get_logger(),
       "Saved-map product range cap: geometry %.1f m, colour %.1f m (0 = keep every return; only map_N.pcd / rgb_map_N.pcd are "
       "filtered, the archive and the estimator are not). Change with rtk.save_map_max_range / rtk.save_rgb_max_range, "
-      "run_wuhu_round.sh --map-range M --rgb-range M, or launch save_map_max_range:=M save_rgb_max_range:=M",
-      save_map_max_range, save_rgb_max_range);
+      "run_wuhu_round.sh --map-range M --rgb-range M, or launch save_map_max_range:=M save_rgb_max_range:=M; "
+      "rgb_map_N.pcd voxel %.3f m (rtk.save_rgb_voxel, run_wuhu_round.sh --rgb-voxel M, 0 = every coloured row)",
+      save_map_max_range, save_rgb_max_range, save_rgb_voxel);
   {
     parameters.param<double>("rtk/revisit_min_path_m", revisit_min_path, revisit_min_path);
     parameters.param<double>("rtk/keyframe_stationary_interval_sec", key_stationary_interval, key_stationary_interval);
@@ -2987,7 +3055,8 @@ void RtkFusion::exportMap()
     frame_index.flush();
     std::size_t chunk_index = 0;
     // rgb_map_*.pcd = the rows of map_*.pcd with a camera colour (colors.bin, view within save_rgb_max_range),
-    // written chunk by chunk with the same index; both only when export_map_chunks.
+    // one point per save_rgb_voxel cube of the chunk, written chunk by chunk with the same index; both only
+    // when export_map_chunks.
     if (color_enabled) color_archive.flush();
     // Both products: scans are transformed in parallel batches and consumed in frame order, so every row,
     // tie-break and chunk boundary is the one of the former sequential loop (export 90 s -> ~15 s at 8.7k scans).
@@ -3026,25 +3095,91 @@ void RtkFusion::exportMap()
       pcl::PointCloud<pcl::PointXYZI> chunk;
       PointCloudXYZRGB rgb_chunk;
       std::size_t rgb_written = 0;
-      std::future<void> writing;  // the previous chunk is written while the next batch is transformed
-      const auto write = [&](pcl::PointCloud<pcl::PointXYZI> &&cloud, PointCloudXYZRGB &&rgb) {
+      std::atomic<std::size_t> rgb_points{0};
+      std::atomic<std::int64_t> thinning_us{0};
+      double rgb_wait_sec = 0.0;
+      std::vector<std::uint64_t> stop_voxels;  // colour voxels written since the truck stopped
+      // The previous chunk is written while the next batch is transformed. The colour part of a chunk (voxel
+      // filter, ~70 ms per million rows) is a task of its own, up to three at a time beside the geometry writer;
+      // each waits for its predecessor before it touches stop_voxels and writes its file (chunk order).
+      std::future<void> writing;
+      std::deque<std::shared_future<void>> rgb_tasks;
+      const auto wait_rgb = [&](std::size_t keep) {
+        const auto start = std::chrono::steady_clock::now();
+        for (; rgb_tasks.size() > keep; rgb_tasks.pop_front()) rgb_tasks.front().get();
+        rgb_wait_sec += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+      };
+      const auto write = [&](pcl::PointCloud<pcl::PointXYZI> &&cloud, PointCloudXYZRGB &&rgb, bool standing) {
         if (writing.valid()) writing.get();
+        wait_rgb(2);
         const std::size_t index = chunk_index++;
-        writing = std::async(std::launch::async, [this, index, cloud = std::move(cloud), rgb = std::move(rgb)]() {
+        writing = std::async(std::launch::async, [this, index, cloud = std::move(cloud)]() {
           const auto file = directory / ("map_" + std::to_string(index) + ".pcd");
           if (pcl::io::savePCDFileBinary(file.string(), cloud) != 0)
             throw std::runtime_error("Cannot write optimized point cloud " + file.string());
-          if (rgb.empty()) return;  // rgb_map_<index>.pcd = coloured rows of map_<index>.pcd
-          const auto rgb_file = directory / ("rgb_map_" + std::to_string(index) + ".pcd");
-          if (pcl::io::savePCDFileBinary(rgb_file.string(), rgb) != 0)
-            throw std::runtime_error("Cannot write optimized RGB point cloud " + rgb_file.string());
         });
+        if (rgb.empty() && standing) return;  // nothing to write, the stop goes on
+        std::shared_future<void> previous = rgb_tasks.empty() ? std::shared_future<void>() : rgb_tasks.back();
+        // The task's captures live as long as its future (std::async), so the rows and the link to the previous
+        // task are dropped as soon as they are used: otherwise every chunk's rows stay alive until the end.
+        rgb_tasks.push_back(std::async(std::launch::async, [this, index, standing, previous, &rgb_points,
+                                                            &thinning_us, &stop_voxels, rgb = std::move(rgb)]() mutable {
+          const auto start = std::chrono::steady_clock::now();
+          PointCloudXYZRGB thinned;
+          std::vector<std::uint64_t> voxels;
+          if (save_rgb_voxel > 0.0)
+          {
+            thinned = voxelMean(rgb, save_rgb_voxel, voxels);
+            rgb = PointCloudXYZRGB();
+          }
+          thinning_us += std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - start).count();
+          if (previous.valid()) previous.get();  // chunk order; rethrows an earlier failure
+          previous = std::shared_future<void>();
+          if (!standing)
+            stop_voxels.clear();
+          else if (save_rgb_voxel > 0.0)
+            dropWritten(thinned, voxels, stop_voxels);
+          const PointCloudXYZRGB &out = save_rgb_voxel > 0.0 ? thinned : rgb;
+          rgb_points += out.size();
+          if (out.empty()) return;  // rgb_map_<index>.pcd = coloured rows of map_<index>.pcd, one per voxel
+          const auto rgb_file = directory / ("rgb_map_" + std::to_string(index) + ".pcd");
+          if (pcl::io::savePCDFileBinary(rgb_file.string(), out) != 0)
+            throw std::runtime_error("Cannot write optimized RGB point cloud " + rgb_file.string());
+        }).share());
       };
       std::vector<pcl::PointCloud<pcl::PointXYZI>> outputs(export_batch);
       std::vector<PointCloudXYZRGB> rgb_outputs(export_batch);
+      // A standing truck sees the same surfaces in every scan (20261013: 55 % of the frames and 60 % of the written
+      // rows, mostly one 6 min stop), each scan with slightly different samples (together ~70x the 5 cm voxels of
+      // one scan). While it stands - moved < save_rgb_voxel and turned < 1 deg since the last moving frame - its
+      // colour rows only fill the voxels not yet written since it stopped (chunks of standing frames).
+      std::vector<char> colour_frame(export_batch, 0), standing_frame(export_batch, 0);
+      gtsam::Pose3 moving_pose;
+      bool moving_posed = false, chunk_standing = false;
+      std::size_t standing_frames = 0;
       for (std::size_t first = 0; first < frames.size(); first += export_batch)
       {
         const std::size_t count = std::min(export_batch, frames.size() - first);
+        for (std::size_t n = 0; n < count; ++n)
+        {
+          const Frame &frame = frames[first + n];
+          colour_frame[n] = color_enabled && frame.count > 0 && frame.color_count == frame.count;
+          bool standing = false;
+          if (colour_frame[n] && save_rgb_voxel > 0.0 && moving_posed)
+          {
+            const gtsam::Pose3 step = moving_pose.between(frame.raw);
+            standing = step.translation().norm() < save_rgb_voxel &&
+                       gtsam::Rot3::Logmap(step.rotation()).norm() < M_PI / 180.0;
+          }
+          if (colour_frame[n] && !standing)
+          {
+            moving_pose = frame.raw;
+            moving_posed = true;
+          }
+          standing_frame[n] = standing;
+          standing_frames += standing ? 1 : 0;
+        }
         std::exception_ptr error;
 #pragma omp parallel
         {
@@ -3063,7 +3198,7 @@ void RtkFusion::exportMap()
               auto &rgb = rgb_outputs[n];
               rgb.clear();
               const Frame &frame = frames[first + static_cast<std::size_t>(n)];
-              if (color_enabled && frame.count > 0 && frame.color_count == frame.count && !outputs[n].empty())
+              if (colour_frame[static_cast<std::size_t>(n)] && !outputs[n].empty())
               {
                 // the written rows' own camera colours (colourScan), view distance within save_rgb_max_range
                 std::vector<std::uint32_t> colours(frame.count);
@@ -3117,23 +3252,29 @@ void RtkFusion::exportMap()
           chunk.insert(chunk.end(), outputs[n].begin(), outputs[n].end());
           rgb_chunk.insert(rgb_chunk.end(), rgb_outputs[n].begin(), rgb_outputs[n].end());
           rgb_written += rgb_outputs[n].size();
+          chunk_standing = chunk_standing || (standing_frame[n] && !rgb_outputs[n].empty());
           if (chunk.size() >= static_cast<std::size_t>(export_chunk_points))
           {
-            write(std::move(chunk), std::move(rgb_chunk));
+            write(std::move(chunk), std::move(rgb_chunk), chunk_standing);
             chunk = pcl::PointCloud<pcl::PointXYZI>();
             rgb_chunk = PointCloudXYZRGB();
+            chunk_standing = false;
           }
         }
       }
-      if (!chunk.empty()) write(std::move(chunk), std::move(rgb_chunk));
+      if (!chunk.empty()) write(std::move(chunk), std::move(rgb_chunk), chunk_standing);
       if (writing.valid()) writing.get();
+      wait_rgb(0);
       if (color_enabled)
         RCLCPP_INFO(node->get_logger(),
-            "Saved RGB map: %zu of %zu geometry rows coloured (%.1f %%; own camera colour from a view within "
-            "%.1f m): rgb_map_N.pcd = coloured rows of map_N.pcd",
+            "Saved RGB map: %zu of %zu geometry rows coloured (%.1f %%; own camera colour from views within "
+            "%.1f m): rgb_map_N.pcd = %zu points, one per %.3f m voxel of each chunk (centroid, mean colour; the "
+            "%zu frames of a standing truck only fill voxels not written since it stopped; rtk.save_rgb_voxel, "
+            "0 = every coloured row); voxel filter %.1f s in tasks beside the export, which waited %.1f s for them",
             rgb_written, returns_written,
             returns_written ? 100.0 * static_cast<double>(rgb_written) / static_cast<double>(returns_written) : 0.0,
-            save_rgb_max_range);
+            save_rgb_max_range, rgb_points.load(), save_rgb_voxel, standing_frames, 1e-6 * thinning_us.load(),
+            rgb_wait_sec);
       RCLCPP_INFO(node->get_logger(),
           "Saved geometry map: %zu of %zu returns within the %.1f m cap written (%.1f %%; range priority %s: ratio %.2f, "
           "margin %.1f m, %zu cells of %.2f m, %zu seen-free cells of %.2f m from returns within %.1f m, pass 1 %.1f s; "
