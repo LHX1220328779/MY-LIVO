@@ -475,6 +475,8 @@ void LIVMapper::readParameters()
   nh.param<int>("publish/rgb_view_margin", rgb_view_margin, 60);
   nh.param<double>("publish/rgb_view_feather", rgb_view_feather, 90.0);
   nh.param<bool>("publish/rgb_flat_field_en", rgb_flat_field_en, true);
+  nh.param<int>("publish/rgb_occluder_frames", rgb_occluder_frames, 20);
+  if (rgb_occluder_frames < 0) throw std::runtime_error("publish/rgb_occluder_frames must be >= 0");
   if (!(rgb_view_spacing > 0.0) || !(rgb_view_span >= 0.0) || rgb_view_margin < 1 || !(rgb_view_feather >= 0.0))
     throw std::runtime_error("publish/rgb_view_spacing must be > 0, rgb_view_span >= 0, rgb_view_margin >= 1, "
                              "rgb_view_feather >= 0");
@@ -3222,6 +3224,58 @@ std::vector<std::uint32_t> LIVMapper::colourScan(const PointCloudXYZI &world)
     float &depth = current.depth[cellOf(px)];
     depth = std::min(depth, static_cast<float>(pf.z()));
   }
+  if (rgb_occluder_frames > 0)
+  {
+    // The view's own scan alone (decimated, 4 LiDARs) leaves 60-80 % of the 8 px cells empty: a sign board 5-8 m
+    // in front of a bush often had no return in a cell and painted its colours onto the bush behind it (20261013:
+    // ghost copies of road signs on the vegetation). Occluders = the returns of the last rgb_occluder_frames
+    // frames more than 0.3 m above the lowest return of their 1 m column (ground does not hide ground; grazing
+    // ground spreads over a cell's depth), checked with max(1 m, 5 %) (foliage just behind foliage passes).
+    constexpr int span = 160;  // 1 m columns within +-80 m of the camera
+    std::vector<float> lowest(static_cast<std::size_t>(span) * span, std::numeric_limits<float>::infinity());
+    const double ox = std::floor(current.centre.x()) - span / 2, oy = std::floor(current.centre.y()) - span / 2;
+    const auto column = [&](const PointType &q) -> long {
+      const long ix = static_cast<long>(std::floor(q.x - ox)), iy = static_cast<long>(std::floor(q.y - oy));
+      return ix < 0 || iy < 0 || ix >= span || iy >= span ? -1 : iy * span + ix;
+    };
+    for (const PointType &q : world.points)
+    {
+      const long c = column(q);
+      if (c >= 0) lowest[static_cast<std::size_t>(c)] = std::min(lowest[static_cast<std::size_t>(c)], q.z);
+    }
+    std::vector<Eigen::Vector3f> elevated;
+    elevated.reserve(world.size() / 2);
+    for (const PointType &q : world.points)
+    {
+      const long c = column(q);
+      if (c >= 0 && q.z > lowest[static_cast<std::size_t>(c)] + 0.3f) elevated.emplace_back(q.x, q.y, q.z);
+    }
+    occluder_frames_.push_back(std::move(elevated));
+    while (static_cast<int>(occluder_frames_.size()) > rgb_occluder_frames) occluder_frames_.pop_front();
+    const std::size_t cells = current.depth.size();
+    const int frames_held = static_cast<int>(occluder_frames_.size());
+    std::vector<std::vector<float>> partial(static_cast<std::size_t>(frames_held));
+#ifdef MP_EN
+#pragma omp parallel for num_threads(MP_PROC_NUM) schedule(dynamic, 1)
+#endif
+    for (int f = 0; f < frames_held; ++f)
+    {
+      auto &grid = partial[static_cast<std::size_t>(f)];
+      grid.assign(cells, std::numeric_limits<float>::infinity());
+      for (const Eigen::Vector3f &p : occluder_frames_[static_cast<std::size_t>(f)])
+      {
+        const V3D pf = current.T_f_w * p.cast<double>();
+        if (pf.z() <= 0.1) continue;
+        const V2D px = cam.world2cam(pf);
+        if (!cam.isInFrame(px.cast<int>(), 1)) continue;
+        float &depth = grid[cellOf(px)];
+        depth = std::min(depth, static_cast<float>(pf.z()));
+      }
+    }
+    current.occluders.assign(cells, std::numeric_limits<float>::infinity());
+    for (const auto &grid : partial)
+      for (std::size_t i = 0; i < cells; ++i) current.occluders[i] = std::min(current.occluders[i], grid[i]);
+  }
   std::vector<const ColourView *> views{&current};
   for (auto view = colour_views_.rbegin(); view != colour_views_.rend(); ++view) views.push_back(&*view);
   const auto channel = [](float v) { return static_cast<std::uint32_t>(std::min(255.f, std::max(0.f, v + 0.5f))); };
@@ -3247,6 +3301,7 @@ std::vector<std::uint32_t> LIVMapper::colourScan(const PointCloudXYZI &world)
       const V2D px = cam.world2cam(pf);
       if (!cam.isInFrame(px.cast<int>(), rgb_view_margin)) continue;
       if (pf.z() > view->depth[cellOf(px)] + std::max(0.3, 0.04 * pf.z())) continue;
+      if (!view->occluders.empty() && pf.z() > view->occluders[cellOf(px)] + std::max(1.0, 0.05 * pf.z())) continue;
       const double border = std::min(std::min(px.x(), right - px.x()), std::min(px.y(), bottom - px.y()));
       const float ramp = rgb_view_feather > 0.0
           ? static_cast<float>(std::min(1.0, std::max(1e-3, (border - rgb_view_margin) / rgb_view_feather)))

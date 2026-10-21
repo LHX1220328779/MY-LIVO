@@ -126,7 +126,11 @@ public:
     V3D centre;                // camera centre
     cv::Mat image;             // BGR; the VIO clones a new image per frame, the buffer only keeps a reference
     std::vector<float> depth;  // nearest depth of the view's own scan per 8 px cell
+    std::vector<float> occluders;  // nearest depth of the recent frames' elevated returns per 8 px cell
   };
+  // Occlusion check of colourScan: the elevated returns of the last rgb_occluder_frames frames (0 = own scan only).
+  int rgb_occluder_frames = 20;
+  std::deque<std::vector<Eigen::Vector3f>> occluder_frames_;
   std::deque<ColourView> colour_views_;
   std::vector<std::uint32_t> scan_colours_;  // colours of the current frame's returns (pcl_w_wait_pub order)
   double colour_seconds_ = 0.0;
