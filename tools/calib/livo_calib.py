@@ -99,7 +99,7 @@ STAGES = {
     "camfocus": {"order": 6, "label": "相机内参/畸变（光流×深度）", "command": "camera-focus",
                  "input": "原始录制（含相机）+ 一次 LIVO 建图结果", "output": "camera.intrinsics 的 fx/fy 与畸变 k1（连续帧光流 vs LiDAR 深度预测流；外参/时间偏移/卷帘一阶抵消）",
                  "needs": ["dataset", "camera", "run"], "mapping": "livo", "advisory": False, "seconds": 240},
-    "camphoto": {"order": 7.5, "label": "相机光度标定（内参复核 + 外参/时间精修）", "command": "camera-photo",
+    "camphoto": {"order": 7.5, "label": "相机光度标定（内参复核 + 外参/时间精修 + 暗角）", "command": "camera-photo",
                  "input": "原始录制（含相机）+ 一次 LIVO 建图结果（父版本）",
                  "output": "相机→后轴旋转与 time_offsets.camera（同一回波在多帧图像里纹理一致；两半交叉验证）；内参仅在留出数据显著改善时才改",
                  "needs": ["dataset", "camera", "run"], "mapping": "livo", "advisory": False, "seconds": 300},
@@ -2267,9 +2267,13 @@ def cmd_camera_photo(a):
     calib = json.loads((out_dir / "calibration.json").read_text())
     applied = calib.get("refinement", {}).get("camera_photometric", {}).get("applied", {})
     rot = applied.get("rot_delta_deg_cam_xyz", [0, 0, 0])
-    note = (f"相机光度标定：旋转 (相机系 x/y/z) {rot[0]:+.3f} / {rot[1]:+.3f} / {rot[2]:+.3f}°，时间偏移 "
-            f"{applied.get('camera_time_offset_s', 0):+.4f} s，内参{'修正' if applied.get('intrinsics') else '复核不变'}"
-            f"（光度一致性 {100 * applied.get('cost_gain_all', 0):+.1f} %）")
+    flat = "，暗角（平场）已标定" if applied.get("flat_field") else ""
+    if applied.get("rotation_time", True):
+        note = (f"相机光度标定：旋转 (相机系 x/y/z) {rot[0]:+.3f} / {rot[1]:+.3f} / {rot[2]:+.3f}°，时间偏移 "
+                f"{applied.get('camera_time_offset_s', 0):+.4f} s，内参{'修正' if applied.get('intrinsics') else '复核不变'}"
+                f"（光度一致性 {100 * applied.get('cost_gain_all', 0):+.1f} %）{flat}")
+    else:
+        note = f"相机光度标定：外参 / 时间 / 内参无显著改变{flat}"
     finalize_version(out_dir, calib, mine=mine, truck=truck, stage="camphoto", parent=a.id, note=a.note or note,
                      inputs={"bag": a.bag, "dataset": ds_info, "run": str(run)},
                      metrics={"camera_photometric": calib.get("refinement", {}).get("camera_photometric", {})},

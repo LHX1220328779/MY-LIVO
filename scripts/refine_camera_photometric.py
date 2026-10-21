@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Camera rotation + time offset (with an intrinsics check) from the multi-view photo-consistency of a LIVO round.
+"""Camera rotation + time offset (with an intrinsics check) and the camera flat field from the multi-view
+photo-consistency of a LIVO round.
 
 Why: the RGB map colours every LiDAR return from a camera view that sees it (look-back colouring); a return
 is seen by many views 2-60 m apart at different image positions, and with the right camera model they all show
@@ -24,7 +25,15 @@ half's fit is scored on the other half. The intrinsics check refits with fx/fy s
 Gate: the rotation/time correction is applied when both halves improve their held-out cost by >= 5 % and the
 two halves agree (each rotation axis within 0.08 deg, dt within 6 ms); the applied values are the fit on all
 returns. Intrinsics are applied only when they add >= 2 % on both held-out halves and the halves agree (focal
-scales within 0.5 %, k1 within 0.02). Otherwise no file is written (the parent stays, exit 0, "kept").
+scales within 0.5 %, k1 within 0.02).
+
+Flat field (camera.flat_field, used by the LIVO RGB colouring): the raw grey value of the same return in its views
+= albedo of the return + exposure of the view + log flat field of the image position (poly8 in x = (u - cx) / (W/2),
+y = (v - cy) / (H/2), 0 at the principal point), alternating least squares on log grey. truck29raw: image edges
+15-25 % darker, bottom row ~10 %; each 2 m band of look-back views otherwise leaves this as a ripple on the ground.
+Written when both halves reduce their held-out cross-view variance by >= 5 % and their gain maps agree within 3 %
+(fit on all returns, y range = the sampled one). No significant rotation/time, intrinsics or flat field: no file is
+written (the parent stays, exit 0, "kept").
 
 Usage (container):
   /usr/bin/python3 scripts/refine_camera_photometric.py --calibration <parent calibration.json> --bag <dataset> \\
@@ -53,6 +62,7 @@ DELTA_M, SPAN_M, KMAX, MARGIN_PX = 2.0, 80.0, 10, 40
 BLIND_M, TOL_ABS, TOL_REL = 2.0, 0.3, 0.04
 ROWS_PER_FRAME, MAX_VIEWS, POINTS = 2500, 260, 50000
 MIN_GAIN, AGREE_ROT_DEG, AGREE_DT_S = 0.05, 0.08, 0.006
+FLAT_MIN_GAIN, AGREE_FLAT = 0.05, 0.03
 INTR_MIN_GAIN, AGREE_FOCAL, AGREE_K1 = 0.02, 0.005, 0.02
 NAMES = ["rx", "ry", "rz", "dt", "sfx", "sfy", "k1"]
 SCALE = np.array([0.05, 0.05, 0.05, 0.005, 0.01, 0.01, 0.02])
@@ -178,8 +188,10 @@ def collect(run, bag, calib, out_dir, window, log):
                 if not ok.any():
                     continue
                 if vw["id"] is None:
+                    import cv2
                     vw["id"] = len(views)
                     vw["img"] = lcn(vw["bgr"])
+                    vw["gray"] = cv2.cvtColor(vw["bgr"], cv2.COLOR_BGR2GRAY)
                     vw["bgr"] = None
                     views.append(vw)
                 s_ = todo[ok]
@@ -212,7 +224,8 @@ def collect(run, bag, calib, out_dir, window, log):
     TCW = np.stack([vw["tcw"] for vw in views])
     VEL = np.stack([vw["vel"] for vw in views])
     OMG = np.stack([vw["omega"] for vw in views])
-    data = {"img": np.stack([vw["img"] for vw in views]), "px": px, "pv": pv, "half": half, "n": len(P),
+    data = {"img": np.stack([vw["img"] for vw in views]), "gray": np.stack([vw["gray"] for vw in views]),
+            "px": px, "pv": pv, "half": half, "n": len(P),
             "C": np.einsum("nij,nj->ni", RCW[pv], P[px]) + TCW[pv], "V": np.einsum("nij,nj->ni", RCW[pv], VEL[pv]),
             "Wc": OMG[pv], "K": (fx, fy, cx, cy), "frames": len(want), "views": len(views)}
     log(f"collection: {len(want)} frames with an image, {len(views)} views, {len(P)} returns (>= 3 views), {len(px)} samples")
@@ -271,6 +284,98 @@ def fit(score, free, part, start=None):
     th = th0.copy()
     th[fi] = base + res.x * SCALE[fi]
     return th
+
+
+def project_samples(data, theta):
+    """Image position of every (return, view) sample under the camera model perturbed by theta (as in score)."""
+    fx, fy, cx, cy = data["K"]
+    rx, ry, rz, dt, sfx, sfy, k1 = theta
+    C = data["C"] - data["V"] * dt
+    C = C - np.cross(data["Wc"] * dt, C)
+    if rx or ry or rz:
+        C = C @ Rot.from_rotvec(np.radians([rx, ry, rz])).as_matrix().T
+    x, y = C[:, 0] / C[:, 2], C[:, 1] / C[:, 2]
+    dist = 1 + k1 * (x * x + y * y)
+    u = np.clip(fx * (1 + sfx) * x * dist + cx, 0, W_IMG - 2.001)
+    v = np.clip(fy * (1 + sfy) * y * dist + cy, 0, H_IMG - 2.001)
+    return u, v
+
+
+def flat_terms(x, y):
+    """poly8 log flat field terms (no constant: 0 at the principal point)."""
+    x2 = x * x
+    return np.column_stack([x2, x2 * x2, y, y * y, y ** 3, y ** 4, x2 * y, x2 * y * y])
+
+
+def flat_field(data, theta, log):
+    """Flat field from the raw grey values of the samples (see the module doc). Returns (calibration entry or None,
+    metrics)."""
+    fx, fy, cx, cy = data["K"]
+    u, v = project_samples(data, theta)
+    g = data["gray"].reshape(len(data["gray"]), -1)
+    a, b = np.floor(u).astype(np.int64), np.floor(v).astype(np.int64)
+    du, dv = u - a, v - b
+    off = b * W_IMG + a
+    pv, px, n = data["pv"], data["px"], data["n"]
+    grey = ((1 - du) * (1 - dv) * g[pv, off] + du * (1 - dv) * g[pv, off + 1]
+            + (1 - du) * dv * g[pv, off + W_IMG] + du * dv * g[pv, off + W_IMG + 1])
+    ok = (grey > 8) & (grey < 247)                     # neither black nor saturated
+    L = np.log(grey + 1.0)
+    x, y = (u - cx) / (W_IMG / 2), (v - cy) / (H_IMG / 2)
+    F = flat_terms(x, y)
+    nv = int(pv.max()) + 1
+    half = data["half"][px]
+
+    def fit_part(mask, with_flat):
+        c, e = np.zeros(F.shape[1]), np.zeros(nv)
+        for _ in range(10):
+            r = L - (F @ c if with_flat else 0) - e[pv]
+            alb = np.bincount(px[mask], r[mask], n) / np.maximum(np.bincount(px[mask], minlength=n), 1)
+            if with_flat:
+                c = np.linalg.lstsq(F[mask], (L - alb[px] - e[pv])[mask], rcond=None)[0]
+            r = L - alb[px] - (F @ c if with_flat else 0)
+            e = np.bincount(pv[mask], r[mask], nv) / np.maximum(np.bincount(pv[mask], minlength=nv), 1)
+            e -= np.median(e)
+        return c, e
+
+    def cost(mask, c, e):
+        r = L - F @ c - e[pv]
+        cnt = np.bincount(px[mask], minlength=n)
+        s1, s2 = np.bincount(px[mask], r[mask], n), np.bincount(px[mask], r[mask] ** 2, n)
+        good = cnt >= 3
+        return float(np.mean(np.minimum((s2[good] - s1[good] ** 2 / cnt[good]) / (cnt[good] - 1), 1.0)))
+
+    y_range = [float(np.percentile(y[ok], 1)), float(np.percentile(y[ok], 99))]
+    gx, gy = np.meshgrid(np.linspace(-1, 1, 33), np.linspace(y_range[0], y_range[1], 19))
+    G = flat_terms(gx.ravel(), gy.ravel())
+    halves, maps = [], []
+    for p in (0, 1):
+        m, q = ok & (half == p), ok & (half == 1 - p)
+        c, e = fit_part(m, True)
+        c0, e0 = fit_part(m, False)
+        gain = 1 - cost(q, c, e) / cost(q, np.zeros_like(c), e0)
+        halves.append({"coefficients": np.round(c, 5).tolist(), "test_gain": round(gain, 4)})
+        maps.append(np.exp(-(G @ c)))
+        log(f"flat field half {p}: held-out cross-view variance {100 * gain:+.1f} %, darkest position "
+            f"{100 * (np.exp((G @ c).min()) - 1):+.0f} % of the principal point")
+    spread = float(np.max(np.abs(maps[0] - maps[1])))
+    metrics = {"halves": halves, "gain_map_spread": round(spread, 4), "y_range": [round(r, 3) for r in y_range],
+               "min_test_gain": FLAT_MIN_GAIN, "max_spread": AGREE_FLAT, "samples": int(ok.sum())}
+    if min(h["test_gain"] for h in halves) < FLAT_MIN_GAIN or spread > AGREE_FLAT:
+        log(f"flat field: not applied (held-out gains {[h['test_gain'] for h in halves]}, half spread {spread:.3f})")
+        metrics["applied"] = False
+        return None, metrics
+    c, e = fit_part(ok, True)
+    flat = {"model": "poly8", "coefficients": [round(float(v), 6) for v in c], "y_range": [round(r, 4) for r in y_range],
+            "source": f"camera-photo: multi-view grey consistency (held-out {100 * halves[0]['test_gain']:.1f} / "
+                      f"{100 * halves[1]['test_gain']:.1f} %)"}
+    edge = np.exp(G @ c)
+    log(f"flat field: applied (held-out {100 * halves[0]['test_gain']:.1f} / {100 * halves[1]['test_gain']:.1f} %, "
+        f"half spread {100 * spread:.1f} %); image positions {100 * (edge.min() - 1):+.0f} .. "
+        f"{100 * (edge.max() - 1):+.0f} % of the principal point")
+    metrics["applied"] = True
+    metrics["coefficients"] = flat["coefficients"]
+    return flat, metrics
 
 
 def main():
@@ -345,9 +450,22 @@ def main():
                              "intrinsics_extra_gain": [round(e, 4) for e in extra], "intrinsics_ok": intr_ok}})
     if not (gain_ok and agree):
         log("rotation/time: " + ("held-out gain below 5 %" if not gain_ok else "halves disagree")
-            + f" (rotation spread {np.round(d[:3], 3).tolist()} deg, dt spread {1000 * d[3]:.1f} ms); parent kept")
+            + f" (rotation spread {np.round(d[:3], 3).tolist()} deg, dt spread {1000 * d[3]:.1f} ms): kept")
         log(f"intrinsics: {'not applied' if not intr_ok else 'would improve, but the rotation/time gate failed'}")
-        finish(a, report, metrics, None)
+        flat, metrics["flat_field"] = flat_field(data, zero, log)
+        if flat is None:
+            finish(a, report, metrics, None)
+            return
+        out = json.loads(json.dumps(calib))
+        out["camera"]["flat_field"] = flat
+        out["calibration_type"] = str(calib.get("calibration_type", "")) + "+camera_photometric"
+        applied = {"rot_delta_deg_cam_xyz": [0.0, 0.0, 0.0],
+                   "camera_time_offset_s": float((calib.get("time_offsets") or {}).get("camera", 0.0)),
+                   "dt_s": 0.0, "intrinsics": False, "cost_gain_all": 0.0, "rotation_time": False, "flat_field": True}
+        out.setdefault("refinement", {})["camera_photometric"] = {**metrics, "applied": applied}
+        metrics["applied"] = applied
+        log(f"applied: flat field only (camera rotation / time unchanged) ({time.time() - t_start:.0f} s)")
+        finish(a, report, metrics, out)
         return
     free = ["rx", "ry", "rz", "dt"] + (["sfx", "sfy", "k1"] if intr_ok else [])
     th = fit(score, ["rx", "ry", "rz", "dt"], None)
@@ -370,14 +488,19 @@ def main():
         out["camera"]["distortion"] = [float(th[6]), 0.0, 0.0, 0.0, 0.0]
         out["camera"]["source"] = "camera-photo (multi-view photo-consistency)"
     out["calibration_type"] = str(calib.get("calibration_type", "")) + "+camera_photometric"
+    flat, metrics["flat_field"] = flat_field(data, th, log)
+    if flat is not None:
+        out["camera"]["flat_field"] = flat
     applied = {"rot_delta_deg_cam_xyz": np.round(th[:3], 4).tolist(), "camera_time_offset_s": offs["camera"],
-               "dt_s": round(float(th[3]), 5), "intrinsics": intr_ok, "cost_gain_all": round(gain_all, 4)}
+               "dt_s": round(float(th[3]), 5), "intrinsics": intr_ok, "cost_gain_all": round(gain_all, 4),
+               "rotation_time": True, "flat_field": flat is not None}
     if intr_ok:
         applied.update({"fx_scale": round(1 + float(th[4]), 5), "fy_scale": round(1 + float(th[5]), 5), "k1": round(float(th[6]), 5)})
     out.setdefault("refinement", {})["camera_photometric"] = {**metrics, "applied": applied}
     metrics["applied"] = applied
     log(f"applied: camera rotation (camera frame) rx {th[0]:+.3f} ry {th[1]:+.3f} rz {th[2]:+.3f} deg, time offset "
         f"{old:+.4f} -> {offs['camera']:+.4f} s; intrinsics {'refined' if intr_ok else 'confirmed (unchanged)'}; "
+        f"flat field {'written' if flat is not None else 'not applied'}; "
         f"cost {100 * gain_all:+.1f} % on all returns ({time.time() - t_start:.0f} s)")
     finish(a, report, metrics, out)
 

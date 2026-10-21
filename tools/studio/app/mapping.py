@@ -113,6 +113,14 @@ def round_cmd(round_name, mode, calibration_file, body, *, force_save_map=False,
         if not math.isfinite(voxel) or not 0 <= voxel <= 0.5:
             raise StudioError("彩色点云体素必须是 0 到 0.5 m 之间的数（0 表示保留每一行）")
         cmd += ["--rgb-voxel", str(voxel)]
+    if body.get("map_filter") not in (None, ""):
+        try:
+            value = float(body["map_filter"])
+        except (TypeError, ValueError):
+            raise StudioError("强度点云过滤值必须是 0 到 0.1 m 之间的数（0 表示不过滤）") from None
+        if not math.isfinite(value) or not 0 <= value <= 0.1:
+            raise StudioError("强度点云过滤值必须是 0 到 0.1 m 之间的数（0 表示不过滤）")
+        cmd += ["--map-filter", str(value)]
     if body.get("skip_stationary"):
         try:
             smin = float(body.get("stationary_min") or 30)
@@ -259,7 +267,7 @@ def start(body):
     meta = {"round": round_name, "mode": mode, "dataset": dataset, "calibration_id": cid,
             "options": {k: body.get(k) for k in ("use_rtk", "save_map", "rviz", "rate", "precheck", "frame_divider",
                                                   "evaluate", "extra_sets", "start_offset", "duration", "map_range", "rgb_range",
-                                                  "rgb_voxel",
+                                                  "rgb_voxel", "map_filter",
                                                   "skip_stationary", "stationary_min", "stationary_lidar_interval",
                                                   "loop_closure", "map_priority",
                                                   "map_export", "map_voxel", "map_source", "map_tile", "map_keyframes")}}

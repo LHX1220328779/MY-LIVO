@@ -23,7 +23,7 @@ STAGE_FALLBACK = {
     "camtime": {"order": 5, "label": "相机时间偏移", "command": "camera-time", "advisory": False, "mapping": None},
     "camlidar": {"order": 6, "label": "相机-LiDAR 偏航/横滚复核", "command": "camera-lidar", "advisory": True, "mapping": "livo"},
     "camloop": {"order": 7, "label": "相机外参闭环标定", "command": "set", "advisory": False, "mapping": "livo", "internal": True},
-    "camphoto": {"order": 7.5, "label": "相机光度标定（内参复核 + 外参/时间精修）", "command": "camera-photo", "advisory": False, "mapping": "livo"},
+    "camphoto": {"order": 7.5, "label": "相机光度标定（内参复核 + 外参/时间精修 + 暗角）", "command": "camera-photo", "advisory": False, "mapping": "livo"},
     "precheck": {"order": 8, "label": "采纳建图自检修正", "command": "from-precheck", "advisory": False, "mapping": "any"},
     "manual": {"order": 9, "label": "手动设置", "command": "set", "advisory": False, "mapping": None},
     "scan": {"order": 10, "label": "闭环扫描点（临时）", "command": "set", "advisory": True, "mapping": None, "internal": True},
@@ -781,7 +781,7 @@ def _camphoto_steps(steps, body, mapping_cmd, *, truck, stamp, auto_activate, pa
                                                    duration=_cam_round_duration(ctx, body, round_duration),
                                                    start_offset=_round_start(ctx, body)),
                   "after": lambda ctx, lines: ctx.update(photo_round=rb, photo_fusion=latest_fusion_dir(rb))})
-    steps.append({"title": "相机光度标定 (camera-photo：多视角光度一致性 → 相机旋转 + 时间偏移，内参复核；无显著改善则沿用父版本)",
+    steps.append({"title": "相机光度标定 (camera-photo：多视角光度一致性 → 相机旋转 + 时间偏移、暗角平场，内参复核；无显著改善则沿用父版本)",
                   "build": lambda ctx: stage_cmd("camera-photo", {"id": parent, "dataset": body.get("dataset"),
                                                                     "run": ctx["photo_fusion"], "note": body.get("note") or ""}),
                   "after": lambda ctx, lines: ctx.__setitem__("photo_id", parse_version_id(lines))})

@@ -12,8 +12,10 @@
 #        [--no-rtk] [--no-save-map] [--rviz] [--rate R] [--start-offset S] [--duration D]
 #        [--map-range M] [--rgb-range M]   (saved-map product caps in metres, 0 = keep every return;
 #                                           defaults come from the yaml: rtk.save_map_max_range / save_rgb_max_range)
-#        [--rgb-voxel M]                   (rgb_map_N.pcd: one point per M m voxel of each chunk, 0 = every coloured
-#                                           row; default rtk.save_rgb_voxel)
+#        [--rgb-voxel M]                   (rgb_map_N.pcd: one point per M m voxel of the whole map, 0 = every
+#                                           coloured row; default rtk.save_rgb_voxel)
+#        [--map-filter M]                  (map_N.pcd: per chunk the nearest return per M m voxel, a standing truck
+#                                           once; 0 = off, useful 0..0.10; default rtk.save_map_filter)
 #        [--no-map-priority]               (map_N.pcd range priority + seen-free check OFF: every return within the
 #                                           cap; default on, rtk.save_map_priority_enabled; --map-priority = on)
 #        [--skip-stationary] [--stationary-min S] [--stationary-lidar-interval S]
@@ -57,6 +59,7 @@ while (($#)); do
     --map-range) sets+=("rtk.save_map_max_range=$2"); shift 2 ;;   # geometry product cap [m], 0 = all
     --rgb-range) sets+=("rtk.save_rgb_max_range=$2"); shift 2 ;;   # colour product cap [m], 0 = all, -1 = same as geometry
     --rgb-voxel) sets+=("rtk.save_rgb_voxel=$2"); shift 2 ;;   # rgb_map_N.pcd: one point per voxel [m], 0 = every coloured row
+    --map-filter) sets+=("rtk.save_map_filter=$2"); shift 2 ;;   # map_N.pcd: nearest return per voxel [m], 0 = off
     --map-priority) sets+=("rtk.save_map_priority_enabled=true"); shift ;;   # far duplicate returns not written (default)
     --no-map-priority) sets+=("rtk.save_map_priority_enabled=false"); shift ;;   # every return within the cap
     --no-eval) do_eval=0; shift ;;

@@ -474,6 +474,7 @@ void LIVMapper::readParameters()
   nh.param<double>("publish/rgb_view_span", rgb_view_span, 80.0);
   nh.param<int>("publish/rgb_view_margin", rgb_view_margin, 60);
   nh.param<double>("publish/rgb_view_feather", rgb_view_feather, 90.0);
+  nh.param<bool>("publish/rgb_flat_field_en", rgb_flat_field_en, true);
   if (!(rgb_view_spacing > 0.0) || !(rgb_view_span >= 0.0) || rgb_view_margin < 1 || !(rgb_view_feather >= 0.0))
     throw std::runtime_error("publish/rgb_view_spacing must be > 0, rgb_view_span >= 0, rgb_view_margin >= 1, "
                              "rgb_view_feather >= 0");
@@ -651,6 +652,18 @@ void LIVMapper::loadMultiLidarCalibration()
                 camera_intrinsics[2], camera_intrinsics[3], camera_distortion[0],
                 camera_distortion[1], camera_distortion[2], camera_distortion[3],
                 camera_distortion[4]);
+    if (camera.isMember("flat_field") && camera["flat_field"].isObject())
+    {
+      const Json::Value &flat = camera["flat_field"];
+      if (flat.get("model", "").asString() != "poly8")
+        throw std::runtime_error("camera.flat_field.model must be poly8");
+      flat_field_coefficients_ = read_numbers(flat["coefficients"], 8, "camera.flat_field.coefficients");
+      const vector<double> range = read_numbers(flat["y_range"], 2, "camera.flat_field.y_range");
+      flat_field_y_lo_ = range[0];
+      flat_field_y_hi_ = range[1];
+      RCLCPP_INFO(node_->get_logger(), "Camera flat field from calibration file: poly8, y range [%.2f, %.2f]",
+                  flat_field_y_lo_, flat_field_y_hi_);
+    }
   }
   if (calibration.isMember("time_offsets") && calibration["time_offsets"].isObject())
   {
@@ -3171,6 +3184,26 @@ std::vector<std::uint32_t> LIVMapper::colourScan(const PointCloudXYZI &world)
   const vk::AbstractCamera &cam = *frame->cam_;
   const int columns = cam.width() / cell + 1;
   const double right = cam.width() - 1.0, bottom = cam.height() - 1.0;
+  if (rgb_flat_field_en && !flat_field_coefficients_.empty() && flat_gain_.empty())
+  {
+    // colour gain = 1 / flat field (the image edges are 15-25 % darker), clamped to [1/1.6, 1.6]
+    const int width = cam.width(), height = cam.height();
+    const double cx = camera_intrinsics[2], cy = camera_intrinsics[3], sx = 0.5 * width, sy = 0.5 * height;
+    const auto &c = flat_field_coefficients_;
+    flat_gain_.resize(static_cast<std::size_t>(width) * height);
+    for (int v = 0; v < height; ++v)
+    {
+      const double y = std::min(flat_field_y_hi_, std::max(flat_field_y_lo_, (v - cy) / sy));
+      for (int u = 0; u < width; ++u)
+      {
+        const double x = std::min(1.05, std::max(-1.05, (u - cx) / sx)), x2 = x * x;
+        const double log_flat = c[0] * x2 + c[1] * x2 * x2 + c[2] * y + c[3] * y * y + c[4] * y * y * y +
+                                c[5] * y * y * y * y + c[6] * x2 * y + c[7] * x2 * y * y;
+        flat_gain_[static_cast<std::size_t>(v) * width + u] =
+            static_cast<float>(std::min(1.6, std::max(1.0 / 1.6, std::exp(-log_flat))));
+      }
+    }
+  }
   const auto cellOf = [columns](const V2D &px) {
     return static_cast<std::size_t>(static_cast<int>(px.y()) / cell * columns + static_cast<int>(px.x()) / cell);
   };
@@ -3220,7 +3253,11 @@ std::vector<std::uint32_t> LIVMapper::colourScan(const PointCloudXYZI &world)
           : 1.f;
       const float w = std::min(ramp, 1.f - weight);
       if (weight == 0.f) source = distance;
-      sum += w * vio_manager->getInterpolatedPixel(view->image, px);
+      V3F sample = vio_manager->getInterpolatedPixel(view->image, px);
+      if (!flat_gain_.empty())
+        sample *= flat_gain_[static_cast<std::size_t>(px.y()) * static_cast<std::size_t>(cam.width()) +
+                             static_cast<std::size_t>(px.x())];
+      sum += w * sample;
       weight += w;
       if (weight >= 0.9999f) break;
     }

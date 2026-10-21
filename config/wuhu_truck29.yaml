@@ -349,14 +349,21 @@ laser_mapping:
       # pixel covers ~2.5 cm, at 60 m ~3.3 cm. Console: run_wuhu_round.sh --rgb-range M / launch
       # save_rgb_max_range:=M.
       save_rgb_max_range: 60.0
-      # rgb_map_N.pcd keeps one point per save_rgb_voxel cube of each chunk (centroid and mean colour of its
-      # coloured rows); while the truck stands (moved < save_rgb_voxel, turned < 1 deg since the last moving frame)
-      # its frames only fill the voxels not yet written since it stopped. 20261013 has the truck standing for 55 %
-      # of the frames (one 6 min stop): 60 % of the map_N rows, ~70x duplicated at 5 cm. 0 = every coloured row of
-      # every frame (same rows as map_N). 3 cm: rgb_map_N 136.7 M rows / 2.19 GB -> 44.9 M points / 0.72 GB
-      # (driven stretches -20..-30 %, sign plates keep 93-95 %, the stop 55.6 M -> 2.3 M points; 10 cm coverage
-      # of the geometry 99.6 -> 98.8 %, the thinning grid). Console: run_wuhu_round.sh --rgb-voxel M.
-      save_rgb_voxel: 0.03
+      # rgb_map_N.pcd keeps one point per save_rgb_voxel cube of the whole map: the row coloured from the nearest
+      # view, from the first chunk that has the voxel (a standing truck's frames and later passes only fill new
+      # voxels). 0 = every coloured row of every frame (same rows as map_N). 3.5 cm keeps the density of the
+      # first LIVO RGB map (362c75b, one point per 3 cm voxel of far in-image returns) on the road; 20261013:
+      # see docs/mcp-livo-rgb-original-density.md. Console: run_wuhu_round.sh --rgb-voxel M.
+      save_rgb_voxel: 0.035
+      # Map filter of map_N.pcd (intensity map): per chunk one return per save_map_filter cube, the one nearest
+      # to its LiDAR (the most accurate); while the truck stands (moved < 3 cm, turned < 1 deg since the last
+      # moving frame) one frame per second. map_rows.bin follows, so the evaluation and global_map.pcd use the
+      # rows on disk. 0 = off (every range-priority row, as before); useful 0 .. 0.10 m. 20261013 full LIVO
+      # (149 M rows, 2.39 GB): 0.01 -> 67.8 M / 1.08 GB (driving rows 98.7 % kept, 4185 of 4714 standing frames
+      # left out), 0.02 -> 0.96 GB (driving 90 %), 0.03 -> 0.82 GB (78 %), 0.05 -> 0.60 GB (58 %), 0.10 -> 0.31 GB
+      # (30 %). With fewer rows at the stop the evaluation's plane-RMS medians rise (5-20 m 19.2 -> 19.6 mm,
+      # 20-40 m 27.3 -> 32.9 mm: stop cells only; driving cells unchanged). Console: run_wuhu_round.sh --map-filter M.
+      save_map_filter: 0.01
       # Range priority of map_N.pcd (and of the standard global_map.pcd): per 0.5 m cell the nearest scan that
       # put >= 2 returns into it sets r_min; returns of that cell farther than max(ratio * r_min, r_min + margin)
       # are not written. Coverage of the 45 m cap stays (a cell seen only from far keeps its far returns); a
@@ -542,6 +549,10 @@ laser_mapping:
       rgb_view_span: 80.0
       rgb_view_margin: 60
       rgb_view_feather: 90.0
+      # Divide the camera flat field (calibration camera.flat_field, camera-photo stage: image edges 15-25 %
+      # darker) out of the sampled colours; without it the edge darkening of each 2 m band of views stays a faint
+      # ripple on the ground.
+      rgb_flat_field_en: true
 
     evo:
       seq_name: "wuhu_truck29"

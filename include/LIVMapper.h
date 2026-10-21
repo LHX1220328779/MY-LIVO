@@ -113,6 +113,13 @@ public:
   // image border; a view's weight ramps up over the next rgb_view_feather px (0 = the newest view alone).
   double rgb_view_spacing = 2.0, rgb_view_span = 80.0, rgb_view_feather = 90.0;
   int rgb_view_margin = 60;
+  // Camera flat field (calibration camera.flat_field, camera-photo stage): log brightness of an image position
+  // relative to the principal point, poly8 in x = (u - cx) / (W / 2), y = (v - cy) / (H / 2) (y clamped to the
+  // fitted range); colourScan divides it out (publish/rgb_flat_field_en). Empty = none.
+  std::vector<double> flat_field_coefficients_;
+  double flat_field_y_lo_ = -1.0, flat_field_y_hi_ = 1.0;
+  bool rgb_flat_field_en = true;
+  std::vector<float> flat_gain_;  // colour gain per pixel, built at the first colourScan
   struct ColourView
   {
     SE3 T_f_w;                 // camera from world (native frontend frame)
