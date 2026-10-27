@@ -74,3 +74,9 @@
 * 轮次鲁棒性：`run_wuhu_round.sh` 识别 `Mapping failed`（IMU 间隙）→ `status=incomplete`/退出码 4；流水线建图步骤自动重试一次；拟合与判定拒绝时长不一致的轮次。
 * 结果图：优化后轨迹 vs RTK 实线（`evaluation/error_series.csv`，由 `round_summary.py` 写出）+ 在线轨迹虚线。
 * 修复：版本详情抽屉在无 `closed_loop.json` 的版本上因 `stage` 提前引用而报错（TDZ）；`meta.json` 的 overlays 列表只收 `*.png` 而实际为 `*.jpg`。jsdom 冒烟 28/28。
+
+## 10. 2026-10-27：车身过滤页 404 与 Studio 路由热更新边界
+
+`tools/studio/server.py` 的 `reload_app_modules()` 只按 mtime 热重载 `studio.app.*` 模块，不会重新加载 `server.py` 自身或已经注册的 URL 路由表。因此新增/修改 `/api/body-filter` 等路由后，必须重启长期运行的 Studio 进程；`/api/system` 动态读取当前 git 提交，不能作为进程已加载新代码的依据。
+
+用户反馈的 `unknown path /api/body-filter` 已通过停止旧 PID、重新执行 `tools/studio/server.py --port 8765` 解决。完整诊断、后端 API 与 Chrome CDP 前端全功能验证记录见 `docs/mcp-studio-body-filter-route-404-analysis.md`。
