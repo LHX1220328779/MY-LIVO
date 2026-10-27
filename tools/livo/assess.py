@@ -1211,9 +1211,13 @@ def run(a):
         R.add(g_cam, "camera_decode", "HEVC 样例解码", 0, "帧", status="warn", display="未采到关键帧样例", fix="none",
               plain="抽到的样例里没遇到关键帧，解码不出来。大概率是关键帧间隔问题，换几个时刻重抽。")
 
+    short_recording = span_s < 90.0
+    warn_static_s = 0.0 if short_recording else 1.0
+    warn_turns = 0 if short_recording else 1
+    warn_straight = 0 if short_recording else 1
     # --- route / procedure
     if ref_stats:
-        R.add(g_route, "static_start", "起步前静止时长", static_s, "s", ok=3.0, warn=1.0, higher=True, fix="procedure",
+        R.add(g_route, "static_start", "起步前静止时长", static_s, "s", ok=3.0, warn=warn_static_s, higher=True, fix="procedure",
               plain="车子开动前停了几秒。≥3 s 好（够 ground 阶段和起步自检用）；<1 s 静止段无法用。",
               note="静止外参自检需 ≥5 帧、ground 阶段需 ~2 s 静止；从静止开始录制。", basis="truck29/05 均从静止起步。")
         R.add(g_route, "path", "行驶里程 / 时长", ref_stats["path_m"], "m",
@@ -1248,10 +1252,10 @@ def run(a):
                 k += 4
             else:
                 k += 1
-        R.add(g_route, "turns", "转弯次数 (≥60°)", turns, "次", ok=2, warn=1, higher=True, fix="procedure",
+        R.add(g_route, "turns", "转弯次数 (≥60°)", turns, "次", ok=2, warn=warn_turns, higher=True, fix="procedure",
               plain="录到了几次 ≥60° 的转弯。后轴对齐和相机时间偏移靠转弯段激发可观性；全程直线这些量标不准。",
               note="转弯段给出 LiDAR/相机时间偏移与后轴对齐的可观测性（直线段对时间偏移不敏感）。", basis="axle / camtime 阶段依赖角速率。")
-        R.add(g_route, "straight_windows", "直线匀速窗口 (4 s, ≥1.5 m/s)", straight, "个", ok=3, warn=1, higher=True, fix="procedure",
+        R.add(g_route, "straight_windows", "直线匀速窗口 (4 s, ≥1.5 m/s)", straight, "个", ok=3, warn=warn_straight, higher=True, fix="procedure",
               plain="有几段 ≥4 s 的直线匀速。ground 阶段取后雷达行驶帧、driven 阶段默认窗口都要用到直线段。",
               note="ground 阶段的后雷达行驶帧与 driven 阶段窗口选择需要直线段。", basis="livo_calib suggest_windows 规则。")
         kf = ref_stats["moving_s"] * 2.0

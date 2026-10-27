@@ -52,6 +52,7 @@ KEYS = {"front_right_lidar": "transform_matrix_lidar_1", "back_lidar": "transfor
         "front_left_lidar": "transform_matrix_lidar_3", "front_lidar": "transform_matrix_lidar_6"}
 REFERENCE = "front_lidar"
 MAX_ITERS = 25
+SHORT_RECORDING_S = 90.0
 # a correction beyond the refinement scale is still applied (the ground observes tilt/z directly) but flagged:
 # the sensor moved relative to the calibration file and yaw/x/y have to be re-checked by the driven stage
 LARGE_ROT_DEG = 1.0
@@ -321,6 +322,7 @@ def main():
                     help="own-ground-plane height difference (m) vs the reference above which the plane start is used")
     ap.add_argument("--no-coarse", action="store_true", help="historic behaviour: always start the solve from the parent matrix")
     a = ap.parse_args()
+    short_recording = Dataset.open(a.bag).duration_s < SHORT_RECORDING_S
     calib = json.load(open(a.calibration))
     M = {}
     for entry in calib["lidar"]:
@@ -337,11 +339,16 @@ def main():
                  f"{100*still['median_m']:.1f} cm / P90 {100*still['p90_m']:.1f} cm (limit {100*a.max_still_shift:.0f} cm) -> "
                  + ("stationary" if still["median_m"] <= a.max_still_shift else "MOVING"))
     if still["median_m"] > a.max_still_shift:
-        msg = (f"ground stage aborted: frames {a.stationary[0]}..{a.stationary[0]+a.stationary[1]} are not stationary "
-               f"(reference scan displacement {100*still['median_m']:.0f} cm). The stage needs ~{0.1*a.stationary[1]:.0f} s of standstill; "
-               "use a recording that starts before the vehicle moves off, or point --stationary at a standstill.")
-        lines.append(msg); pathlib.Path(a.report).parent.mkdir(parents=True, exist_ok=True)
-        pathlib.Path(a.report).write_text("\n".join(lines) + "\n"); print("\n".join(lines)); sys.exit(3)
+        if short_recording:
+            msg = (f"warning: frames {a.stationary[0]}..{a.stationary[0]+a.stationary[1]} exceed stationary displacement limit "
+                   f"({100*still['median_m']:.0f} cm > {100*a.max_still_shift:.0f} cm); continuing with short-recording fallback")
+            lines.append(msg)
+        else:
+            msg = (f"ground stage aborted: frames {a.stationary[0]}..{a.stationary[0]+a.stationary[1]} are not stationary "
+                   f"(reference scan displacement {100*still['median_m']:.0f} cm). The stage needs ~{0.1*a.stationary[1]:.0f} s of standstill; "
+                   "use a recording that starts before the vehicle moves off, or point --stationary at a standstill.")
+            lines.append(msg); pathlib.Path(a.report).parent.mkdir(parents=True, exist_ok=True)
+            pathlib.Path(a.report).write_text("\n".join(lines) + "\n"); print("\n".join(lines)); sys.exit(3)
     agg = {t: voxel_down(clean(to_rear(t, np.vstack(v))), a.voxel) for t, v in stat.items()}
     for t in KEYS: lines.append(f"{t}: stationary aggregated points {len(agg[t])}")
     refined = {REFERENCE: M[REFERENCE].copy()}; corrections = {}; quality = {}

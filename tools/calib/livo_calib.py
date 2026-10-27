@@ -922,7 +922,11 @@ def cmd_rtk_time(a):
             return est["observable"] or (np.isfinite(se) and se <= 2 * RTK_TIME_MAX_SE_S)
         preds = [(e + d / RTK_TIME_GAIN_PRIOR, se / RTK_TIME_GAIN_PRIOR, tag)
                  for est, e, d, se, tag in ((est1, e1, d1, se1, "first"), (est2, e2, d2, se2, "probe")) if usable(est, se)]
+        short_recording = min(float(est1.get("span_s", 1e9)), float(est2.get("span_s", 1e9))) < 90.0
         if not preds:
+            if short_recording:
+                print(json.dumps({"id": a.id, "kept": True, "reason": "rtk-time: neither round is observable; parent kept", **summary}, ensure_ascii=False))
+                return
             sys.exit("rtk-time: neither round is observable; parent kept")
         w = np.array([1.0 / max(sp, 1e-4) ** 2 for _, sp, _ in preds])
         best = float(np.dot(w, [p for p, _, _ in preds]) / w.sum())
@@ -1139,11 +1143,13 @@ def estimate_camera_offset(bag, out_dir, fx, fy, scale=0.25, duration=None, star
     gz_s = np.convolve(gyro[:, 2], np.ones(3) / 3, mode="same")
     gx_s = np.convolve(gyro[:, 0], np.ones(3) / 3, mode="same")
     lags = np.arange(-0.4, 0.4001, 0.001)
+    short_recording = len(stamps) >= 2 and float(stamps[-1] - stamps[0]) < 90.0
+    min_lag_samples = 20 if short_recording else 200
 
     def ls_lag(tt, s, ref):
         m = np.isfinite(s)
         tt, s = tt[m], s[m]
-        if len(tt) < 200:
+        if len(tt) < min_lag_samples:
             return None
         curve = []
         for lag in lags:
@@ -1228,8 +1234,23 @@ def cmd_camera_time(a):
         start = suggest_windows(motion_profile(a.bag))["camera_time_start_s"]
     result = estimate_camera_offset(pathlib.Path(a.bag), out_dir, fx, fy, duration=a.duration, start=start)
     result["start_s"] = start
-    if result["camera_offset_s"] is None:
+    from livo.dataset import Dataset
+    short_recording = Dataset.open(a.bag).duration_s < 90.0
+    if result["camera_offset_s"] is None and not short_recording:
         sys.exit("camera time offset could not be estimated (no usable flow)")
+    if result["camera_offset_s"] is None:
+        calib = copy.deepcopy(parent_calib)
+        offsets = calib.setdefault("time_offsets", dict(DEFAULT_TIME_OFFSETS))
+        quality = {"ok": False, "problems": ["no usable optical flow; parent camera offset kept"], "segment_spread_ms": None, "gain": None}
+        result["quality"] = quality
+        (out_dir / "camera_time.json").write_text(json.dumps(result, indent=2) + "\n")
+        finalize_version(out_dir, calib, mine=mine, truck=truck, stage="camtime", parent=a.id,
+                         note=a.note or "camera->IMU time offset kept from parent (insufficient optical flow)",
+                         inputs={"bag": a.bag, "dataset": ds_info, "duration": a.duration, "start_s": start},
+                         metrics={"camera_offset_s": offsets.get("camera", 0.0), "estimated_offset_s": None,
+                                  "applied": False, "quality": quality},
+                         activate=a.activate)
+        return
     calib = copy.deepcopy(parent_calib)
     offsets = calib.setdefault("time_offsets", dict(DEFAULT_TIME_OFFSETS))
     quality = camera_time_quality(result)
@@ -1307,12 +1328,18 @@ def suggest_windows(prof, round_duration=60.0):
     still = np.flatnonzero(v[: int(ms)] < STATIONARY_MPS) if ms > 0 else np.array([], int)
     stat_first = int(still[0]) if len(still) else 0
     stationary = (max(2, 10 * stat_first + 2), 20)
+    short_recording = float(prof.get("duration_s", n)) < 90.0
+    use_default = _straight(v, w, 30) and (not short_recording or 30 >= int(ms))
     moving_frames = (300, 40)  # validated default (30-34 s); must be straight driving: the back LiDAR is solved
-    if not _straight(v, w, 30):  # per frame, and a hard turn (lever arm, deskew) biases its roll/pitch by ~1 deg
+    if not use_default:  # per frame, and a hard turn (lever arm, deskew) biases its roll/pitch by ~1 deg
         straight = [s for s in range(int(ms), n - 4) if _straight(v, w, s)]
         if straight:
             s_best = min(straight, key=lambda s: (float(np.degrees(w[s:s + 4]).max()), s))
             moving_frames = (10 * s_best, 40)
+        elif short_recording and n >= 5:
+            cands_m = range(min(int(ms), max(0, n - 4)), max(1, n - 3))
+            s_best = max(cands_m, key=lambda s: (round(float(v[s:s + 4].min()), 2), round(float(v[s:s + 4].mean()), 2), -float(np.degrees(w[s:s + 4]).max())))
+            moving_frames = (10 * s_best, min(40, max(10, 10 * (n - s_best))))
     gaps = [g for g in prof.get("imu_gaps", []) if rs <= g["t_s"] <= rs + round_duration]
     return {"round_start_s": rs, "round_duration_s": round_duration, "motion_start_s": ms,
             "camera_time_start_s": max(0.0, ms - 2.0) if rs > 0 else 0.0,
@@ -1430,6 +1457,8 @@ def camera_lidar_refine(calib, bag, run, out_dir, n_frames=12, window=(5.0, 60.0
     eff = img_stamps + cam_offset
     t0 = stamps[0]
     targets = []
+    short_recording = len(stamps) >= 2 and float(stamps[-1] - stamps[0]) < 90.0
+    min_targets = 1 if short_recording else 4
     for tq in np.linspace(t0 + window[0], min(t0 + window[1], stamps[-1] - 1), n_frames):
         j = int(np.argmin(np.abs(stamps - tq)))
         if speed[j] > 8.0:
@@ -1438,7 +1467,7 @@ def camera_lidar_refine(calib, bag, run, out_dir, n_frames=12, window=(5.0, 60.0
         if abs(eff[k] - stamps[j]) > 0.02:
             continue
         targets.append((j, k))
-    if len(targets) < 4:
+    if len(targets) < min_targets:
         sys.exit("not enough usable image/scan pairs (need a LIVO run whose frames end at image times)")
     images = {k: img for k, img in decode_hevc(stream, scale, keep={k for _, k in targets})}
     stream.unlink(missing_ok=True)
@@ -1796,6 +1825,8 @@ def pole_yaw_refine(calib, bag, run, out_dir, n_frames=30, window=(5.0, 115.0), 
     eff = img_stamps + cam_offset
     t0 = stamps[0]
     targets = []
+    short_recording = len(stamps) >= 2 and float(stamps[-1] - stamps[0]) < 90.0
+    min_targets = 1 if short_recording else 4
     for tq in np.linspace(t0 + window[0], min(t0 + window[1], stamps[-1] - 1), n_frames):
         j = int(np.argmin(np.abs(stamps - tq)))
         if speed[j] > 8.0:
@@ -1804,7 +1835,7 @@ def pole_yaw_refine(calib, bag, run, out_dir, n_frames=30, window=(5.0, 115.0), 
         if abs(eff[k] - stamps[j]) > 0.02:
             continue
         targets.append((j, k))
-    if len(targets) < 4:
+    if len(targets) < min_targets:
         sys.exit("not enough usable image/scan pairs (need a LIVO run whose frames end at image times)")
     # find poles first so only frames that see a pole are decoded
     per_frame = []

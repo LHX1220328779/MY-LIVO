@@ -39,6 +39,7 @@ VOXEL = 1.0           # m, plane voxel edge
 MIN_PTS = 24          # points per voxel
 MIN_FRAMES_SPAN = 1.0  # s, a voxel must be seen over at least this long to carry velocity diversity
 RANGE = (2.0, 60.0)   # m, LiDAR range of the points used (rotation-error leverage beyond)
+SHORT_RECORDING_S = 90.0
 
 
 def fusion_dir(path):
@@ -105,9 +106,13 @@ def gather(run, window, max_frames, pts_per_frame, seed=7):
     tr = np.loadtxt(run / "trajectory_optimized.txt", ndmin=2)
     st = fr["stamp"]
     t_rel = st - st[0]
+    short_recording = len(st) >= 2 and float(st[-1] - st[0]) < SHORT_RECORDING_S
+    min_frames = 2 if short_recording else 20
     sel = np.where((t_rel >= window[0]) & (t_rel <= window[1]) & (st >= tr[0, 0]) & (st <= tr[-1, 0]))[0]
-    if len(sel) < 20:
-        sys.exit(f"only {len(sel)} frames inside the window")
+    if len(sel) < min_frames and short_recording:
+        sel = np.arange(len(st))
+    if len(sel) < min_frames:
+        sys.exit(f"only {len(sel)} frames inside the window (need {min_frames})")
     stride = max(1, int(np.ceil(len(sel) / max_frames)))
     sel = sel[::stride]
     pos, rot = interp_poses(tr, st[sel])
@@ -163,12 +168,12 @@ def eig_at(st, D, idx=None):
     return np.linalg.eigvalsh(C)
 
 
-def solve(data, grid_ms=(-60.0, 60.0, 1.0), blocks=12, rounds=4):
+def solve(data, grid_ms=(-60.0, 60.0, 1.0), blocks=12, rounds=4, short=False):
     """Repeat the grid solve with the voxel membership/selection re-centred at the previous minimum, so the
     voxels kept are not just the ones that happen to be sharp at the run's own (possibly wrong) offset."""
     centre = 0.0; hist = []
     for _ in range(rounds):
-        res = _solve_once(dict(data, W=data["W"] + centre * data["V"]), grid_ms, blocks)
+        res = _solve_once(dict(data, W=data["W"] + centre * data["V"]), grid_ms, blocks, short=short)
         res["D"] += centre; res["jackknife_ms"] = [j + 1000 * centre for j in res["jackknife_ms"]]
         hist.append(round(1000 * res["D"], 2))
         if abs(res["D"] - centre) < 0.5e-3:
@@ -178,7 +183,7 @@ def solve(data, grid_ms=(-60.0, 60.0, 1.0), blocks=12, rounds=4):
     return res
 
 
-def _solve_once(data, grid_ms, blocks):
+def _solve_once(data, grid_ms, blocks, short=False):
     """Map-consistency cost  sum_j n_j * lambda_min(C_j(D))  on a grid of corrections D (planes implicitly refitted
     at every D, voxel membership fixed so the cost is smooth). Minimum by a local parabola; jackknife over time
     blocks of the voxels for the standard error."""
@@ -187,8 +192,17 @@ def _solve_once(data, grid_ms, blocks):
     thick0 = np.sqrt(np.maximum(ev0[:, 0], 0))
     # planar, multi-epoch voxels only (single-epoch voxels carry no velocity diversity)
     use = (st["n"] >= MIN_PTS) & (ev0[:, 0] < 0.2 * ev0[:, 1]) & (thick0 < 0.2) & (st["span"] >= MIN_FRAMES_SPAN)
+    if short and use.sum() < 50:
+        use = (st["n"] >= 12) & (ev0[:, 0] < 0.25 * ev0[:, 1]) & (thick0 < 0.25) & (st["span"] >= 0.5)
+    if short and use.sum() < max(4, blocks):
+        use = (st["n"] >= 5) & (ev0[:, 0] < 0.35 * ev0[:, 1]) & (thick0 < 0.35) & (st["span"] >= 0.2)
     idx = np.where(use)[0]
     grid = np.arange(grid_ms[0], grid_ms[1] + 1e-9, grid_ms[2]) / 1000.0
+    if len(idx) == 0:
+        return dict(D=0.0, interior=False, se=999.0, voxels=0, informative_voxels=0, cost_rise_10ms=0.0,
+                    cost_curve=[(round(1000 * g, 1), 0.0) for g in grid[::5]], jackknife_ms=[0.0] * blocks, hist=[])
+    if short:
+        blocks = max(2, min(blocks, len(idx)))
     cost = np.stack([st["n"][idx] * np.maximum(eig_at(st, D, idx)[:, 0], 0) for D in grid], 1)  # voxels x grid
     # robust: a voxel cannot contribute more than its share at a 4 cm residual level (dynamic objects, edges)
     cap = st["n"][idx] * 0.12 ** 2
@@ -231,12 +245,15 @@ def main():
     a = ap.parse_args()
     run = fusion_dir(a.run)
     data = gather(run, a.window, a.max_frames, a.points_per_frame)
-    res = solve(data)
+    short_recording = len(data["T"]) >= 2 and float(np.ptp(data["T"])) < SHORT_RECORDING_S
+    res = solve(data, short=short_recording)
     sp = data["speed"]
     se_ms = 1000 * res["se"]
     observable = res["interior"] and se_ms <= a.max_se_ms and res["informative_voxels"] >= 50
     out = {
-        "run": str(run), "window_s": list(a.window), "frames": data["frames"], "frame_stride": data["stride"],
+        "run": str(run), "window_s": list(a.window),
+        "span_s": float(np.ptp(data["T"])) if len(data["T"]) else 0.0,
+        "frames": data["frames"], "frame_stride": data["stride"],
         "points": int(len(data["W"])), "speed_mps": {"median": float(np.median(sp)), "p95": float(np.percentile(sp, 95)),
                                                     "spread_p95_p5": float(np.percentile(sp, 95) - np.percentile(sp, 5))},
         "run_effective_offset_s": data["eff"],

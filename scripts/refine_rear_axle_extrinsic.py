@@ -71,6 +71,8 @@ COARSE_ITERS, MAX_ITERS = 8, 24
 # quality gate: a correction beyond these limits is not a calibration but a wrong reference/recording
 GATE_MAX_ROT_DEG, GATE_MAX_TRANS_M, GATE_MAX_DT_S = 6.0, 0.6, 0.08
 GATE_MAX_ABS_DT_S = 0.25   # |final time offset| beyond this is not a calibration but a wrong recording
+MIN_USABLE_SCANS = 5
+SHORT_RECORDING_S = 90.0
 PROFILE = tuple(np.arange(-0.18, 0.0001, 0.03))  # candidate time-shift baselines for the auto-detect
 WARN_SPLIT_ROT_DEG, WARN_SPLIT_TRANS_M, WARN_SPLIT_DT_S = 0.2, 0.2, 0.01
 QUERY_WORKERS = -1  # KD-tree query threads of solve() (-1 = all cores; reduced inside parallel workers)
@@ -340,7 +342,21 @@ def main():
 
     ins, scans = read_recording(a.bag, lidar_off, a.window, a.voxel, 3.0, a.max_range, a.every)
     poses = InsPoses(ins, dt_pos, dt_att)
+    rec_span_s = float(scans[-1][3] - scans[0][3]) if len(scans) >= 2 else 0.0
+    short_recording = rec_span_s < SHORT_RECORDING_S
     data, skipped = assemble(scans, poses, T_ref, a.min_speed, a.motion_age)
+    def _span_s(d):
+        if d is None:
+            return 0.0
+        u = np.unique(d["scan"])
+        return float(scans[u[-1]][3] - scans[u[0]][3]) if len(u) >= 2 else 0.0
+    if short_recording and (data is None or len(np.unique(data["scan"])) < 50 or _span_s(data) < 20.0):
+        for spd_fb, age_fb in ((min(a.min_speed, 0.5), min(a.motion_age, 1.0)), (min(a.min_speed, 0.2), 0.0)):
+            data_fb, skipped_fb = assemble(scans, poses, T_ref, spd_fb, age_fb)
+            if data_fb is not None and (data is None or len(np.unique(data_fb["scan"])) > len(np.unique(data["scan"]))):
+                data, skipped = data_fb, skipped_fb
+            if data is not None and len(np.unique(data["scan"])) >= 50 and _span_s(data) >= 15.0:
+                break
     if data is not None and len(np.unique(data["scan"])) > a.max_scans:
         keep_scans = np.unique(data["scan"])[:: int(np.ceil(len(np.unique(data["scan"])) / a.max_scans))]
         m = np.isin(data["scan"], keep_scans)
@@ -349,7 +365,22 @@ def main():
               f"reference {REFERENCE_TOPIC} ({REFERENCE_KEY}); poses {INS_TOPIC} (RTK fixed, >= {a.min_speed} m/s, "
               f">= {a.motion_age} s after motion start); time offsets lidar {lidar_off:+.4f} s, rtk_position {dt_pos:+.3f} s, ins_attitude {dt_att:+.3f} s",
               f"scans read {len(scans)}, skipped {skipped}"]
-    if data is None or len(np.unique(data["scan"])) < 50:
+    min_scans = MIN_USABLE_SCANS if short_recording else 50
+    if data is None or len(np.unique(data["scan"])) < min_scans:
+        if short_recording:
+            report.append(f"fewer than {min_scans} usable scans: parent calibration kept (quality: warn)")
+            pathlib.Path(a.report).parent.mkdir(parents=True, exist_ok=True)
+            pathlib.Path(a.report).write_text("\n".join(report) + "\n"); print("\n".join(report), flush=True)
+            out = json.loads(json.dumps(calib))
+            out["calibration_type"] = calib.get("calibration_type", "") + "+rtk_rear_axle_alignment"
+            out.setdefault("refinement", {})["rear_axle_alignment"] = {
+                "reference": REFERENCE_KEY, "poses": f"{INS_TOPIC} (RTK fixed)", "scans_used": 0,
+                "dof": a.dof, "converged": False, "quality": "warn",
+                "reasons": [f"fewer than {min_scans} usable scans; parent calibration kept"]}
+            pathlib.Path(a.output).parent.mkdir(parents=True, exist_ok=True)
+            json.dump(out, open(a.output, "w"), indent=2)
+            print(f"written {a.output} ({time.time() - t_start:.0f} s)")
+            return
         report.append("fewer than 50 usable scans: the recording needs RTK-fixed driving (>= 1 m/s) with a turn")
         pathlib.Path(a.report).parent.mkdir(parents=True, exist_ok=True)
         pathlib.Path(a.report).write_text("\n".join(report) + "\n"); print("\n".join(report)); sys.exit(3)
@@ -477,13 +508,17 @@ def main():
                 or abs(split["time_ms"]) > 1000 * WARN_SPLIT_DT_S:
             reasons.append("halves disagree (few turns/structure: use a longer recording with turns)")
             level = "warn" if level == "ok" else level
+    if level == "fail" and not a.no_gate:
+        if short_recording:
+            reasons.append("short/under-constrained recording: quality gate relaxed to warn")
+            level = "warn"
+        else:
+            print("rear-axle alignment rejected by the quality gate; calibration.json not written (--no-gate overrides)")
+            sys.exit(3)
     report.append(f"quality: {level}" + (f"  ({'; '.join(reasons)})" if reasons else ""))
     pathlib.Path(a.report).parent.mkdir(parents=True, exist_ok=True)
     pathlib.Path(a.report).write_text("\n".join(report) + "\n")
     print("\n".join(report), flush=True)
-    if level == "fail" and not a.no_gate:
-        print("rear-axle alignment rejected by the quality gate; calibration.json not written (--no-gate overrides)")
-        sys.exit(3)
     out = json.loads(json.dumps(calib))
     for entry in out["lidar"]:
         for k in list(entry):

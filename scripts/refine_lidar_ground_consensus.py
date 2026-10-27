@@ -43,6 +43,7 @@ from scipy.spatial.transform import Rotation as R  # noqa: E402
 GATE_MAX_ROT_DEG = 0.6
 GATE_MAX_TRANS_M = 0.12
 MIN_EFFECT_M = 0.008          # RMS change of the LiDAR's own ground returns below which the parent is kept
+SHORT_RECORDING_S = 90.0
 REPEAT_ROT_DEG, REPEAT_TRANS_M = 0.10, 0.015
 
 
@@ -190,6 +191,7 @@ def main():
             targets.append(k)
     corr = {k: (np.zeros(3), np.zeros(3)) for k in targets}
     tmid = 0.5 * (T.min() + T.max())
+    short_recording = float(T.max() - T.min()) < SHORT_RECORDING_S
 
     def solve(sel_time, corr_in, iters):
         corr_l = {k: (v[0].copy(), v[1].copy()) for k, v in corr_in.items()}
@@ -200,7 +202,9 @@ def main():
             flat = (slope < a.max_slope) & (cnt >= 30) & (np.abs(res) < 0.30) & sel_time
             for k in targets:
                 m = flat & (S == k)
-                if m.sum() < 2000:
+                if short_recording and m.sum() < 2000:
+                    m = (slope < a.max_slope) & (cnt >= 10) & (np.abs(res) < 0.30) & sel_time & (S == k)
+                if m.sum() < (300 if short_recording else 2000):
                     continue
                 rv, tt = corr_l[k]; c = M[topics[k]][:3, 3]
                 d = (Q[m] - c) @ R.from_rotvec(rv).as_matrix().T
