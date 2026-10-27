@@ -13,11 +13,15 @@ import numpy as np
 from . import calibration
 from .common import StudioError, load_state, read_json, safe_path
 from livo import rosenv
-from livo.body_filter import (DEFAULT_REAR_AXLE_BOX, LIDAR_TOPICS, lidar_filter_mask, normalize,
-                              stamp, to_yaml_overrides)
+from livo.body_filter import (DEFAULT_REAR_AXLE_BOX, LIDAR_TOPICS, lidar_filter_mask,
+                              lidar_transform_matrix, normalize, stamp, to_yaml_overrides,
+                              transform_points)
 from livo.dataset import Dataset
 
 MAX_POINTS = 12000
+MULTI_COLORS = ("#0071e3", "#34c759", "#ff9f0a", "#af52de", "#ff2d55",
+                "#5ac8fa", "#a2845e", "#30b0c7")
+MULTI_MAX_POINTS = 12000
 SCAN_MESSAGES = 3
 MAX_RANGE = 30.0
 
@@ -124,7 +128,7 @@ def _sample_scan(ds, topic, filt, t_s, max_points):
             break
     if not clouds:
         return {"error": "该时间点附近没有读到点云；请调整采样时刻", "topic": topic,
-                "topic_key": _key(topic), "t_s": t_s, "stamps": stamps, "points": [],
+                "topic_key": _key(topic), "t_s": t_s, "stamps": stamps, "points": [], "points_full": [],
                 "filtered": [], "filtered_count": 0, "raw_points": 0,
                 "xy": {"x_min": -10, "x_max": 10, "y_min": -10, "y_max": 10},
                 "xz": {"x_min": -10, "x_max": 10, "y_min": -4, "y_max": 4}}
@@ -139,25 +143,144 @@ def _sample_scan(ds, topic, filt, t_s, max_points):
     xz = _bounds(P[:, 0], P[:, 2], [], extra_y=filt["minimum_z"], default_y=(-4.0, 4.0))
     return {
         "topic": topic, "topic_key": _key(topic), "t_s": t_s, "stamps": stamps,
-        "raw_points": raw_count, "points": P.round(3).tolist(),
+        "raw_points": raw_count, "points": P.round(3).tolist(), "points_full": P.tolist(),
         "filtered": mask.astype(bool).tolist(), "filtered_count": int(mask.sum()),
         "xy": xy, "xz": xz, "minimum_z": float(filt["minimum_z"]),
         "enabled": bool(filt["enabled"]),
     }
 
 
-def get(mine=None, truck=None, vid=None, dataset=None, topic=None, t=None, max_points=MAX_POINTS):
+def _rect_polygons(rectangles, M):
+    """Transform 2D LiDAR-frame rectangles into rear-axle-frame polygons."""
+    out = []
+    for r in rectangles or []:
+        try:
+            corners = np.array([
+                [float(r["x_min"]), float(r["y_min"]), 0.0],
+                [float(r["x_max"]), float(r["y_min"]), 0.0],
+                [float(r["x_max"]), float(r["y_max"]), 0.0],
+                [float(r["x_min"]), float(r["y_max"]), 0.0],
+                [float(r["x_min"]), float(r["y_min"]), 0.0],
+            ], dtype=float)
+            Q = transform_points(corners, M)
+            out.append({"rect": {k: float(r[k]) for k in ("x_min", "x_max", "y_min", "y_max")},
+                        "polygon": Q[:, :2].round(3).tolist()})
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def _multi_bounds(series, rear_box):
+    xs, ys = [], []
+    for item in series:
+        for x, y, _z in item.get("points") or []:
+            xs.append(float(x)); ys.append(float(y))
+        for poly in item.get("rectangles") or []:
+            for x, y in poly.get("polygon") or []:
+                xs.append(float(x)); ys.append(float(y))
+    for x in (rear_box["x_min"], rear_box["x_max"]):
+        for y in (rear_box["y_min"], rear_box["y_max"]):
+            xs.append(float(x)); ys.append(float(y))
+    if not xs or not ys:
+        return {"x_min": -12.0, "x_max": 12.0, "y_min": -12.0, "y_max": 12.0}
+    xa, ya = np.asarray(xs, float), np.asarray(ys, float)
+    xa, ya = xa[np.isfinite(xa)], ya[np.isfinite(ya)]
+    if not len(xa) or not len(ya):
+        return {"x_min": -12.0, "x_max": 12.0, "y_min": -12.0, "y_max": 12.0}
+    x_min, x_max = float(np.nanpercentile(xa, 1)), float(np.nanpercentile(xa, 99))
+    y_min, y_max = float(np.nanpercentile(ya, 1)), float(np.nanpercentile(ya, 99))
+    x_min, x_max = min(x_min, float(xa.min())), max(x_max, float(xa.max()))
+    y_min, y_max = min(y_min, float(ya.min())), max(y_max, float(ya.max()))
+    dx = max(x_max - x_min, 2.0) * 0.06
+    dy = max(y_max - y_min, 2.0) * 0.06
+    return {"x_min": x_min - dx, "x_max": x_max + dx,
+            "y_min": y_min - dy, "y_max": y_max + dy}
+
+
+def _sample_multi_scan(ds, filt, t, max_points, parent_calib):
+    """Sample every LiDAR topic and stitch the points into the rear-axle frame."""
+    topics = list(ds.lidar_topics or [])
+    if not topics:
+        return {"error": "数据集中没有 LiDAR 点云话题", "series": [], "xy": _multi_bounds([], filt["rear_axle_box"]),
+                "raw_points": 0, "sampled_points": 0, "filtered_count": 0, "topics": [],
+                "colors": {}, "rear_axle_box": filt["rear_axle_box"]}
+    budget = max(1000, min(MULTI_MAX_POINTS, _finite(max_points, MULTI_MAX_POINTS)))
+    per_topic = max(1000, budget // len(topics))
+    series, colors = [], {}
+    for i, topic in enumerate(topics):
+        key = _key(topic)
+        color = MULTI_COLORS[i % len(MULTI_COLORS)]
+        colors[key] = color
+        M = lidar_transform_matrix(parent_calib, topic)
+        try:
+            one = _sample_scan(ds, topic, filt, t, per_topic)
+            P = np.asarray(one.get("points_full") or one.get("points") or [], dtype=float).reshape(-1, 3)
+            Q = transform_points(P, M)
+            filtered = [bool(v) for v in (one.get("filtered") or [])]
+            series.append({
+                "topic": topic, "topic_key": key, "color": color,
+                "points": Q.round(3).tolist(), "points_local": P.tolist(), "filtered": filtered,
+                "raw_points": int(one.get("raw_points") or 0),
+                "sampled_points": int(len(Q)),
+                "filtered_count": int(sum(filtered)),
+                "t_s": float(one.get("t_s") or 0.0),
+                "stamps": one.get("stamps") or [],
+                "rectangles": _rect_polygons(filt["lidar_rectangles"].get(key, []), M),
+                "transform_identity": bool(np.allclose(M, np.eye(4))),
+                "error": one.get("error"),
+            })
+        except Exception as exc:  # noqa: BLE001 - one bad topic must not hide the others
+            series.append({
+                "topic": topic, "topic_key": key, "color": color,
+                "points": [], "points_local": [], "filtered": [], "raw_points": 0, "sampled_points": 0,
+                "filtered_count": 0, "t_s": _finite(t, 0.0), "stamps": [],
+                "rectangles": _rect_polygons(filt["lidar_rectangles"].get(key, []), M),
+                "transform_identity": bool(np.allclose(M, np.eye(4))),
+                "error": str(exc),
+            })
+    return {
+        "frame": "vehicle_rear_axle", "topics": topics, "colors": colors,
+        "series": series, "xy": _multi_bounds(series, filt["rear_axle_box"]),
+        "rear_axle_box": filt["rear_axle_box"],
+        "raw_points": int(sum(x["raw_points"] for x in series)),
+        "sampled_points": int(sum(x["sampled_points"] for x in series)),
+        "filtered_count": int(sum(x["filtered_count"] for x in series)),
+        "t_s": float(series[0]["t_s"]) if series else _finite(t, 0.0),
+    }
+
+
+def get(mine=None, truck=None, vid=None, dataset=None, topic=None, t=None, max_points=MAX_POINTS,
+        parent_id=None):
     mine, truck = _defaults(mine, truck)
     path, version_id = _calibration_file(mine, truck, vid)
     calib = read_json(path, {}) or {}
     filt = normalize(calib)
+    parent_path, parent_version_id = path, version_id
+    if parent_id:
+        try:
+            if not str(parent_id).startswith(f"{mine}/{truck}/"):
+                raise StudioError("父版本不属于当前车辆")
+            candidate = calibration.calibration_file(parent_id)
+            parent_calib = read_json(candidate, {}) or {}
+            if parent_calib:
+                parent_path, parent_version_id = candidate, parent_id
+            else:
+                parent_calib = calib
+        except Exception:  # noqa: BLE001 - bad parent id falls back to the active calibration
+            parent_calib = calib
+    else:
+        parent_calib = calib
     dataset_path = _dataset_path(dataset)
+    multi_scan = {"error": "数据集未打开", "series": [], "xy": _multi_bounds([], filt["rear_axle_box"]),
+                  "raw_points": 0, "sampled_points": 0, "filtered_count": 0, "topics": [],
+                  "colors": {}, "rear_axle_box": filt["rear_axle_box"]}
     try:
         ds = Dataset.open(dataset_path)
         topics = ds.lidar_topics
         duration_s = float(ds.duration_s)
         scan = _sample_scan(ds, topic, filt, t, max_points)
         topic = scan.get("topic") or _pick_topic(ds, topic)
+        multi_scan = _sample_multi_scan(ds, filt, t, max_points, parent_calib)
     except Exception as exc:  # noqa: BLE001 - a bad dataset must not hide the saved parameters
         topics, duration_s = list(LIDAR_TOPICS), 0.0
         scan = {"error": str(exc), "topic": topic or LIDAR_TOPICS[0],
@@ -166,11 +289,14 @@ def get(mine=None, truck=None, vid=None, dataset=None, topic=None, t=None, max_p
                 "xy": {"x_min": -10, "x_max": 10, "y_min": -10, "y_max": 10},
                 "xz": {"x_min": -10, "x_max": 10, "y_min": -4, "y_max": 4}}
         topic = scan["topic"]
+        multi_scan["error"] = str(exc)
     return {
         "mine": mine, "truck": truck, "id": version_id, "calibration_file": str(path),
+        "parent_id": parent_version_id, "parent_calibration_file": str(parent_path),
         "dataset": dataset_path, "duration_s": duration_s, "topics": topics,
         "topic": topic, "topic_key": scan.get("topic_key") or _key(topic),
         "body_filter": filt, "yaml_overrides": to_yaml_overrides(filt), "scan": scan,
+        "multi_scan": multi_scan,
     }
 
 

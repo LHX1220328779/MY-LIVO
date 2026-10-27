@@ -34,6 +34,40 @@ STAGE_FALLBACK = {
 RTK_ROUND_S = 240.0
 SCAN_STEP_DEG = 0.05  # pitch increment of the closed-loop scan rounds (0.55 % scale change, 20x the run-to-run noise)
 DEFAULT_PITCH_SLOPE = 0.105  # path-length ratio change per degree of camera pitch (measured 0.104-0.106 on truck29)
+
+# Injected into the selected parent calibration.json before ANY automated calibration stage.
+# The active vehicle calibration is the source of truth for body_filter; older/factory parents
+# receive a copy (with a one-time backup) so every child version and mapping round inherits it.
+BODY_FILTER_PREP_CODE = r"""
+import json, pathlib, sys
+sys.path.insert(0, sys.argv[3])
+from livo.body_filter import normalize
+parent = pathlib.Path(sys.argv[1])
+source = pathlib.Path(sys.argv[2])
+doc = json.loads(parent.read_text())
+if source != parent and source.exists():
+    src_doc = json.loads(source.read_text())
+else:
+    src_doc = doc
+if "body_filter" in doc and str(doc["body_filter"].get("source", "")).startswith("Studio"):
+    # A parent already tuned in the visual editor keeps its own vehicle-specific mask.
+    bf = normalize(doc)
+else:
+    if "body_filter" not in src_doc and "body_filter" in doc:
+        src_doc = doc
+    bf = normalize(src_doc)
+old = doc.get("body_filter")
+if old != bf:
+    bak = parent.with_name(parent.name + ".pre_body_filter.bak")
+    if not bak.exists():
+        bak.write_text(parent.read_text())
+    doc["body_filter"] = bf
+    parent.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
+print(json.dumps({"body_filter_injected": old != bf, "parent": str(parent),
+                  "source": str(source), "enabled": bf["enabled"],
+                  "minimum_z": bf["minimum_z"]}, ensure_ascii=False))
+"""
+
 OVERLAY_DIR = RESULTS / ".studio" / "overlays"
 
 
@@ -283,7 +317,7 @@ def _ident(body):
 
 
 def _parent(body):
-    vid = body.get("id") or body.get("parent_id")
+    vid = body.get("parent_id") or body.get("id")
     if not vid:
         raise StudioError("缺少父版本 id")
     calibration_file(vid)
@@ -912,10 +946,9 @@ def pipeline_steps(kind, body, mapping_cmd):
     if body.get("resume"):
         return _resume_steps(body, mapping_cmd)
     parent = requested_parent = _parent(body)
-    if kind == "lidar" and body.get("from_factory", True):
-        # A complete calibration starts from the factory import of the vehicle (root of the requested version's
-        # lineage), never from an earlier refinement: the result does not depend on previous pipeline runs.
-        parent = factory_root(parent) or parent
+    # Any version of the current vehicle can be the parent of an automated pipeline.  The
+    # legacy `from_factory` flag is intentionally ignored: the operator now chooses the parent
+    # explicitly in Studio, including the factory import when a fresh start is desired.
     dataset = str(safe_path(body.get("dataset") or ""))
     mine, truck = parent.split("/")[:2]
     standard = (body.get("mode") or "standard") != "fast"
@@ -932,6 +965,20 @@ def pipeline_steps(kind, body, mapping_cmd):
     stamp = body.get("_stamp") or dt.datetime.now().strftime("%m%d_%H%M%S")  # _stamp: resume keeps round names
     auto_activate = bool(body.get("activate", True))
     steps = []
+    source_id = body.get("body_filter_source_id") or active_id(mine, truck) or parent
+    if not str(source_id).startswith(f"{mine}/{truck}/"):
+        source_id = active_id(mine, truck) or parent
+    try:
+        source_file = str(calibration_file(source_id))
+    except Exception:  # noqa: BLE001 - fall back to the selected parent's own body_filter
+        source_id, source_file = parent, str(calibration_file(parent))
+    body = {**body, "_body_filter_source_id": source_id}
+    steps.append({
+        "title": "前置：将当前车辆 body_filter 写入父版本标定文件",
+        "cmd": [PY, "-c", BODY_FILTER_PREP_CODE, str(calibration_file(parent)), source_file,
+                str(REPO / "tools")],
+        "after": lambda ctx, lines: ctx.__setitem__("body_filter_source_id", source_id),
+    })
     if body.get("dataset") and not body.get("skip_assess"):
         # data assessment first (cached per recording): warns about defects calibration cannot compensate and stops
         # the pipeline before any expensive stage when the recording is unusable
@@ -1051,7 +1098,8 @@ def pipeline_steps(kind, body, mapping_cmd):
     else:
         raise StudioError(f"未知流水线 {kind}")
     _cleanup_step(steps, body, truck, stamp)
-    return steps, {"mine": mine, "truck": truck, "parent": parent, "requested_parent": requested_parent, "dataset": dataset,
+    return steps, {"mine": mine, "truck": truck, "parent": parent, "requested_parent": requested_parent,
+                   "body_filter_source_id": source_id, "dataset": dataset,
                    "mode": "standard" if standard else "fast", "mode_note": mode_note,
                    "pitch_slope": None if standard else slope_info["slope"],
                    "pitch_slope_source": None if standard else slope_info["source"]}

@@ -196,7 +196,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/body-filter":
             return self._send(200, body_filter.get(
                 q.get("mine"), q.get("truck"), q.get("id"), q.get("dataset"), q.get("topic"),
-                q.get("t"), q.get("max_points", 12000)))
+                q.get("t"), q.get("max_points", 12000), q.get("parent_id")))
         if path == "/api/calibrations/version":
             return self._send(200, calibration.version_detail(q["id"]))
         if path == "/api/calibrations/file":

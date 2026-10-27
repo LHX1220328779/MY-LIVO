@@ -80,3 +80,12 @@
 `tools/studio/server.py` 的 `reload_app_modules()` 只按 mtime 热重载 `studio.app.*` 模块，不会重新加载 `server.py` 自身或已经注册的 URL 路由表。因此新增/修改 `/api/body-filter` 等路由后，必须重启长期运行的 Studio 进程；`/api/system` 动态读取当前 git 提交，不能作为进程已加载新代码的依据。
 
 用户反馈的 `unknown path /api/body-filter` 已通过停止旧 PID、重新执行 `tools/studio/server.py --port 8765` 解决。完整诊断、后端 API 与 Chrome CDP 前端全功能验证记录见 `docs/mcp-studio-body-filter-route-404-analysis.md`。
+
+
+## 11. 2026-10-27：车身过滤前置、全雷达彩色拼接与任意父版本
+
+`tools/studio/app/calibration.py` 的 `pipeline_steps()` 不再根据 `from_factory` 回退到出厂根版本；控制台新增父版本下拉框，自动化流水线、单步执行和车身过滤拼接共用 `state.calibration.parent_id`，因此当前车辆任意版本都可以作为自动化标定父版本。
+
+每条流水线第一步新增「前置：将当前车辆 body_filter 写入父版本标定文件」：从当前激活版本读取 `body_filter` 并写入所选父版本（已有 Studio 保存值的父版本保留自身值，写入前生成备份）。后续 `livo_calib.py` 子版本继承该字段，离线精修脚本与流水线映射轮次都会先应用车辆专属车身过滤，再开始标定计算。
+
+车身过滤页新增按父版本外参拼接全部 LiDAR 的俯视画布，四路点云颜色不同，红点为当前参数会过滤的点。详细实现与真实迭代测试见 `docs/mcp-body-filter-multilidar-parent.md`。

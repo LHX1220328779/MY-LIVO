@@ -21,6 +21,12 @@ import numpy as np
 DEFAULT_MINIMUM_Z = -3.0
 DEFAULT_REAR_AXLE_BOX = {"x_min": -2.8, "x_max": 2.8, "y_min": -4.5, "y_max": 9.5}
 LIDAR_TOPICS = ("front_right_lidar", "back_lidar", "front_left_lidar", "front_lidar")
+LIDAR_MATRIX_KEYS = {
+    "front_right_lidar": "transform_matrix_lidar_1",
+    "back_lidar": "transform_matrix_lidar_2",
+    "front_left_lidar": "transform_matrix_lidar_3",
+    "front_lidar": "transform_matrix_lidar_6",
+}
 DEFAULT_LIDAR_RECTANGLES = {
     "front_right_lidar": [
         {"x_min": -3.0, "y_min": -9.0, "x_max": 0.5, "y_max": 2.0},
@@ -88,6 +94,43 @@ def normalize(doc: dict | None) -> dict:
         "source": str(raw.get("source", "default")),
         "updated": str(raw.get("updated", "")),
     }
+
+
+def lidar_transform_matrix(doc: dict | None, topic: str) -> np.ndarray:
+    """4x4 lidar->rear-axle transform for `topic` from a calibration.json.
+
+    The schema stores the matrices under lidar[0].transform_matrix_lidar_N; older
+    files may expose a transforms.<topic>_to_rear_axle entry.  Missing entries
+    fall back to identity so a new LiDAR topic still appears in the stitched view.
+    """
+    key = LIDAR_MATRIX_KEYS.get(_topic_key(topic))
+    doc = doc or {}
+    entries = doc.get("lidar") or []
+    if isinstance(entries, dict):
+        entries = [entries]
+    for entry in entries:
+        if isinstance(entry, dict) and key and key in entry:
+            try:
+                return np.asarray(entry[key], dtype=float).reshape(4, 4)
+            except (TypeError, ValueError):
+                break
+    transforms = doc.get("transforms") or {}
+    for name in (f"{_topic_key(topic)}_to_rear_axle", f"{topic}_to_rear_axle"):
+        entry = transforms.get(name) if isinstance(transforms, dict) else None
+        if isinstance(entry, dict) and "transform_matrix" in entry:
+            try:
+                return np.asarray(entry["transform_matrix"], dtype=float).reshape(4, 4)
+            except (TypeError, ValueError):
+                break
+    return np.eye(4)
+
+
+def transform_points(P: np.ndarray, M: np.ndarray) -> np.ndarray:
+    """Apply a target-from-source 4x4 matrix to Nx3 points."""
+    P = np.asarray(P, dtype=float)
+    if P.size == 0:
+        return np.empty((0, 3), dtype=float)
+    return P @ np.asarray(M, dtype=float)[:3, :3].T + np.asarray(M, dtype=float)[:3, 3]
 
 
 def from_calibration_file(path: str | pathlib.Path) -> dict:
