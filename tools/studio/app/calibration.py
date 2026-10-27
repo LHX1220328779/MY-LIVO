@@ -274,7 +274,12 @@ def delete(vid):
 def validate(vid, strict=False):
     cmd = [PY, str(CALIB_TOOL), "validate", "--id", vid] + (["--strict"] if strict else [])
     rc, text, payload = run_tool(cmd)
-    return payload or {"ok": rc == 0, "errors": [text.strip()[-300:]], "warnings": []}
+    if isinstance(payload, dict):
+        payload.setdefault("ok", rc == 0)
+        payload.setdefault("errors", [])
+        payload.setdefault("warnings", [])
+        return payload
+    return {"ok": rc == 0, "errors": [text.strip()[-300:]], "warnings": []}
 
 
 def calibration_file(vid):

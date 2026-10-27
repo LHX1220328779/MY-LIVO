@@ -301,7 +301,8 @@ def run_tool(cmd, timeout=120):
     proc = subprocess.run(cmd, cwd=REPO, capture_output=True, text=True, timeout=timeout)
     text = (proc.stdout or "") + (proc.stderr or "")
     payload = None
-    for line in reversed((proc.stdout or "").strip().splitlines()):
+    out = (proc.stdout or "").strip()
+    for line in reversed(out.splitlines()):
         line = line.strip()
         if line.startswith("{") and line.endswith("}"):
             try:
@@ -309,6 +310,14 @@ def run_tool(cmd, timeout=120):
                 break
             except json.JSONDecodeError:
                 continue
+    if payload is None and out:
+        # Some tools (validate) pretty-print their JSON across several lines.
+        i, j = out.find("{"), out.rfind("}")
+        if i >= 0 and j > i:
+            try:
+                payload = json.loads(out[i:j + 1])
+            except json.JSONDecodeError:
+                payload = None
     return proc.returncode, text, payload
 
 

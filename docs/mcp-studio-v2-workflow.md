@@ -89,3 +89,8 @@
 每条流水线第一步新增「前置：将当前车辆 body_filter 写入父版本标定文件」：从当前激活版本读取 `body_filter` 并写入所选父版本（已有 Studio 保存值的父版本保留自身值，写入前生成备份）。后续 `livo_calib.py` 子版本继承该字段，离线精修脚本与流水线映射轮次都会先应用车辆专属车身过滤，再开始标定计算。
 
 车身过滤页新增按父版本外参拼接全部 LiDAR 的俯视画布，四路点云颜色不同，红点为当前参数会过滤的点。详细实现与真实迭代测试见 `docs/mcp-body-filter-multilidar-parent.md`。
+
+
+## 12. 2026-10-27：自动标定实跑的空数组与 JSON 解析修复
+
+自动标定任务 `1a17bdd7087` 的预检与实跑发现：没有矩形的 LiDAR 话题会生成 `body_filter.<topic>: []`，ROS 2 无法推断空数组类型；`livo_calib.py validate` 的格式化 JSON 又会被 Studio 当成错误文本。现在 `tools/livo/effective_config.py` 会从有效配置中删除空数组参数，`tools/studio/app/common.py` 与 `tools/studio/app/calibration.py` 会解析并返回结构化校验结果。修复后 17 个步骤全部完成并自动激活 `zongyang/truck02/v015_gcons`。详细根因与验证记录见 `docs/mcp-auto-calibration-empty-body-filter-fix.md`。

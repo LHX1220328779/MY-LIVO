@@ -52,7 +52,13 @@ def write_effective_config(src: str, dst: str, calibration: str, sets: list[str]
             ml = params.setdefault("multi_lidar", {})
             bf = ml.setdefault("body_filter", {})
             for k, v in ov["body_filter"].items():
-                bf[k] = v
+                if k != "minimum_z" and isinstance(v, list) and not v:
+                    # ROS 2 cannot infer the type of an empty YAML sequence.  A topic with no
+                    # rectangles must have NO parameter at all; remove any production fallback.
+                    bf.pop(k, None)
+                    logs.append(f"override multi_lidar.body_filter.{k}: disabled (no rectangles)")
+                else:
+                    bf[k] = v
             pre = ml.setdefault("precheck", {})
             pre["body_box"] = ov["precheck"]["body_box"]
             logs.append(f"override multi_lidar.body_filter: from calibration {calibration}")

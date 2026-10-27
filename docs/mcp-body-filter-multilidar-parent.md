@@ -73,3 +73,7 @@
 - `tools/studio/server.py`：`parent_id` 查询参数传递
 - `docs/mcp-studio-v2-workflow.md`：Studio 工作流补充
 - `docs/mcp-studio-body-filter-route-404-analysis.md`：此前 404 诊断
+
+## 7. 2026-10-27：自动标定实跑的问题修复
+
+以 `zongyang/truck02/v009_ground` 为父版本启动自动标定后，发现两个实跑问题：`front_lidar` 的空过滤矩形数组被写入 ROS 参数 YAML，导致 mapper 报 `No parameter value set`；Studio 校验接口把多行 JSON 文本误当成 `errors`。已分别修复为“生成 YAML 时省略空数组参数”和“解析整体 JSON 并返回结构化结果”。任务 `1a17bdd7087` 的 17 个步骤全部完成，结果版本 `zongyang/truck02/v015_gcons` 已自动激活。生成配置、校验 API、流水线预检与完整实跑验证见 `docs/mcp-auto-calibration-empty-body-filter-fix.md`。
