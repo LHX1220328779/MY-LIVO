@@ -29,6 +29,9 @@ import numpy as np
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation as R
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "tools"))
+from livo.body_filter import normalize, rear_axle_mask  # noqa: E402
+
 KEYS = {
     "front_right_lidar": "transform_matrix_lidar_1",
     "back_lidar": "transform_matrix_lidar_2",
@@ -36,6 +39,7 @@ KEYS = {
     "front_lidar": "transform_matrix_lidar_6"
 }
 REFERENCE = "front_lidar"
+BODY_FILTER = normalize({})  # vehicle-specific body box; loaded from calibration.json in run_precorrection()
 
 
 def sanitize_transform_matrix(raw_values, name="extrinsic"):
@@ -82,7 +86,7 @@ def load_truck_calibration(json_path):
 
 def clean_points(Q, rmin=3.0, rmax=60.0):
     r = np.hypot(Q[:, 0], Q[:, 1])
-    body = (Q[:, 0] > -2.8) & (Q[:, 0] < 2.8) & (Q[:, 1] > -4.5) & (Q[:, 1] < 9.5)
+    body = rear_axle_mask(Q, BODY_FILTER)
     return Q[(r > rmin) & (r < rmax) & ~body & np.isfinite(Q).all(axis=1)]
 
 
@@ -156,7 +160,9 @@ def solve_ground(pairs, center, iterations=25, max_dist=0.6, huber=0.05,
 
 def run_precorrection(calib_path, bag_path, output_path=None, report_path=None):
     print(f"[Pre-corrector] Loading nominal calibration: {calib_path}")
+    global BODY_FILTER
     raw_json, truck_num, mats = load_truck_calibration(calib_path)
+    BODY_FILTER = normalize(raw_json)
     
     if REFERENCE not in mats:
         raise RuntimeError(f"Reference LiDAR {REFERENCE} not found in calibration!")

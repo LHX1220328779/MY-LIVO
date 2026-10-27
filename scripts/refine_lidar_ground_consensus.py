@@ -34,7 +34,9 @@ import argparse, json, pathlib, sys
 import numpy as np
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "tools"))
 import refine_multi_lidar_yaw as rm  # noqa: E402  (ROS environment, Dataset, pose helpers, LiDAR keys)
+from livo.body_filter import normalize, rear_axle_mask  # noqa: E402
 from rclpy.serialization import deserialize_message  # noqa: E402
 from sensor_msgs.msg import PointCloud2  # noqa: E402
 from sensor_msgs_py import point_cloud2 as pc2  # noqa: E402
@@ -44,6 +46,7 @@ GATE_MAX_ROT_DEG = 0.6
 GATE_MAX_TRANS_M = 0.12
 MIN_EFFECT_M = 0.008          # RMS change of the LiDAR's own ground returns below which the parent is kept
 SHORT_RECORDING_S = 90.0
+BODY_FILTER = normalize({})  # vehicle-specific body box; loaded from calibration.json in main()
 REPEAT_ROT_DEG, REPEAT_TRANS_M = 0.10, 0.015
 
 
@@ -81,7 +84,9 @@ def main():
                          "the map is built from) or the raw bag re-deskewed per point with the optimized poses")
     a = ap.parse_args()
 
+    global BODY_FILTER
     calib = json.load(open(a.calibration))
+    BODY_FILTER = normalize(calib)
     M = {}
     for entry in calib["lidar"]:
         for topic, k in rm.KEYS.items():
@@ -111,7 +116,7 @@ def main():
     def add_scan(topic, P, ts, h):
         Q = P @ M[topic][:3, :3].T + M[topic][:3, 3]                      # rear-axle frame
         rng = np.linalg.norm(Q[:, :2] - M[topic][:2, 3], axis=1)
-        excl = (Q[:, 0] > -2.8) & (Q[:, 0] < 2.8) & (Q[:, 1] > -4.5) & (Q[:, 1] < 9.5)
+        excl = rear_axle_mask(Q, BODY_FILTER)
         keep = (rng > a.min_range) & (rng < a.max_range) & ~excl
         if keep.sum() < 200:
             return

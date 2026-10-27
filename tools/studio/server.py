@@ -28,7 +28,7 @@ from livo import rosenv  # noqa: E402
 
 rosenv.ensure()
 
-from studio.app import calibration, common, datasets, jobs, mapping  # noqa: E402
+from studio.app import body_filter, calibration, common, datasets, jobs, mapping  # noqa: E402
 from livo import results_gc  # noqa: E402
 from studio.app.common import (CAL_ROOT, MAPPER_BINARY, REPO, RESULTS, STUDIO_DIR, WEB, StudioError,  # noqa: E402
                                load_state, now, remember_dataset, update_state)
@@ -50,7 +50,8 @@ def reload_app_modules() -> None:
         busy = jobs.active()
     except Exception:  # noqa: BLE001
         busy = None
-    for name in ("studio.app.common", "studio.app.datasets", "studio.app.calibration", "studio.app.mapping"):
+    for name in ("studio.app.common", "studio.app.datasets", "studio.app.calibration", "studio.app.mapping",
+                 "studio.app.body_filter"):
         mod = sys.modules.get(name)
         path = getattr(mod, "__file__", None) if mod is not None else None
         if not path:
@@ -192,6 +193,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"vehicles": calibration.vehicles(cat), "stages": cat["stages"], "sources": cat["sources"]})
         if path == "/api/calibrations":
             return self._send(200, calibration.catalogue(refresh=q.get("refresh") == "1"))
+        if path == "/api/body-filter":
+            return self._send(200, body_filter.get(
+                q.get("mine"), q.get("truck"), q.get("id"), q.get("dataset"), q.get("topic"),
+                q.get("t"), q.get("max_points", 12000)))
         if path == "/api/calibrations/version":
             return self._send(200, calibration.version_detail(q["id"]))
         if path == "/api/calibrations/file":
@@ -255,6 +260,8 @@ class Handler(BaseHTTPRequestHandler):
             state["data"]["recent"] = [x for x in state["data"].get("recent", []) if x != body.get("path")]
             common.save_state(state)
             return self._send(200, state)
+        if path == "/api/body-filter":
+            return self._send(200, body_filter.save(body))
         if path == "/api/calibrations/import":
             cmd = calibration.import_cmd(body)
             job = jobs.start("calibration", f"导入出厂标定 · {body.get('mine')}/{body.get('truck')}",

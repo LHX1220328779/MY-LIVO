@@ -13,10 +13,11 @@ const S = {
   winCalib:  { mode: "auto", head_dur: 60, start: 0, end: "" },
   overlayForm: { times: "20,60,100", delta: "0 0 0", run: "" }, overlay: null, overlayBusy: false,
   assess: null, assessSummary: null, assessLoading: false,
+  body: null, bodyBusy: false, bodyForm: { topic: "", t: 0, max_points: 12000, sel: null },
 };
 const $ = (sel, root = document) => root.querySelector(sel);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
-const PAGES = { home: "工作台", data: "数据源", calib: "标定", map: "建图", results: "结果", system: "系统" };
+const PAGES = { home: "工作台", data: "数据源", calib: "标定", body: "车身过滤", map: "建图", results: "结果", system: "系统" };
 const PHASES = [["starting", "启动"], ["playing", "回放"], ["draining", "收尾"], ["finalizing", "优化导出"], ["exported", "已导出"], ["evaluating", "评估"], ["done", "完成"]];
 
 // ------------------------------------------------------------------ plumbing
@@ -302,8 +303,9 @@ function render() {
   $("#context").innerHTML = `<span class="ctx">车辆 <b>${esc(v ? `${v.mine}/${v.truck}` : "—")}</b></span><span class="ctx">数据源 <b title="${esc(d?.path || "")}">${esc(d ? ((d.path || "").split("/").filter(Boolean).slice(-2).join("/") || d.name) : "—")}</b></span><span class="ctx">标定 <b title="${S.state?.mapping?.calibration_id ? "本轮指定版本" : "激活版本"}">${esc(((S.state?.mapping?.calibration_id || v?.active) || "").split("/").pop() || "无")}</b></span>`;
   $("#jobpill").outerHTML = jobPill();
   $("#sidebar-foot").innerHTML = footHtml();
-  const page = { home: pageHome, data: pageData, calib: pageCalib, map: pageMap, results: pageResults, system: pageSystem }[S.page];
+  const page = { home: pageHome, data: pageData, calib: pageCalib, body: pageBody, map: pageMap, results: pageResults, system: pageSystem }[S.page];
   $("#page").innerHTML = page();
+  if (S.page === "body") initBodyCanvases();
   renderDrawer();
   if (S.page === "data" && S.dataset && !S.dataset.error && (!S.assess || S.assess.path !== S.dataset.path) && !S.assessLoading) {
     S.assessLoading = true;
@@ -906,6 +908,7 @@ const A = {
     render();
     if (page === "data" && !S.fs) A["fs-open"]({ dataset: { path: S.dataset?.path ? S.dataset.path.replace(/\/[^/]+$/, "") : "/home/project" } });
     if (page === "system") A["results-usage"]();
+    if (page === "body") A["bf-load"]();
   },
   close() { S.drawer = null; renderDrawer(); },
   async "drawer-job"() { S.drawer = "job"; if (!S.job && S.jobs.length) { await A["open-job"]({ dataset: { id: S.jobs[0].id } }); return; } renderDrawer(); if (S.job) { await pollJob(); renderDrawer(); } },
@@ -913,7 +916,7 @@ const A = {
   mode(el) { S.state.mapping.mode = el.dataset.mode; saveState({ mapping: { mode: el.dataset.mode } }); render(); },
   toggle(el) { const sec = el.dataset.section, key = el.dataset.key; S.state[sec][key] = el.checked; saveState({ [sec]: { [key]: el.checked } }); if (sec === "calibration" || (sec === "mapping" && key === "save_map")) render(); },
   field(el) { const sec = el.dataset.section, key = el.dataset.key; const v = el.type === "number" ? (el.value === "" ? "" : Number(el.value)) : el.value; S.state[sec][key] = v; saveState({ [sec]: { [key]: v } }); if (el.tagName === "SELECT") render(); },
-  "set-vehicle"(el) { const [mine, truck] = el.value.split("/"); S.state.vehicle = { mine, truck }; S.calibForm.parent = null; S.state.mapping.calibration_id = ""; saveState({ vehicle: { mine, truck }, mapping: { calibration_id: "" } }); render(); },
+  "set-vehicle"(el) { const [mine, truck] = el.value.split("/"); S.state.vehicle = { mine, truck }; S.calibForm.parent = null; S.state.mapping.calibration_id = ""; saveState({ vehicle: { mine, truck }, mapping: { calibration_id: "" } }); render(); if (S.page === "body") A["bf-load"](); },
   async start() {
     const v = vehicle(); const m = S.state.mapping; const d = S.dataset;
     const mode = m.mode === "livo" && !d?.livo_ready ? "lio" : m.mode;
@@ -1025,6 +1028,391 @@ const A = {
   },
   async "refresh-dataset"() { await act(async () => { S.dataset = await api(`/api/datasets?path=${encodeURIComponent(S.dataset.path)}&refresh=1`); render(); }, "已重新读取"); },
 };
+
+// ------------------------------------------------------------------ body-point visual filter
+function bfKey(t) { return String(t || "").replace(/^\/+/, "").replace(/\//g, "_"); }
+function bfNum(v) { return (v == null || v === "") ? "" : String(Math.round(Number(v) * 1000) / 1000); }
+function bfNormalizeRect(r) {
+  if (!r) return null;
+  const x1 = Number(r.x_min), x2 = Number(r.x_max), y1 = Number(r.y_min), y2 = Number(r.y_max);
+  if (![x1, x2, y1, y2].every(Number.isFinite)) return null;
+  return { x_min: Math.min(x1, x2), x_max: Math.max(x1, x2), y_min: Math.min(y1, y2), y_max: Math.max(y1, y2) };
+}
+function bfDefaultRect() { return { x_min: -1.5, y_min: -1.5, x_max: 1.5, y_max: 1.5 }; }
+function bfYamlOverrides(f) {
+  const std = ["front_right_lidar", "back_lidar", "front_left_lidar", "front_lidar"];
+  const keys = Array.from(new Set([...std, ...Object.keys(f.lidar_rectangles || {})]));
+  const bf = { minimum_z: Number(f.minimum_z) };
+  keys.forEach((k) => {
+    const flat = [];
+    (f.lidar_rectangles[k] || []).forEach((r) => flat.push(Number(r.x_min), Number(r.y_min), Number(r.x_max), Number(r.y_max)));
+    bf[k] = flat;
+  });
+  const b = f.rear_axle_box || { x_min: -2.8, x_max: 2.8, y_min: -4.5, y_max: 9.5 };
+  return { body_filter: bf, precheck: { body_box: [Number(b.x_min), Number(b.x_max), Number(b.y_min), Number(b.y_max)] } };
+}
+function bfRecompute() {
+  const b = S.body, f = b && b.body_filter, s = b && b.scan;
+  if (!f || !s) return;
+  const rects = (f.lidar_rectangles || {})[b.topic_key] || [];
+  const minz = Number(f.minimum_z), enabled = !!f.enabled;
+  let count = 0;
+  s.filtered = (s.points || []).map((p) => {
+    const inside = rects.some((r) => p[0] > r.x_min && p[0] < r.x_max && p[1] > r.y_min && p[1] < r.y_max);
+    const hit = enabled && inside && p[2] > minz;
+    if (hit) count++;
+    return hit;
+  });
+  s.filtered_count = count;
+  b.yaml_overrides = bfYamlOverrides(f);
+  const c = document.getElementById("bf-filtered-count");
+  if (c) c.innerHTML = `当前样本过滤 <b>${count}</b> / ${(s.points || []).length} 点（原始 ${s.raw_points || 0} 点）`;
+  const pre = document.getElementById("bf-yaml");
+  if (pre) pre.textContent = JSON.stringify(b.yaml_overrides, null, 2);
+}
+function bfX2p(x, b, w) { return (x - b.x_min) / (b.x_max - b.x_min) * w; }
+function bfY2p(y, b, h) { return h - (y - b.y_min) / (b.y_max - b.y_min) * h; }
+function bfP2x(px, b, w) { return b.x_min + px / w * (b.x_max - b.x_min); }
+function bfP2y(py, b, h) { return b.y_min + (h - py) / h * (b.y_max - b.y_min); }
+function bfCanvasSize(c) { return { w: Math.max(320, c.clientWidth || 600), h: Math.max(220, c.clientHeight || 320) }; }
+function bfSetupCanvas(c) {
+  const { w, h } = bfCanvasSize(c), dpr = window.devicePixelRatio || 1;
+  const W = Math.round(w * dpr), H = Math.round(h * dpr);
+  if (c.width !== W || c.height !== H) { c.width = W; c.height = H; }
+  const ctx = c.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  return { ctx, w, h };
+}
+function bfCanvasPoint(ev, c) { const r = c.getBoundingClientRect(); return { x: ev.clientX - r.left, y: ev.clientY - r.top }; }
+function bfGrid(ctx, w, h, b, label) {
+  ctx.fillStyle = "#fbfbfd"; ctx.fillRect(0, 0, w, h);
+  ctx.strokeStyle = "#ececf0"; ctx.lineWidth = 1;
+  for (let i = 1; i < 10; i++) {
+    const x = w * i / 10, y = h * i / 10;
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+  }
+  if (b.x_min < 0 && b.x_max > 0) { const x = bfX2p(0, b, w); ctx.strokeStyle = "#d2d2d7"; ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke(); }
+  if (b.y_min < 0 && b.y_max > 0) { const y = bfY2p(0, b, h); ctx.strokeStyle = "#d2d2d7"; ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke(); }
+  ctx.fillStyle = "#8e8e93"; ctx.font = "11px sans-serif";
+  ctx.fillText(label, 8, 15);
+  ctx.fillText(`x ${b.x_min.toFixed(1)}..${b.x_max.toFixed(1)} m`, 8, h - 8);
+  ctx.textAlign = "right"; ctx.fillText(`y ${b.y_min.toFixed(1)}..${b.y_max.toFixed(1)} m`, w - 8, h - 8); ctx.textAlign = "left";
+}
+function bfDrawRect(ctx, r, b, w, h, selected, draft) {
+  const x1 = bfX2p(r.x_min, b, w), x2 = bfX2p(r.x_max, b, w);
+  const y1 = bfY2p(r.y_max, b, h), y2 = bfY2p(r.y_min, b, h);
+  ctx.fillStyle = draft ? "rgba(255,159,10,.18)" : selected ? "rgba(0,113,227,.12)" : "rgba(10,132,255,.07)";
+  ctx.fillRect(x1, y1, x2 - x1, y2 - y1);
+  ctx.strokeStyle = draft ? "#ff9f0a" : selected ? "#0071e3" : "#0a84ff";
+  ctx.lineWidth = selected || draft ? 2 : 1.2;
+  ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+  if (selected && !draft) {
+    ctx.fillStyle = "#0071e3";
+    [[x1, y1], [x2, y1], [x1, y2], [x2, y2], [(x1 + x2) / 2, y1], [(x1 + x2) / 2, y2], [x1, (y1 + y2) / 2], [x2, (y1 + y2) / 2]].forEach(([x, y]) => ctx.fillRect(x - 3, y - 3, 6, 6));
+  }
+}
+function bfDrawPoints(ctx, s, b, w, h, axis) {
+  const pts = s.points || [], fil = s.filtered || [];
+  for (let i = 0; i < pts.length; i++) {
+    const p = pts[i], x = p[0], y = axis === "xy" ? p[1] : p[2];
+    if (x < b.x_min || x > b.x_max || y < b.y_min || y > b.y_max) continue;
+    ctx.fillStyle = fil[i] ? "rgba(255,59,48,.75)" : "rgba(0,113,227,.30)";
+    const px = bfX2p(x, b, w), py = bfY2p(y, b, h);
+    ctx.fillRect(px - 1, py - 1, 2, 2);
+  }
+}
+function bfHitRect(rects, pt, b, w, h) {
+  const tol = 8;
+  for (let i = rects.length - 1; i >= 0; i--) {
+    const r = rects[i], x1 = bfX2p(r.x_min, b, w), x2 = bfX2p(r.x_max, b, w);
+    const y1 = bfY2p(r.y_max, b, h), y2 = bfY2p(r.y_min, b, h), xm = (x1 + x2) / 2, ym = (y1 + y2) / 2;
+    const handles = [
+      ["x_min_y_max", x1, y1], ["x_max_y_max", x2, y1], ["x_min_y_min", x1, y2], ["x_max_y_min", x2, y2],
+      ["y_max", xm, y1], ["y_min", xm, y2], ["x_min", x1, ym], ["x_max", x2, ym],
+    ];
+    for (const [k, x, y] of handles) if (Math.abs(pt.x - x) <= tol && Math.abs(pt.y - y) <= tol) return { i, handle: k };
+  }
+  for (let i = rects.length - 1; i >= 0; i--) {
+    const r = rects[i], x1 = bfX2p(r.x_min, b, w), x2 = bfX2p(r.x_max, b, w);
+    const y1 = bfY2p(r.y_max, b, h), y2 = bfY2p(r.y_min, b, h);
+    if (pt.x >= x1 && pt.x <= x2 && pt.y >= y1 && pt.y <= y2) return { i, handle: null };
+  }
+  return { i: null, handle: null };
+}
+function bfResizeRect(orig, handle, wx, wy) {
+  const r = { ...orig };
+  if (handle.includes("x_min")) r.x_min = wx;
+  if (handle.includes("x_max")) r.x_max = wx;
+  if (handle.includes("y_min")) r.y_min = wy;
+  if (handle.includes("y_max")) r.y_max = wy;
+  return bfNormalizeRect(r) || r;
+}
+function bfRearBounds(f) {
+  const b = (f && f.rear_axle_box) || { x_min: -2.8, x_max: 2.8, y_min: -4.5, y_max: 9.5 };
+  return { x_min: Math.min(-8, b.x_min - 2), x_max: Math.max(8, b.x_max + 2), y_min: Math.min(-10, b.y_min - 2), y_max: Math.max(12, b.y_max + 2) };
+}
+function bfDrawXY() {
+  const c = document.getElementById("bf-xy"), b = S.body;
+  if (!c || !b || !b.scan || !b.body_filter) return;
+  const { ctx, w, h } = bfSetupCanvas(c), vb = b.scan.xy;
+  bfGrid(ctx, w, h, vb, `XY 俯视 · ${b.topic}`);
+  bfDrawPoints(ctx, b.scan, vb, w, h, "xy");
+  const rects = b.body_filter.lidar_rectangles[b.topic_key] || [], drag = S.bodyForm.drag;
+  rects.forEach((r, i) => {
+    if (drag && drag.i === i && drag.mode !== "draw") return;
+    bfDrawRect(ctx, r, vb, w, h, S.bodyForm.sel === i, false);
+  });
+  if (drag && drag.rect) bfDrawRect(ctx, drag.rect, vb, w, h, true, true);
+}
+function bfDrawXZ() {
+  const c = document.getElementById("bf-xz"), b = S.body;
+  if (!c || !b || !b.scan || !b.body_filter) return;
+  const { ctx, w, h } = bfSetupCanvas(c), vb = b.scan.xz;
+  bfGrid(ctx, w, h, vb, "XZ 侧视 · 横轴 X / 纵轴 Z");
+  bfDrawPoints(ctx, b.scan, vb, w, h, "xz");
+  const z = Number(b.body_filter.minimum_z), py = bfY2p(z, vb, h);
+  ctx.strokeStyle = "#ff3b30"; ctx.lineWidth = 1.5; ctx.setLineDash([6, 4]);
+  ctx.beginPath(); ctx.moveTo(0, py); ctx.lineTo(w, py); ctx.stroke(); ctx.setLineDash([]);
+  ctx.fillStyle = "#ff3b30"; ctx.font = "11px sans-serif"; ctx.fillText(`minimum_z = ${z.toFixed(2)} m`, 8, Math.max(14, py - 5));
+}
+function bfDrawRear() {
+  const c = document.getElementById("bf-rear"), b = S.body;
+  if (!c || !b || !b.body_filter) return;
+  const { ctx, w, h } = bfSetupCanvas(c), vb = bfRearBounds(b.body_filter);
+  bfGrid(ctx, w, h, vb, "后轴 XY 框（网格示意）");
+  const drag = S.bodyForm.rearDrag;
+  if (!drag || drag.mode === "draw") bfDrawRect(ctx, b.body_filter.rear_axle_box, vb, w, h, false, false);
+  if (drag && drag.rect) bfDrawRect(ctx, drag.rect, vb, w, h, true, true);
+  ctx.fillStyle = "#8e8e93"; ctx.font = "11px sans-serif"; ctx.fillText("+Y 车头方向", 8, 30);
+}
+function bfDrawAll() { bfDrawXY(); bfDrawXZ(); bfDrawRear(); }
+function bfAttachXY(c) {
+  c.addEventListener("pointerdown", (ev) => {
+    const b = S.body; if (!b || !b.scan || !b.body_filter) return;
+    const { w, h } = bfCanvasSize(c), pt = bfCanvasPoint(ev, c), vb = b.scan.xy;
+    const wx = bfP2x(pt.x, vb, w), wy = bfP2y(pt.y, vb, h);
+    const rects = b.body_filter.lidar_rectangles[b.topic_key] || (b.body_filter.lidar_rectangles[b.topic_key] = []);
+    const hit = bfHitRect(rects, pt, vb, w, h);
+    let drag;
+    if (hit.handle) drag = { mode: "resize", i: hit.i, handle: hit.handle, orig: { ...rects[hit.i] }, rect: { ...rects[hit.i] }, start: { wx, wy } };
+    else if (hit.i != null) drag = { mode: "move", i: hit.i, orig: { ...rects[hit.i] }, rect: { ...rects[hit.i] }, start: { wx, wy } };
+    else drag = { mode: "draw", rect: { x_min: wx, y_min: wy, x_max: wx, y_max: wy }, start: { wx, wy } };
+    S.bodyForm.drag = drag; S.bodyForm.sel = hit.i;
+    c.setPointerCapture(ev.pointerId); bfDrawXY();
+  });
+  c.addEventListener("pointermove", (ev) => {
+    const drag = S.bodyForm.drag, b = S.body; if (!drag || !b) return;
+    const { w, h } = bfCanvasSize(c), pt = bfCanvasPoint(ev, c), vb = b.scan.xy;
+    const wx = bfP2x(pt.x, vb, w), wy = bfP2y(pt.y, vb, h);
+    if (drag.mode === "draw") drag.rect = bfNormalizeRect({ x_min: drag.start.wx, y_min: drag.start.wy, x_max: wx, y_max: wy });
+    else if (drag.mode === "move") {
+      const dx = wx - drag.start.wx, dy = wy - drag.start.wy;
+      drag.rect = { x_min: drag.orig.x_min + dx, x_max: drag.orig.x_max + dx, y_min: drag.orig.y_min + dy, y_max: drag.orig.y_max + dy };
+    } else drag.rect = bfResizeRect(drag.orig, drag.handle, wx, wy);
+    bfDrawXY();
+  });
+  const finish = () => {
+    const drag = S.bodyForm.drag, b = S.body; if (!drag || !b) return;
+    S.bodyForm.drag = null;
+    const rects = b.body_filter.lidar_rectangles[b.topic_key] || (b.body_filter.lidar_rectangles[b.topic_key] = []);
+    const r = bfNormalizeRect(drag.rect);
+    if (r && r.x_max - r.x_min > 0.05 && r.y_max - r.y_min > 0.05) {
+      if (drag.mode === "draw") { rects.push(r); S.bodyForm.sel = rects.length - 1; }
+      else { rects[drag.i] = r; S.bodyForm.sel = drag.i; }
+    }
+    bfRecompute(); render();
+  };
+  c.addEventListener("pointerup", finish);
+  c.addEventListener("pointercancel", () => { S.bodyForm.drag = null; bfDrawXY(); });
+}
+function bfAttachXZ(c) {
+  const setZ = (ev) => {
+    const b = S.body; if (!b || !b.body_filter || !b.scan) return;
+    const { h } = bfCanvasSize(c), pt = bfCanvasPoint(ev, c);
+    b.body_filter.minimum_z = Math.round(bfP2y(pt.y, b.scan.xz, h) * 100) / 100;
+    bfRecompute(); bfDrawAll();
+    const inp = document.querySelector('[data-act="bf-global"][data-k="minimum_z"]'); if (inp) inp.value = b.body_filter.minimum_z;
+  };
+  c.addEventListener("pointerdown", (ev) => { S.bodyForm.zDrag = true; c.setPointerCapture(ev.pointerId); setZ(ev); });
+  c.addEventListener("pointermove", (ev) => { if (S.bodyForm.zDrag) setZ(ev); });
+  c.addEventListener("pointerup", () => { S.bodyForm.zDrag = false; });
+  c.addEventListener("pointercancel", () => { S.bodyForm.zDrag = false; });
+}
+function bfAttachRear(c) {
+  c.addEventListener("pointerdown", (ev) => {
+    const b = S.body; if (!b || !b.body_filter) return;
+    const { w, h } = bfCanvasSize(c), pt = bfCanvasPoint(ev, c), vb = bfRearBounds(b.body_filter);
+    const wx = bfP2x(pt.x, vb, w), wy = bfP2y(pt.y, vb, h), orig = b.body_filter.rear_axle_box;
+    const hit = bfHitRect([orig], pt, vb, w, h);
+    let drag;
+    if (hit.handle) drag = { mode: "resize", handle: hit.handle, orig: { ...orig }, rect: { ...orig }, start: { wx, wy } };
+    else if (hit.i != null) drag = { mode: "move", orig: { ...orig }, rect: { ...orig }, start: { wx, wy } };
+    else drag = { mode: "draw", rect: { x_min: wx, y_min: wy, x_max: wx, y_max: wy }, start: { wx, wy } };
+    S.bodyForm.rearDrag = drag; c.setPointerCapture(ev.pointerId); bfDrawRear();
+  });
+  c.addEventListener("pointermove", (ev) => {
+    const drag = S.bodyForm.rearDrag, b = S.body; if (!drag || !b) return;
+    const { w, h } = bfCanvasSize(c), pt = bfCanvasPoint(ev, c), vb = bfRearBounds(b.body_filter);
+    const wx = bfP2x(pt.x, vb, w), wy = bfP2y(pt.y, vb, h);
+    if (drag.mode === "draw") drag.rect = bfNormalizeRect({ x_min: drag.start.wx, y_min: drag.start.wy, x_max: wx, y_max: wy });
+    else if (drag.mode === "move") {
+      const dx = wx - drag.start.wx, dy = wy - drag.start.wy;
+      drag.rect = { x_min: drag.orig.x_min + dx, x_max: drag.orig.x_max + dx, y_min: drag.orig.y_min + dy, y_max: drag.orig.y_max + dy };
+    } else drag.rect = bfResizeRect(drag.orig, drag.handle, wx, wy);
+    bfDrawRear();
+  });
+  const finish = () => {
+    const drag = S.bodyForm.rearDrag, b = S.body; if (!drag || !b) return;
+    S.bodyForm.rearDrag = null;
+    const r = bfNormalizeRect(drag.rect);
+    if (r && r.x_max - r.x_min > 0.1 && r.y_max - r.y_min > 0.1) b.body_filter.rear_axle_box = r;
+    bfRecompute(); render();
+  };
+  c.addEventListener("pointerup", finish);
+  c.addEventListener("pointercancel", () => { S.bodyForm.rearDrag = null; bfDrawRear(); });
+}
+function initBodyCanvases() {
+  S.bodyForm.drag = null; S.bodyForm.rearDrag = null; S.bodyForm.zDrag = false;
+  const xy = document.getElementById("bf-xy"), xz = document.getElementById("bf-xz"), rear = document.getElementById("bf-rear");
+  if (xy) bfAttachXY(xy); if (xz) bfAttachXZ(xz); if (rear) bfAttachRear(rear);
+  bfDrawAll();
+}
+window.addEventListener("resize", () => { if (S.page === "body") bfDrawAll(); });
+
+function pageBody() {
+  const b = S.body, f = b && b.body_filter, s = b && b.scan, v = vehicle(), d = S.dataset;
+  const topics = (b && b.topics) || [], key = (b && b.topic_key) || bfKey((b && b.topic) || "");
+  const rects = (f && f.lidar_rectangles && f.lidar_rectangles[key]) || [];
+  const rear = (f && f.rear_axle_box) || { x_min: -2.8, x_max: 2.8, y_min: -4.5, y_max: 9.5 };
+  const filtered = s ? s.filtered_count : 0, total = s && s.points ? s.points.length : 0;
+  const err = (b && b.error) || (s && s.error);
+  const dur = (b && b.duration_s) || 0;
+  return `
+  <div class="card">
+    <div class="card-h"><h2>车身点云可视化过滤</h2><div class="row">
+      <button class="btn sm" data-act="bf-reload" ${S.bodyBusy ? "disabled" : ""}>重新加载</button>
+      <button class="btn sm primary" data-act="bf-save" ${S.bodyBusy || !f ? "disabled" : ""}>保存到标定文件</button>
+    </div></div>
+    <div class="small muted">在真实录制点云上拖拽绘制 / 移动 / 拉伸车身过滤矩形；红色点会被当前参数删除。参数写入该车激活版本的 <code>calibration.json:body_filter</code>，在线建图与离线标定都会读取。</div>
+    <div class="form" style="margin-top:12px">
+      <div class="field"><label>车辆</label><select data-act="set-vehicle">${S.vehicles.map((x) => `<option value="${esc(x.id)}" ${v && x.id === v.id ? "selected" : ""}>${esc(x.mine)} / ${esc(x.truck)}</option>`).join("")}</select></div>
+      <div class="field"><label>标定版本</label><input type="text" value="${esc((b && b.id) || (v && v.active) || "—")}" readonly></div>
+      <div class="field wide"><label>标定文件</label><input type="text" class="mono small" value="${esc((b && b.calibration_file) || "")}" readonly></div>
+      <div class="field wide"><label>数据源</label><input type="text" class="mono small" value="${esc((b && b.dataset) || (d && d.path) || "")}" readonly></div>
+      <div class="field"><label>LiDAR 话题</label><select data-act="bf-param" data-key="topic">${topics.map((t) => `<option value="${esc(t)}" ${(b && b.topic) === t ? "selected" : ""}>${esc(t)}</option>`).join("")}</select></div>
+      <div class="field"><label>采样时刻（s，0–${bfNum(dur)}）</label><input type="number" min="0" max="${bfNum(dur)}" step="1" data-act="bf-param" data-key="t" value="${bfNum((s && s.t_s) || 0)}"></div>
+    </div>
+    ${err ? `<div class="callout bad" style="margin-top:10px">${esc(err)}</div>` : ""}
+  </div>
+
+  <div class="card">
+    <div class="card-h"><h2>点云预览</h2><span class="small muted" id="bf-filtered-count">当前样本过滤 <b>${filtered}</b> / ${total} 点（原始 ${(s && s.raw_points) || 0} 点）</span></div>
+    <div class="bf-grid">
+      <div><h4>XY 俯视（物理 ${esc((b && b.topic) || "LiDAR")} 坐标系，单位 m）</h4><canvas id="bf-xy" class="bf-canvas"></canvas>
+        <div class="bf-legend"><span><i class="keep"></i>保留点</span><span><i class="drop"></i>将过滤点</span><span><i class="rect"></i>过滤框</span></div></div>
+      <div><h4>XZ 侧视（拖动设置 minimum_z）</h4><canvas id="bf-xz" class="bf-canvas"></canvas>
+        <div class="small muted">仅当点位于 XY 矩形内且 <code>z &gt; minimum_z</code> 时删除；在图中上下拖动红色虚线。</div></div>
+    </div>
+    <div class="callout warn" style="margin-top:12px">操作：空白处拖拽＝新增矩形；框内拖拽＝移动；拖拽边框或角点＝缩放；右侧表格可以精确输入。每次修改都会立即重算红色点，点击“保存到标定文件”后生效。</div>
+  </div>
+
+  <div class="grid g2">
+    <div class="card"><div class="card-h"><h2>${esc(key)} 过滤矩形（${rects.length}）</h2><button class="btn sm" data-act="bf-addrect">新增</button></div>
+      <table class="bf-table"><thead><tr><th>#</th><th>x_min</th><th>x_max</th><th>y_min</th><th>y_max</th><th></th></tr></thead><tbody>
+      ${rects.length ? rects.map((r, i) => `<tr><td>${i + 1}</td>${["x_min", "x_max", "y_min", "y_max"].map((k) => `<td><input type="number" step="0.1" data-act="bf-rect" data-i="${i}" data-k="${k}" value="${bfNum(r[k])}"></td>`).join("")}<td><button class="btn sm danger" data-act="bf-delrect" data-i="${i}">删除</button></td></tr>`).join("") : '<tr><td colspan="6" class="empty">暂无矩形；在 XY 画布空白处拖拽绘制。</td></tr>'}
+      </tbody></table>
+    </div>
+    <div class="card"><div class="card-h"><h2>后轴车身框（离线标定）</h2></div>
+      <canvas id="bf-rear" class="bf-canvas short"></canvas>
+      <div class="form" style="margin-top:10px">${["x_min", "x_max", "y_min", "y_max"].map((k) => `<div class="field"><label>${k}</label><input type="number" step="0.1" data-act="bf-rear" data-k="${k}" value="${bfNum(rear[k])}"></div>`).join("")}</div>
+      <div class="small muted" style="margin-top:8px">该框位于后轴坐标系，用于 axle / ground / driven / gcons / 评估等离线阶段的车身点剔除。画布为网格示意，可拖拽重画。</div>
+    </div>
+  </div>
+
+  <div class="card"><div class="card-h"><h2>全局参数与生效预览</h2></div>
+    <div class="form">
+      <label class="check"><input type="checkbox" data-act="bf-global" data-k="enabled" ${f && f.enabled ? "checked" : ""}><span class="switch"></span><span>启用车身过滤</span></label>
+      <div class="field"><label>minimum_z（m）</label><input type="number" step="0.1" data-act="bf-global" data-k="minimum_z" value="${bfNum(f && f.minimum_z)}"></div>
+      <div class="field"><label>来源</label><input type="text" value="${esc((f && f.source) || "")}" readonly></div>
+      <div class="field"><label>更新时间</label><input type="text" value="${esc((f && f.updated) || "")}" readonly></div>
+    </div>
+    <h4 style="margin-top:14px">将写入轮次 config.yaml 的 ROS 参数</h4>
+    <pre id="bf-yaml" class="small">${esc(JSON.stringify((b && b.yaml_overrides) || {}, null, 2))}</pre>
+  </div>`;
+}
+
+Object.assign(A, {
+  async "bf-load"() {
+    if (S.bodyBusy) return;
+    const st = S.state || {}, v = st.vehicle || {};
+    if (S.body && (S.body.mine !== v.mine || S.body.truck !== v.truck)) S.bodyForm.topic = "";
+    S.bodyBusy = true; render();
+    try {
+      const q = new URLSearchParams({
+        mine: v.mine || "", truck: v.truck || "", dataset: (st.data && st.data.dataset) || "",
+        topic: S.bodyForm.topic || "", t: String(S.bodyForm.t || 0), max_points: String(S.bodyForm.max_points || 12000),
+      });
+      S.body = await api("/api/body-filter?" + q.toString());
+      S.bodyForm.topic = S.body.topic || "";
+      S.bodyForm.t = (S.body.scan && S.body.scan.t_s) || 0;
+      S.bodyForm.sel = null;
+    } catch (e) {
+      S.body = { error: e.message || String(e) };
+      toast(S.body.error, "bad");
+    }
+    S.bodyBusy = false; render();
+  },
+  "bf-param"(el) {
+    const k = el.dataset.key;
+    S.bodyForm[k] = k === "t" ? Number(el.value || 0) : el.value;
+    A["bf-load"]();
+  },
+  "bf-reload"() { A["bf-load"](); },
+  async "bf-save"() {
+    const b = S.body; if (!b || !b.body_filter) return toast("尚未加载车身过滤参数", "bad");
+    await act(async () => {
+      const r = await api("/api/body-filter", "POST", {
+        mine: b.mine, truck: b.truck, id: b.id, source: "Studio 车身点云可视化过滤",
+        body_filter: b.body_filter,
+      });
+      toast(`已保存到 ${r.calibration_file}`, "ok");
+      await A["bf-load"]();
+    });
+  },
+  "bf-addrect"() {
+    const b = S.body, f = b && b.body_filter; if (!f) return;
+    const key = b.topic_key, rects = f.lidar_rectangles[key] || (f.lidar_rectangles[key] = []);
+    rects.push(bfDefaultRect()); S.bodyForm.sel = rects.length - 1; bfRecompute(); render();
+  },
+  "bf-delrect"(el) {
+    const b = S.body, f = b && b.body_filter; if (!f) return;
+    const rects = f.lidar_rectangles[b.topic_key] || [];
+    rects.splice(Number(el.dataset.i), 1); S.bodyForm.sel = null; bfRecompute(); render();
+  },
+  "bf-rect"(el) {
+    const b = S.body, f = b && b.body_filter; if (!f) return;
+    const rects = f.lidar_rectangles[b.topic_key] || [], r = rects[Number(el.dataset.i)];
+    if (!r) return;
+    r[el.dataset.k] = Number(el.value); const n = bfNormalizeRect(r);
+    if (n) rects[Number(el.dataset.i)] = n;
+    S.bodyForm.sel = Number(el.dataset.i); bfRecompute(); bfDrawAll();
+  },
+  "bf-global"(el) {
+    const f = S.body && S.body.body_filter; if (!f) return;
+    if (el.dataset.k === "enabled") f.enabled = el.checked;
+    else if (el.dataset.k === "minimum_z") f.minimum_z = Number(el.value);
+    bfRecompute(); bfDrawAll();
+  },
+  "bf-rear"(el) {
+    const f = S.body && S.body.body_filter; if (!f) return;
+    f.rear_axle_box[el.dataset.k] = Number(el.value);
+    const n = bfNormalizeRect(f.rear_axle_box); if (n) f.rear_axle_box = n;
+    bfRecompute(); bfDrawAll();
+  },
+});
+
 document.addEventListener("click", (ev) => {
   const nav = ev.target.closest("#nav a[data-page]");
   if (nav) { ev.preventDefault(); A.go(nav); return; }
@@ -1054,6 +1442,7 @@ document.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && S.draw
     render();
     if (S.page === "data") A["fs-open"]({ dataset: { path: S.dataset?.path ? S.dataset.path.replace(/\/[^/]+$/, "") : "/home/project" } });
     if (S.page === "system") A["results-usage"]();
+    if (S.page === "body") A["bf-load"]();
     schedule();
   } catch (e) {
     $("#page").innerHTML = `<div class="callout bad">无法连接 Studio 后端：${esc(e.message)}</div>`;

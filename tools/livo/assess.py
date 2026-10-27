@@ -55,8 +55,10 @@ from livo import rosenv  # noqa: E402
 rosenv.ensure()
 
 from livo.dataset import Dataset, norm  # noqa: E402
+from livo.body_filter import normalize, rear_axle_mask  # noqa: E402
 
 SCHEMA = 2
+DEFAULT_BODY_FILTER = normalize({})
 LIDAR_KEYS = {"front_right_lidar": "transform_matrix_lidar_1", "back_lidar": "transform_matrix_lidar_2",
               "front_left_lidar": "transform_matrix_lidar_3", "front_lidar": "transform_matrix_lidar_6"}
 REFERENCE_LIDAR = "front_lidar"
@@ -291,7 +293,7 @@ def load_calibration(path):
             if key in entry:
                 mats[topic] = np.asarray(entry[key], float).reshape(4, 4)
     return {"path": str(path), "matrices": mats, "time_offsets": calib.get("time_offsets", {}),
-            "type": calib.get("calibration_type", "")}
+            "type": calib.get("calibration_type", ""), "body_filter": normalize(calib)}
 
 
 def vehicle_ids(ds, calib_path):
@@ -336,7 +338,7 @@ def is_keyframe(payload):
     return False
 
 
-def slot_structure(d, mats):
+def slot_structure(d, mats, filt=None):
     """Above-ground structure count of one sampled slot (all LiDARs, rear-axle frame, 4-30 m, body box removed)."""
     above = total = 0
     for s, P in d.items():
@@ -344,7 +346,7 @@ def slot_structure(d, mats):
             continue
         Qp = transform(P, mats[s])
         r = np.hypot(Qp[:, 0], Qp[:, 1])
-        body = (np.abs(Qp[:, 0]) < 3.0) & (Qp[:, 1] > -9.0) & (Qp[:, 1] < 5.0)
+        body = rear_axle_mask(Qp, filt or DEFAULT_BODY_FILTER)
         sel = (r > 4.0) & (r < 30.0) & ~body
         above += int(((Qp[:, 2] > 0.5) & sel).sum())
         total += int(sel.sum())
@@ -570,7 +572,7 @@ def scan_chunk(job):
                 if sname not in d:
                     d[sname] = cloud_xyz(data)
                 if len(d) == len(lidar_topics) or ts >= next_sample_ns + NS:
-                    above, total = slot_structure(d, calib["matrices"])
+                    above, total = slot_structure(d, calib["matrices"], calib.get("body_filter"))
                     slots_eval.append({"t_s": round(next_sample_ns / NS - t0, 1), "above_ground": above, "points": total})
                     del sample_slots[next_sample_ns]
                     next_sample_ns += sample_every_ns

@@ -25,7 +25,7 @@
 #        [--map-voxel M] [--map-source all|keyframes] [--map-tile M] [--map-min-points N] [--map-keyframes] [--no-map-export]
 #                                          (standard map products in Log/fusion/<run>/map/, see tools/livo/map_export.py:
 #                                           voxel-filtered global map (+ RGB), optional tiles and per-keyframe clouds)
-#        [--set laser_mapping.key.subkey=value ...] [--no-eval]
+#        [--set laser_mapping.key.subkey=value ...] [--no-eval] [--write-config-only]
 #   (--bag DIR is an alias of --dataset)
 # Examples:
 #   bash scripts/run_wuhu_round.sh wuhu_livo_120 --mode livo --dataset /home/project/data/haibo/wuhu_livo/ros2bag
@@ -45,6 +45,7 @@ mode=lio; use_rtk=true; save_map=true; use_rviz=false; rate=1.0; start_offset=0;
 skip_stationary=0; stationary_min=30; stationary_lidar=1.0
 map_export=1; map_voxel=0.05; map_source=all; map_tile=0; map_keyframes=0; map_min_points=1
 min_free_gb=0
+write_config_only=0
 sets=(); dataset="/home/project/data/haibo/wuhu_livo/ros2bag"; calibration=""
 while (($#)); do
   case "$1" in
@@ -77,6 +78,7 @@ while (($#)); do
     --min-free-gb) min_free_gb="$2"; shift 2 ;;   # below this free space: slim the oldest unprotected rounds first
     --bag|--dataset) dataset="$2"; shift 2 ;;
     --calibration) calibration="$2"; shift 2 ;;
+    --write-config-only) write_config_only=1; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -198,33 +200,15 @@ if [[ $use_rtk == false ]]; then
 fi
 
 # Effective configuration: copy of the production yaml with the requested overrides applied.
+# The vehicle's calibration.json supplies body_filter rectangles and the rear-axle precheck box.
 config="$out/config.yaml"
-/usr/bin/python3 - "$repo/config/wuhu_truck29.yaml" "$config" "${sets[@]}" <<'PY'
-import sys, yaml
-src, dst, *sets = sys.argv[1:]
-with open(src, encoding="utf-8") as f:
-    doc = yaml.safe_load(f)
-params = doc["laser_mapping"]["ros__parameters"]
-for item in sets:
-    key, _, raw = item.partition("=")
-    node = params
-    parts = key.split(".")
-    for p in parts[:-1]:
-        node = node.setdefault(p, {})
-    old = node.get(parts[-1])
-    try:
-        val = yaml.safe_load(raw)
-    except Exception:
-        val = raw
-    if isinstance(old, bool) and not isinstance(val, bool):
-        val = str(raw).lower() in ("1", "true", "yes")
-    elif isinstance(old, float) and isinstance(val, int):
-        val = float(val)
-    node[parts[-1]] = val
-    print(f"override {key}: {old} -> {val}")
-with open(dst, "w", encoding="utf-8") as f:
-    yaml.safe_dump(doc, f, sort_keys=False, allow_unicode=True)
-PY
+/usr/bin/python3 "$repo/tools/livo/effective_config.py" \
+  "$repo/config/wuhu_truck29.yaml" "$config" "$calibration" "${sets[@]}" | tee -a "$out/run.log"
+
+if (( write_config_only )); then
+  echo "write-config-only: effective config written to $config"
+  exit 0
+fi
 
 # Refuse to start on top of a stale mapper/player from an earlier round.
 # Only this pipeline's own processes count as stale (an earlier mapper competes for CPU/memory). A foreign

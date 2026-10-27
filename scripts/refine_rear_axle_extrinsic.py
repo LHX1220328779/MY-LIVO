@@ -55,6 +55,7 @@ for _cand in (_LivoPath(__file__).resolve().parents[1] / "tools", _LivoPath("/ho
 from livo import rosenv as _rosenv  # noqa: E402
 _rosenv.ensure()
 from livo.dataset import Dataset  # noqa: E402
+from livo.body_filter import normalize, rear_axle_mask  # noqa: E402
 from rclpy.serialization import deserialize_message  # noqa: E402
 from diagnostic_msgs.msg import DiagnosticArray  # noqa: E402
 from nav_msgs.msg import Odometry  # noqa: E402
@@ -66,7 +67,7 @@ from scipy.spatial.transform import Rotation as R, Slerp  # noqa: E402
 REFERENCE_TOPIC, REFERENCE_KEY = "front_lidar", "transform_matrix_lidar_6"
 INS_TOPIC, STATUS_TOPIC = "imu_data/odometry", "imu_data/ins_status"
 RTK_FIXED = 4                       # ins_pos_mode of an RTK-fixed INS solution
-BODY_BOX = (-2.8, 2.8, -4.5, 9.5)   # own-vehicle returns (rear-axle x/y), same box as the other LiDAR stages
+BODY_FILTER = normalize({})  # vehicle-specific body box; loaded from calibration.json in main()
 COARSE_ITERS, MAX_ITERS = 8, 24
 # quality gate: a correction beyond these limits is not a calibration but a wrong reference/recording
 GATE_MAX_ROT_DEG, GATE_MAX_TRANS_M, GATE_MAX_DT_S = 6.0, 0.6, 0.08
@@ -218,7 +219,7 @@ def assemble(scans, poses, T_ref, vmin, motion_age):
         if not fixed:
             skipped["not_rtk_fixed"] += 1; continue
         Q = P @ T_ref[:3, :3].T + T_ref[:3, 3]
-        body = (Q[:, 0] > BODY_BOX[0]) & (Q[:, 0] < BODY_BOX[1]) & (Q[:, 1] > BODY_BOX[2]) & (Q[:, 1] < BODY_BOX[3])
+        body = rear_axle_mask(Q, BODY_FILTER)
         P, tt = P[~body], tt[~body]
         Rw, tw = poses.at(tt)
         vel, om = poses.rates(tt)
@@ -330,7 +331,9 @@ def main():
                          "(default: <= 8, limited by the available memory, ~1.5 GB per worker)")
     a = ap.parse_args()
     t_start = time.time()
+    global BODY_FILTER
     calib = json.load(open(a.calibration))
+    BODY_FILTER = normalize(calib)
     T_ref = None
     for entry in calib.get("lidar", []):
         if REFERENCE_KEY in entry:

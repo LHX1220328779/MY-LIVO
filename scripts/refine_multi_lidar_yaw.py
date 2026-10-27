@@ -61,6 +61,7 @@ for _cand in (_LivoPath(__file__).resolve().parents[1] / "tools", _LivoPath("/ho
 from livo import rosenv as _rosenv  # noqa: E402
 _rosenv.ensure()
 from livo.dataset import Dataset  # noqa: E402
+from livo.body_filter import normalize, rear_axle_mask  # noqa: E402
 from rclpy.serialization import deserialize_message
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2
@@ -77,6 +78,7 @@ GATE_MAX_TRANS_M = 0.15
 GATE_MIN_VERTICAL = 2000         # vertical planar matches needed to trust yaw/x/y
 GATE_VERT_REGRESS_M = 0.005      # vertical residual may not get worse by more than this
 SHORT_RECORDING_S = 90.0
+BODY_FILTER = normalize({})  # vehicle-specific body box; loaded from calibration.json in main()
 
 
 def voxel_down(P, size):
@@ -397,7 +399,9 @@ def main():
                     help="returns to register: the round's own deskewed archive scans.bin/sources.bin (auto when present; "
                          "the geometry the map is built from) or the raw bag with a per-point re-deskew")
     a = ap.parse_args()
+    global BODY_FILTER
     calib = json.load(open(a.calibration))
+    BODY_FILTER = normalize(calib)
     M = {}
     for entry in calib["lidar"]:
         for topic, k in KEYS.items():
@@ -439,7 +443,7 @@ def main():
             kept = []
             for P, ts, h in scans[topic]:
                 Q = P @ M[topic][:3, :3].T + M[topic][:3, 3]
-                excl = (Q[:, 0] > -2.8) & (Q[:, 0] < 2.8) & (Q[:, 1] > -4.5) & (Q[:, 1] < 9.5)
+                excl = rear_axle_mask(Q, BODY_FILTER)
                 if (~excl).sum() >= 100: kept.append((P[~excl], ts[~excl], h))
             scans[topic] = kept
         n_used = {t: len(scans[t]) for t in topics}
@@ -466,7 +470,7 @@ def main():
         sub = voxel_down(P, 0.1)
         P, ts = P[sub], ts[sub]
         Q = P @ M[topic][:3, :3].T + M[topic][:3, 3]                  # rear-axle frame
-        excl = (Q[:, 0] > -2.8) & (Q[:, 0] < 2.8) & (Q[:, 1] > -4.5) & (Q[:, 1] < 9.5)
+        excl = rear_axle_mask(Q, BODY_FILTER)
         scans[topic].append((P[~excl], ts[~excl], h)); n_used[topic] += 1
     pass2_label = optimized.label if optimized is not None else "disabled"
     report = [f"calibration={a.calibration}", f"run={run}",

@@ -42,6 +42,7 @@ for _cand in (_LivoPath(__file__).resolve().parents[1] / "tools", _LivoPath("/ho
 from livo import rosenv as _rosenv  # noqa: E402
 _rosenv.ensure()
 from livo.dataset import Dataset  # noqa: E402
+from livo.body_filter import normalize, rear_axle_mask  # noqa: E402
 from rclpy.serialization import deserialize_message
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2 as pc2
@@ -53,6 +54,7 @@ KEYS = {"front_right_lidar": "transform_matrix_lidar_1", "back_lidar": "transfor
 REFERENCE = "front_lidar"
 MAX_ITERS = 25
 SHORT_RECORDING_S = 90.0
+BODY_FILTER = normalize({})  # vehicle-specific body box; loaded from calibration.json in main()
 # a correction beyond the refinement scale is still applied (the ground observes tilt/z directly) but flagged:
 # the sensor moved relative to the calibration file and yaw/x/y have to be re-checked by the driven stage
 LARGE_ROT_DEG = 1.0
@@ -86,7 +88,7 @@ def voxel_down(P, size):
 
 def clean(Q, rmin=3.0, rmax=60.0):
     r = np.hypot(Q[:, 0], Q[:, 1])
-    body = (Q[:, 0] > -2.8) & (Q[:, 0] < 2.8) & (Q[:, 1] > -4.5) & (Q[:, 1] < 9.5)
+    body = rear_axle_mask(Q, BODY_FILTER)
     return Q[(r > rmin) & (r < rmax) & ~body & np.isfinite(Q).all(1)]
 
 
@@ -323,7 +325,9 @@ def main():
     ap.add_argument("--no-coarse", action="store_true", help="historic behaviour: always start the solve from the parent matrix")
     a = ap.parse_args()
     short_recording = Dataset.open(a.bag).duration_s < SHORT_RECORDING_S
+    global BODY_FILTER
     calib = json.load(open(a.calibration))
+    BODY_FILTER = normalize(calib)
     M = {}
     for entry in calib["lidar"]:
         for topic, k in KEYS.items():
