@@ -251,10 +251,10 @@ function resourceStats(live) {
   const r = live?.resources; if (!r) return "";
   const n = (k) => { const v = parseFloat(r[k]); return Number.isFinite(v) ? v : null; };
   const gb = (mb) => (mb == null ? "—" : (mb / 1024).toFixed(mb >= 10240 ? 0 : 1));
-  const rt = n("rt_factor"), fps = n("fps");
+  const rt = n("rt_factor"), tp = live?.throughput;
   const skip = live?.player?.skip_windows ? `<div class="small muted" style="margin-top:4px">长时间静止跳过：${live.player.skip_windows} 段，共 ${live.player.skip_s.toFixed(0)} s（快进期间 IMU/INS 全量、激光按间隔抽稀）</div>` : "";
   return `<div class="grid g4" style="margin-top:10px">
-      <div class="stat"><div class="k">处理帧率</div><div class="v">${fps == null ? "—" : fps.toFixed(1)}<small>Hz</small></div></div>
+      <div class="stat"><div class="k">平均帧率</div><div class="v">${tp ? tp.avg_fps.toFixed(1) : "—"}<small>Hz</small></div><div class="small muted">${tp ? `处理 ${tp.frames} 帧 · 活跃 ${tp.window_s.toFixed(0)} s` : "暂无处理数据"}</div></div>
       <div class="stat"><div class="k">实时倍率</div><div class="v ${rt != null && rt < 0.95 ? "warn" : ""}">${rt == null ? "—" : rt.toFixed(2)}<small>×</small></div></div>
       <div class="stat"><div class="k">后端耗时（均值）</div><div class="v">${n("backend_ms") == null ? "—" : n("backend_ms").toFixed(0)}<small>ms/帧</small></div></div>
       <div class="stat"><div class="k">建图进程内存 / CPU</div><div class="v">${gb(n("mapper_rss_mb"))}<small>GB · ${n("mapper_cpu_pct") == null ? "—" : n("mapper_cpu_pct").toFixed(0)}%</small></div></div>

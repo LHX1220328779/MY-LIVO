@@ -7,7 +7,7 @@ import subprocess
 
 from . import calibration, datasets, jobs
 from .common import (PY, REPO, RESULTS, ROUND_SCRIPT, ROS_PROCESS_PATTERN, StudioError, binned_series, count_lines,
-                     csv_last, csv_rows, parse_kv_log, pgrep, read_json, read_tail, safe_path)
+                     csv_all_rows, csv_last, csv_rows, parse_kv_log, pgrep, read_json, read_tail, safe_path)
 
 METRICS_SCRIPT = REPO / "scripts" / "analysis" / "round_metrics.py"
 MAP_EXPORT_TOOL = REPO / "tools" / "livo" / "map_export.py"
@@ -436,6 +436,38 @@ def player_progress(path):
     return out
 
 
+def average_frame_rate(path):
+    """Mean processed frames per wall-clock second over the active processing window of one run.
+
+    Source: results/<round>/resources.csv (tools/livo/resmon.py writes cumulative `frames` and wall time).
+    The window starts at the last sample before the first processed frame and ends at the first sample that
+    already holds the final frame count, so start-up, final export/evaluation and idle tails are excluded.
+    Returns None when the run has no measurable processing window."""
+    header, rows = csv_all_rows(path)
+    if not header or not rows or "wall" not in header or "frames" not in header:
+        return None
+    wi, fi = header.index("wall"), header.index("frames")
+    samples = []
+    for r in rows:
+        try:
+            samples.append((float(r[wi]), float(r[fi])))
+        except (ValueError, IndexError):
+            continue
+    if len(samples) < 2:
+        return None
+    final = samples[-1][1]
+    start = 0
+    for k, (_, frames) in enumerate(samples):
+        if frames > 0:
+            break
+        start = k
+    end = next(k for k, (_, frames) in enumerate(samples) if frames >= final)
+    (w0, f0), (w1, f1) = samples[start], samples[end]
+    if f1 <= f0 or w1 <= w0:
+        return None
+    return {"avg_fps": round((f1 - f0) / (w1 - w0), 2), "frames": int(f1 - f0), "window_s": round(w1 - w0, 1)}
+
+
 def live(round_name):
     p = RESULTS / round_name
     out = {"round": round_name, "exists": p.exists()}
@@ -501,6 +533,7 @@ def live(round_name):
     res = p / "resources.csv"
     if res.exists():
         out["resources"] = csv_last(res)
+        out["throughput"] = average_frame_rate(res)
         out["resource_series"] = binned_series(
             res, "elapsed_s", ["fps", "rt_factor", "mapper_rss_mb", "decoder_rss_mb", "sys_used_mb", "swap_used_mb",
                                "mapper_cpu_pct"],
