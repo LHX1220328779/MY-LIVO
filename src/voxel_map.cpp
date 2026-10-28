@@ -431,8 +431,8 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
       total_residual += fabs(ptpl_list_[i].dis_to_plane_);
     }
     effct_feat_num_ = ptpl_list_.size();
-    cout << "[ LIO ] Raw feature num: " << feats_undistort_->size() << ", downsampled feature num:" << feats_down_size_ 
-         << " effective feature num: " << effct_feat_num_ << " average residual: " << total_residual / std::max(1, effct_feat_num_) << endl;
+    if (iterCount == 0) cout << "[ LIO ] Raw feature num: " << feats_undistort_->size() << ", downsampled feature num:" << feats_down_size_ 
+         << " effective feature num: " << effct_feat_num_ << " average residual: " << total_residual / std::max(1, effct_feat_num_) << '\n';
 
     /*** Computation of Measuremnt Jacobian matrix H and measurents covarience
      * ***/
