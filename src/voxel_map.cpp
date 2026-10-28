@@ -678,11 +678,11 @@ void VoxelMapManager::UpdateVoxelMap(const std::vector<pointWithVar> &input_poin
   float planer_threshold = config_setting_.planner_threshold_;
   int max_layer = config_setting_.max_layer_;
   int max_points_num = config_setting_.max_points_num_;
-  std::vector<int> layer_init_num = config_setting_.layer_init_num_;
+  const std::vector<int> &layer_init_num = config_setting_.layer_init_num_;
   uint plsize = input_points.size();
   for (uint i = 0; i < plsize; i++)
   {
-    const pointWithVar p_v = input_points[i];
+    const pointWithVar &p_v = input_points[i];
     float loc_xyz[3];
     for (int j = 0; j < 3; j++)
     {
@@ -691,17 +691,17 @@ void VoxelMapManager::UpdateVoxelMap(const std::vector<pointWithVar> &input_poin
     }
     VOXEL_LOCATION position((int64_t)loc_xyz[0], (int64_t)loc_xyz[1], (int64_t)loc_xyz[2]);
     auto iter = voxel_map_.find(position);
-    if (iter != voxel_map_.end()) { voxel_map_[position]->UpdateOctoTree(p_v); }
+    if (iter != voxel_map_.end()) { iter->second->UpdateOctoTree(p_v); }
     else
     {
       VoxelOctoTree *octo_tree = new VoxelOctoTree(max_layer, 0, layer_init_num[0], max_points_num, planer_threshold);
       voxel_map_[position] = octo_tree;
-      voxel_map_[position]->layer_init_num_ = &config_setting_.layer_init_num_;
-      voxel_map_[position]->quater_length_ = voxel_size / 4;
-      voxel_map_[position]->voxel_center_[0] = (0.5 + position.x) * voxel_size;
-      voxel_map_[position]->voxel_center_[1] = (0.5 + position.y) * voxel_size;
-      voxel_map_[position]->voxel_center_[2] = (0.5 + position.z) * voxel_size;
-      voxel_map_[position]->UpdateOctoTree(p_v);
+      octo_tree->layer_init_num_ = &config_setting_.layer_init_num_;
+      octo_tree->quater_length_ = voxel_size / 4;
+      octo_tree->voxel_center_[0] = (0.5 + position.x) * voxel_size;
+      octo_tree->voxel_center_[1] = (0.5 + position.y) * voxel_size;
+      octo_tree->voxel_center_[2] = (0.5 + position.z) * voxel_size;
+      octo_tree->UpdateOctoTree(p_v);
     }
   }
 }
@@ -711,10 +711,9 @@ void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, s
   int max_layer = config_setting_.max_layer_;
   double voxel_size = config_setting_.max_voxel_size_;
   double sigma_num = config_setting_.sigma_num_;
-  std::mutex mylock;
   ptpl_list.clear();
   std::vector<PointToPlane> all_ptpl_list(pv_list.size());
-  std::vector<bool> useful_ptpl(pv_list.size());
+  std::vector<char> useful_ptpl(pv_list.size());  // not vector<bool>: each thread writes its own byte
   std::vector<size_t> index(pv_list.size());
   for (size_t i = 0; i < index.size(); ++i)
   {
@@ -757,16 +756,8 @@ void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, s
       }
       if (is_sucess)
       {
-        mylock.lock();
-        useful_ptpl[i] = true;
+        useful_ptpl[i] = 1;
         all_ptpl_list[i] = single_ptpl;
-        mylock.unlock();
-      }
-      else
-      {
-        mylock.lock();
-        useful_ptpl[i] = false;
-        mylock.unlock();
       }
     }
   }

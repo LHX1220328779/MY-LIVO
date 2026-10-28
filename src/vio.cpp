@@ -432,9 +432,7 @@ void VIOManager::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &
     // t_position += omp_get_wtime()-t0;
     // double t1 = omp_get_wtime();
 
-    auto iter = sub_feat_map.find(position);
-    if (iter == sub_feat_map.end()) { sub_feat_map[position] = 0; }
-    else { iter->second = 0; }
+    sub_feat_map[position] = 0;
 
     // t_insert += omp_get_wtime()-t1;
     // double t2 = omp_get_wtime();
@@ -896,7 +894,7 @@ void VIOManager::generateVisualMapPoints(cv::Mat img, vector<pointWithVar> &pg)
   {
     if (grid_num[i] == TYPE_POINTCLOUD) // && (scan_value[i]>=50))
     {
-      pointWithVar pt_var = append_voxel_points[i];
+      const pointWithVar &pt_var = append_voxel_points[i];
       V3D pt = pt_var.point_w;
 
       V3D norm_vec(new_frame_->T_f_w_.rotation_matrix() * pt_var.normal);

@@ -2741,7 +2741,8 @@ void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg_in)
 {
   frame_profile::Scoped cb_timer("cb.image");
   if (!img_en) return;
-  auto msg = std::make_shared<sensor_msgs::Image>(*msg_in);
+  // Only read below (header stamp, cv_bridge copy): no need to duplicate the full image message.
+  const sensor_msgs::ImageConstPtr &msg = msg_in;
   // if ((abs(msg->header.stamp.toSec() - last_timestamp_img) > 0.2 && last_timestamp_img > 0) || sync_jump_flag)
   // {
   //   ROS_WARN("img jumps %.3f\n", msg->header.stamp.toSec() - last_timestamp_img);
