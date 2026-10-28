@@ -9,11 +9,9 @@ point = native scan-end pose * LiDAR extrinsic * p, delivered point = C(t) * nat
 
 Products (default <fusion_run>/map/):
   global_map.pcd          voxel-filtered geometry map (centroid of every voxel; x y z intensity), binary PCD
-  global_map_rgb.pcd      LIVO only: the global_map.pcd points that a camera observation colours (colour of the
-                          nearest observation in the point's 3 cm voxel, else of the nearest such observation
-                          within 6 cm; observations = the kept returns with their own camera colour, colors.bin
-                          LIVORGB2, or the coloured returns of older rounds, LIVORGB1) - the same geometry as
-                          global_map.pcd, like the mapper's rgb_map_N.pcd vs map_N.pcd
+  global_map_rgb.pcd      independent paired-frame camera map: every original coloured return before geometry
+                          row masks / range priority; one nearest/slowest original observation per 3 cm voxel
+                          (LIVORGB2 current scans, or LIVORGB1 older coloured observations)
   tiles/tile_<i>_<j>.pcd  optional square tiles (--tile M) of the same products for large sites
   keyframes/              optional (--keyframe-clouds): per-keyframe body-frame clouds + poses.txt (TUM)
   map_info.json           frame, voxel size, source, ranges, counts, bounds, time span, inputs, calibration
@@ -41,7 +39,6 @@ import tempfile
 import time
 
 import numpy as np
-from scipy.spatial import cKDTree
 
 HEADER_SCANS = b"LIVORTK3"
 HEADER_COLORS = b"LIVORGB1"       # older rounds: float32 x,y,z,r,g,b per coloured return (native world)
@@ -315,29 +312,18 @@ def voxel_keys(xyz, voxel):
     return (v[:, 0] << 42) | (v[:, 1] << 21) | v[:, 2]
 
 
-def colour_points(xyz, rr, voxel):
-    """Packed rgb of every point from the colour returns `rr` (RGBREC): per voxel the lowest score (nearest /
-    slowest observation) is kept; a point takes the colour of its own voxel, else of the nearest kept observation
-    within 2x voxel (a ball: no miss 1 mm across a voxel border, unlike a coarser voxel); -1 = none there."""
-    out = np.full(len(xyz), -1, np.int64)
-    if not len(rr) or not len(xyz):
-        return out
-    cxyz = np.stack([rr["x"], rr["y"], rr["z"]], 1)
-    ck = voxel_keys(cxyz, voxel)
-    order = np.lexsort((rr["s"], ck))
-    ck = ck[order]
-    first = np.r_[True, ck[1:] != ck[:-1]]
-    best = order[first]
-    keys, rgb = ck[first], rr["rgb"][best].astype(np.int64)
-    q = voxel_keys(xyz, voxel)
-    pos = np.minimum(np.searchsorted(keys, q), len(keys) - 1)
-    hit = keys[pos] == q
-    out[hit] = rgb[pos[hit]]
-    rest = np.flatnonzero(~hit)
-    if len(rest):
-        dist, j = cKDTree(cxyz[best].astype(np.float64)).query(xyz[rest], k=1, distance_upper_bound=2.0 * voxel)
-        found = np.isfinite(dist)
-        out[rest[found]] = rgb[j[found]]
+def voxel_select_rgb(rec, voxel):
+    """恢复独立彩色产品：每个 RGB 体素保留全图最优的原始观测，坐标和颜色一起保留。"""
+    if not len(rec):
+        return np.empty(0, XYZRGB)
+    xyz = np.stack([rec["x"], rec["y"], rec["z"]], 1)
+    keys = voxel_keys(xyz, voxel)
+    order = np.lexsort((rec["s"], keys))
+    k = keys[order]
+    selected = order[np.r_[True, k[1:] != k[:-1]]]
+    out = np.empty(len(selected), XYZRGB)
+    for name in ("x", "y", "z", "rgb"):
+        out[name] = rec[name][selected]
     return out
 
 
@@ -383,7 +369,7 @@ def _project_frames(job):
     raw_R, raw_t, tmp = c["raw_R"], c["raw_t"], c["tmp"]
     geo = TileBuffer(tmp / "geo", GEOREC, limit=6_000_000, prefix=f"w{wid}_")
     rgbbuf = TileBuffer(tmp / "rgb", RGBREC, limit=6_000_000, prefix=f"w{wid}_") if c["rgb_wanted"] else None
-    st = {"returns_in": 0, "returns_kept": 0, "returns_in_cap": 0, "t0": None, "t1": None, "kf": []}
+    st = {"returns_in": 0, "returns_kept": 0, "returns_in_cap": 0, "t0": None, "t1": None, "kf": [], "rgb_frames": []}
     n_frames = len(fr["stamp"])
     rows = np.memmap(c["rows"], dtype=np.uint8, mode="r") if c["rows"] else None
     with open(run / "scans.bin", "rb") as scans:
@@ -408,6 +394,8 @@ def _project_frames(job):
             if a.min_range > 0:
                 keep &= rng >= a.min_range
             begin, stamp = fr["begin"][i], fr["stamp"][i]
+            if a.rgb_only:
+                keep[:] = False
             if keep.any():
                 p, inten, off = p[keep], pts[keep, 3], pts[keep, 4].astype(np.float64)
                 times = np.clip(begin + off / 1000.0, begin, stamp)
@@ -418,20 +406,6 @@ def _project_frames(job):
                 rec["r"], rec["f"] = rng[keep], i
                 geo.add(tile_key(world[:, :2], c["tile"], a.voxel), rec)
                 st["returns_kept"] += len(rec)
-                if rgbbuf is not None and c["colour_rows"] and int(fr["color_count"][i]) == cnt:
-                    # the kept returns' own camera colours (nearest view wins in the colour lookup)
-                    colors.seek(int(fr["color_offset_bytes"][i]))
-                    code = np.frombuffer(colors.read(cnt * 4), dtype="<u4")[keep]
-                    metres = code >> 24
-                    m = metres > 0
-                    if c["rgb_range"] > 0:
-                        m &= metres <= c["rgb_range"]
-                    if m.any():
-                        rr = np.empty(int(m.sum()), RGBREC)
-                        rr["x"], rr["y"], rr["z"] = world[m, 0], world[m, 1], world[m, 2]
-                        rr["rgb"] = code[m] & 0xFFFFFF
-                        rr["s"] = metres[m]
-                        rgbbuf.add(tile_key(world[m, :2], c["tile"], a.voxel), rr)
                 st["t0"] = stamp if st["t0"] is None else min(st["t0"], stamp)
                 st["t1"] = stamp if st["t1"] is None else max(st["t1"], stamp)
                 ordinal = c["kf_ordinal"].get(round(float(stamp), 6)) if a.keyframe_clouds else None
@@ -446,6 +420,32 @@ def _project_frames(job):
                     Rc, tc = correction_at(corr, stamp)
                     Rw, tw = Rc @ raw_R[i], Rc @ raw_t[i] + tc
                     st["kf"].append((ordinal, float(stamp), *map(float, tw), *rot_to_quat(Rw), name))
+            # 必须读取完整原始扫描的颜色，不能复用上面的 keep 或强度图行掩码，
+            # 否则即使每帧都已正确取色，导出后仍会大面积稀疏、出现条带。
+            if rgbbuf is not None and c["colour_rows"]:
+                if int(fr["color_count"][i]) != cnt:
+                    raise ValueError(f"camera colour count differs from scan {i}")
+                colors.seek(int(fr["color_offset_bytes"][i]))
+                code = np.frombuffer(colors.read(cnt * 4), dtype="<u4")
+                m = ((code >> 24) > 0) & np.isfinite(pts[:, :3]).all(1)
+                if c["rgb_range"] > 0:
+                    m &= rng <= c["rgb_range"]
+                st["rgb_frames"].append((int(i), int(m.sum())))
+                if m.any():
+                    st["t0"] = stamp if st["t0"] is None else min(st["t0"], stamp)
+                    st["t1"] = stamp if st["t1"] is None else max(st["t1"], stamp)
+                    native = pts[m, :3].astype(np.float64) @ (raw_R[i] @ lr).T + (raw_R[i] @ lt + raw_t[i])
+                    times = np.clip(begin + pts[m, 4].astype(np.float64) / 1000.0, begin, stamp)
+                    cw = apply_correction(native, times, corr)
+                    omega = 0.0
+                    if i + 1 < n_frames:
+                        omega = np.linalg.norm(rot_log(raw_R[i].T @ raw_R[i + 1])) / max(fr["stamp"][i + 1] - stamp, 1e-3)
+                    rr = np.empty(len(cw), RGBREC)
+                    rr["x"], rr["y"], rr["z"] = cw[:, 0], cw[:, 1], cw[:, 2]
+                    rr["rgb"] = code[m] & 0xFFFFFF
+                    # 与建图程序评分一致：距离越近越好，快速转向时提高代价。
+                    rr["s"] = rng[m] + 20.0 * omega
+                    rgbbuf.add(tile_key(cw[:, :2], c["tile"], a.rgb_voxel), rr)
             if rgbbuf is not None and not c["colour_rows"] and int(fr["color_count"][i]) > 0:
                 cc = int(fr["color_count"][i])
                 colors.seek(int(fr["color_offset_bytes"][i]))
@@ -453,7 +453,10 @@ def _project_frames(job):
                 origin = raw_R[i] @ lt + raw_t[i]
                 rng_c = np.linalg.norm(col[:, :3] - origin, axis=1)
                 m = rng_c <= c["rgb_range"] if c["rgb_range"] > 0 else np.ones(cc, bool)
+                st["rgb_frames"].append((int(i), int(m.sum())))
                 if m.any():
+                    st["t0"] = stamp if st["t0"] is None else min(st["t0"], stamp)
+                    st["t1"] = stamp if st["t1"] is None else max(st["t1"], stamp)
                     omega = 0.0
                     if i + 1 < n_frames:
                         dtf = max(fr["stamp"][i + 1] - stamp, 1e-3)
@@ -464,7 +467,7 @@ def _project_frames(job):
                     rr["x"], rr["y"], rr["z"] = cw[:, 0], cw[:, 1], cw[:, 2]
                     rr["rgb"] = (r8 << 16) | (g8 << 8) | b8
                     rr["s"] = rng_c[m] + 20.0 * omega  # nearest observation wins; fast rotation penalised
-                    rgbbuf.add(tile_key(cw[:, :2], c["tile"], a.voxel), rr)   # the geometry tiles: colour lookup per tile
+                    rgbbuf.add(tile_key(cw[:, :2], c["tile"], a.rgb_voxel), rr)
         if colors:
             colors.close()
     geo.spill()
@@ -493,20 +496,10 @@ def _reduce_tile(tile_id):
 
 
 def _colour_tile(tile_id):
-    """Worker (LIVO, after every geometry tile is reduced): <tmp>/red/rgb_<tile>.bin = the reduced geometry points of
-    the tile that a colour return of the tile colours (separate pass: a job never holds the raw geometry and the
-    colour returns of a tile at once)."""
+    """独立归约全部彩色观测，使用 RGB 自身的分区，不受强度图分区和行掩码限制。"""
     c = _CTX
-    tmp, a = c["tmp"], c["a"]
-    geo = np.fromfile(tmp / "red" / f"geo_{tile_id}.bin", dtype=XYZI)
-    xyz = np.stack([geo["x"], geo["y"], geo["z"]], 1).astype(np.float64) if len(geo) else np.zeros((0, 3))
-    rgb = colour_points(xyz, TileBuffer.load_all(tmp / "rgb", tile_id, RGBREC), a.rgb_voxel)
-    hit = rgb >= 0
-    col = np.empty(int(hit.sum()), XYZRGB)
-    for k in ("x", "y", "z"):
-        col[k] = geo[k][hit]
-    col["rgb"] = rgb[hit].astype(np.uint32)
-    return _tile_result("rgb", tile_id, col)
+    rr = TileBuffer.load_all(c["tmp"] / "rgb", tile_id, RGBREC)
+    return _tile_result("rgb", tile_id, voxel_select_rgb(rr, c["a"].rgb_voxel))
 
 
 def export(a):
@@ -536,6 +529,8 @@ def export(a):
             max_range = 0.0
     rgb_wanted = bool(a.rgb and (run / "colors.bin").exists() and "color_count" in fr and fr["color_count"].sum() > 0)
     colour_rows = False
+    if a.rgb_only and not rgb_wanted:
+        raise SystemExit("--rgb-only requires a camera colour archive")
     if rgb_wanted:
         with open(run / "colors.bin", "rb") as f:
             colour_rows = f.read(8) == HEADER_COLOUR_ROWS
@@ -567,7 +562,7 @@ def export(a):
         raise SystemExit("range priority: ratio 0 (off) or >= 1, margin >= 0, cell > 0")
     # The round's settings + map_rows.bin: take the mapper's own row decision (incl. its seen-free cells).
     rows_path, rows_start = run / "map_rows.bin", None
-    if (rows_path.exists() and a.max_range is None and a.min_range <= 0 and a.priority_ratio is None
+    if (not a.rgb_only and rows_path.exists() and a.max_range is None and a.min_range <= 0 and a.priority_ratio is None
             and a.priority_margin is None and a.priority_cell is None):
         counts = fr["count"].astype(np.int64)
         rows_start = 8 + np.concatenate([[0], np.cumsum((counts + 7) // 8)[:-1]])
@@ -605,12 +600,20 @@ def export(a):
     t_span = [min(t0s) if t0s else None, max(t1s) if t1s else None]
     kf_poses = sorted(row for p in parts for row in p["kf"])
     t_project = time.time() - t_start
+    rgb_frames = sorted(row for part in parts for row in part["rgb_frames"])
+    if rgb_wanted:
+        with open(out / "rgb_frame_counts.csv", "w") as f:
+            f.write("frame,stamp,coloured_returns\n")
+            for i, n in rgb_frames:
+                f.write(f"{i},{fr['stamp'][i]:.9f},{n}\n")
+        stats["rgb_observations"] = int(sum(n for _, n in rgb_frames))
+        stats["rgb_frames"] = int(sum(n > 0 for _, n in rgb_frames))
     # ---------------------------------------------------------------- reduce per tile (parallel), assemble products
     jobs = TileBuffer.tiles_on_disk(tmp / "geo")
     with ctx.Pool(max(1, min(a.jobs, 6))) as pool:
         reduced = pool.map(_reduce_tile, jobs, chunksize=1)
         if rgb_wanted:
-            reduced += pool.map(_colour_tile, jobs, chunksize=1)
+            reduced += pool.map(_colour_tile, TileBuffer.tiles_on_disk(tmp / "rgb"), chunksize=1)
     stats["returns_range_priority"] = int(sum(r[6] for r in reduced if r[0] == "geo"))
     files, tile_counts = {}, {}
     bounds = [np.full(3, np.inf), np.full(3, -np.inf)]
@@ -628,7 +631,7 @@ def export(a):
                 continue
             data = np.fromfile(tmp / "red" / f"{kind}_{tid}.bin", dtype=dtype)
             w.write(data)
-            if kind == "geo":
+            if kind == "geo" or a.rgb_only:
                 bounds[0] = np.minimum(bounds[0], lo); bounds[1] = np.maximum(bounds[1], hi)
             if a.tile > 0:
                 i, j = tile_ij(tid)
@@ -660,7 +663,7 @@ def export(a):
                   "trajectory_optimized.txt / corrections.txt use the same frame", "units": "m"},
         "projection": "point time t = scan begin + offset; delivered = C(t) * (native scan-end pose * LiDAR extrinsic * p); "
                       "C(t) = SE(3) interpolation of the final correction knots (identical to the mapper's map_N.pcd, <1e-5 m)",
-        "source": a.source, "voxel_m": a.voxel, "min_points_per_voxel": a.min_points,
+        "source": a.source, "rgb_only": a.rgb_only, "rgb_geometry": "independent paired-frame camera observations", "voxel_m": a.voxel, "min_points_per_voxel": a.min_points,
         "rgb_voxel_m": a.rgb_voxel if rgb_wanted else None,
         "range_m": {"min": a.min_range, "max": max_range or 0.0, "rgb_max": rgb_range if rgb_wanted else None},
         "range_priority": {"ratio": priority[0], "margin_m": priority[1], "cell_m": priority[2],
@@ -675,9 +678,9 @@ def export(a):
         if np.isfinite(bounds[0]).all() else None,
         "keyframe_clouds": len(kf_poses) if a.keyframe_clouds else None,
         "fields": {"global_map.pcd": "x y z intensity (float32; voxel centroid and mean intensity)",
-                   "global_map_rgb.pcd": "x y z rgb (packed uint32 0x00RRGGBB): the global_map.pcd points with a colour "
-                                         "observation in their rgb_voxel_m voxel (nearest/slowest observation), else the "
-                                         "nearest such observation within 2x rgb_voxel_m"},
+                   "global_map_rgb.pcd": "x y z rgb (packed uint32 0x00RRGGBB): original camera-observed points; "
+                                         "best range + 20*angular_rate observation per RGB voxel, independent of "
+                                         "intensity-map filters and chunk order"},
         "elapsed_s": round(time.time() - t_start, 1), "project_s": round(t_project, 1), "jobs": a.jobs,
     }
     (out / "map_info.json").write_text(json.dumps(info, indent=2, ensure_ascii=False) + "\n")
@@ -722,9 +725,9 @@ def build_parser():
                     help="drop geometry voxels with fewer returns (noise / briefly seen moving objects; 1 = keep all)")
     ap.add_argument("--rgb", dest="rgb", action="store_true", default=True)
     ap.add_argument("--no-rgb", dest="rgb", action="store_false", help="skip the colour map (LIVO rounds)")
+    ap.add_argument("--rgb-only", action="store_true", help="rebuild only the independent camera map from the full archive")
     ap.add_argument("--rgb-voxel", type=float, default=0.03,
-                    help="colour lookup voxel (m): a point takes the nearest/slowest colour observation of its voxel, "
-                         "else the nearest such observation within 2x voxel")
+                    help="independent camera-map voxel (m): globally nearest/slowest original observation")
     ap.add_argument("--rgb-max-range", type=float, default=None, help="colour range cap (m; default: the round's)")
     ap.add_argument("--jobs", type=int, default=min(8, max(1, (os.cpu_count() or 2) // 3)),
                     help="parallel worker processes (projection and per-tile reduction)")

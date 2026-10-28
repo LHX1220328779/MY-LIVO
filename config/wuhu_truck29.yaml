@@ -341,20 +341,13 @@ laser_mapping:
       # Production default 45 m (operator asked for more coverage than 30 m): pole shell P90 ~5.5 cm at
       # <=35 m, ~5.9 cm at <=50 m. Console: run_wuhu_round.sh --map-range M / launch save_map_max_range:=M.
       save_map_max_range: 45.0
-      # rgb_map_N.pcd = the rows of map_N.pcd with a camera colour, thinned by save_rgb_voxel below. Every
-      # archived return carries its own colour from the nearest camera views that see it
-      # (publish.rgb_view_*, colors.bin LIVORGB2). This cap drops colours whose view was farther than M m from
-      # the return (-1 = same as save_map_max_range, 0 = none): the camera looks forward (60 x 32 deg), so pole
-      # tops, trees and anything far beside the road are seen only from 40-60 m behind them; at 45 m one 1080p
-      # pixel covers ~2.5 cm, at 60 m ~3.3 cm. Console: run_wuhu_round.sh --rgb-range M / launch
-      # save_rgb_max_range:=M.
+      # 恢复早期独立彩色地图：连续累积每帧全部同帧着色回波，
+      # 不受强度地图距离优先、看穿检查或行掩码裁剪。
+      # RGB 距离从虚拟雷达量起；-1 沿用强度图距离上限，0 不截断。
       save_rgb_max_range: 60.0
-      # rgb_map_N.pcd keeps one point per save_rgb_voxel cube of the whole map: the row coloured from the nearest
-      # view, from the first chunk that has the voxel (a standing truck's frames and later passes only fill new
-      # voxels). 0 = every coloured row of every frame (same rows as map_N). 3.5 cm keeps the density of the
-      # first LIVO RGB map (362c75b, one point per 3 cm voxel of far in-image returns) on the road; 20261013:
-      # see docs/mcp-livo-rgb-original-density.md. Console: run_wuhu_round.sh --rgb-voxel M.
-      save_rgb_voxel: 0.035
+      # 全图每体素选最优原始观测（近距离优先，惩罚快速转向），默认 3 厘米。
+      # 每帧连续参与，后续观测可更新已有体素，不按分块先到先占；0 保留全部着色回波。
+      save_rgb_voxel: 0.03
       # Map filter of map_N.pcd (intensity map): per chunk one return per save_map_filter cube, the one nearest
       # to its LiDAR (the most accurate); while the truck stands (moved < 3 cm, turned < 1 deg since the last
       # moving frame) one frame per second. map_rows.bin follows, so the evaluation and global_map.pcd use the
@@ -531,34 +524,9 @@ laser_mapping:
       pub_plane_en: false
       pub_scan_num: 1
       blind_rgb_points: 2.0
-      # Look-back colouring (LIVMapper::colourScan): a return takes the colour of the newest camera view that
-      # sees it - the current image, else one of the views kept every rgb_view_spacing m of camera travel over
-      # the last rgb_view_span m (0 = current image only) - sampled rgb_view_margin px inside the image border,
-      # unless the view's own scan saw a nearer surface in that direction. Range priority keeps the nearest
-      # returns of every surface, taken beside the truck, where the 60 x 32 deg front camera does not look:
-      # 20261013, only 3 % of the kept returns were in the image of their own scan (former RGB map: the rest
-      # borrowed colours of far returns displaced 10-20 cm; road signs 2-60 % coloured, nothing legible).
-      # Prototype on 6.1 M kept returns: 93 % coloured from views 9-34 m away (P10-P90), sign plates 100 %;
-      # span 50 m: 91 %; spacing 1 m: same as 2 m at twice the memory (6.2 MB per buffered full-HD view);
-      # margin 3 -> 60 px: returns whose colour disagrees with the median of their other views 27 -> 19 %.
-      # Hand-over: a view's weight ramps 0 -> 1 over rgb_view_feather px beyond the margin, older views fill the
-      # rest (0 = newest view alone). The newest view alone coloured every return where it was about to leave the
-      # image (bottom rows / side columns): each 2 m band of views drew a camera-frustum-shaped ripple on the
-      # ground (colour jumps across bands 4.5-5.6x those within one; 90 px: 2.0x, local texture -7..-11 %).
-      rgb_view_spacing: 2.0
-      rgb_view_span: 80.0
-      rgb_view_margin: 60
-      rgb_view_feather: 90.0
-      # Divide the camera flat field (calibration camera.flat_field, camera-photo stage: image edges 15-25 %
-      # darker) out of the sampled colours; without it the edge darkening of each 2 m band of views stays a faint
-      # ripple on the ground.
+      # 原始配对帧投影：只用当前图像和对应扫描，保留 3 像素图像边距。
+      # 不回看历史视图，不做跨视图混色；存在平场标定时继续应用。
       rgb_flat_field_en: true
-      # Occlusion check: besides the view's own scan, the returns of the last rgb_occluder_frames frames that are
-      # > 0.3 m above the lowest return of their 1 m column, per 8 px cell, max(1 m, 5 %). The own scan alone
-      # leaves 60-80 % of the cells empty (decimated): road signs painted ghost copies of themselves onto the
-      # vegetation behind them. 20 frames: those leaks -73 %, coloured rows -0 % on open road, -7 % in dense
-      # roadside vegetation (points hidden behind nearer foliage / signs stay uncoloured). 0 = own scan only.
-      rgb_occluder_frames: 20
 
     evo:
       seq_name: "wuhu_truck29"

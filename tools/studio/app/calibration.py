@@ -153,8 +153,10 @@ def vehicle_status(cat, mine, truck):
     # Working chain = lineage of the newest leaf (the branch currently being built/tested), not of the
     # active version: a pipeline must light up its checklist the moment its stages land, before
     # activation. Temporary scan versions never pick the tip.
-    leaves = [v for v in versions if not v.get("children") and v.get("stage") != "scan"]
-    tip = max(leaves or versions, key=lambda v: (v.get("created") or "", v.get("version") or "")) if versions else None
+    eligible = [v for v in versions if v.get("stage") != "scan"]
+    eligible_ids = {v["id"] for v in eligible}
+    leaves = [v for v in eligible if not any(c in eligible_ids for c in v.get("children", []))]
+    tip = max(leaves or eligible, key=lambda v: (v.get("created") or "", v.get("version") or "")) if eligible else None
     work = tip or active
     stages_done = []
     calib = {}
@@ -177,7 +179,7 @@ def vehicle_status(cat, mine, truck):
     camera_time_ok = isinstance(offsets.get("camera"), (int, float)) and (offsets.get("camera") != 0.0 or "camera_source" in offsets)
     camera_ext_refined = "camlidar" in stages_done or "camera_lidar" in ctype or "camera_pole_yaw" in ctype
     camera_loop_failed = bool(work) and work.get("closed_loop") == "fail"
-    camera_loop_done = ("camloop" in stages_done or "camera_closed_loop" in ctype) and not camera_loop_failed
+    camera_loop_done = bool(work) and work.get("closed_loop") == "pass"
     checks = [
         {"key": "import", "label": "出厂标定已导入", "ok": bool(active), "stage": "import"},
         {"key": "axle", "label": "参考雷达已对齐后轴（RTK/INS 位姿）", "ok": axle_done, "stage": "axle"},
@@ -187,7 +189,7 @@ def vehicle_status(cat, mine, truck):
         {"key": "camtime", "label": "相机时间偏移已确认", "ok": camera_time_ok, "stage": "camtime",
          "value": offsets.get("camera")},
         {"key": "camlidar", "label": "相机偏航已复核（灯柱投影）", "ok": camera_ext_refined, "stage": "camlidar", "optional": True},
-        {"key": "camloop", "label": "相机俯仰已闭环标定（原生里程尺度）", "ok": camera_loop_done, "stage": "camloop", "optional": True},
+        {"key": "camloop", "label": "相机标定已通过闭环验证（原生轨迹）", "ok": camera_loop_done, "stage": "camloop", "optional": True},
     ]
     if not active:
         next_step = {"stage": "import", "pipeline": None, "reason": "该车辆还没有标定版本，先导入出厂标定 JSON"}
@@ -534,7 +536,7 @@ def _play_duration(ctx, body, default):
 
 
 def _cam_round_duration(ctx, body, default):
-    """Length of a camera-loop LIVO round: the configured length (default 60 s), but never past the end of a
+    """Length of a camera-loop LIVO round: the configured length (default 120 s), but never past the end of a
     manual data window (window + lead-in to the last standstill). Before, a 30 s window still mapped 60 s and a
     window with cam_round_duration=0 mapped the whole recording."""
     uw = _user_window(body)
@@ -722,31 +724,25 @@ def _camloop_steps(steps, body, mapping_cmd, *, truck, stamp, auto_activate, bas
                   ["/bin/echo", f"camera pitch unchanged: round {ctx[round0_key]} already maps this extrinsic, verify skipped"],
                   "after": lambda ctx, lines: ctx.__setitem__("verify_round", rv if pitch_mode(ctx) == "adopt" else ctx[round0_key])})
     steps.append({"title": "闭环判定：基线轮次 vs 闭环版本（原生里程尺度 / 后轴误差 / 偏航）", "build": lambda ctx: [
-        PY, str(REPO / "scripts" / "analysis" / "closed_loop_verdict.py"), ctx[baseline_key], ctx["verify_round"],
+        PY, str(REPO / "scripts" / "analysis" / "closed_loop_verdict.py"), ctx.get(baseline_key, ctx[round0_key]), ctx["verify_round"],
         "--version-dir", str(CAL_ROOT.joinpath(*ctx["camloop_id"].split("/"))),
         "--scale-margin", "0.002" if ctx.get("scan_needed", standard) else "0.0005", "--exit-zero"]
-        if pitch_mode(ctx) == "adopt" else
-        ["/bin/echo", {"keep": "native drift is minimal at the current pitch: closed loop pass (pitch kept)",
-                       "kept": "camera pitch unobservable on this data: kept (base version is the result)"}[pitch_mode(ctx)]],
-        "after": lambda ctx, lines: ctx.update(closed_loop=_verdict(lines) if pitch_mode(ctx) == "adopt"
-                                               else ("pass" if pitch_mode(ctx) == "keep" else "kept"))})
+        if pitch_mode(ctx) in ("adopt", "keep") else
+        ["/bin/echo", "camera pitch unobservable on this data: kept (base version is the result)"],
+        "after": lambda ctx, lines: ctx.update(closed_loop=_verdict(lines) if pitch_mode(ctx) in ("adopt", "keep")
+                                               else "kept")})
     steps.append({"title": "校验新版本", "build": lambda ctx: [PY, str(CALIB_TOOL), "validate", "--id", ctx["camloop_id"], "--strict"]})
 
     def activate_ok(ctx):
-        if not auto_activate:
-            return False
-        if ctx.get("closed_loop") == "pass":
-            return True
-        # pitch unobservable: the base version is still the best available one when its own round met the budget
-        return ctx.get("closed_loop") == "kept" and _round_budget(ctx.get(round0_key)) == "PASS"
+        return auto_activate and ctx.get("closed_loop") == "pass"
 
     def activate_cmd(ctx):
         if activate_ok(ctx):
             return [PY, str(CALIB_TOOL), "activate", "--id", ctx["camloop_id"]]
         why = ("未勾选自动激活" if not auto_activate else
-               "俯仰不可观测且零俯仰轮次未达预算" if ctx.get("closed_loop") == "kept" else "闭环未通过")
+               "俯仰不可观测，保留当前激活版本" if ctx.get("closed_loop") == "kept" else "闭环未通过")
         return [PY, "-c", f"print('not activated: {why}; active version unchanged')"]
-    steps.append({"title": "激活闭环版本（闭环通过，或俯仰不可观测但零俯仰轮次达预算；需勾选自动激活）", "build": activate_cmd,
+    steps.append({"title": "激活闭环版本（仅在闭环通过且勾选自动激活时）", "build": activate_cmd,
                   "after": lambda ctx, lines: ctx.__setitem__("activated", activate_ok(ctx))})
 
 
@@ -964,7 +960,7 @@ def pipeline_steps(kind, body, mapping_cmd):
         # prior for this one, so the first closed loop of a vehicle measures it with the standard scan
         standard, mode_note = True, "本车尚无实测俯仰斜率（其他车的斜率不适用），已自动改用标准扫描"
     cam_dur = body.get("cam_round_duration")
-    cam_dur = 60.0 if cam_dur in (None, "") else (float(cam_dur) or None)  # default: 60 s rounds; 0 = full
+    cam_dur = 120.0 if cam_dur in (None, "") else (float(cam_dur) or None)  # sustained driving for scale; 0 = full
     body = {**body, "_parent_id": parent, "pitch_slope": slope_info["slope"], "pitch_slope_source": slope_info["source"],
             "_cam_round_duration": cam_dur, "_has_zero_round": kind == "camera"}
     stamp = body.get("_stamp") or dt.datetime.now().strftime("%m%d_%H%M%S")  # _stamp: resume keeps round names
@@ -1080,13 +1076,14 @@ def pipeline_steps(kind, body, mapping_cmd):
         steps.append({"title": f"LIVO 建图轮次 A {round_name}（基线，俯仰增量 0）", "retry": 1, "round": round_name, "build": lambda ctx: mapping_cmd(
             round_name, "livo", str(calibration_file(ctx["camtime_id"])), body,
             duration=_cam_round_duration(ctx, body, cam_dur), start_offset=_round_start(ctx, body)),
-            "after": lambda ctx, lines: ctx.update(round=round_name, fusion_dir=latest_fusion_dir(round_name))})
+            "after": lambda ctx, lines: ctx.update(round=round_name, camera_baseline_round=round_name,
+                                                    fusion_dir=latest_fusion_dir(round_name))})
         steps.append({"title": "相机-LiDAR 偏航复核 (camera-lidar：灯柱投影列偏差，俯仰不动)", "build": lambda ctx: stage_cmd(
             "camera-lidar", {"id": ctx["camtime_id"], "dataset": dataset, "run": ctx["fusion_dir"],
                              "frames": body.get("frames") or 30, "note": body.get("note") or ""}),
             "after": lambda ctx, lines: ctx.update(camlidar_id=parse_version_id(lines), result_id=ctx["camtime_id"])})
         _camloop_steps(steps, body, mapping_cmd, truck=truck, stamp=stamp, auto_activate=auto_activate,
-                       base_key="camlidar_id", round0_key="round", baseline_key="round", standard=standard)
+                       base_key="camlidar_id", round0_key="round", baseline_key="camera_baseline_round", standard=standard)
     elif kind == "camphoto":
         datasets.require(dataset, camera=True)
         cam_dur_eff = _round_duration(body, cam_dur or 60)

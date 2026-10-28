@@ -268,17 +268,14 @@ struct RtkFusion
   int minimum_satellites = 12, max_planes = 800, max_pair_factors = 120;
   int local_neighbors = 3, local_map_frames = 30, queue_capacity = 8;
   int export_chunk_points = 1000000;
-  // Saved-map product filter only (archive and estimator untouched): returns farther than this many
-  // metres from the virtual LiDAR origin are not written to map_N.pcd / rgb_map_N.pcd. 0 = keep all.
+  // 仅限制强度地图落盘距离，不改存档和估计器；超过此虚拟雷达距离的点不写入 map_N。
+  // 0 表示不截断；RGB 使用下面的独立距离上限。
   double save_map_max_range = 0.0;
-  // rgb_map_N.pcd = the rows of map_N.pcd whose camera colour (colors.bin, one per archived return) comes from a
-  // view at most this many metres away from the return. The camera looks forward (60 x 32 deg): tall objects
-  // and anything far beside the road are seen only from 40-60 m behind them. <0 = same as save_map_max_range,
-  // 0 = no cap.
+  // 独立彩色产品保留全部同帧着色回波，不套用强度地图筛选。
+  // <0 表示沿用强度图距离上限，0 表示不截断。
   double save_rgb_max_range = -1.0;
-  // rgb_map_N.pcd keeps one point per save_rgb_voxel cube of the whole map: the row coloured from the nearest
-  // view, from the first chunk that has the voxel. 0 = every coloured row of every frame.
-  double save_rgb_voxel = 0.035;
+  // 全图每体素保留最优原始观测（距离 + 20 米 × 角速度）；0 表示保留全部着色回波。
+  double save_rgb_voxel = 0.03;
   // Map filter of map_N.pcd (intensity map): per chunk one return per save_map_filter cube, the one nearest to
   // its LiDAR; of a standing truck one frame per second. map_rows.bin follows. 0 = off (every range-priority row).
   double save_map_filter = 0.01;
@@ -427,6 +424,7 @@ struct RtkFusion
   void appendDisplayCloud(const Frame &frame, PointCloudXYZRGB &cloud) const;
   void publishCurrent(const Frame &frame);
   void publish(double stamp, bool force = false);
+  void exportRgbMap() const;
   void exportMap();
   void accumulateSolverStats(const gtsam::ISAM2Result &result);
 };

@@ -108,11 +108,6 @@ public:
   double gyr_bias_rw_sigma = 0.001, acc_bias_rw_sigma = 0.001;
   double initial_gyr_bias_sigma = std::sqrt(1e-5);
   double blind_rgb_points = 0.0;
-  // Look-back colouring of the LIVO RGB map (colourScan): camera views buffered every rgb_view_spacing m of camera
-  // travel over the last rgb_view_span m (0 = current image only), colours sampled rgb_view_margin px inside the
-  // image border; a view's weight ramps up over the next rgb_view_feather px (0 = the newest view alone).
-  double rgb_view_spacing = 2.0, rgb_view_span = 80.0, rgb_view_feather = 90.0;
-  int rgb_view_margin = 60;
   // Camera flat field (calibration camera.flat_field, camera-photo stage): log brightness of an image position
   // relative to the principal point, poly8 in x = (u - cx) / (W / 2), y = (v - cy) / (H / 2) (y clamped to the
   // fitted range); colourScan divides it out (publish/rgb_flat_field_en). Empty = none.
@@ -120,18 +115,6 @@ public:
   double flat_field_y_lo_ = -1.0, flat_field_y_hi_ = 1.0;
   bool rgb_flat_field_en = true;
   std::vector<float> flat_gain_;  // colour gain per pixel, built at the first colourScan
-  struct ColourView
-  {
-    SE3 T_f_w;                 // camera from world (native frontend frame)
-    V3D centre;                // camera centre
-    cv::Mat image;             // BGR; the VIO clones a new image per frame, the buffer only keeps a reference
-    std::vector<float> depth;  // nearest depth of the view's own scan per 8 px cell
-    std::vector<float> occluders;  // nearest depth of the recent frames' elevated returns per 8 px cell
-  };
-  // Occlusion check of colourScan: the elevated returns of the last rgb_occluder_frames frames (0 = own scan only).
-  int rgb_occluder_frames = 20;
-  std::deque<std::vector<Eigen::Vector3f>> occluder_frames_;
-  std::deque<ColourView> colour_views_;
   std::vector<std::uint32_t> scan_colours_;  // colours of the current frame's returns (pcl_w_wait_pub order)
   double colour_seconds_ = 0.0;
   std::size_t colour_frames_ = 0, colour_returns_ = 0, colour_coloured_ = 0;

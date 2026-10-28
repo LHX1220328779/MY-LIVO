@@ -470,16 +470,9 @@ void LIVMapper::readParameters()
   nh.param<int>("debug/frame_cnt", frame_cnt, 6);
 
   nh.param<double>("publish/blind_rgb_points", blind_rgb_points, 0.01);
-  nh.param<double>("publish/rgb_view_spacing", rgb_view_spacing, 2.0);
-  nh.param<double>("publish/rgb_view_span", rgb_view_span, 80.0);
-  nh.param<int>("publish/rgb_view_margin", rgb_view_margin, 60);
-  nh.param<double>("publish/rgb_view_feather", rgb_view_feather, 90.0);
   nh.param<bool>("publish/rgb_flat_field_en", rgb_flat_field_en, true);
-  nh.param<int>("publish/rgb_occluder_frames", rgb_occluder_frames, 20);
-  if (rgb_occluder_frames < 0) throw std::runtime_error("publish/rgb_occluder_frames must be >= 0");
-  if (!(rgb_view_spacing > 0.0) || !(rgb_view_span >= 0.0) || rgb_view_margin < 1 || !(rgb_view_feather >= 0.0))
-    throw std::runtime_error("publish/rgb_view_spacing must be > 0, rgb_view_span >= 0, rgb_view_margin >= 1, "
-                             "rgb_view_feather >= 0");
+  RCLCPP_INFO(node_->get_logger(),
+              "RGB colouring: paired synchronized image and scan only (no cached camera views)");
   nh.param<int>("publish/pub_scan_num", pub_scan_num, 1);
   nh.param<bool>("publish/pub_effect_point_en", pub_effect_point_en, false);
   nh.param<bool>("publish/dense_map_en", dense_map_en, false);
@@ -3162,33 +3155,15 @@ void LIVMapper::publish_img_rgb(const image_transport::Publisher &pubImage, VIOM
 
 std::vector<std::uint32_t> LIVMapper::colourScan(const PointCloudXYZI &world)
 {
-  // Look-back colouring of the RGB map. The front camera (60 x 32 deg) sees a return at scan time only if it lies
-  // ahead, while range priority keeps the nearest returns of every surface, taken when the truck is beside it:
-  // on truck29 20261013 only 3 % of the kept returns were inside the image of their own scan, and the former
-  // colour lookup (own 3 cm voxel, else the nearest coloured return within 6 cm) painted the rest from far-range
-  // returns displaced 10-20 cm (sign plates 2-60 % coloured, nothing legible on them). Every return now takes
-  // its colour from the NEWEST camera views that see it: the current image, else the views buffered every
-  // rgb_view_spacing m of camera travel over the last rgb_view_span m (driving forward, newest = nearest).
-  // Hand-over: a view's weight ramps from 0 at rgb_view_margin to 1 at rgb_view_margin + rgb_view_feather px
-  // inside its border and the older views fill the remaining weight. The newest view alone coloured every return
-  // where it was about to leave that image (bottom rows / side columns: ~20 % vignetting, the fastest image
-  // motion), so each 2 m band of views drew a camera-frustum-shaped ripple on the ground (neighbour colour jumps
-  // across bands 4.5-5.6x those within one; 90 px hand-over: 2.0x, local texture -7..-11 %).
-  // Sees = in front of the camera, farther than blind_rgb_points, rgb_view_margin px inside the image (border
-  // pixels disagreed with the other views of the same return 1.5x more often) and not behind the nearest return
-  // the view's OWN scan put into the same 8 px cell (+ max(0.3 m, 4 %)): that scan was taken with the image, so
-  // it holds the image's occluders, vehicles gone since included (the scans of later frames would also hide
-  // grazing ground: 93 % -> 65 % coloured). Per return: 0 = no view, else
-  // (distance of the newest view that sees it, m, 1..255) << 24 | R << 16 | G << 8 | B.
+  // 恢复早期同帧投影：当前图像只给同步对应的扫描取色，保留原来的 3 像素边距。
+  // 不缓存历史视图，也不跨帧借色；视野外的点保留颜色码 0。
+  // 每个扫描回波对应一个颜色码，与现有 LIVORGB2 存档逐点对齐。
   const auto start = std::chrono::steady_clock::now();
-  constexpr int cell = 8;
   const auto &frame = vio_manager->new_frame_;
   const vk::AbstractCamera &cam = *frame->cam_;
-  const int columns = cam.width() / cell + 1;
-  const double right = cam.width() - 1.0, bottom = cam.height() - 1.0;
   if (rgb_flat_field_en && !flat_field_coefficients_.empty() && flat_gain_.empty())
   {
-    // colour gain = 1 / flat field (the image edges are 15-25 % darker), clamped to [1/1.6, 1.6]
+    // 沿用已有平场标定补偿边缘暗角：增益为平场的倒数，并限制在 [1/1.6, 1.6]。
     const int width = cam.width(), height = cam.height();
     const double cx = camera_intrinsics[2], cy = camera_intrinsics[3], sx = 0.5 * width, sy = 0.5 * height;
     const auto &c = flat_field_coefficients_;
@@ -3206,138 +3181,40 @@ std::vector<std::uint32_t> LIVMapper::colourScan(const PointCloudXYZI &world)
       }
     }
   }
-  const auto cellOf = [columns](const V2D &px) {
-    return static_cast<std::size_t>(static_cast<int>(px.y()) / cell * columns + static_cast<int>(px.x()) / cell);
+  const cv::Mat &image = vio_manager->img_rgb;
+  const auto channel = [](float v) {
+    return static_cast<std::uint32_t>(std::min(255.f, std::max(0.f, v)));
   };
-  ColourView current;
-  current.T_f_w = frame->T_f_w_;
-  current.centre = frame->pos();
-  current.image = vio_manager->img_rgb;
-  current.depth.assign(static_cast<std::size_t>(columns) * (cam.height() / cell + 1),
-                       std::numeric_limits<float>::infinity());
-  for (const PointType &q : world.points)
-  {
-    const V3D pf = current.T_f_w * V3D(q.x, q.y, q.z);
-    if (pf.z() <= 0.1) continue;
-    const V2D px = cam.world2cam(pf);
-    if (!cam.isInFrame(px.cast<int>(), 1)) continue;
-    float &depth = current.depth[cellOf(px)];
-    depth = std::min(depth, static_cast<float>(pf.z()));
-  }
-  if (rgb_occluder_frames > 0)
-  {
-    // The view's own scan alone (decimated, 4 LiDARs) leaves 60-80 % of the 8 px cells empty: a sign board 5-8 m
-    // in front of a bush often had no return in a cell and painted its colours onto the bush behind it (20261013:
-    // ghost copies of road signs on the vegetation). Occluders = the returns of the last rgb_occluder_frames
-    // frames more than 0.3 m above the lowest return of their 1 m column (ground does not hide ground; grazing
-    // ground spreads over a cell's depth), checked with max(1 m, 5 %) (foliage just behind foliage passes).
-    constexpr int span = 160;  // 1 m columns within +-80 m of the camera
-    std::vector<float> lowest(static_cast<std::size_t>(span) * span, std::numeric_limits<float>::infinity());
-    const double ox = std::floor(current.centre.x()) - span / 2, oy = std::floor(current.centre.y()) - span / 2;
-    const auto column = [&](const PointType &q) -> long {
-      const long ix = static_cast<long>(std::floor(q.x - ox)), iy = static_cast<long>(std::floor(q.y - oy));
-      return ix < 0 || iy < 0 || ix >= span || iy >= span ? -1 : iy * span + ix;
-    };
-    for (const PointType &q : world.points)
-    {
-      const long c = column(q);
-      if (c >= 0) lowest[static_cast<std::size_t>(c)] = std::min(lowest[static_cast<std::size_t>(c)], q.z);
-    }
-    std::vector<Eigen::Vector3f> elevated;
-    elevated.reserve(world.size() / 2);
-    for (const PointType &q : world.points)
-    {
-      const long c = column(q);
-      if (c >= 0 && q.z > lowest[static_cast<std::size_t>(c)] + 0.3f) elevated.emplace_back(q.x, q.y, q.z);
-    }
-    occluder_frames_.push_back(std::move(elevated));
-    while (static_cast<int>(occluder_frames_.size()) > rgb_occluder_frames) occluder_frames_.pop_front();
-    const std::size_t cells = current.depth.size();
-    const int frames_held = static_cast<int>(occluder_frames_.size());
-    std::vector<std::vector<float>> partial(static_cast<std::size_t>(frames_held));
-#ifdef MP_EN
-#pragma omp parallel for num_threads(MP_PROC_NUM) schedule(dynamic, 1)
-#endif
-    for (int f = 0; f < frames_held; ++f)
-    {
-      auto &grid = partial[static_cast<std::size_t>(f)];
-      grid.assign(cells, std::numeric_limits<float>::infinity());
-      for (const Eigen::Vector3f &p : occluder_frames_[static_cast<std::size_t>(f)])
-      {
-        const V3D pf = current.T_f_w * p.cast<double>();
-        if (pf.z() <= 0.1) continue;
-        const V2D px = cam.world2cam(pf);
-        if (!cam.isInFrame(px.cast<int>(), 1)) continue;
-        float &depth = grid[cellOf(px)];
-        depth = std::min(depth, static_cast<float>(pf.z()));
-      }
-    }
-    current.occluders.assign(cells, std::numeric_limits<float>::infinity());
-    for (const auto &grid : partial)
-      for (std::size_t i = 0; i < cells; ++i) current.occluders[i] = std::min(current.occluders[i], grid[i]);
-  }
-  std::vector<const ColourView *> views{&current};
-  for (auto view = colour_views_.rbegin(); view != colour_views_.rend(); ++view) views.push_back(&*view);
-  const auto channel = [](float v) { return static_cast<std::uint32_t>(std::min(255.f, std::max(0.f, v + 0.5f))); };
   std::vector<std::uint32_t> colours(world.size(), 0);
   std::size_t coloured = 0;
-  // Returns are independent. A return behind a view (all returns behind the truck, for every buffered view) is
-  // rejected by the depth row alone (first full round: 7.2 ms per frame single-threaded, +78 s of player pacing).
 #ifdef MP_EN
-#pragma omp parallel for num_threads(MP_PROC_NUM) schedule(dynamic, 1024) reduction(+ : coloured)
+#pragma omp parallel for num_threads(MP_PROC_NUM) schedule(static) reduction(+ : coloured)
 #endif
   for (std::size_t i = 0; i < world.size(); ++i)
   {
-    const V3D pw(world.points[i].x, world.points[i].y, world.points[i].z);
-    V3F sum(0.f, 0.f, 0.f);
-    float weight = 0.f;
-    double source = 0.0;  // distance of the newest view that sees the return
-    for (const ColourView *view : views)
-    {
-      if (view->T_f_w.rotation_matrix().row(2).dot(pw) + view->T_f_w.translation().z() <= 0.1) continue;
-      const V3D pf = view->T_f_w * pw;
-      const double distance = pf.norm();
-      if (distance <= blind_rgb_points) continue;
-      const V2D px = cam.world2cam(pf);
-      if (!cam.isInFrame(px.cast<int>(), rgb_view_margin)) continue;
-      if (pf.z() > view->depth[cellOf(px)] + std::max(0.3, 0.04 * pf.z())) continue;
-      if (!view->occluders.empty() && pf.z() > view->occluders[cellOf(px)] + std::max(1.0, 0.05 * pf.z())) continue;
-      const double border = std::min(std::min(px.x(), right - px.x()), std::min(px.y(), bottom - px.y()));
-      const float ramp = rgb_view_feather > 0.0
-          ? static_cast<float>(std::min(1.0, std::max(1e-3, (border - rgb_view_margin) / rgb_view_feather)))
-          : 1.f;
-      const float w = std::min(ramp, 1.f - weight);
-      if (weight == 0.f) source = distance;
-      V3F sample = vio_manager->getInterpolatedPixel(view->image, px);
-      if (!flat_gain_.empty())
-        sample *= flat_gain_[static_cast<std::size_t>(px.y()) * static_cast<std::size_t>(cam.width()) +
-                             static_cast<std::size_t>(px.x())];
-      sum += w * sample;
-      weight += w;
-      if (weight >= 0.9999f) break;
-    }
-    if (weight <= 0.f) continue;
-    const V3F bgr = sum / weight;
-    const auto metres = static_cast<std::uint32_t>(std::min(255.0, std::max(1.0, std::ceil(source))));
+    const PointType &point = world.points[i];
+    const V3D pw(point.x, point.y, point.z);
+    const V3D pf = frame->w2f(pw);
+    if (pf.z() <= 0.0 || pf.norm() <= blind_rgb_points) continue;
+    const V2D px = frame->w2c(pw);
+    if (!cam.isInFrame(px.cast<int>(), 3)) continue;
+    V3F bgr = vio_manager->getInterpolatedPixel(image, px);
+    if (!flat_gain_.empty())
+      bgr *= flat_gain_[static_cast<std::size_t>(px.y()) * static_cast<std::size_t>(cam.width()) +
+                        static_cast<std::size_t>(px.x())];
+    const auto metres = static_cast<std::uint32_t>(std::min(255.0, std::max(1.0, std::ceil(pf.norm()))));
     colours[i] = metres << 24 | channel(bgr[2]) << 16 | channel(bgr[1]) << 8 | channel(bgr[0]);
     ++coloured;
   }
-  const V3D centre = current.centre;
-  if (rgb_view_span > 0.0 &&
-      (colour_views_.empty() || (centre - colour_views_.back().centre).norm() >= rgb_view_spacing))
-    colour_views_.push_back(std::move(current));
-  while (!colour_views_.empty() && (colour_views_.front().centre - centre).norm() > rgb_view_span)
-    colour_views_.pop_front();
   colour_seconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
   colour_returns_ += world.size();
   colour_coloured_ += coloured;
   if (++colour_frames_ % 600 == 0)
   {
     RCLCPP_INFO(node_->get_logger(),
-                "RGB look-back colouring: %.1f ms per frame, %.1f %% of the returns coloured, %zu views buffered",
+                "RGB paired-frame colouring: %.1f ms per frame, %.1f %% of the returns coloured",
                 1e3 * colour_seconds_ / static_cast<double>(colour_frames_),
-                100.0 * static_cast<double>(colour_coloured_) / static_cast<double>(std::max<std::size_t>(colour_returns_, 1)),
-                colour_views_.size());
+                100.0 * static_cast<double>(colour_coloured_) / static_cast<double>(std::max<std::size_t>(colour_returns_, 1)));
   }
   return colours;
 }

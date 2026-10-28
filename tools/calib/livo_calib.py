@@ -301,7 +301,7 @@ def finalize_version(out_dir, calib, *, mine, truck, stage, parent, note, inputs
         lines += ["## stage report", "", "```"] + list(report_lines) + ["```", ""]
     (out_dir / "report.md").write_text("\n".join(lines))
     reg = load_registry()
-    if activate or f"{mine}/{truck}" not in reg["active"]:
+    if stage != "scan" and (activate or f"{mine}/{truck}" not in reg["active"]):
         reg["active"][f"{mine}/{truck}"] = vid
     save_registry(reg)
     print(json.dumps({"id": vid, "dir": str(out_dir), "metrics": metrics or {}}, ensure_ascii=False))
@@ -1083,7 +1083,7 @@ def dump_camera_stream(bag, out_dir, duration=None, start=0.0, t_from=None, t_to
                 if t_to is not None and t > t_to:
                     break
             else:
-                if start and not stamps and (t - t0 < start or not key):
+                if not stamps and (t - t0 < start or not key):
                     continue
                 if duration is not None and stamps and t - stamps[0] > duration:
                     break
@@ -1311,8 +1311,9 @@ def suggest_windows(prof, round_duration=60.0):
     rest = v < 0.1
     # standstill -> driving transitions only (>= 4 s at rest right before): the round must start at rest
     starts = [i for i in range(5, n) if moving[i] and not moving[i - 1] and rest[i - 5:i - 1].all()]
-    if moving[:1].any() or not starts:  # moving right away (or never resting): the validated offset-0 round
-        starts = [0] + starts
+    # A gradual departure can fail the immediate-rest test despite a valid stationary head.
+    # Always compare the recording head with the later standstill-to-driving transitions.
+    starts = [0] + starts
     cands = []
     for s in starts:
         rs = max(0.0, s - ROUND_LEAD_S)
@@ -2664,6 +2665,9 @@ def cmd_show(a):
 
 def cmd_activate(a):
     d = version_dir(a.id)
+    meta = json.loads((d / "meta.json").read_text()) if (d / "meta.json").exists() else {}
+    if meta.get("stage") == "scan" or d.name.endswith("_scan"):
+        sys.exit("temporary pitch scan versions cannot be activated; select the parent or a validated result")
     reg = load_registry()
     mine, truck, _ = a.id.strip("/").split("/")
     reg["active"][f"{mine}/{truck}"] = a.id
