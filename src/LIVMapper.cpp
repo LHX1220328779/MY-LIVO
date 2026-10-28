@@ -11,6 +11,7 @@ which is included as part of this source code package.
 */
 
 #include "LIVMapper.h"
+#include "frame_profile.h"
 #include "rtk_fusion.h"
 
 #include <json/json.h>
@@ -1187,6 +1188,7 @@ void LIVMapper::stateEstimationAndMapping()
 
 void LIVMapper::handleVIO() 
 {
+  frame_profile::Stopwatch fp;
   euler_cur = RotMtoEuler(_state.rot_end);
   fout_pre << std::setw(20) << LidarMeasures.last_lio_update_time - _first_lidar_time << " " << euler_cur.transpose() * 57.3 << " "
             << _state.pos_end.transpose() << " " << _state.vel_end.transpose() << " " << _state.bias_g.transpose() << " "
@@ -1214,6 +1216,7 @@ void LIVMapper::handleVIO()
   // photometric update is evaluated against this frame's own LiDAR conditioning.
   vio_manager->lidar_information = voxelmap_manager->lidar_information_body_;
   vio_manager->processFrame(LidarMeasures.measures.back().img, _pv_list, voxelmap_manager->voxel_map_, LidarMeasures.last_lio_update_time - _first_lidar_time);
+  fp.lap("vio.process_frame");
 
   if (imu_prop_enable) 
   {
@@ -1236,6 +1239,7 @@ void LIVMapper::handleVIO()
   // }
 
   publish_frame_world(pubLaserCloudFullRes, vio_manager);
+  fp.lap("vio.publish_colour_world");
   if (rtk_fusion_ && slam_mode_ == LIVO && pending_rtk_livo_frame_.valid)
   {
     // scan_colours_ follow pcl_w_wait_pub, i.e. the pending cloud in the world frame (dense_map_en)
@@ -1249,12 +1253,15 @@ void LIVMapper::handleVIO()
     pending_rtk_livo_frame_.valid = false;
     pending_rtk_livo_frame_.cloud.reset();
   }
+  fp.lap("vio.rtk_submit");
   publish_img_rgb(pubImage, vio_manager);
+  fp.lap("vio.publish_image");
 
   euler_cur = RotMtoEuler(_state.rot_end);
   fout_out << std::setw(20) << LidarMeasures.last_lio_update_time - _first_lidar_time << " " << euler_cur.transpose() * 57.3 << " "
             << _state.pos_end.transpose() << " " << _state.vel_end.transpose() << " " << _state.bias_g.transpose() << " "
             << _state.bias_a.transpose() << " " << V3D(_state.inv_expo_time, 0, 0).transpose() << " " << feats_undistort->points.size() << std::endl;
+  fp.lap("vio.logging");
 }
 
 void LIVMapper::handleLIO() 
@@ -1270,6 +1277,7 @@ void LIVMapper::handleLIO()
     return;
   }
 
+  frame_profile::Stopwatch fp;
   double t0 = omp_get_wtime();
 
   std::unordered_map<DownsampleVoxelKey, DownsampleMetadata,
@@ -1504,6 +1512,7 @@ void LIVMapper::handleLIO()
   _pv_list = voxelmap_manager->pv_list_;
   
   double t4 = omp_get_wtime();
+  fp.lap("lio.front_icp_voxel_map");
 
   if(voxelmap_manager->config_setting_.map_sliding_en)
   {
@@ -1529,6 +1538,7 @@ void LIVMapper::handleLIO()
     }
   }
   
+  fp.lap("lio.map_sliding");
   // World-frame copies of the scan are display products in LIO mode (the RTK backend archives the
   // body-frame deskewed scan). LIVO always needs pcl_w_wait_pub: the next VIO update colours it for the
   // RGB map. Without a subscriber (no RViz) the two ~100k-point transforms + PointCloud2 serializations
@@ -1547,7 +1557,9 @@ void LIVMapper::handleLIO()
     }
     *pcl_w_wait_pub = *laserCloudWorld;
 
+    fp.lap("lio.world_transform_copy");
     publish_frame_world(pubLaserCloudFullRes, vio_manager);
+    fp.lap("lio.publish_world_cloud");
   }
   if (pubCurrentFrame->get_subscription_count() > 0)
   {
@@ -1563,12 +1575,14 @@ void LIVMapper::handleLIO()
     current_frame_msg.header.stamp = stampFromSec(LidarMeasures.last_lio_update_time);
     current_frame_msg.header.frame_id = lio_world_frame;
     pubCurrentFrame->publish(current_frame_msg);
+    fp.lap("lio.publish_current_frame");
   }
   if (pub_effect_point_en) publish_effect_world(pubLaserCloudEffect, voxelmap_manager->ptpl_list_);
   if (voxelmap_manager->config_setting_.is_pub_plane_map_) voxelmap_manager->pubVoxelMap();
   publish_path(pubPath);
   publish_mavros(mavros_pose_publisher);
   publishReferenceTrajectory(LidarMeasures.last_lio_update_time);
+  fp.lap("lio.publish_effect_path_misc");
   if (rtk_fusion_)
   {
     // point_time_reference is the absolute time represented by curvature==0.
@@ -1600,6 +1614,7 @@ void LIVMapper::handleLIO()
     }
   }
 
+  fp.lap("lio.rtk_submit");
   frame_num++;
   aver_time_consu = aver_time_consu * (frame_num - 1) / frame_num + (t4 - t0) / frame_num;
 
@@ -1682,6 +1697,8 @@ void LIVMapper::handleLIO()
   fout_out << std::setw(20) << LidarMeasures.last_lio_update_time - _first_lidar_time << " " << euler_cur.transpose() * 57.3 << " "
             << _state.pos_end.transpose() << " " << _state.vel_end.transpose() << " " << _state.bias_g.transpose() << " "
             << _state.bias_a.transpose() << " " << V3D(_state.inv_expo_time, 0, 0).transpose() << " " << feats_undistort->points.size() << std::endl;
+  fp.lap("lio.logging_tables");
+  frame_profile::Table::instance().endFrame(print_frame_timing);
 }
 
 void LIVMapper::savePCD() 
@@ -1744,24 +1761,30 @@ void LIVMapper::run(const volatile std::sig_atomic_t &stop_requested)
   // mapper's own buffers instead; playback lead is bounded by the player.
   rclcpp::executors::SingleThreadedExecutor executor;
   executor.add_node(node_);
+  frame_profile::Stopwatch run_sw;
   while (rclcpp::ok())
   {
     // Once stopped, drain already accepted complete LiDAR/IMU groups, but
     // stop admitting an unbounded live stream into the finalization queue.
     if (!stop_requested) executor.spin_all(std::chrono::milliseconds(50));
+    run_sw.lap("run.spin_all_callbacks");
     if (!sync_packages(LidarMeasures)) 
     {
+      run_sw.lap("run.sync_wait");
       if (stop_requested) break;
       rate.sleep();
       continue;
     }
+    run_sw.lap("run.sync_packages");
     handleFirstFrame();
 
     processImu();
+    run_sw.lap("run.imu_process");
 
     // if (!p_imu->imu_time_init) continue;
 
     stateEstimationAndMapping();
+    run_sw.restart();  // frame sections are timed inside handleLIO/handleVIO
   }
   // The backend may spend seconds finalizing its map. Persist frontend
   // diagnostics first, so its completion cannot precede buffered LIO rows.
@@ -2011,6 +2034,7 @@ void LIVMapper::multi_lidar_pcl_cbk(
     const sensor_msgs::PointCloud2::ConstSharedPtr &msg,
     std::size_t source_index)
 {
+  frame_profile::Scoped cb_timer("cb.lidar");
   if (!lidar_en) return;
   std::unique_lock<std::mutex> lock(mtx_buffer);
   try
@@ -2352,6 +2376,7 @@ void LIVMapper::finishExtrinsicPrecheck(const string &reason)
 
 void LIVMapper::standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstSharedPtr &msg)
 {
+  frame_profile::Scoped cb_timer("cb.lidar");
   if (!lidar_en) return;
   mtx_buffer.lock();
 
@@ -2527,6 +2552,7 @@ void LIVMapper::ins_status_cbk(
 
 void LIVMapper::imu_cbk(const sensor_msgs::Imu::ConstSharedPtr &msg_in)
 {
+  frame_profile::Scoped cb_timer("cb.imu");
   if (!imu_en) return;
 
   auto msg = std::make_shared<sensor_msgs::Imu>(*msg_in);
@@ -2713,6 +2739,7 @@ cv::Mat LIVMapper::getImageFromMsg(const sensor_msgs::ImageConstPtr &img_msg)
 
 void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg_in)
 {
+  frame_profile::Scoped cb_timer("cb.image");
   if (!img_en) return;
   auto msg = std::make_shared<sensor_msgs::Image>(*msg_in);
   // if ((abs(msg->header.stamp.toSec() - last_timestamp_img) > 0.2 && last_timestamp_img > 0) || sync_jump_flag)
