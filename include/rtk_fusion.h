@@ -277,7 +277,7 @@ struct RtkFusion
   // 全图每体素保留最优原始观测（距离 + 20 米 × 角速度）；0 表示保留全部着色回波。
   double save_rgb_voxel = 0.03;
   // Map filter of map_N.pcd (intensity map): per chunk one return per save_map_filter cube, the one nearest to
-  // its LiDAR; of a standing truck one frame per second. map_rows.bin follows. 0 = off (every range-priority row).
+  // its LiDAR; every scan participates, including stationary scans. map_rows.bin follows. 0 = off.
   double save_map_filter = 0.01;
   // Saved geometry map (map_N.pcd): range priority. Per save_map_priority_voxel cell the nearest supported
   // observation r_min (a scan with >= 2 returns in the cell) is found first; returns of that cell farther than
@@ -299,15 +299,10 @@ struct RtkFusion
   // would trim the upper half of the far scans' ground band (20261013: lowered > 5 mm on 8 % of the rough
   // columns). 0 = off.
   double save_map_priority_free_range = 25.0;
-  // Detail fill, part of range priority: a return the rule above drops is still written where it adds coverage
-  // without blur. Ground (the column's two lowest occupied cells): in a 0.05 m sub-column none of the column's
-  // written ground rows hits, the rows of the nearest scan with a return there within 3 cm of their plane (the near
-  // scans' rings leave 65-75 % of the 0.05 m driving-band ground cells empty, as transverse stripes one scan apart -
-  // 20261013: 0.47 m at 4.8 m/s; far ground returns sit 1-5 cm off the near plane, only the ones on it fill, and
-  // only the nearest scan's: one scan per gap instead of every far scan's).
-  // Vegetation (cells whose written rows are volumetric): in a 0.1 m sub-voxel none of them hits (a porous canopy
-  // has no surface a far return could blur; 20261013: 0.2 m cells above ground lost to range priority 18-30 % ->
-  // 15-26 %, poles and walls unchanged). false = off.
+  // Ground detail fill: prefer the nearest original on-plane return of each empty 5 cm sub-column.
+  // If the plane is unsupported or has no agreeing candidate, keep that sub-column's nearest original
+  // observation instead of deleting measured road relief. Non-ground pole/wall filtering is unchanged;
+  // volumetric vegetation may fill empty 0.1 m sub-voxels. Coordinates are never synthesized or flattened.
   bool save_map_priority_fill = true;
   std::vector<int> accepted_modes;
   std::filesystem::path directory;
@@ -361,13 +356,14 @@ struct RtkFusion
     std::unordered_map<std::uint64_t, std::int64_t> ground;  // column (x,y cell) -> lowest occupied z cell
     // detail fill (save_map_priority_fill, detailFill): ground column -> plane z = z0 + gx dx + gy dy of its written
     // ground rows (dx, dy from the column corner), its 10x10 sub-columns holding one (bit iy * 10 + ix) and per
-    // empty sub-column the range code of the nearest dropped ground row on the plane (0 = none); volumetric cell ->
+    // empty sub-column the nearest on-plane and fallback original range codes (0 = none); volumetric cell ->
     // its 5x5x5 sub-voxels holding a written row
     struct GroundPlane
     {
-      float z0, gx, gy;
+      double z0, gx, gy;
       std::array<std::uint64_t, 2> occupied;
-      std::array<std::uint8_t, 100> nearest;
+      // First 100: closest on-plane candidate; last 100: closest original candidate if no on-plane one exists.
+      std::array<std::uint8_t, 200> nearest;
     };
     std::unordered_map<std::uint64_t, GroundPlane> ground_planes;
     std::unordered_map<std::uint64_t, std::array<std::uint64_t, 2>> vegetation;
@@ -425,6 +421,7 @@ struct RtkFusion
   void publishCurrent(const Frame &frame);
   void publish(double stamp, bool force = false);
   void exportRgbMap() const;
+  void exportIntensityMap() const;
   void exportMap();
   void accumulateSolverStats(const gtsam::ISAM2Result &result);
 };

@@ -1528,7 +1528,6 @@ void LIVMapper::handleLIO()
   }
   voxelmap_manager->StateEstimation(state_propagat);
   _state = voxelmap_manager->state_;
-  _pv_list = voxelmap_manager->pv_list_;
   if (frontend_attitude_weak_geometry_info > 0.0 && voxelmap_manager->collect_geometry_diagnostics_)
   {
     // LiDAR-only information (attitude rows are added after it is captured), state order [rot, pos].
@@ -1631,7 +1630,7 @@ void LIVMapper::handleLIO()
   }
   voxelmap_manager->UpdateVoxelMap(voxelmap_manager->pv_list_);
   if (print_frame_timing) std::cout << "[ LIO ] Update Voxel Map" << std::endl;
-  _pv_list = voxelmap_manager->pv_list_;
+  if (slam_mode_ == LIVO) _pv_list = voxelmap_manager->pv_list_;
   
   double t4 = omp_get_wtime();
   fp.lap("lio.front_icp_voxel_map");
@@ -2087,11 +2086,11 @@ void LIVMapper::imu_prop_callback()
 
 void LIVMapper::transformLidar(const Eigen::Matrix3d rot, const Eigen::Vector3d t, const PointCloudXYZI::Ptr &input_cloud, PointCloudXYZI::Ptr &trans_cloud)
 {
-  PointCloudXYZI().swap(*trans_cloud);
+  trans_cloud->clear();
   trans_cloud->reserve(input_cloud->size());
   for (size_t i = 0; i < input_cloud->size(); i++)
   {
-    pcl::PointXYZINormal p_c = input_cloud->points[i];
+    const pcl::PointXYZINormal &p_c = input_cloud->points[i];
     Eigen::Vector3d p(p_c.x, p_c.y, p_c.z);
     p = (rot * (extR * p + extT) + t);
     PointType pi;

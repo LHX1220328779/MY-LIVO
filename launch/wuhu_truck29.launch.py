@@ -144,6 +144,8 @@ def generate_launch_description():
             package="fast_livo",
             executable="fastlivo_mapping",
             name="laser_mapping",
+            # OpenMP workers sleep between frames; keep an explicit operator override.
+            additional_env={"OMP_WAIT_POLICY": os.environ.get("OMP_WAIT_POLICY", "PASSIVE")},
             output="screen",
             sigterm_timeout=LaunchConfiguration("finalize_timeout_sec"),
             parameters=[config_file, overrides],

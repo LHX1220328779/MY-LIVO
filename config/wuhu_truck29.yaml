@@ -349,14 +349,9 @@ laser_mapping:
       # 全图每体素选最优原始观测（近距离优先，惩罚快速转向），默认 3 厘米。
       # 每帧连续参与，后续观测可更新已有体素，不按分块先到先占；0 保留全部着色回波。
       save_rgb_voxel: 0.03
-      # Map filter of map_N.pcd (intensity map): per chunk one return per save_map_filter cube, the one nearest
-      # to its LiDAR (the most accurate); while the truck stands (moved < 3 cm, turned < 1 deg since the last
-      # moving frame) one frame per second. map_rows.bin follows, so the evaluation and global_map.pcd use the
-      # rows on disk. 0 = off (every range-priority row, as before); useful 0 .. 0.10 m. 20261013 full LIVO
-      # (149 M rows, 2.39 GB): 0.01 -> 67.8 M / 1.08 GB (driving rows 98.7 % kept, 4185 of 4714 standing frames
-      # left out), 0.02 -> 0.96 GB (driving 90 %), 0.03 -> 0.82 GB (78 %), 0.05 -> 0.60 GB (58 %), 0.10 -> 0.31 GB
-      # (30 %). With fewer rows at the stop the evaluation's plane-RMS medians rise (5-20 m 19.2 -> 19.6 mm,
-      # 20-40 m 27.3 -> 32.9 mm: stop cells only; driving cells unchanged). Console: run_wuhu_round.sh --map-filter M.
+      # Per chunk keep the nearest original return per voxel. Every scan contributes: removing whole
+      # stationary scans after visibility selection can discard a cell's only chosen observation.
+      # map_rows.bin, evaluation and global_map.pcd follow the actual delivered rows; 0 disables voxel filtering.
       save_map_filter: 0.01
       # Range priority of map_N.pcd (and of the standard global_map.pcd): per 0.5 m cell the nearest scan that
       # put >= 2 returns into it sets r_min; returns of that cell farther than max(ratio * r_min, r_min + margin)
@@ -365,7 +360,7 @@ laser_mapping:
       # offset with near returns 2.0-3.4 cm, but the far-lane returns (17-40 m) are pulled 2-4 cm toward the
       # sensor and spread to a 12-20 cm shell (P10-P90) = the visible "ghost"; ratio 1.5 / margin 2 m: shell
       # 12-20 -> 5-12 cm, road ground P10-P90 52 -> 38 mm. ratio 0 = off (every return within the cap).
-      # Switch of the whole rule (this + the seen-free check below), default ON (best map). Side effect: each
+      # Switch of the whole rule (this + the seen-free check below), default ON. Side effect: each
       # chunk keeps only the returns whose nearest observation lies in that chunk, so the chunk of the far pass
       # lacks the poles and the opposite lane (the union keeps the coverage: 1 m columns -0.05 %). A consistency
       # variant (keep far returns within 3/5/8 cm of a near return) still dropped 34-79 % of each scan's rows at
@@ -382,14 +377,11 @@ laser_mapping:
       # the two lowest occupied 0.5 m cells of each column (grazing beams would trim the ground band). 20261013
       # LIVO: pole shell (P10-P90) median 7.2 -> ~3 cm, ground unchanged. 0 = off.
       save_map_priority_free_range_m: 25.0
-      # Detail fill (pass 2 of the rule): a dropped return is still written where it adds coverage without blur.
-      # Ground (two lowest occupied cells of a column): in a 0.05 m sub-column none of the column's written
-      # ground rows hits, the rows of the nearest scan with a return there within 3 cm of their plane - the near
-      # scans' rings left 65-75 % of the 0.05 m driving-band ground cells empty, as transverse stripes one scan
-      # apart (0.47 m at 4.8 m/s), while the far ground returns sit 1-5 cm off the near plane (20261013).
-      # Vegetation (cells whose written rows are volumetric): in a 0.1 m sub-voxel none of them hits - a porous
-      # canopy has no surface to blur. Poles, signs and walls keep the plain rule (far returns there spread
-      # 9-15 cm against 2-4 cm near). false = off.
+      # Ground detail fill: each missing 5 cm sub-column prefers the nearest original return within 3 cm
+      # of the local plane. If that plane cannot be fitted or no candidate agrees, keep the nearest actual
+      # return of the sub-column instead of deleting measured road relief in rectangular 0.5 m patches.
+      # Coordinates are never interpolated/flattened. Above-ground poles/walls keep the existing range/free
+      # rules; volumetric vegetation may still fill missing 0.1 m sub-voxels. false disables detail fill.
       save_map_priority_fill: true
 
     reference_frame_conversion:

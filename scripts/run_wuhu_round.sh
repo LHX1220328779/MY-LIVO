@@ -14,8 +14,8 @@
 #                                           defaults come from the yaml: rtk.save_map_max_range / save_rgb_max_range)
 #        [--rgb-voxel M]                   (rgb_map_N.pcd: one point per M m voxel of the whole map, 0 = every
 #                                           coloured row; default rtk.save_rgb_voxel)
-#        [--map-filter M]                  (map_N.pcd: per chunk the nearest return per M m voxel, a standing truck
-#                                           once; 0 = off, useful 0..0.10; default rtk.save_map_filter)
+#        [--map-filter M]                  (map_N.pcd: per chunk the nearest return per M m voxel, every scan
+#                                           contributes; 0 = off, useful 0..0.10; default rtk.save_map_filter)
 #        [--no-map-priority]               (map_N.pcd range priority + seen-free check OFF: every return within the
 #                                           cap; default on, rtk.save_map_priority_enabled; --map-priority = on)
 #        [--skip-stationary] [--stationary-min S] [--stationary-lidar-interval S]

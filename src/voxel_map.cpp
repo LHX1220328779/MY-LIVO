@@ -394,7 +394,7 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
     cross_mat_list_.push_back(point_crossmat);
   }
 
-  vector<pointWithVar>().swap(pv_list_);
+  pv_list_.clear();
   pv_list_.resize(feats_down_size_);
 
   int rematch_num = 0;
