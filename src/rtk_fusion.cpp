@@ -1163,6 +1163,7 @@ void RtkFusion::submit(double stamp, double begin, const StatesGroup &state,
   if (!lidar_information.allFinite()) throw std::runtime_error("Nonfinite native LiDAR information");
   frame.lidar_information = lidar_information;
   frame.frontend_speed = state.vel_end.norm();
+  frame.frontend_velocity = state.vel_end;
   Observation reference;
   gtsam::Pose3 alignment;
   if (referenceAt(stamp, reference) && frontendAlignment(alignment))
@@ -2120,35 +2121,31 @@ void RtkFusion::process(Frame frame)
   // One scan of latency lets same-stamp INS/status callbacks arrive before
   // matching. A late RTK seed must not leave permanently frozen wrong matches.
   const Frame &candidate = recent_frames.size() > 1 ? recent_frames[recent_frames.size() - 2] : frame;
-  // Detect a native discontinuity between the two newest frames: the front
-  // end can settle/jump by several centimetres right after IMU
-  // initialization (and after any relocalization) while the vehicle and the
-  // INS reference barely move. Such a step between sparse knots would be
-  // smeared across the whole keyframe interval by the interpolated global
-  // correction, so bracket it with immediate knots on both sides instead.
+  // A native registration jump is a position increment inconsistent with
+  // the frontend's own velocity in the SAME native world. Comparing the
+  // native increment with an INS increment mistakes smooth LIO drift (or
+  // reference jitter) for a reset and creates scan-rate graph growth.
+  // Still bracket real position resets so correction interpolation never
+  // spreads an instantaneous jump over an ordinary keyframe interval.
   bool discontinuity_key = pending_discontinuity_key;
   pending_discontinuity_key = false;
   if (frames.size() >= 2)
   {
     const Frame &previous = frames[frames.size() - 2];
     const double step_dt = frame.stamp - previous.stamp;
-    Observation previous_reference, current_reference;
-    if (step_dt > 0 && step_dt < 0.5 &&
-        referenceAt(previous.stamp, previous_reference) &&
-        referenceAt(frame.stamp, current_reference) &&
-        previous_reference.imu_position.allFinite() &&
-        current_reference.imu_position.allFinite())
+    if (step_dt > 0 && step_dt < 0.5 && previous.frontend_velocity.allFinite() &&
+        frame.frontend_velocity.allFinite())
     {
       const V3D native_step = frame.raw.translation() - previous.raw.translation();
-      const V3D reference_step = current_reference.imu_position - previous_reference.imu_position;
-      const double mismatch = (native_step - reference_step).norm();
-      if (mismatch > key_discontinuity)
+      const V3D predicted_step = 0.5 * step_dt * (previous.frontend_velocity + frame.frontend_velocity);
+      const double defect = (native_step - predicted_step).norm();
+      if (defect > key_discontinuity)
       {
         discontinuity_key = true;
         pending_discontinuity_key = true;
         RCLCPP_INFO(node->get_logger(),
-            "Native pose discontinuity %.3f m within %.3f s at %.3f; bracketing correction knots",
-            mismatch, step_dt, frame.stamp);
+            "Native registration discontinuity %.3f m against frontend velocity within %.3f s at %.3f; bracketing correction knots",
+            defect, step_dt, frame.stamp);
       }
     }
   }

@@ -228,7 +228,8 @@ def start(body):
     round_name = f"{base}_{number}"
     cid = body.get("calibration_id") or ""
     if cid == "active" or not cid:
-        cid = calibration.active_id(body.get("mine") or "", body.get("truck") or "") or ""
+        cid = calibration.mapping_default(calibration.catalogue(), body.get("mine") or "",
+                                          body.get("truck") or "", dataset) or ""
     if not cid:
         # Without a version the mapper silently fell back to config/wuhu_truck29.yaml's calibration_file, a hand-tuned
         # file of the 2026-08 truck29 data: truck29raw 20261013 rounds wuhu_29_livo_4..6 ran with front_left_lidar

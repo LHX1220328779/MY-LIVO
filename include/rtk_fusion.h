@@ -63,6 +63,7 @@ struct RtkFusion
     std::uint32_t color_count = 0;
     double frontend_residual = std::numeric_limits<double>::quiet_NaN();
     double frontend_speed = 0;
+    V3D frontend_velocity = V3D::Zero();
     V3D gravity = V3D(0, 0, -G_m_s2);
     gtsam::Matrix6 lidar_information = gtsam::Matrix6::Zero();
     V3D reference_imu = V3D::Constant(std::numeric_limits<double>::quiet_NaN());

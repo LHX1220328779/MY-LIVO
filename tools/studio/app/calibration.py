@@ -115,6 +115,9 @@ def catalogue(refresh=False):
         v["overlays"] = sorted(p.name for p in (d / "overlays").glob("*.*")) if (d / "overlays").is_dir() else []
         cl = read_json(d / "closed_loop.json", None) if (d / "closed_loop.json").is_file() else None
         v["closed_loop"] = cl.get("verdict") if isinstance(cl, dict) else None
+    by_id = {v["id"]: v for v in payload["versions"]}
+    for v in payload["versions"]:
+        v["source_dataset"] = source_dataset(by_id, v["id"])
     payload["sources"] = loose_sources()
     with _lock:
         _cache.update(sig=sig, doc=payload)
@@ -134,6 +137,33 @@ def lineage(versions_by_id, vid):
         chain.insert(0, vid)
         vid = versions_by_id[vid].get("parent")
     return chain
+
+
+def source_dataset(by_id, vid):
+    """Nearest recorded dataset in the lineage; manual children inherit their parent's provenance."""
+    seen = set()
+    while vid in by_id and vid not in seen:
+        seen.add(vid)
+        meta = by_id[vid]
+        inputs = meta.get("inputs") or {}
+        source = inputs.get("bag") or (inputs.get("dataset") or {}).get("path")
+        if isinstance(source, str) and source:
+            return str(pathlib.Path(source).resolve())
+        vid = meta.get("parent")
+    return None
+
+
+def mapping_default(cat, mine, truck, dataset):
+    """Prefer an existing final calibration of this recording over another date's vehicle-wide active version."""
+    active = cat["active"].get(f"{mine}/{truck}")
+    target = str(pathlib.Path(dataset).resolve())
+    versions = [v for v in cat["versions"] if v.get("mine") == mine and v.get("truck") == truck]
+    by_id = {v["id"]: v for v in versions}
+    matches = [v for v in versions if v.get("stage") != "scan" and not v.get("advisory")
+               and source_dataset(by_id, v["id"]) == target]
+    if any(v["id"] == active for v in matches):
+        return active
+    return max(matches, key=lambda v: (v.get("created") or "", v["id"]))["id"] if matches else active
 
 
 def factory_root(vid):
