@@ -1,0 +1,17 @@
+warning: window end 150.0 s exceeds available poses (147.8 s); clamping
+calibration=/home/project/MY-LIVO/config/carlibration/zongyang/truck02/v003_ground/calibration.json
+run=/home/project/MY-LIVO/results/calib_truck02_lio_1026_190734/Log/fusion/1793012966412668423
+window 0.0..147.30000281333923 s, lidar_time_offset -0.002
+pass 1 poses: native frames.csv (6 DoF); pass 2 poses: RTK-optimized trajectory_optimized.txt (tilt about x/y and z of LiDARs with median match time gap > 2.0 s)
+scans used: front_right_lidar:1471, back_lidar:1471, front_left_lidar:1471, front_lidar:1471
+scan source: round archive scans.bin/sources.bin (mapper deskew; returns at scan end, round extrinsics inverted)
+matching: viewing-side consistent (oriented normals)
+reference front_lidar: 643235 world points
+pairing: same-time for LiDARs overlapping the reference (1.0 s blocks +-0.5 s, 5191044 block points); cross-time LiDARs use the accumulated target (nearest-range voxels)
+front_right_lidar: pass 1 matches 58419->55102 |res| median 3.12->1.76 cm; ground 2.93->1.75 (n=42730); vertical 3.84->1.75 (n=11707); match time gap median 0.6 s; correction rot deg (x,y,z)=(-0.128,+0.135,+0.275) trans cm=(+19.4,+0.4,+1.2); iters 6  [quality: ok]
+front_left_lidar: pass 1 matches 51045->46923 |res| median 1.94->1.65 cm; ground 1.94->1.59 (n=31206); vertical 1.91->1.76 (n=14791); match time gap median 0.6 s; correction rot deg (x,y,z)=(+0.126,-0.007,-0.054) trans cm=(-1.5,-0.9,-3.9); iters 7  [quality: ok]
+back_lidar: pass 1 matches 35253->37525 |res| median 4.81->4.28 cm; ground 4.69->3.71 (n=23343); vertical 5.05->5.79 (n=12697); match time gap median 33.6 s; correction rot deg (x,y,z)=(+0.112,-0.339,-0.389) trans cm=(-5.7,+0.6,+2.0); iters 25
+    pass 2 (cross-time LiDAR, drift-free poses, ground only): ground 4.38->4.50 cm (n=15675); tilt about x/y adjusted by (+0.225,-0.034) deg, z by +4.6 cm; iters 7
+    final correction rot deg (x,y,z)=(+0.337,-0.373,-0.389) trans cm=(-5.7,+0.6,+6.6)  [quality: warn; not converged in 25 iterations]
+quality: warn  (back_lidar: not converged in 25 iterations)
+written /home/project/MY-LIVO/config/carlibration/zongyang/truck02/v004_driven/calibration.json

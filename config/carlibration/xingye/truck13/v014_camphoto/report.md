@@ -1,0 +1,362 @@
+# xingye/truck13/v014_camphoto
+
+- stage: camphoto (相机光度标定（内参复核 + 外参/时间精修 + 暗角）)
+- parent: xingye/truck13/v011_scan
+- lineage: xingye/truck13/v001_import -> xingye/truck13/v002_axle -> xingye/truck13/v003_ground -> xingye/truck13/v004_driven -> xingye/truck13/v005_gcons -> xingye/truck13/v008_camtime -> xingye/truck13/v009_camlidar -> xingye/truck13/v011_scan -> xingye/truck13/v014_camphoto
+- created: 2026-10-28T12:55:21+08:00
+- note: 相机外参旋转/时间光度精修；内参、平移沿用厂家。68 分段全量 A/B 与 1010–1020 s 尾段闭环通过，真实建图光度代价降低 13–39%。
+
+## inputs
+
+- bag: /home/project/data/haibo/xingye/13/20261027/ros2bag
+- run: /home/project/MY-LIVO/results/audit_x13_recovered_native
+- recovered_from: /home/project/MY-LIVO/results/xingye_13_livo_2/Log/fusion/1793158627821370974
+- window_s_after_first_mapping_frame: [600, 715]
+- baseline_round: audit_x13_current_full_1028
+- verification_round: audit_x13_camera_fixed_full_1028
+- full_recording_segments: 68
+- full_recording_messages_per_round: 479382
+- solver: scripts/refine_camera_photometric.py (existing rotation/time solver; factory intrinsics/translation held)
+
+## changes vs parent
+
+```
+{
+  "camera_to_rear": {
+    "dt_cm": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "drpy_deg": [
+      0.813,
+      -0.692,
+      0.176
+    ]
+  },
+  "time_offsets": {
+    "camera": {
+      "from": -0.0109,
+      "to": -0.0261
+    }
+  }
+}
+```
+
+## metrics
+
+```
+{
+  "camera_photometric": {
+    "method": "multi-view photo-consistency of the round's returns (LCN cross-view variance)",
+    "frames": 1151,
+    "views": 203,
+    "returns": 50000,
+    "cost_zero": [
+      0.40367,
+      0.39913
+    ],
+    "halves": [
+      {
+        "rot_deg": [
+          -0.796,
+          0.0629,
+          0.6875
+        ],
+        "dt_s": -0.01699,
+        "train_gain": 0.3233,
+        "test_gain": 0.3107,
+        "intrinsics": {
+          "fx_scale": 0.99651,
+          "fy_scale": 0.97812,
+          "k1": 0.02311,
+          "test_gain": 0.3388
+        }
+      },
+      {
+        "rot_deg": [
+          -0.817,
+          0.0936,
+          0.7104
+        ],
+        "dt_s": -0.01362,
+        "train_gain": 0.3168,
+        "test_gain": 0.317,
+        "intrinsics": {
+          "fx_scale": 0.99737,
+          "fy_scale": 0.97987,
+          "k1": 0.0179,
+          "test_gain": 0.3444
+        }
+      }
+    ],
+    "gate": {
+      "min_test_gain": 0.05,
+      "halves_agree": true,
+      "gain_ok": true,
+      "intrinsics_extra_gain": [
+        0.0281,
+        0.0274
+      ],
+      "intrinsics_ok": true
+    },
+    "flat_field": {
+      "halves": [
+        {
+          "coefficients": [
+            -0.13341,
+            -0.30084,
+            -0.27504,
+            0.49572,
+            -0.23834,
+            -0.24402,
+            0.12226,
+            -0.12779
+          ],
+          "test_gain": 0.2247
+        },
+        {
+          "coefficients": [
+            -0.15134,
+            -0.27689,
+            -0.24451,
+            0.50589,
+            -0.41042,
+            -0.11069,
+            0.10303,
+            -0.1216
+          ],
+          "test_gain": 0.2213
+        }
+      ],
+      "gain_map_spread": 0.0317,
+      "y_range": [
+        -0.442,
+        0.753
+      ],
+      "min_test_gain": 0.05,
+      "max_spread": 0.03,
+      "samples": 455835,
+      "applied": false
+    },
+    "applied": {
+      "rot_delta_deg_cam_xyz": [
+        -0.8092925655788404,
+        0.0742595347605248,
+        0.7095164754442498
+      ],
+      "camera_time_offset_s": -0.0261,
+      "dt_s": -0.015200000000000002,
+      "rotation_time": true,
+      "intrinsics": false,
+      "flat_field": false
+    },
+    "intrinsics_policy": "Factory intrinsics held: route-dependent focal corrections were not consistent across independent route sections.",
+    "actual_full_run_photo_checks": [
+      {
+        "window": [
+          18,
+          140
+        ],
+        "baseline_cost": [
+          0.40298345594430585,
+          0.3998514142506583
+        ],
+        "candidate_cost": [
+          0.3026876829341613,
+          0.30664713285831474
+        ],
+        "gain": [
+          0.24888310309196882,
+          0.23309729081992392
+        ]
+      },
+      {
+        "window": [
+          180,
+          310
+        ],
+        "baseline_cost": [
+          0.5371577042804896,
+          0.5388818046448376
+        ],
+        "candidate_cost": [
+          0.4170132210564933,
+          0.4226620796839327
+        ],
+        "gain": [
+          0.2236670576752261,
+          0.2156683041794335
+        ]
+      },
+      {
+        "window": [
+          600,
+          715
+        ],
+        "baseline_cost": [
+          0.4224085534760195,
+          0.4152347039611882
+        ],
+        "candidate_cost": [
+          0.2929354760287035,
+          0.2908781613459838
+        ],
+        "gain": [
+          0.30651149552222856,
+          0.2994849453306483
+        ]
+      },
+      {
+        "window": [
+          750,
+          900
+        ],
+        "baseline_cost": [
+          0.40910738656279094,
+          0.40667995855860645
+        ],
+        "candidate_cost": [
+          0.310726567327842,
+          0.31083349491665485
+        ],
+        "gain": [
+          0.2404767610321531,
+          0.2356803221424033
+        ]
+      },
+      {
+        "window": [
+          930,
+          1000
+        ],
+        "baseline_cost": [
+          0.33885067534022417,
+          0.30828272148696984
+        ],
+        "candidate_cost": [
+          0.20585538888610344,
+          0.2680895665153641
+        ],
+        "gain": [
+          0.3924893651771134,
+          0.13037757931335958
+        ]
+      }
+    ]
+  },
+  "full_recording_validation": {
+    "closed_loop": "pass",
+    "position_budget": "PASS",
+    "maximum_position_reference_error_m": 0.0577,
+    "ground_thickness_mm": 18.87
+  }
+}
+```
+
+## summary
+
+```
+{
+  "lidars": [
+    {
+      "lidar": "front_right_lidar",
+      "key": "transform_matrix_lidar_1",
+      "t": [
+        1.9464,
+        7.0057,
+        1.0298
+      ],
+      "rpy_deg": [
+        -1.755,
+        -0.435,
+        14.043
+      ]
+    },
+    {
+      "lidar": "back_lidar",
+      "key": "transform_matrix_lidar_2",
+      "t": [
+        -0.1422,
+        -1.9111,
+        0.4543
+      ],
+      "rpy_deg": [
+        0.043,
+        -3.423,
+        -90.139
+      ]
+    },
+    {
+      "lidar": "front_left_lidar",
+      "key": "transform_matrix_lidar_3",
+      "t": [
+        -1.9445,
+        6.9514,
+        1.0499
+      ],
+      "rpy_deg": [
+        0.796,
+        -0.59,
+        167.928
+      ]
+    },
+    {
+      "lidar": "front_lidar",
+      "key": "transform_matrix_lidar_6",
+      "t": [
+        -0.0002,
+        7.0096,
+        0.6541
+      ],
+      "rpy_deg": [
+        0.426,
+        2.516,
+        90.688
+      ]
+    }
+  ],
+  "camera_to_rear": {
+    "t": [
+      -0.0123,
+      7.0409,
+      1.4569
+    ],
+    "rpy_deg": [
+      -97.912,
+      0.661,
+      -0.336
+    ]
+  },
+  "camera": {
+    "topic": "/midrange_camera/image_raw",
+    "width": 1920,
+    "height": 1080,
+    "intrinsics": [
+      1642.15,
+      1855.56,
+      963.247,
+      544.29
+    ],
+    "distortion": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "source": "midrange_camera[0].camera_in_params"
+  },
+  "time_offsets": {
+    "lidar": -0.0502,
+    "lidar_frontend": -0.0427,
+    "camera": -0.0261,
+    "rtk_position": 0.025,
+    "ins_attitude": 0.0,
+    "lidar_source": "rear-axle alignment (cross-time consistency vs INS poses)",
+    "source": "import (verify with camera-time / LIO evaluation)",
+    "lidar_frontend_source": "axle: lidar -0.0502 + imu/ins clock lag +0.0075 (corr 0.997); template -0.1250 replaced",
+    "camera_source": "camera-photo: independently checked extrinsic/time candidate"
+  }
+}
+```

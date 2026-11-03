@@ -1,0 +1,34 @@
+{
+ "verdict": "pass",
+ "reasons": [],
+ "common_window": {
+  "t0": 50,
+  "t1": 60,
+  "baseline_rear_m": 1.133,
+  "candidate_rear_m": 1.137
+ },
+ "baseline": {
+  "round": "calib_truck29raw_livo_1015_090255",
+  "mode": "livo",
+  "calibration_id": "wuhu/truck29raw/v040_camtime",
+  "duration_s": 57.7,
+  "scale": 0.9999,
+  "median_m": 0.1858,
+  "final_m": 1.4904,
+  "final_xy_m": 0.3463,
+  "yaw_p95_deg": 0.1324
+ },
+ "candidate": {
+  "round": "calib_truck29raw_livo_1015_090255_verify",
+  "mode": "livo",
+  "calibration_id": "wuhu/truck29raw/v042_camloop",
+  "duration_s": 57.7,
+  "scale": 1.0,
+  "median_m": 0.187,
+  "final_m": 1.4962,
+  "final_xy_m": 0.3481,
+  "yaw_p95_deg": 0.135
+ },
+ "scale_margin": 0.0005,
+ "criteria": "scale within baseline+0.1%; rear error at last common window <= 1.10x+0.10 m; yaw P95 <= baseline+0.15 deg; round durations within 10%"
+}

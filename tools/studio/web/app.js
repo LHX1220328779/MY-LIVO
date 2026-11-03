@@ -13,7 +13,7 @@ const S = {
   winCalib:  { mode: "auto", head_dur: 60, start: 0, end: "" },
   overlayForm: { times: "20,60,100", delta: "0 0 0", run: "" }, overlay: null, overlayBusy: false,
   assess: null, assessSummary: null, assessLoading: false,
-  body: null, bodyBusy: false, bodyForm: { topic: "", t: 0, max_points: 12000, sel: null },
+  body: null, bodyBusy: false, bodyForm: { t: 0, max_points: 40000, view: "top", viewer: null },
 };
 const $ = (sel, root = document) => root.querySelector(sel);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -53,7 +53,6 @@ const pct = (v) => v == null ? "—" : `${Number(v).toFixed(1)}%`;
 const sdeg = (v) => v == null ? "—" : `${Number(v) > 0 ? "+" : ""}${Number(v).toFixed(2)}°`;
 const secondsBetween = (a, b) => (a && b) ? Math.max(0, (new Date(b) - new Date(a)) / 1000) : null;
 const baseName = (p) => String(p || "").replace(/\/+$/, "").split("/").pop();
-function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
 function captureForms() {
   // keep uncontrolled form fields across re-renders (poller re-renders while the user types)
   S.drafts = S.drafts || {};
@@ -61,17 +60,16 @@ function captureForms() {
     S.drafts[el.id] = el.type === "checkbox" ? el.checked : el.value;
   });
 }
-const saveState = debounce((patch) => api("/api/state", "POST", patch).then((s) => { S.state = s; }).catch((e) => toast(e.message, "bad")), 400);
+const saveState = (patch) => api("/api/state", "POST", patch).catch((e) => toast(e.message, "bad"));
 
 // ------------------------------------------------------------------ data loading
 async function loadOverview() {
   const o = await api("/api/overview");
   Object.assign(S, { state: o.state, system: o.system, vehicles: o.vehicles, stages: o.stages, runs: o.runs, jobs: o.jobs, dataset: o.dataset, assessSummary: o.assessment || null });
   const pid = S.state?.calibration?.parent_id;
-  if (pid && !S.calibForm.parent) S.calibForm.parent = pid;
+  if (pid && !S.calibForm.parent && pid.startsWith(`${S.state.vehicle.mine}/${S.state.vehicle.truck}/`)) S.calibForm.parent = pid;
   const active = o.system.active_job;
   if (active && (!S.job || S.job.id !== active.id)) { S.job = active; S.jobLog = []; S.jobLogNext = 0; }
-  if (!active && S.job && S.job.status === "running") { S.job = null; }
   if (active) S.job = { ...S.job, ...active };
 }
 async function loadCatalogue(refresh = false) { S.cal = await api(`/api/calibrations${refresh ? "?refresh=1" : ""}`); S.stages = S.cal.stages; }
@@ -91,6 +89,12 @@ async function pollJob() {
   if (finished) {
     toast(doc.status === "done" ? `✓ ${doc.title} 完成` : `${doc.title}：${doc.error || doc.status}`, doc.status === "done" ? "ok" : "bad");
     await Promise.all([loadOverview(), loadCatalogue(true), loadRuns()]);
+    if (doc.kind === "calibration" && doc.meta?.source && doc.status === "done" &&
+        doc.meta.mine === S.state.vehicle.mine && doc.meta.truck === S.state.vehicle.truck) {
+      S.calibForm.parent = doc.results.result_id;
+      S.state.calibration.parent_id = S.calibForm.parent;
+      saveState({ calibration: { parent_id: S.calibForm.parent } });
+    }
     if (doc.kind === "assess" || doc.kind === "pipeline") await loadAssessment(true);
     render();
     return;
@@ -103,11 +107,24 @@ async function pollJob() {
   }
 }
 function currentRound() {
-  if (S.job && S.job.status === "running") {
-    if (S.job.kind === "mapping") return S.job.meta.round;
-    if (S.job.kind === "pipeline") return S.job.results.round || (((S.job.steps[S.job.current] || {}).title || "").match(/calib_[A-Za-z0-9_]+/) || [])[0] || null;
+  const selectedDataset = S.dataset?.path || S.state?.data?.dataset || "";
+  // Keep the just-finished mapping round pinned; otherwise a page reload loses the
+  // live/result panel even though round.json and evaluation metrics are present.
+  if (S.job?.kind === "mapping" && S.job.meta?.round &&
+      (!selectedDataset || !S.job.meta.dataset || S.job.meta.dataset === selectedDataset) &&
+      !(S.job.status === "done" && S.job.meta.options?.save_map === false)) return S.job.meta.round;
+  if (S.job?.status === "running" && S.job.kind === "pipeline")
+    return S.job.results.round || (((S.job.steps[S.job.current] || {}).title || "").match(/calib_[A-Za-z0-9_]+/) || [])[0] || null;
+  if (S.runDetail?.round) return S.runDetail.round;
+  if (S.page === "mapping" && Array.isArray(S.runs)) {
+    const candidates = S.runs.filter((r) => r.mode && (!selectedDataset || r.dataset === selectedDataset));
+    candidates.sort((a, b) => String(b.start || "").localeCompare(String(a.start || "")));
+    const mapped = candidates.find((r) => r.status === "done" && r.options?.save_map !== false && r.map_chunks > 0);
+    const newestFailure = candidates.find((r) => ["failed", "lost", "incomplete"].includes(r.status));
+    if (newestFailure && (!mapped || String(newestFailure.start || "") >= String(mapped.start || ""))) return newestFailure.round;
+    return mapped?.round || candidates[0]?.round || null;
   }
-  return S.runDetail?.round || null;
+  return null;
 }
 async function pollLive() {
   const round = currentRound();
@@ -127,7 +144,7 @@ function schedule() {
         }
         await pollLive(); patchLive();
       }
-      else if (S.tick++ % 3 === 0) { await loadOverview(); if (S.page === "results" && S.runDetail) await pollLive(); patchLive(); }
+      else if (S.tick++ % 3 === 0) { await loadOverview(); if ((S.page === "results" && S.runDetail) || (S.page === "mapping" && currentRound())) await pollLive(); patchLive(); }
     } catch (e) { /* transient */ }
   }, 2000);
   S.tick = 0;
@@ -143,7 +160,12 @@ function patchLive() {
 
 // ------------------------------------------------------------------ shared components
 function calibFlags() { return (S.state && S.state.calibration) || {}; }
-function vehicle() { const v = S.state?.vehicle || {}; return S.vehicles.find((x) => x.mine === v.mine && x.truck === v.truck) || S.vehicles[0] || null; }
+function vehicle() { const v = S.state?.vehicle || {}; return S.vehicles.find((x) => x.mine === v.mine && x.truck === v.truck) || null; }
+function selectedParent() {
+  const v = vehicle();
+  const versions = (S.cal?.versions || []).filter((x) => x.mine === v?.mine && x.truck === v?.truck);
+  return versions.some((x) => x.id === S.calibForm.parent) ? S.calibForm.parent : v?.active || "";
+}
 // Factory import at the root of a version's lineage: where the LiDAR pipeline starts by default.
 function factoryOf(id) { const by = new Map((S.cal?.versions || []).map((x) => [x.id, x])); let cur = by.get(id); const seen = new Set(); while (cur && cur.parent && by.has(cur.parent) && !seen.has(cur.id)) { seen.add(cur.id); cur = by.get(cur.parent); } return cur && cur.stage === "import" ? cur.id : null; }
 
@@ -290,7 +312,7 @@ function liveMonitor() {
     <div class="phases" style="margin:8px 0 10px">${PHASES.map(([k, l], i) => `<span class="phase ${k === phase ? "on" : i < phaseIdx ? "done" : ""}">${l}</span>`).join("")}${rec?.status === "failed" ? `<span class="phase" style="background:var(--bad-soft);color:var(--bad)">失败</span>` : rec?.status === "incomplete" ? `<span class="phase" style="background:var(--warn-soft, #fff4e5);color:var(--warn)" title="${esc(rec.error || "")}">不完整</span>` : ""}</div>
     <div class="progress"><div style="width:${pct}%"></div></div>
     <div class="row small muted" style="margin-top:6px;justify-content:space-between"><span>${player.t != null ? `回放 ${player.t.toFixed(1)} / ${player.total.toFixed(1)} s · ${player.msgs} 条 · 延迟 ${player.lag_ms} ms` : !round && j ? "当前步骤不是建图轮次（见任务日志）" : phase === "starting" ? "正在启动建图节点…" : ""}</span><span>${rec?.start ? `开始 ${fmtT(rec.start)}` : ""}</span></div>
-    ${rec?.error ? `<div class="callout bad" style="margin-top:8px">${esc(rec.error)}</div>` : ""}
+    ${rec ? `<div class="callout ${rec.error ? "bad" : rec.status === "done" ? "ok" : "warn"}" style="margin-top:8px"><b>状态：</b>${esc(rec.status || phase || "未知")} · <b>错误：</b>${rec.error ? esc(rec.error) : rec.status === "done" ? "无" : "暂未报告"}${rec.map_chunks != null ? ` · 地图 ${rec.map_chunks} 块` : ""}${rec.metrics_complete != null ? ` · 评估 ${rec.metrics_complete ? "完整" : "不完整"}` : ""}</div>` : ""}
     <div class="grid g4" style="margin-top:14px">
       <div class="stat"><div class="k">关键帧</div><div class="v">${latest.keyframes ?? "—"}</div></div>
       <div class="stat"><div class="k">前端 RTK 残差</div><div class="v">${cm(latest.frontend_rtk_residual_m)}</div></div>
@@ -608,8 +630,8 @@ function pageCalib() {
   const needs = info.needs || [];
   const modeForRun = info.mapping;
   const runOpts = S.runs.filter((r) => r.fusion_dir && r.status === "done" && (!modeForRun || modeForRun === "any" || r.mode === modeForRun));
-  const parents = versions.map((x) => `<option value="${esc(x.id)}" ${(f.parent || v?.active) === x.id ? "selected" : ""}>${esc(x.version)} · ${esc(x.stage_label)}${x.active ? " ★" : ""}</option>`).join("");
-  const pipelineParent = f.parent || v?.active || "";
+  const pipelineParent = selectedParent();
+  const parents = versions.map((x) => `<option value="${esc(x.id)}" ${pipelineParent === x.id ? "selected" : ""}>${esc(x.version)} · ${esc(x.stage_label)}${x.active ? " ★" : ""}</option>`).join("");
   return `<h1 style="margin-bottom:6px">标定</h1><div class="muted" style="margin-bottom:18px">每辆车的标定按 <code>config/carlibration/&lt;矿山&gt;/&lt;车辆&gt;/vNNN_&lt;阶段&gt;/</code> 版本化保存；每个阶段都以父版本为输入生成新版本，绝不覆盖。SLAM 只读取“激活”的版本。</div>
   <div class="card"><div class="card-h"><h2>车辆 &nbsp;<select data-act="set-vehicle">${S.vehicles.map((x) => `<option value="${x.id}" ${v && x.id === v.id ? "selected" : ""}>${esc(x.mine)} / ${esc(x.truck)}</option>`).join("")}</select></h2>
     <div class="row">${v?.active ? `<span class="badge dark">激活：${esc(v.active.split("/").pop())}</span>` : '<span class="badge bad">无激活版本</span>'}<button class="btn sm" data-act="toggle-import">${S.showImport ? "收起" : "新建车辆 / 导入出厂标定"}</button></div></div>
@@ -674,7 +696,7 @@ function pageMap() {
       <div class="field"><label>标定版本</label><select data-act="field" data-section="mapping" data-key="calibration_id"><option value="" ${!m.calibration_id ? "selected" : ""}>激活版本（${esc(v?.active ? v.active.split("/").pop() : "无")}）</option>${versions.map((x) => `<option value="${esc(x.id)}" ${m.calibration_id === x.id ? "selected" : ""}>${esc(x.version)} · ${esc(x.stage_label)}</option>`).join("")}</select></div>
 
       <div class="field"><label>回放倍速</label><input type="number" step="0.1" min="0.1" max="4" data-act="field" data-section="mapping" data-key="rate" value="${esc(m.rate)}"></div>
-      <div class="field"><label>起始偏移 (s)</label><input type="number" step="1" min="0" data-act="field" data-section="mapping" data-key="start_offset" value="${esc(m.start_offset ?? 0)}"></div>
+      <div class="field"><label>起始偏移 (s)</label><input type="number" step="0.001" min="0" data-act="field" data-section="mapping" data-key="start_offset" value="${esc(m.start_offset ?? 0)}"><div class="small muted">数据评估后自动填入全程最早可用静止段的起点，可手动修改。${S.assessSummary?.startup?.stationary ? `检测静止段：${num(S.assessSummary.startup.stationary.start_s, 3)}–${num(S.assessSummary.startup.stationary.end_s, 3)} s。` : ""}</div></div>
       <div class="field"><label>回放时长 (s，空=全部)</label><input type="number" step="1" min="0" data-act="field" data-section="mapping" data-key="duration" value="${esc(m.duration ?? "")}"></div>
       <div class="field"><label>几何点云截取距离 (m)</label><input type="number" step="1" min="0" data-act="field" data-section="mapping" data-key="map_range" value="${esc(m.map_range ?? 45)}" ${m.save_map ? "" : "disabled"}></div>
       <div class="field"><label>强度点云过滤值 (m，0 = 不过滤，0–0.1)</label><input type="number" step="0.005" min="0" max="0.1" data-act="field" data-section="mapping" data-key="map_filter" value="${esc(m.map_filter ?? 0.01)}" ${m.save_map ? "" : "disabled"} title="map_N.pcd：每个分块里每个该尺寸的小格只留离雷达最近（最准）的一个回波，停车时每秒只留一帧；值越大剔除的重复点越多、文件越小，0 = 不过滤（与以前完全一致）。20261013 全程（2.39 GB）：0.01 → 1.08 GB（行驶路段保留 98.7 %，默认），0.02 → 0.96 GB（90 %），0.03 → 0.82 GB（78 %），0.05 → 0.60 GB（58 %），0.1 → 0.31 GB（30 %）"></div>
@@ -775,7 +797,7 @@ function drawerJob() {
   if (!j) return `<div class="drawer-h"><h2>任务</h2><button class="btn sm" data-act="close">关闭</button></div><div class="empty">当前没有选中的任务</div>`;
   const res = j.results || {};
   const resHtml = Object.keys(res).length ? `<div class="kv small" style="margin:10px 0">${Object.entries(res).map(([k, v]) => `<div class="k">${esc(k)}</div><div class="mono">${esc(v)}</div></div>`).join("")}</div>` : "";
-  return `<div class="drawer-h"><div><h2>${esc(j.title)}</h2><div class="small muted">${fmtT(j.started)} · ${j.status === "running" ? "运行中" : esc(j.status)} ${j.error ? `· <span class="bad">${esc(j.error)}</span>` : ""}</div></div>
+  return `<div class="drawer-h"><div><h2>${esc(j.title)}</h2><div class="small muted">${fmtT(j.started)} · ${j.status === "running" ? "运行中" : esc(j.status)} · 错误：${j.error ? `<span class="bad">${esc(j.error)}</span>` : j.status === "done" ? "无" : "暂未报告"}</div></div>
     <div class="row">${j.status === "running" ? `<button class="btn" data-act="stop" data-mode="finish">提前结束并保存</button><button class="btn danger" data-act="stop" data-mode="abort">强制终止</button>` : ""}${j.kind === "pipeline" && ["failed", "stopped", "lost"].includes(j.status) ? `<button class="btn" data-act="resumeJob" title="从第一个未完成的步骤继续，已完成的阶段与轮次不再重跑">从失败步骤续跑</button>` : ""}<button class="btn sm" data-act="close">关闭</button></div></div>
     ${j.steps.length > 1 ? `<div class="list" id="job-steps">${jobStepsHtml()}</div>` : ""}${resHtml}
     ${res.result_id ? `<div class="row" style="margin-bottom:10px"><button class="btn" data-act="open-version" data-id="${esc(res.result_id)}">查看版本 ${esc(res.result_id.split("/").pop())}</button>${res.camlidar_id ? `<button class="btn" data-act="open-version" data-id="${esc(res.camlidar_id)}">查看相机复核 ${esc(res.camlidar_id.split("/").pop())}</button>` : ""}</div>` : ""}
@@ -925,6 +947,7 @@ const A = {
     saveState({ ui: { page } });
     render();
     if (page === "data" && !S.fs) A["fs-open"]({ dataset: { path: S.dataset?.path ? S.dataset.path.replace(/\/[^/]+$/, "") : "/home/project" } });
+    if (page === "mapping" && currentRound()) pollLive().then(() => { if (S.page === "mapping") render(); }).catch(() => {});
     if (page === "system") A["results-usage"]();
     if (page === "body") A["bf-load"]();
   },
@@ -934,7 +957,7 @@ const A = {
   mode(el) { S.state.mapping.mode = el.dataset.mode; saveState({ mapping: { mode: el.dataset.mode } }); render(); },
   toggle(el) { const sec = el.dataset.section, key = el.dataset.key; S.state[sec][key] = el.checked; saveState({ [sec]: { [key]: el.checked } }); if (sec === "calibration" || (sec === "mapping" && key === "save_map")) render(); },
   field(el) { const sec = el.dataset.section, key = el.dataset.key; const v = el.type === "number" ? (el.value === "" ? "" : Number(el.value)) : el.value; S.state[sec][key] = v; saveState({ [sec]: { [key]: v } }); if (el.tagName === "SELECT") render(); },
-  "set-vehicle"(el) { const [mine, truck] = el.value.split("/"); S.state.vehicle = { mine, truck }; S.calibForm.parent = null; S.state.calibration.parent_id = ""; S.state.mapping.calibration_id = ""; saveState({ vehicle: { mine, truck }, calibration: { parent_id: "" }, mapping: { calibration_id: "" } }); render(); if (S.page === "body") A["bf-load"](); },
+  async "set-vehicle"(el) { const [mine, truck] = el.value.split("/"); S.state.vehicle = { mine, truck }; S.calibForm.parent = null; S.state.calibration.parent_id = ""; S.state.mapping.calibration_id = ""; await saveState({ vehicle: { mine, truck }, calibration: { parent_id: "" }, mapping: { calibration_id: "" } }); render(); if (S.page === "body") A["bf-load"](); },
   async start() {
     const v = vehicle(); const m = S.state.mapping; const d = S.dataset;
     const mode = m.mode === "livo" && !d?.livo_ready ? "lio" : m.mode;
@@ -957,9 +980,9 @@ const A = {
     const label = { lidar: "LiDAR 标定流水线（后轴对齐 → 地面精修 → LIO 建图 → 行驶段精修 → 校验）", camera: `相机标定流水线（时间偏移 → LIVO 建图 A → 灯柱偏航复核 → 俯仰闭环${std ? "扫描" : "（快速）"} → 验证建图 → 闭环判定）`, camloop: `相机外参闭环微调（${std ? "标准" : "快速"}：${std ? "两轮扫描" : "复用已有轮次 + 一轮验证"} → 闭环判定）`, camphoto: "相机光度标定（LIVO 建图 → 光度一致性求旋转/时间、暗角，内参复核 → 验证建图 → 判定）" }[kind];
     const w = winEffective(S.winCalib, d?.duration_s);
     const winInfo = w ? `\n时间窗口：${winLabel(S.winCalib, d?.duration_s)}` : "\n时间窗口：自动（按运动窗口）";
-    const parent = S.calibForm.parent || v.active;
+    const parent = selectedParent();
     if (!confirm(`运行 ${label}\n父版本：${parent}${parent !== v.active ? `（当前激活 ${v.active}）` : ""}\n数据源：${d?.path}${winInfo}\n流水线包含一次完整回放建图，请勿同时启动其他建图。`)) return;
-    await act(async () => { const job = await api("/api/calibrations/pipeline", "POST", { kind, id: parent, parent_id: parent, from_factory: false, body_filter_source_id: v.active, dataset: d.path, activate: c.auto_activate !== false, use_rtk: true, rate: 1.0, note: "", mode: c.fast === false ? "standard" : "fast", window_start: w?.start_s ?? null, window_duration: w?.duration_s ?? null, keep_calib_maps: c.keep_maps === true }); S.job = job; S.jobLog = []; S.jobLogNext = 0; S.drawer = "job"; await loadOverview(); render(); }, "流水线已启动");
+    await act(async () => { const job = await api("/api/calibrations/pipeline", "POST", { kind, mine: v.mine, truck: v.truck, id: parent, parent_id: parent, from_factory: false, body_filter_source_id: v.active, dataset: d.path, activate: c.auto_activate !== false, use_rtk: true, rate: 1.0, note: "", mode: c.fast === false ? "standard" : "fast", window_start: w?.start_s ?? null, window_duration: w?.duration_s ?? null, keep_calib_maps: c.keep_maps === true }); S.job = job; S.jobLog = []; S.jobLogNext = 0; S.drawer = "job"; await loadOverview(); render(); }, "流水线已启动");
   },
   "toggle-import"() { S.showImport = !S.showImport; render(); },
   async import() {
@@ -968,7 +991,7 @@ const A = {
     const camera = ($("#imp-camera").value || "").trim();
     if (lidar !== "") body.lidar_offset = lidar;  // 留空 = 不传，程序自动检测时间偏移
     if (camera !== "") body.camera_offset = camera;
-    await act(async () => { const job = await api("/api/calibrations/import", "POST", body); S.state.vehicle = { mine: body.mine, truck: body.truck }; saveState({ vehicle: S.state.vehicle, calibration: { source_file: body.source, lidar_offset: lidar === "" ? null : Number(lidar), camera_offset: camera === "" ? null : Number(camera) } }); S.drafts = {}; S.job = job; S.jobLog = []; S.jobLogNext = 0; S.drawer = "job"; S.showImport = false; render(); }, "导入已开始");
+    await act(async () => { const job = await api("/api/calibrations/import", "POST", body); S.state.vehicle = { mine: body.mine, truck: body.truck }; S.calibForm.parent = null; S.state.calibration.parent_id = ""; S.state.mapping.calibration_id = ""; await saveState({ vehicle: S.state.vehicle, mapping: { calibration_id: "" }, calibration: { parent_id: "", source_file: body.source, lidar_offset: lidar === "" ? null : Number(lidar), camera_offset: camera === "" ? null : Number(camera) } }); S.drafts = {}; S.job = job; S.jobLog = []; S.jobLogNext = 0; S.drawer = "job"; S.showImport = false; render(); }, "导入已开始");
   },
   "calib-stage"(el) { S.calibForm.stage = el.value; render(); },
   "calib-field"(el) {
@@ -978,11 +1001,12 @@ const A = {
       S.state.calibration.parent_id = S.calibForm.parent || "";
       saveState({ calibration: { parent_id: S.state.calibration.parent_id } });
     }
+    if (k === "parent") render();
   },
   async "run-stage"() {
     const v = vehicle(); const f = S.calibForm; const d = S.dataset;
     const w = winEffective(S.winCalib, d?.duration_s);
-    const body = { stage: f.stage, id: f.parent || v?.active, dataset: d?.path, run: f.run || ($("select[data-key=run]") || {}).value, run_dir: f.run_dir || ($("select[data-key=run_dir]") || {}).value, note: f.note, activate: !!f.activate, frames: f.frames, window_start: w?.start_s ?? null, window_duration: w?.duration_s ?? null };
+    const body = { stage: f.stage, mine: v?.mine, truck: v?.truck, id: selectedParent(), dataset: d?.path, run: f.run || ($("select[data-key=run]") || {}).value, run_dir: f.run_dir || ($("select[data-key=run_dir]") || {}).value, note: f.note, activate: !!f.activate, frames: f.frames, window_start: w?.start_s ?? null, window_duration: w?.duration_s ?? null };
     if (f.stage === "manual") { if (f.camera_offset !== "" && f.camera_offset != null) body.camera_offset = Number(f.camera_offset); if (f.lidar_offset !== "" && f.lidar_offset != null) body.lidar_offset = Number(f.lidar_offset); if (f.camera_rot_delta && f.camera_rot_delta.trim()) body.camera_rot_delta = f.camera_rot_delta.trim().split(/[\s,]+/).map(Number); }
     await act(async () => { const job = await api("/api/calibrations/stage", "POST", body); S.job = job; S.jobLog = []; S.jobLogNext = 0; S.drawer = "job"; render(); }, "阶段已启动");
   },
@@ -1062,16 +1086,40 @@ function bfNormalizeRect(r) {
   if (![x1, x2, y1, y2].every(Number.isFinite)) return null;
   return { x_min: Math.min(x1, x2), x_max: Math.max(x1, x2), y_min: Math.min(y1, y2), y_max: Math.max(y1, y2) };
 }
+function bfUpdateFusedRectInputs() {
+  const r = S.body && S.body.body_filter && S.body.body_filter.fused_rectangle;
+  document.querySelectorAll('[data-act="bf-fused-rect"]').forEach((input) => {
+    input.value = r ? bfNum(r[input.dataset.k]) : "";
+  });
+}
+function bfBodyModeNote(f) {
+  const rect = f && f.fused_rectangle;
+  const legacyCount = Object.values((f && f.lidar_rectangles) || {}).reduce((n, rs) => n + (rs || []).length, 0);
+  if (rect) return `<div class="callout ok">当前使用统一后轴坐标系矩形；保存后会自动移除旧版逐雷达矩形，并保留原文件备份。</div>`;
+  if (legacyCount) return `<div class="bf-legacy-note small">当前版本仍使用旧版逐雷达多框（${legacyCount} 个）；红点是旧规则的预览。请在俯视图拖出一个统一矩形，红点将立即切换为新框的过滤预览；保存后自动替换旧多框。</div>`;
+  return `<div class="callout warn">尚未设置统一矩形。切到俯视图，在点云上拖动一次即可绘制；红色点会即时显示将被过滤的点。</div>`;
+}
+function bfUpdateBodyModeNote() {
+  const f = S.body && S.body.body_filter, note = document.getElementById("bf-mode-note");
+  if (note) note.innerHTML = bfBodyModeNote(f);
+  const clear = document.querySelector('[data-act="bf-clear-rect"]');
+  if (clear) clear.disabled = !(f && f.fused_rectangle);
+}
 function bfDefaultRect() { return { x_min: -1.5, y_min: -1.5, x_max: 1.5, y_max: 1.5 }; }
 function bfYamlOverrides(f) {
-  const std = ["front_right_lidar", "back_lidar", "front_left_lidar", "front_lidar"];
-  const keys = Array.from(new Set([...std, ...Object.keys(f.lidar_rectangles || {})]));
-  const bf = { minimum_z: Number(f.minimum_z) };
-  keys.forEach((k) => {
-    const flat = [];
-    (f.lidar_rectangles[k] || []).forEach((r) => flat.push(Number(r.x_min), Number(r.y_min), Number(r.x_max), Number(r.y_max)));
-    bf[k] = flat;
-  });
+  const bf = { enabled: !!f.enabled, minimum_z: Number(f.minimum_z) };
+  if (f.fused_rectangle) {
+    const r = f.fused_rectangle;
+    bf.fused_rectangle = [Number(r.x_min), Number(r.y_min), Number(r.x_max), Number(r.y_max)];
+  } else {
+    const std = ["front_right_lidar", "back_lidar", "front_left_lidar", "front_lidar"];
+    const keys = Array.from(new Set([...std, ...Object.keys(f.lidar_rectangles || {})]));
+    keys.forEach((k) => {
+      const flat = [];
+      (f.lidar_rectangles[k] || []).forEach((r) => flat.push(Number(r.x_min), Number(r.y_min), Number(r.x_max), Number(r.y_max)));
+      bf[k] = flat;
+    });
+  }
   const b = f.rear_axle_box || { x_min: -2.8, x_max: 2.8, y_min: -4.5, y_max: 9.5 };
   return { body_filter: bf, precheck: { body_box: [Number(b.x_min), Number(b.x_max), Number(b.y_min), Number(b.y_max)] } };
 }
@@ -1087,20 +1135,29 @@ function bfRecomputeMulti() {
   const b = S.body, f = b && b.body_filter, m = b && b.multi_scan;
   if (!f || !m || !m.series) return;
   const minz = Number(f.minimum_z), enabled = !!f.enabled;
-  let total = 0;
   m.series.forEach((s) => {
-    const local = s.points_local || [];
-    if (local.length !== (s.points || []).length) return;
-    const rects = (f.lidar_rectangles || {})[s.topic_key] || [];
-    s.filtered = local.map((p) => {
-      const inside = rects.some((r) => p[0] > r.x_min && p[0] < r.x_max && p[1] > r.y_min && p[1] < r.y_max);
-      return enabled && inside && p[2] > minz;
-    });
+    const points = s.points || [];
+    if (f.fused_rectangle) {
+      const r = f.fused_rectangle;
+      s.filtered = points.map((p) => enabled && p[0] > r.x_min && p[0] < r.x_max &&
+        p[1] > r.y_min && p[1] < r.y_max && p[2] > minz);
+    } else {
+      const local = s.points_local || [];
+      if (local.length !== points.length) return;
+      const rects = (f.lidar_rectangles || {})[s.topic_key] || [];
+      s.filtered = local.map((p) => {
+        const inside = rects.some((r) => p[0] > r.x_min && p[0] < r.x_max && p[1] > r.y_min && p[1] < r.y_max);
+        return enabled && inside && p[2] > minz;
+      });
+    }
     s.filtered_count = s.filtered.filter(Boolean).length;
   });
   m.filtered_count = m.series.reduce((n, s) => n + (s.filtered_count || 0), 0);
+  b.yaml_overrides = bfYamlOverrides(f);
   const c = document.getElementById("bf-all-count");
-  if (c) c.innerHTML = `拼接样本过滤 <b>${m.filtered_count}</b> / ${m.sampled_points || 0} 点（原始 ${m.raw_points || 0} 点）`;
+  if (c) c.innerHTML = `${f.fused_rectangle ? "统一矩形" : "旧版多框"}: <b>${m.filtered_count}</b> / ${m.sampled_points || 0} 点（原始 ${m.raw_points || 0} 点）`;
+  const pre = document.getElementById("bf-yaml");
+  if (pre) pre.textContent = JSON.stringify(b.yaml_overrides, null, 2);
 }
 function bfRecompute() {
   const b = S.body, f = b && b.body_filter, s = b && b.scan;
@@ -1287,7 +1344,7 @@ function bfDrawAllLidars() {
   ctx.fillStyle = "#8e8e93"; ctx.font = "11px sans-serif";
   ctx.fillText("+Y 车头方向 · 虚线＝后轴车身框", 8, 30);
 }
-function bfDrawAll() { bfDrawXY(); bfDrawXZ(); bfDrawRear(); bfDrawAllLidars(); }
+function bfDrawAll() { bfDrawXY(); bfDrawXZ(); bfDrawRear(); bfDrawAllLidars(); if (S.bodyForm.viewer) S.bodyForm.viewer.draw(); }
 function bfAttachXY(c) {
   c.addEventListener("pointerdown", (ev) => {
     const b = S.body; if (!b || !b.scan || !b.body_filter) return;
@@ -1374,31 +1431,42 @@ function bfAttachRear(c) {
   c.addEventListener("pointercancel", () => { S.bodyForm.rearDrag = null; bfDrawRear(); });
 }
 function initBodyCanvases() {
-  S.bodyForm.drag = null; S.bodyForm.rearDrag = null; S.bodyForm.zDrag = false;
-  const xy = document.getElementById("bf-xy"), xz = document.getElementById("bf-xz"), rear = document.getElementById("bf-rear");
-  if (xy) bfAttachXY(xy); if (xz) bfAttachXZ(xz); if (rear) bfAttachRear(rear);
+  const canvas = document.getElementById("bf-scene");
+  if (!canvas || !window.LivoBodyViewer) { S.bodyForm.viewer = null; return; }
+  S.bodyForm.viewer = window.LivoBodyViewer.attach(canvas, () => {
+    const body = S.body, filter = body && body.body_filter, scan = body && body.multi_scan;
+    return { series: (scan && scan.series) || [], bounds: scan && scan.xy,
+      rectangle: filter && filter.fused_rectangle, minimum_z: filter && filter.minimum_z,
+      enabled: !(filter && filter.enabled === false) };
+  }, (rectangle) => {
+    const filter = S.body && S.body.body_filter; if (!filter) return;
+    filter.fused_rectangle = rectangle;
+    bfUpdateFusedRectInputs();
+    bfRecomputeMulti();
+    bfUpdateBodyModeNote();
+  }, S.bodyForm.view || "top");
+  document.querySelectorAll(".bf-view-btn").forEach((button) => {
+    button.classList.toggle("primary", button.dataset.view === (S.bodyForm.view || "top"));
+  });
   bfDrawAll();
 }
 window.addEventListener("resize", () => { if (S.page === "body") bfDrawAll(); });
 
 function pageBody() {
-  const b = S.body, f = b && b.body_filter, s = b && b.scan, v = vehicle(), d = S.dataset;
-  const m = (b && b.multi_scan) || {}, series = m.series || [];
+  const b = S.body, f = b && b.body_filter, v = vehicle(), d = S.dataset;
+  const m = (b && b.multi_scan) || {}, series = m.series || [], rect = f && f.fused_rectangle;
   const parentVersions = bfParentVersions(), parentId = (b && b.parent_id) || bfCurrentParentId();
   const parentOptions = parentVersions.map((x) => `<option value="${esc(x.id)}" ${parentId === x.id ? "selected" : ""}>${esc(x.version)} · ${esc(x.stage_label)}${x.active ? " ★" : ""}</option>`).join("");
-  const topics = (b && b.topics) || [], key = (b && b.topic_key) || bfKey((b && b.topic) || "");
-  const rects = (f && f.lidar_rectangles && f.lidar_rectangles[key]) || [];
-  const rear = (f && f.rear_axle_box) || { x_min: -2.8, x_max: 2.8, y_min: -4.5, y_max: 9.5 };
-  const filtered = s ? s.filtered_count : 0, total = s && s.points ? s.points.length : 0;
-  const err = (b && b.error) || (s && s.error);
-  const dur = (b && b.duration_s) || 0;
+  const legacyCount = Object.values((f && f.lidar_rectangles) || {}).reduce((n, rs) => n + (rs || []).length, 0);
+  const err = (b && b.error) || (m && m.error), dur = (b && b.duration_s) || 0;
+  const modeNote = bfBodyModeNote(f);
   return `
   <div class="card">
     <div class="card-h"><h2>车身点云可视化过滤</h2><div class="row">
       <button class="btn sm" data-act="bf-reload" ${S.bodyBusy ? "disabled" : ""}>重新加载</button>
-      <button class="btn sm primary" data-act="bf-save" ${S.bodyBusy || !f ? "disabled" : ""}>保存到标定文件</button>
+      <button class="btn sm primary" data-act="bf-save" ${S.bodyBusy || !f ? "disabled" : ""}>保存唯一矩形到标定文件</button>
     </div></div>
-    <div class="small muted">在真实录制点云上拖拽绘制 / 移动 / 拉伸车身过滤矩形；红色点会被当前参数删除。参数写入该车激活版本的 <code>calibration.json:body_filter</code>，在线建图与离线标定都会读取。</div>
+    <div class="small muted">所有 LiDAR 先按所选父版本外参拼接到后轴坐标系，再使用一个 XY 矩形和 minimum_z 过滤；红色点是将被删除的点。保存写入该车激活版本的 <code>calibration.json:body_filter</code>，流水线会把它同步到所选父版本。</div>
     <div class="form" style="margin-top:12px">
       <div class="field"><label>车辆</label><select data-act="set-vehicle">${S.vehicles.map((x) => `<option value="${esc(x.id)}" ${v && x.id === v.id ? "selected" : ""}>${esc(x.mine)} / ${esc(x.truck)}</option>`).join("")}</select></div>
       <div class="field"><label>标定版本</label><input type="text" value="${esc((b && b.id) || (v && v.active) || "—")}" readonly></div>
@@ -1406,56 +1474,43 @@ function pageBody() {
       <div class="field"><label>父版本（拼接外参 / 自动化标定）</label><select data-act="bf-parent">${parentOptions || "<option>（无）</option>"}</select></div>
       <div class="field wide"><label>父版本标定文件</label><input type="text" class="mono small" value="${esc((b && b.parent_calibration_file) || "")}" readonly></div>
       <div class="field wide"><label>数据源</label><input type="text" class="mono small" value="${esc((b && b.dataset) || (d && d.path) || "")}" readonly></div>
-      <div class="field"><label>LiDAR 话题</label><select data-act="bf-param" data-key="topic">${topics.map((t) => `<option value="${esc(t)}" ${(b && b.topic) === t ? "selected" : ""}>${esc(t)}</option>`).join("")}</select></div>
-      <div class="field"><label>采样时刻（s，0–${bfNum(dur)}）</label><input type="number" min="0" max="${bfNum(dur)}" step="1" data-act="bf-param" data-key="t" value="${bfNum((s && s.t_s) || 0)}"></div>
+      <div class="field"><label>整帧采样时刻（s，0–${bfNum(dur)}）</label><input type="number" min="0" max="${bfNum(dur)}" step="0.1" data-act="bf-param" data-key="t" value="${bfNum(m.t_s || 0)}"></div>
     </div>
     ${err ? `<div class="callout bad" style="margin-top:10px">${esc(err)}</div>` : ""}
   </div>
 
   <div class="card">
-    <div class="card-h"><h2>多雷达拼接俯视（后轴坐标系）</h2><span class="small muted" id="bf-all-count">拼接样本过滤 <b>${m.filtered_count || 0}</b> / ${m.sampled_points || 0} 点（原始 ${m.raw_points || 0} 点）</span></div>
-    <div class="small muted">按上方父版本标定文件中的 LiDAR→后轴外参，把数据集中全部 LiDAR 话题拼到同一坐标系；每一路颜色不同，红点＝当前参数会过滤的点，彩色线框＝各 LiDAR 的过滤矩形。</div>
-    <canvas id="bf-all" class="bf-canvas wide"></canvas>
-    <div class="bf-legend" id="bf-all-legend">
-      ${series.length ? series.map((x) => `<button class="btn sm" data-act="bf-focus-topic" data-topic="${esc(x.topic)}" style="border-color:${esc(x.color)}"><i style="background:${esc(x.color)}"></i>${esc(x.topic)} (${x.sampled_points || 0})</button>`).join("") : '<span class="muted">暂无多雷达采样</span>'}
-      <span><i class="drop"></i>将过滤点</span>
+    <div class="card-h"><h2>全部 LiDAR 拼接整帧 · 后轴坐标系</h2><span class="small muted" id="bf-all-count">${rect ? "统一矩形" : "旧版多框"}: <b>${m.filtered_count || 0}</b> / ${m.sampled_points || 0} 点（原始 ${m.raw_points || 0} 点）</span></div>
+    <div class="bf-scene-toolbar">
+      <button class="btn sm bf-view-btn ${S.bodyForm.view !== "orbit" ? "primary" : ""}" data-act="bf-view" data-view="top">俯视 · XY</button>
+      <button class="btn sm bf-view-btn ${S.bodyForm.view === "orbit" ? "primary" : ""}" data-act="bf-view" data-view="orbit">平视 / 360°环视 · Z-up</button>
+      <button class="btn sm" data-act="bf-view-reset">复位视角</button>
+      <button class="btn sm danger" data-act="bf-clear-rect" ${rect ? "" : "disabled"}>清除统一矩形</button>
+      <span class="small muted">${m.sampled_points || 0} 点 · ${series.length} 路 LiDAR</span>
     </div>
+    <canvas id="bf-scene" class="bf-scene"></canvas>
+    <div class="bf-legend" id="bf-all-legend">
+      ${series.length ? series.map((x) => `<span><i style="background:${esc(x.color)}"></i>${esc(x.topic)} (${x.sampled_points || 0})</span>`).join("") : '<span class="muted">暂无多雷达采样</span>'}
+      <span><i class="drop"></i>将过滤点</span><span><i class="rect"></i>唯一过滤框</span>
+    </div>
+    <div class="small muted">请求时刻 ${bfNum(m.requested_t_s)} s · 实际整帧 ${bfNum(m.t_s)} s · header 时间跨度 ${bfNum(m.frame_time_span_ms)} ms（在线同步阈值 20 ms）</div>
+    ${m.alignment_warning && m.frame_time_span_ms != null ? `<div class="callout warn small" style="margin-top:8px">${esc(m.alignment_warning)}</div>` : ""}
+    <div class="bf-view-help small muted">俯视：滚轮围绕鼠标位置缩放；右键 / 中键拖动或 Shift+左键拖动平移；左键空白拖动新建框，框内拖动平移，四角或边线拖动缩放。平视/环视：左键水平拖动可绕世界 Z 轴连续 360°旋转，垂直拖动改变仰角且保持 Z-up；滚轮缩放，Shift+拖动平移。</div>
+    <div id="bf-mode-note" style="margin-top:12px">${modeNote}</div>
     ${m.error ? `<div class="callout bad" style="margin-top:8px">${esc(m.error)}</div>` : ""}
   </div>
 
   <div class="card">
-    <div class="card-h"><h2>点云预览</h2><span class="small muted" id="bf-filtered-count">当前样本过滤 <b>${filtered}</b> / ${total} 点（原始 ${(s && s.raw_points) || 0} 点）</span></div>
-    <div class="bf-grid">
-      <div><h4>XY 俯视（物理 ${esc((b && b.topic) || "LiDAR")} 坐标系，单位 m）</h4><canvas id="bf-xy" class="bf-canvas"></canvas>
-        <div class="bf-legend"><span><i class="keep"></i>保留点</span><span><i class="drop"></i>将过滤点</span><span><i class="rect"></i>过滤框</span></div></div>
-      <div><h4>XZ 侧视（拖动设置 minimum_z）</h4><canvas id="bf-xz" class="bf-canvas"></canvas>
-        <div class="small muted">仅当点位于 XY 矩形内且 <code>z &gt; minimum_z</code> 时删除；在图中上下拖动红色虚线。</div></div>
-    </div>
-    <div class="callout warn" style="margin-top:12px">操作：空白处拖拽＝新增矩形；框内拖拽＝移动；拖拽边框或角点＝缩放；右侧表格可以精确输入。每次修改都会立即重算红色点，点击“保存到标定文件”后生效。</div>
-  </div>
-
-  <div class="grid g2">
-    <div class="card"><div class="card-h"><h2>${esc(key)} 过滤矩形（${rects.length}）</h2><button class="btn sm" data-act="bf-addrect">新增</button></div>
-      <table class="bf-table"><thead><tr><th>#</th><th>x_min</th><th>x_max</th><th>y_min</th><th>y_max</th><th></th></tr></thead><tbody>
-      ${rects.length ? rects.map((r, i) => `<tr><td>${i + 1}</td>${["x_min", "x_max", "y_min", "y_max"].map((k) => `<td><input type="number" step="0.1" data-act="bf-rect" data-i="${i}" data-k="${k}" value="${bfNum(r[k])}"></td>`).join("")}<td><button class="btn sm danger" data-act="bf-delrect" data-i="${i}">删除</button></td></tr>`).join("") : '<tr><td colspan="6" class="empty">暂无矩形；在 XY 画布空白处拖拽绘制。</td></tr>'}
-      </tbody></table>
-    </div>
-    <div class="card"><div class="card-h"><h2>后轴车身框（离线标定）</h2></div>
-      <canvas id="bf-rear" class="bf-canvas short"></canvas>
-      <div class="form" style="margin-top:10px">${["x_min", "x_max", "y_min", "y_max"].map((k) => `<div class="field"><label>${k}</label><input type="number" step="0.1" data-act="bf-rear" data-k="${k}" value="${bfNum(rear[k])}"></div>`).join("")}</div>
-      <div class="small muted" style="margin-top:8px">该框位于后轴坐标系，用于 axle / ground / driven / gcons / 评估等离线阶段的车身点剔除。画布为网格示意，可拖拽重画。</div>
-    </div>
-  </div>
-
-  <div class="card"><div class="card-h"><h2>全局参数与生效预览</h2></div>
-    <div class="form">
+    <div class="bf-scene-fields">
       <label class="check"><input type="checkbox" data-act="bf-global" data-k="enabled" ${f && f.enabled ? "checked" : ""}><span class="switch"></span><span>启用车身过滤</span></label>
-      <div class="field"><label>minimum_z（m）</label><input type="number" step="0.1" data-act="bf-global" data-k="minimum_z" value="${bfNum(f && f.minimum_z)}"></div>
-      <div class="field"><label>来源</label><input type="text" value="${esc((f && f.source) || "")}" readonly></div>
-      <div class="field"><label>更新时间</label><input type="text" value="${esc((f && f.updated) || "")}" readonly></div>
+      ${["x_min", "x_max", "y_min", "y_max"].map((k) => `<div class="field"><label>统一框 ${k}（m）</label><input type="number" step="0.05" data-act="bf-fused-rect" data-k="${k}" value="${rect ? bfNum(rect[k]) : ""}" placeholder="俯视图拖动绘制"></div>`).join("")}
+      <div class="field"><label>minimum_z（m）</label><input type="number" step="0.05" data-act="bf-global" data-k="minimum_z" value="${bfNum(f && f.minimum_z)}"></div>
     </div>
-    <h4 style="margin-top:14px">将写入轮次 config.yaml 的 ROS 参数</h4>
-    <pre id="bf-yaml" class="small">${esc(JSON.stringify((b && b.yaml_overrides) || {}, null, 2))}</pre>
+    <div class="small muted" style="margin-top:8px">坐标：后轴原点，X 横向、Y 朝车头、Z 向上。矩形按 fused 点的 X/Y 过滤，且仅删除 <code>z &gt; minimum_z</code> 的点；平视图显示该高度阈值和过滤棱柱。</div>
+    <details style="margin-top:10px"><summary>生效参数与标定元数据</summary>
+      <div class="kv small" style="margin:10px 0"><div class="k">来源</div><div>${esc((f && f.source) || "")}</div><div class="k">更新时间</div><div>${esc((f && f.updated) || "")}</div></div>
+      <pre id="bf-yaml" class="small">${esc(JSON.stringify((b && b.yaml_overrides) || {}, null, 2))}</pre>
+    </details>
   </div>`;
 }
 
@@ -1463,18 +1518,16 @@ Object.assign(A, {
   async "bf-load"() {
     if (S.bodyBusy) return;
     const st = S.state || {}, v = st.vehicle || {};
-    if (S.body && (S.body.mine !== v.mine || S.body.truck !== v.truck)) S.bodyForm.topic = "";
+    if (S.body && (S.body.mine !== v.mine || S.body.truck !== v.truck)) S.bodyForm.t = 0;
     S.bodyBusy = true; render();
     try {
       const q = new URLSearchParams({
         mine: v.mine || "", truck: v.truck || "", dataset: (st.data && st.data.dataset) || "",
-        topic: S.bodyForm.topic || "", t: String(S.bodyForm.t || 0), max_points: String(S.bodyForm.max_points || 12000),
+        t: String(S.bodyForm.t || 0), max_points: String(S.bodyForm.max_points || 40000),
         parent_id: bfCurrentParentId(),
       });
       S.body = await api("/api/body-filter?" + q.toString());
-      S.bodyForm.topic = S.body.topic || "";
-      S.bodyForm.t = (S.body.scan && S.body.scan.t_s) || 0;
-      S.bodyForm.sel = null;
+      S.bodyForm.t = (S.body.multi_scan && S.body.multi_scan.t_s) || 0;
       if (S.body && S.body.parent_id) S.state.calibration.parent_id = S.body.parent_id;
     } catch (e) {
       S.body = { error: e.message || String(e) };
@@ -1492,7 +1545,7 @@ Object.assign(A, {
     const b = S.body; if (!b || !b.body_filter) return toast("尚未加载车身过滤参数", "bad");
     await act(async () => {
       const r = await api("/api/body-filter", "POST", {
-        mine: b.mine, truck: b.truck, id: b.id, source: "Studio 车身点云可视化过滤",
+        mine: b.mine, truck: b.truck, id: b.id, source: "Studio 融合整帧单矩形车身过滤",
         body_filter: b.body_filter,
       });
       toast(`已保存到 ${r.calibration_file}`, "ok");
@@ -1521,7 +1574,35 @@ Object.assign(A, {
     const f = S.body && S.body.body_filter; if (!f) return;
     if (el.dataset.k === "enabled") f.enabled = el.checked;
     else if (el.dataset.k === "minimum_z") f.minimum_z = Number(el.value);
-    bfRecompute(); bfDrawAll();
+    bfRecomputeMulti(); bfDrawAll();
+  },
+  "bf-fused-rect"() {
+    const f = S.body && S.body.body_filter; if (!f) return;
+    const values = {};
+    for (const key of ["x_min", "x_max", "y_min", "y_max"]) {
+      const input = document.querySelector(`[data-act="bf-fused-rect"][data-k="${key}"]`);
+      if (!input || input.value === "") return;
+      values[key] = Number(input.value);
+    }
+    const rect = bfNormalizeRect(values);
+    if (!rect || rect.x_max - rect.x_min < 0.05 || rect.y_max - rect.y_min < 0.05) return toast("统一矩形宽和长都必须大于 0.05 m", "bad");
+    f.fused_rectangle = rect;
+    bfUpdateFusedRectInputs(); bfRecomputeMulti(); bfDrawAll();
+    bfUpdateBodyModeNote();
+  },
+  "bf-clear-rect"() {
+    const f = S.body && S.body.body_filter; if (!f) return;
+    f.fused_rectangle = null;
+    f.lidar_rectangles = Object.fromEntries(["front_right_lidar", "back_lidar", "front_left_lidar", "front_lidar"].map((k) => [k, []]));
+    bfRecomputeMulti(); render();
+  },
+  "bf-view"(el) {
+    S.bodyForm.view = el.dataset.view === "orbit" ? "orbit" : "top";
+    if (S.bodyForm.viewer) S.bodyForm.viewer.setView(S.bodyForm.view);
+    document.querySelectorAll(".bf-view-btn").forEach((button) => button.classList.toggle("primary", button.dataset.view === S.bodyForm.view));
+  },
+  "bf-view-reset"() {
+    if (S.bodyForm.viewer) S.bodyForm.viewer.reset();
   },
   "bf-rear"(el) {
     const f = S.body && S.body.body_filter; if (!f) return;
@@ -1566,6 +1647,7 @@ document.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && S.draw
     const hashPage = location.hash.replace("#", "");
     S.page = PAGES[hashPage] ? hashPage : (S.state.ui?.page && PAGES[S.state.ui.page] ? S.state.ui.page : "home");
     if (S.job) { await pollJob(); await pollLive(); }
+    else if (S.page === "mapping" && currentRound()) await pollLive();
     render();
     if (S.page === "data") A["fs-open"]({ dataset: { path: S.dataset?.path ? S.dataset.path.replace(/\/[^/]+$/, "") : "/home/project" } });
     if (S.page === "system") A["results-usage"]();

@@ -1673,7 +1673,7 @@
   },
   "body_filter": {
     "enabled": true,
-    "minimum_z": -3.0,
+    "minimum_z": -1.01,
     "rear_axle_box": {
       "x_min": -3.2,
       "y_min": -5.0,
@@ -1697,10 +1697,10 @@
       ],
       "back_lidar": [
         {
-          "x_min": -1.5,
-          "y_min": -2.5,
-          "x_max": 3.5,
-          "y_max": 2.5
+          "x_min": -1.6762740696977687,
+          "y_min": -2.696086090355937,
+          "x_max": 3.491976664726824,
+          "y_max": 2.9728233507455464
         }
       ],
       "front_left_lidar": [
@@ -1719,7 +1719,7 @@
       ],
       "front_lidar": []
     },
-    "source": "Studio visual preview (zongyang/truck02 manual body mask)",
-    "updated": "2026-10-27T10:40:37+08:00"
+    "source": "Studio 车身点云可视化过滤",
+    "updated": "2026-10-27T11:50:59+08:00"
   }
 }

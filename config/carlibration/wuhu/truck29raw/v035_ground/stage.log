@@ -1,0 +1,16 @@
+calibration=/home/project/MY-LIVO/config/carlibration/wuhu/truck29raw/v034_axle/calibration.json
+bag=/home/project/data/haibo/wuhu/29/20261013/ros2bag
+reference=front_lidar
+stationary frames 2..22 (aggregated) for side LiDARs; moving frames 810..850 (per frame) for back LiDAR
+stationary check (front_lidar, first vs last frame of 20): scan displacement median 10.9 cm / P90 163.5 cm (limit 30 cm) -> stationary
+front_right_lidar: stationary aggregated points 22803
+back_lidar: stationary aggregated points 820
+front_left_lidar: stationary aggregated points 24944
+front_lidar: stationary aggregated points 56876
+front_right_lidar: yaw/xy solved=True; matches 5542->5484; |res| median 8.53->6.12 cm; ground 9.53->6.70 cm (n=4412); vertical 7.38->5.03 cm (n=677); correction rot deg (x,y,z)=(-0.120,+0.290,+0.102) trans cm=(+3.0,+4.9,-0.8); iters 19  [quality: ok]
+front_left_lidar: plane start: own ground vs reference tilt 6.75 deg (fore-aft -6.23, lateral -2.60), height -3.9 cm over 1 plane pair(s) -> start rot deg (x,y,z)=(-6.231,+2.589,+0.110) z -3.9 cm; ground residual 15.64->8.77 cm (n=2731->5363): used
+front_left_lidar: yaw/xy solved=True; matches 3105->6468; |res| median 15.79->7.58 cm; ground 15.64->8.65 cm (n=5372); vertical 17.91->3.40 cm (n=601); correction rot deg (x,y,z)=(-6.290,+2.612,+0.087) trans cm=(+1.6,+3.0,-3.0); iters 25  [quality: warn; plane start applied (6.75 deg / -3.9 cm): outside the refinement basin of the parent calibration (mount moved or coarse parent file); yaw/x/y are re-checked by the driven stage]
+back_lidar: plane start: own ground vs reference tilt 2.03 deg (fore-aft -0.13, lateral +2.03), height +10.4 cm over 40 plane pair(s) -> start rot deg (x,y,z)=(-0.126,-2.028,+0.005) z +10.4 cm; ground residual 10.57->16.56 cm (n=29455->24634): not used (does not improve the overlap)
+back_lidar: (moving, per-frame vs refined sides) yaw/xy solved=False; matches 32450->32528; |res| median 11.54->10.35 cm; ground 10.57->9.45 cm (n=29506); vertical 25.27->26.23 cm (n=1693); correction rot deg (x,y,z)=(-0.422,-0.155,+0.000) trans cm=(+0.0,+0.0,-5.5); iters 21  [quality: ok]
+quality: warn  (front_left_lidar: plane start applied (6.75 deg / -3.9 cm): outside the refinement basin of the parent calibration (mount moved or coarse parent file); yaw/x/y are re-checked by the driven stage)
+written /home/project/MY-LIVO/config/carlibration/wuhu/truck29raw/v035_ground/calibration.json

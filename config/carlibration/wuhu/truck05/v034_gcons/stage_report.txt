@@ -1,0 +1,8 @@
+calibration=/home/project/MY-LIVO/config/carlibration/wuhu/truck05/v033_rtktime/calibration.json
+run=/home/project/MY-LIVO/results/calib_truck05_rtk1_1014_134623/Log/fusion/1791957544629248223
+window 0.0..237.4 s, stride 4, scans front_right_lidar:592, back_lidar:592, front_left_lidar:592, front_lidar:592; ground-band returns 8848786
+front_right_lidar: ground returns 1747805, median along-track position +9.7 m (kept (overlaps the reference, driven stage))
+back_lidar: ground returns 914491, median along-track position -13.1 m (rear-facing -> solved)
+front_left_lidar: ground returns 2094753, median along-track position +9.5 m (kept (overlaps the reference, driven stage))
+back_lidar: correction rotvec x +0.260 y +0.003 deg (about the LiDAR, rear-axle frame), z -0.51 cm; own-ground change RMS 7.0 cm; flat-ground |res| median 4.42->2.03 cm (n=572483); signed median by range: 4-10 m +1.0->-0.6, 10-20 m +5.1->+0.8, 20-40 m +7.8->-0.4; halves: 0.046 deg / 0.2 cm  [quality: ok]
+result: applied to back_lidar

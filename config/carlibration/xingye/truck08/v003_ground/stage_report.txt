@@ -1,0 +1,16 @@
+calibration=/home/project/MY-LIVO/config/carlibration/xingye/truck08/v002_axle/calibration.json
+bag=/home/project/data/haibo/xingye/08/20261018/ros2bag
+reference=front_lidar
+stationary frames 2..22 (aggregated) for side LiDARs; moving frames 2520..2560 (per frame) for back LiDAR
+stationary check (front_lidar, first vs last frame of 20): scan displacement median 8.0 cm / P90 30.2 cm (limit 30 cm) -> stationary
+front_right_lidar: stationary aggregated points 13945
+back_lidar: stationary aggregated points 7282
+front_left_lidar: stationary aggregated points 21490
+front_lidar: stationary aggregated points 24704
+front_right_lidar: plane start: own ground vs reference tilt 7.85 deg (fore-aft +2.72, lateral -7.37), height -146.9 cm over 1 plane pair(s) -> start rot deg (x,y,z)=(+2.711,+7.367,+0.105) z -146.9 cm; ground residual 12.59->21.24 cm (n=3425->2010): not used (does not improve the overlap)
+front_right_lidar: yaw/xy solved=True; matches 4826->4767; |res| median 8.07->5.98 cm; ground 12.59->8.03 cm (n=3384); vertical 2.98->2.87 cm (n=710); correction rot deg (x,y,z)=(+0.289,+0.203,+0.095) trans cm=(+2.6,-1.9,-3.7); iters 25  [quality: ok]
+front_left_lidar: plane start: own ground vs reference tilt 4.89 deg (fore-aft +3.71, lateral -3.20), height -109.2 cm over 1 plane pair(s) -> start rot deg (x,y,z)=(+3.695,+3.200,-0.182) z -109.2 cm; ground residual 10.64->21.67 cm (n=3529->2377): not used (does not improve the overlap)
+front_left_lidar: yaw/xy solved=True; matches 4996->4970; |res| median 7.66->5.04 cm; ground 10.64->6.55 cm (n=3526); vertical 2.63->2.48 cm (n=713); correction rot deg (x,y,z)=(+0.323,-0.057,-0.094) trans cm=(-1.2,+0.7,-3.3); iters 15  [quality: ok]
+back_lidar: plane start: own ground vs reference tilt 2.10 deg (fore-aft -1.15, lateral +1.78), height +3.5 cm over 40 plane pair(s) -> start rot deg (x,y,z)=(-1.144,-1.778,+0.013) z +3.5 cm; ground residual 13.15->16.52 cm (n=14386->12276): not used (does not improve the overlap)
+back_lidar: (moving, per-frame vs refined sides) yaw/xy solved=False; matches 19610->20280; |res| median 13.18->7.40 cm; ground 13.15->5.98 cm (n=14943); vertical 17.83->19.94 cm (n=1978); correction rot deg (x,y,z)=(+0.641,+0.539,+0.000) trans cm=(+0.0,+0.0,-7.7); iters 25  [quality: ok]
+quality: ok

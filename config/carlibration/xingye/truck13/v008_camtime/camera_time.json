@@ -1,0 +1,37 @@
+{
+  "yaw": {
+    "lag_s": -0.01085632086070022,
+    "corr": 0.9956793537553037,
+    "gain": 1.1673967594655903,
+    "n": 1800,
+    "sse_ratio_zero_lag": 1.1448494751946483
+  },
+  "pitch": {
+    "lag_s": -0.011648565755421912,
+    "corr": 0.8571096471593235,
+    "gain": 0.9068716812103546,
+    "n": 1800,
+    "sse_ratio_zero_lag": 1.0560073205361185
+  },
+  "segments": [
+    {
+      "start_s": 0,
+      "lag_s": -0.011169202810124774,
+      "corr": 0.9948556413619695
+    },
+    {
+      "start_s": 30,
+      "note": "insufficient yaw excitation"
+    }
+  ],
+  "camera_offset_s": -0.01085632086070022,
+  "segment_spread_ms": null,
+  "implied_fx_from_gain": 1917.0405885564192,
+  "start_s": 337.0,
+  "quality": {
+    "ok": true,
+    "problems": [],
+    "segment_spread_ms": null,
+    "gain": 1.167
+  }
+}

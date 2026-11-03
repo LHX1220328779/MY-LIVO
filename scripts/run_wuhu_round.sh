@@ -189,6 +189,48 @@ doc = {"round": round_name, "mode": mode, "dataset": dataset, "calibration": cal
 json.dump(doc, open(path, "w"), indent=2, ensure_ascii=False)
 PY
 
+# Keep the result manifest truthful when the user stops a round: without this trap,
+# SIGTERM leaves round.json stuck at status=running/phase=playing with no explanation.
+# ros2 launch can exit after its mapper while leaving the per-round RViz child alive.
+# Signal only PIDs reported by this launch, and verify the command still points into this round.
+stop_round_rviz() {
+  local rviz_pid rviz_cmd rviz_state i
+  [[ -n "${out:-}" && -f "$out/launch.log" ]] || return 0
+  while IFS= read -r rviz_pid; do
+    [[ "$rviz_pid" =~ ^[0-9]+$ ]] || continue
+    rviz_cmd=$(ps -p "$rviz_pid" -o args= 2>/dev/null || true)
+    [[ "$rviz_cmd" == *"/rviz2"* && "$rviz_cmd" == *"$out/"* ]] || continue
+    echo "stopping round RViz pid=$rviz_pid" >> "$out/run.log"
+    kill -TERM "$rviz_pid" 2>/dev/null || true
+    for i in $(seq 1 10); do
+      rviz_state=$(ps -p "$rviz_pid" -o stat= 2>/dev/null || true)
+      [[ -z "$rviz_state" || "$rviz_state" == Z* ]] && break
+      sleep 0.5
+    done
+    rviz_state=$(ps -p "$rviz_pid" -o stat= 2>/dev/null || true)
+    rviz_cmd=$(ps -p "$rviz_pid" -o args= 2>/dev/null || true)
+    if [[ -n "$rviz_state" && "$rviz_state" != Z* && "$rviz_cmd" == *"/rviz2"* && "$rviz_cmd" == *"$out/"* ]]; then
+      kill -KILL "$rviz_pid" 2>/dev/null || true
+      echo "round RViz pid=$rviz_pid required SIGKILL" >> "$out/run.log"
+    fi
+  done < <(sed -nE 's/.*\[rviz2-[0-9]+\]: process started with pid \[([0-9]+)\].*/\1/p' "$out/launch.log" | sort -u)
+}
+
+round_terminate() {
+  local sig="$1" rc=143
+  [[ "$sig" == "INT" ]] && rc=130
+  if [[ -n "${manifest:-}" && -f "$manifest" ]]; then
+    phase stopped status=stopped end="\"$(date -u +%FT%TZ)\"" error="\"round interrupted by SIG${sig}\""
+    if [[ -n "${out:-}" && -d "$out" ]]; then
+      echo "round interrupted by SIG${sig} at $(date -u +%FT%TZ)" >> "$out/run.log"
+    fi
+  fi
+  stop_round_rviz
+  exit "$rc"
+}
+trap 'round_terminate TERM' TERM
+trap 'round_terminate INT' INT
+
 # --no-rtk mapping: the exporter (frames.csv/scans.bin/trajectories/map_N.pcd) lives in the RTK
 # backend, so the backend must run; rtk.observations_enabled=false starves it of INS/RTK
 # observations instead -> pure-odometry graph, products in the INS-anchored mine frame,
@@ -210,15 +252,16 @@ if (( write_config_only )); then
   exit 0
 fi
 
-# Refuse to start on top of a stale mapper/player from an earlier round.
-# Only this pipeline's own processes count as stale (an earlier mapper competes for CPU/memory). A foreign
-# `ros2 bag play` on another DDS domain cannot reach the round any more and is left alone.
-stale='fastlivo_mapping|livo/player.py|livo.player|wuhu_truck29.launch'
+# Refuse to start on top of a stale mapper/player/RViz from an earlier round.
+# An orphaned RViz keeps the private Fast DDS domain alive and can make the next player's graph isolated.
+rviz_stale='rviz2.*(wuhu_truck29\.rviz|/home/project/MY-LIVO/results/[^[:space:]]+/(lio_display|camera_display)\.rviz)'
+stale="fastlivo_mapping|livo/player.py|livo.player|wuhu_truck29.launch|$rviz_stale"
 if pgrep -f "$stale" >/dev/null; then
   echo "stale ROS processes present; killing them" | tee -a "$out/run.log"
   pkill -INT -f 'livo/player.py|livo.player' || true; sleep 1
   pkill -TERM -f 'fastlivo_mapping' || true; sleep 2
   pkill -TERM -f 'wuhu_truck29.launch' || true; sleep 2
+  pkill -TERM -f "$rviz_stale" || true; sleep 1
   pkill -KILL -f "$stale" || true
 fi
 
@@ -229,6 +272,18 @@ echo "bag=$dataset"; echo "dataset=$dataset"; echo "calibration=${calibration:-y
 echo "start=$(date -u +%FT%TZ)"; echo "commit=$(git rev-parse --short HEAD 2>/dev/null)"; echo "branch=$(git branch --show-current 2>/dev/null)"
 git status --short -- src include config launch scripts tools CMakeLists.txt 2>/dev/null | sed 's/^/dirty: /'
 } > "$out/run.log"
+# The stale-process cleanup above may have stopped the last participant. Reap its
+# Fast DDS IPC, then fail clearly if this round's domain is still occupied (including
+# stale ports that the current UID cannot remove) instead of publishing into a split graph.
+timeout 30 fastdds shm clean > "$out/fastdds_shm_clean.log" 2>&1 || true
+domain_base=$((7400 + 250 * ROS_DOMAIN_ID))
+for port_file in /dev/shm/fastrtps_port${domain_base}*; do
+  [[ -e "$port_file" ]] || continue
+  shm_error="Fast DDS domain ${ROS_DOMAIN_ID} is already in use (${port_file##*/}); stop existing ROS nodes or choose LIVO_ROUND_DOMAIN_ID"
+  echo "ERROR: $shm_error" | tee -a "$out/run.log" >&2
+  phase failed status=failed end="\"$(date -u +%FT%TZ)\"" error="\"$shm_error\""
+  exit 2
+done
 if [[ -z "$calibration" ]]; then
   # The yaml fallback is a fixed file, not the vehicle's calibration version: a recording of another date/vehicle
   # (sensor moved, new firmware) maps with stale extrinsics (truck29raw 20261013: front_left 6.4 deg off).
@@ -250,7 +305,7 @@ mapper_pid=$(sed -n 's/.*fastlivo_mapping.*process started with pid \[\([0-9][0-
 echo "launch_pid=$launch_pid mapper_pid=${mapper_pid:-none}" >> "$out/run.log"
 if [[ -z "${mapper_pid:-}" ]]; then
   echo "mapper did not start" | tee -a "$out/run.log"; phase failed status=failed error='"mapper did not start"'
-  kill -INT "$launch_pid" 2>/dev/null; exit 2
+  kill -INT "$launch_pid" 2>/dev/null; sleep 1; stop_round_rviz; exit 2
 fi
 
 # Resource / throughput monitor (resources.csv: fps, real-time factor, RSS/CPU of mapper, decoder, player).
@@ -272,7 +327,8 @@ while kill -0 "$player_pid" 2>/dev/null; do
   sleep 2
 done
 wait "$player_pid"
-echo "playback_exit=$? at $(date -u +%FT%TZ)" >> "$out/run.log"
+playback_exit=$?
+echo "playback_exit=$playback_exit at $(date -u +%FT%TZ)" >> "$out/run.log"
 
 # Drain: wait until the mapper has caught up with the played data (tail processed). With save_map the fusion
 # frame index frames.csv grows per frame; --no-save-map rounds (closed-loop scan rounds) write nothing before
@@ -309,13 +365,19 @@ kill -TERM "$launch_pid" 2>/dev/null
 for i in $(seq 1 30); do kill -0 "$launch_pid" 2>/dev/null || break; sleep 1; done
 if kill -0 "$launch_pid" 2>/dev/null; then pkill -KILL -f "image_transport/republish" 2>/dev/null; kill -KILL "$launch_pid" 2>/dev/null; fi
 wait "$launch_pid" 2>/dev/null
-echo "launch_exit=$?" >> "$out/run.log"
+launch_exit=$?
+echo "launch_exit=$launch_exit" >> "$out/run.log"
+stop_round_rviz
 pkill -KILL -f "image_transport/republish" 2>/dev/null || true
 grep -E "RTK finalized|Final keyframe|INS attitude factors|position budget|Mapping failed|RTK backend failed" "$out/launch.log" >> "$out/run.log"
 # The node aborts on an input IMU gap (> maximum_time_gap, e.g. one dropped 100 Hz message under load) and
 # exports only the prefix: keep the output for diagnosis but mark the round incomplete (exit 4).
 # A FATAL stop (e.g. a backwards input stamp) or a killed mapper (OOM: exit -9) also leaves only a prefix.
 mapper_error=$(grep -m1 -oE "Mapping failed: [^[:cntrl:]]*|RTK backend failed[^[:cntrl:]]*|\[FATAL\] \[[0-9.]+\] \[laser_mapping\]: [^[:cntrl:]]*|\[fastlivo_mapping[^]]*\]: process has died \[pid [0-9]+, exit code -?[0-9]+" "$out/launch.log" | head -1 | sed 's/"/\\"/g')
+if [[ -n "$mapper_error" || $playback_exit -ne 0 ]]; then
+  # Idempotent, PID-scoped fallback for failed rounds; never kill another viewer.
+  stop_round_rviz
+fi
 map_chunks=$(ls "$fusion_dir"/map_*.pcd 2>/dev/null | wc -l)
 echo "map_chunks=$map_chunks" >> "$out/run.log"
 echo "fusion_dir=$fusion_dir" >> "$out/run.log"
@@ -324,14 +386,14 @@ phase exported fusion_dir="\"${fusion_dir%/}\"" map_chunks="$map_chunks"
 # Standard map products (voxel-filtered global map, optional tiles / keyframe clouds, map_info.json) from the
 # archived scans and the final corrections; runs next to the evaluation (both read the archive only).
 export_pid=""
-if [[ $save_map == true && $map_export -eq 1 && -n "${fusion_dir:-}" && -f "$fusion_dir/scans.bin" && -f "$fusion_dir/corrections.txt" ]]; then
+if [[ $playback_exit -eq 0 && $save_map == true && $map_export -eq 1 && -n "${fusion_dir:-}" && -f "$fusion_dir/scans.bin" && -f "$fusion_dir/corrections.txt" ]]; then
   export_args=("$fusion_dir" --voxel "$map_voxel" --source "$map_source" --tile "$map_tile" --min-points "$map_min_points")
   (( map_keyframes )) && export_args+=(--keyframe-clouds)
   echo "map export start $(date -u +%FT%TZ): ${export_args[*]}" >> "$out/run.log"
   /usr/bin/python3 tools/livo/map_export.py "${export_args[@]}" > "$out/map_export.log" 2>&1 &
   export_pid=$!
 fi
-if [[ $do_eval -eq 1 && -n "${fusion_dir:-}" && -f "$fusion_dir/trajectory_optimized.txt" ]]; then
+if [[ $playback_exit -eq 0 && $do_eval -eq 1 && -n "${fusion_dir:-}" && -f "$fusion_dir/trajectory_optimized.txt" ]]; then
   phase evaluating
   eval_args=(--dataset "$dataset"); (( quick_eval )) && eval_args+=(--quick)
   bash scripts/evaluate_wuhu_round.sh "$round" "${eval_args[@]}" >> "$out/run.log" 2>&1
@@ -340,13 +402,32 @@ if [[ -n "$export_pid" ]]; then
   wait "$export_pid"; echo "map export exit=$? at $(date -u +%FT%TZ): $(tail -1 "$out/map_export.log" | cut -c1-300)" >> "$out/run.log"
 fi
 rc=0
-if [[ -n "${fusion_dir:-}" && -f "$fusion_dir/trajectory_optimized.txt" && -z "$mapper_error" ]]; then
+if [[ $playback_exit -ne 0 ]]; then
+  playback_error=$(/usr/bin/python3 - "$out/playback.log" "$playback_exit" <<'PY'
+import json, sys
+path, code = sys.argv[1:]
+message = f"player exited with code {code}; see playback.log"
+try:
+    with open(path, errors="replace") as f:
+        message = next((line.strip() for line in f if "ERROR:" in line), message)
+except Exception:
+    pass
+print(json.dumps(message, ensure_ascii=False))
+PY
+)
+  phase failed status=failed end="\"$(date -u +%FT%TZ)\"" error="$playback_error"
+  echo "FAILED: playback exit $playback_exit ($playback_error)" >> "$out/run.log"
+  rc=3
+elif [[ -n "${fusion_dir:-}" && -f "$fusion_dir/trajectory_optimized.txt" && -z "$mapper_error" ]]; then
   phase done status=done end="\"$(date -u +%FT%TZ)\""
 elif [[ -n "${fusion_dir:-}" && -f "$fusion_dir/trajectory_optimized.txt" ]]; then
   phase done status=incomplete end="\"$(date -u +%FT%TZ)\"" error="\"$mapper_error\""
   echo "INCOMPLETE: $mapper_error" >> "$out/run.log"; rc=4
 else
-  phase failed status=failed end="\"$(date -u +%FT%TZ)\"" error='"no optimized trajectory exported"'; rc=3
+  failure_error="${mapper_error:-no optimized trajectory exported}"
+  phase failed status=failed end="\"$(date -u +%FT%TZ)\"" error="\"$failure_error\""
+  echo "FAILED: $failure_error" >> "$out/run.log"
+  rc=3
 fi
 chown -R 1000:1000 "$out" 2>/dev/null || true
 echo "end=$(date -u +%FT%TZ)" >> "$out/run.log"

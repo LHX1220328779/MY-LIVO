@@ -1,0 +1,371 @@
+# wuhu/truck29/v082_axle
+
+- stage: axle (后轴对齐（RTK/INS）)
+- parent: wuhu/truck29/v001_import
+- lineage: wuhu/truck29/v001_import -> wuhu/truck29/v082_axle
+- created: 2026-10-12T09:04:19+08:00
+- note: pipeline: axle
+
+## inputs
+
+- bag: /home/project/data/haibo/wuhu_livo/ros2bag
+- dataset: {'path': '/home/project/data/haibo/wuhu_livo/ros2bag', 'kind': 'raw_split', 'segments': 8, 'duration_s': 120.13, 'has_camera': True}
+- window: [0.0, 1000000000.0]
+- dof: xy
+- time_offset: estimated
+
+## changes vs parent
+
+```
+{
+  "lidars": {
+    "front_right_lidar": {
+      "dt_cm": [
+        -7.59,
+        24.72,
+        0.0
+      ],
+      "drpy_deg": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "back_lidar": {
+      "dt_cm": [
+        -7.59,
+        24.73,
+        0.0
+      ],
+      "drpy_deg": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "front_left_lidar": {
+      "dt_cm": [
+        -7.59,
+        24.73,
+        0.0
+      ],
+      "drpy_deg": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "front_lidar": {
+      "dt_cm": [
+        -7.59,
+        24.73,
+        0.0
+      ],
+      "drpy_deg": [
+        0.0,
+        0.0,
+        0.0
+      ]
+    }
+  },
+  "camera_to_rear": {
+    "dt_cm": [
+      -7.59,
+      24.73,
+      0.0
+    ],
+    "drpy_deg": [
+      0.0,
+      0.0,
+      0.0
+    ]
+  },
+  "time_offsets": {
+    "lidar": {
+      "from": -0.125,
+      "to": -0.146
+    },
+    "lidar_frontend": {
+      "from": null,
+      "to": -0.1335
+    }
+  }
+}
+```
+
+## metrics
+
+```
+{
+  "rear_axle_alignment": {
+    "reference": "transform_matrix_lidar_6",
+    "poses": "imu_data/odometry (RTK fixed)",
+    "applied_to": "all LiDARs and the camera (rig correction)",
+    "solution_rotvec_deg": [
+      -0.1386,
+      0.1519,
+      -0.2319
+    ],
+    "solution_translation_cm": [
+      -7.59,
+      24.73,
+      0.0
+    ],
+    "correction_rotvec_deg": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "correction_translation_cm": [
+      -7.59,
+      24.73,
+      0.0
+    ],
+    "correction_matrix": [
+      0.9999999999999999,
+      -8.673617379884035e-19,
+      3.469446951953614e-18,
+      -0.07591163938446713,
+      2.168404344971009e-19,
+      1.0,
+      0.0,
+      0.24728871249133544,
+      -3.469446951953614e-18,
+      3.469446951953614e-18,
+      0.9999999999999999,
+      6.938893903907228e-18,
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ],
+    "time_shift_s": -0.021,
+    "time_offsets_used": {
+      "lidar": -0.125,
+      "rtk_position": 0.025,
+      "ins_attitude": 0.0
+    },
+    "residual_cm": {
+      "before": 1.962,
+      "after": 1.881,
+      "ground_after": 1.653,
+      "vertical_after": 3.254
+    },
+    "sqrt_information": {
+      "rx": 5081.8,
+      "ry": 2550.2,
+      "rz": 2252.5,
+      "tx": 20.8,
+      "ty": 20.8,
+      "dt": 379.4
+    },
+    "repeatability_halves": {
+      "rotvec_deg": [
+        0.002,
+        0.001,
+        0.053
+      ],
+      "translation_cm": [
+        7.9,
+        6.8,
+        0.0
+      ],
+      "time_ms": -0.9
+    },
+    "time_profile": [
+      {
+        "baseline_s": -0.18,
+        "dt_s": -0.0853,
+        "median_cm": 4.636,
+        "ground_cm": 5.129
+      },
+      {
+        "baseline_s": -0.15,
+        "dt_s": -0.0631,
+        "median_cm": 4.176,
+        "ground_cm": 4.38
+      },
+      {
+        "baseline_s": -0.12,
+        "dt_s": -0.042,
+        "median_cm": 3.566,
+        "ground_cm": 3.518
+      },
+      {
+        "baseline_s": -0.09,
+        "dt_s": -0.03,
+        "median_cm": 2.849,
+        "ground_cm": 2.669
+      },
+      {
+        "baseline_s": -0.06,
+        "dt_s": -0.023,
+        "median_cm": 2.193,
+        "ground_cm": 1.968
+      },
+      {
+        "baseline_s": -0.03,
+        "dt_s": -0.021,
+        "median_cm": 1.893,
+        "ground_cm": 1.665
+      },
+      {
+        "baseline_s": 0.0,
+        "dt_s": -0.0213,
+        "median_cm": 1.868,
+        "ground_cm": 1.651
+      },
+      {
+        "baseline_s": 0.03,
+        "dt_s": -0.0223,
+        "median_cm": 1.889,
+        "ground_cm": 1.669
+      }
+    ],
+    "time_profile_min_dt_s": -0.0213,
+    "scans_used": 550,
+    "window_s": [
+      9.8,
+      119.6
+    ],
+    "dof": "xy",
+    "iterations": 12,
+    "converged": true,
+    "quality": "ok",
+    "reasons": [],
+    "runtime_s": 238.8
+  },
+  "frontend_sync": {
+    "imu_ins_lag_s": 0.012500000000000289,
+    "corr": 0.9978,
+    "yaw_rms_rad_s": 0.0596,
+    "template": null,
+    "decision": "replaced template with -0.1335"
+  }
+}
+```
+
+## summary
+
+```
+{
+  "lidars": [
+    {
+      "lidar": "front_right_lidar",
+      "key": "transform_matrix_lidar_1",
+      "t": [
+        2.7364,
+        5.9468,
+        1.8154
+      ],
+      "rpy_deg": [
+        -0.75,
+        -3.418,
+        -1.241
+      ]
+    },
+    {
+      "lidar": "back_lidar",
+      "key": "transform_matrix_lidar_2",
+      "t": [
+        -0.0755,
+        -0.2752,
+        0.6848
+      ],
+      "rpy_deg": [
+        -0.973,
+        0.543,
+        -91.144
+      ]
+    },
+    {
+      "lidar": "front_left_lidar",
+      "key": "transform_matrix_lidar_3",
+      "t": [
+        -3.1279,
+        5.7108,
+        1.974
+      ],
+      "rpy_deg": [
+        -3.351,
+        -1.89,
+        178.724
+      ]
+    },
+    {
+      "lidar": "front_lidar",
+      "key": "transform_matrix_lidar_6",
+      "t": [
+        -0.1089,
+        8.0403,
+        0.051
+      ],
+      "rpy_deg": [
+        1.3,
+        -1.67,
+        90.16
+      ]
+    }
+  ],
+  "camera_to_rear": {
+    "t": [
+      -0.0017,
+      8.0387,
+      1.7519
+    ],
+    "rpy_deg": [
+      -96.438,
+      1.487,
+      0.699
+    ]
+  },
+  "camera": {
+    "topic": "/midrange_camera/image_raw",
+    "width": 1920,
+    "height": 1080,
+    "intrinsics": [
+      1642.570556640625,
+      1855.53173828125,
+      971.0083025529602,
+      534.2602337509306
+    ],
+    "distortion": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "source": "defaults (wuhu truck29 yaml)"
+  },
+  "time_offsets": {
+    "lidar": -0.146,
+    "camera": 0.0,
+    "rtk_position": 0.025,
+    "ins_attitude": 0.0,
+    "source": "import (verify with camera-time / LIO evaluation)",
+    "lidar_source": "rear-axle alignment (cross-time consistency vs INS poses)",
+    "lidar_frontend": -0.1335,
+    "lidar_frontend_source": "axle: lidar -0.1460 + imu/ins clock lag +0.0125 (corr 0.998); template none replaced"
+  }
+}
+```
+
+## stage report
+
+```
+calibration=/home/project/MY-LIVO/config/carlibration/wuhu/truck29/v001_import/calibration.json
+bag=/home/project/data/haibo/wuhu_livo/ros2bag
+reference front_lidar (transform_matrix_lidar_6); poses imu_data/odometry (RTK fixed, >= 1.0 m/s, >= 5.0 s after motion start); time offsets lidar -0.1250 s, rtk_position +0.025 s, ins_attitude +0.000 s
+scans read 600, skipped {'slow': 24, 'startup': 23, 'not_rtk_fixed': 0, 'outside_ins': 3}
+scans used 550 (9.8..119.6 s), points 4071144; dof xy + LiDAR time shift; cross-time gap > 1.5 s
+time-offset candidates (exact re-pose baseline + local joint solve): -0.180/-0.085s:4.64cm, -0.150/-0.063s:4.18cm, -0.120/-0.042s:3.57cm, -0.090/-0.030s:2.85cm, -0.060/-0.023s:2.19cm, -0.030/-0.021s:1.89cm, +0.000/-0.021s:1.87cm, +0.030/-0.022s:1.89cm
+detected time shift -0.021 s (median 1.87 cm) -> final joint solve
+residual median 1.96 -> 1.88 cm (ground 1.71 -> 1.65, n=82187; vertical 3.43 -> 3.25, n=6967); match time gap median 3.5 s; iterations 12
+solution about the LiDAR (rear-axle frame): rotvec x(pitch) -0.139, y(roll) +0.152, z(yaw) -0.232 deg; translation x -7.6, y +24.7 cm
+applied (xy): rotvec x(pitch) +0.000, y(roll) +0.000, z(yaw) +0.000 deg; translation x -7.6, y +24.7, z +0.0 cm; LiDAR time shift -21.0 ms -> time_offsets.lidar -0.1460 s
+repeatability (first vs second half of the used scans): rotvec [0.002, 0.001, 0.053] deg, translation [7.9, 6.8, 0.0] cm, time -0.9 ms
+quality: ok
+written /home/project/MY-LIVO/config/carlibration/wuhu/truck29/v082_axle/calibration.json (239 s)
+frontend time base: replaced template with -0.1335; imu/ins lag +12.5 ms, corr 0.998, yaw rms 0.060 rad/s
+```

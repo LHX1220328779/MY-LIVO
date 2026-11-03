@@ -1,0 +1,15 @@
+calibration=/home/project/MY-LIVO/config/carlibration/wuhu/truck13/v003_ground/calibration.json
+run=/home/project/MY-LIVO/results/calib_truck13_lio_1026_172302/Log/fusion/1793006649815897152
+window 8.0..35.299999952316284 s, lidar_time_offset 0.036
+pass 1 poses: native frames.csv (6 DoF); pass 2 poses: RTK-optimized trajectory_optimized.txt (tilt about x/y and z of LiDARs with median match time gap > 2.0 s)
+scans used: front_right_lidar:275, back_lidar:275, front_left_lidar:275, front_lidar:275
+scan source: round archive scans.bin/sources.bin (mapper deskew; returns at scan end, round extrinsics inverted)
+matching: viewing-side consistent (oriented normals)
+reference front_lidar: 106146 world points
+pairing: same-time for LiDARs overlapping the reference (1.0 s blocks +-0.5 s, 1148432 block points); cross-time LiDARs use the accumulated target (nearest-range voxels)
+front_right_lidar: pass 1 matches 82214->72814 |res| median 1.55->1.34 cm; ground 1.55->1.34 (n=72814); vertical nan->nan (n=0); match time gap median 0.5 s; correction rot deg (x,y,z)=(-0.037,-0.014,-0.010) trans cm=(-1.4,+2.3,+1.4); iters 9  [quality: warn; only 0 vertical planar matches (yaw/x/y weakly observed)]
+front_left_lidar: pass 1 matches 92202->80605 |res| median 1.53->1.45 cm; ground 1.53->1.45 (n=80570); vertical 2.17->2.76 (n=11); match time gap median 0.5 s; correction rot deg (x,y,z)=(-0.003,-0.038,+0.026) trans cm=(-2.2,-1.0,+0.6); iters 8  [quality: warn; only 11 vertical planar matches (yaw/x/y weakly observed)]
+back_lidar: pass 1 matches 2305->2304 |res| median 5.59->2.10 cm; ground 5.59->2.10 (n=2304); vertical nan->nan (n=0); match time gap median 12.6 s; correction rot deg (x,y,z)=(-0.195,+0.038,+0.004) trans cm=(+0.3,+0.1,-7.0); iters 4
+    pass 2 (cross-time LiDAR, drift-free poses, ground only): ground 2.08->1.71 cm (n=2278); tilt about x/y adjusted by (-0.169,-0.002) deg, z by -2.4 cm; iters 3
+    final correction rot deg (x,y,z)=(-0.364,+0.037,+0.004) trans cm=(+0.3,+0.1,-9.4)  [quality: warn; only 0 vertical planar matches (yaw/x/y weakly observed)]
+quality: warn  (front_right_lidar: only 0 vertical planar matches (yaw/x/y weakly observed); front_left_lidar: only 11 vertical planar matches (yaw/x/y weakly observed); back_lidar: only 0 vertical planar matches (yaw/x/y weakly observed))

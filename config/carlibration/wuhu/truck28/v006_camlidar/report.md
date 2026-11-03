@@ -1,0 +1,216 @@
+# wuhu/truck28/v006_camlidar
+
+- stage: camlidar (相机-LiDAR 偏航/横滚复核)
+- parent: wuhu/truck28/v005_camtime
+- lineage: wuhu/truck28/v001_import -> wuhu/truck28/v002_axle -> wuhu/truck28/v003_ground -> wuhu/truck28/v004_driven -> wuhu/truck28/v005_camtime -> wuhu/truck28/v006_camlidar
+- created: 2026-10-11T12:45:35+08:00
+- note: pole yaw not applied (only 1 usable pole observations): extrinsic kept
+
+## inputs
+
+- bag: /home/project/data/haibo/wuhu/28/ros2bag
+- dataset: {'path': '/home/project/data/haibo/wuhu/28/ros2bag', 'kind': 'raw_split', 'segments': 82, 'duration_s': 1229.98, 'has_camera': True}
+- run: /home/project/MY-LIVO/results/calib_truck28_livo_1011_123654/Log/fusion/1791693457375613243
+- frames: 30
+- window: [5.0, 115.0]
+
+## metrics
+
+```
+{
+  "method": "pole yaw (LiDAR pole axis vs image pole column)",
+  "frames_checked": 29,
+  "frames_with_poles": 2,
+  "observations": [
+    {
+      "t": 19.2,
+      "image": 33621,
+      "depth_m": 25.6,
+      "height_m": 8.7,
+      "rows": 15,
+      "du_px": -35.45,
+      "mad_px": 2.31,
+      "yaw_deg": 1.058,
+      "bar_width_px": 19,
+      "snr": 1.75,
+      "speed_mps": 7.97,
+      "roll_deg": null,
+      "u_px": 1704.2
+    }
+  ],
+  "rejected": [
+    {
+      "t": 15.6,
+      "depth_m": 28.1,
+      "bar_px": 24.3,
+      "rows": 277,
+      "rejected": "rows disagree (MAD 4.7 px over 27 rows, width 24 px)"
+    }
+  ],
+  "image_scale": 1.0,
+  "error": "only 1 usable pole observations",
+  "max_delta_deg": 0.5,
+  "applied": false
+}
+```
+
+## summary
+
+```
+{
+  "lidars": [
+    {
+      "lidar": "front_right_lidar",
+      "key": "transform_matrix_lidar_1",
+      "t": [
+        2.7415,
+        5.8007,
+        1.4489
+      ],
+      "rpy_deg": [
+        0.227,
+        2.437,
+        -0.257
+      ]
+    },
+    {
+      "lidar": "back_lidar",
+      "key": "transform_matrix_lidar_2",
+      "t": [
+        -0.1764,
+        -0.3512,
+        0.3407
+      ],
+      "rpy_deg": [
+        -1.774,
+        2.55,
+        -90.7
+      ]
+    },
+    {
+      "lidar": "front_left_lidar",
+      "key": "transform_matrix_lidar_3",
+      "t": [
+        -3.1134,
+        5.5768,
+        1.5576
+      ],
+      "rpy_deg": [
+        -1.047,
+        -0.228,
+        178.584
+      ]
+    },
+    {
+      "lidar": "front_lidar",
+      "key": "transform_matrix_lidar_6",
+      "t": [
+        -0.1426,
+        7.8507,
+        -0.1568
+      ],
+      "rpy_deg": [
+        2.071,
+        -3.4,
+        89.82
+      ]
+    }
+  ],
+  "camera_to_rear": {
+    "t": [
+      0.1951,
+      7.7526,
+      1.5925
+    ],
+    "rpy_deg": [
+      -100.421,
+      0.211,
+      0.764
+    ]
+  },
+  "camera": {
+    "topic": "/midrange_camera/image_raw",
+    "width": 1920,
+    "height": 1080,
+    "intrinsics": [
+      1637.05,
+      1851.4,
+      1029.33,
+      495.55
+    ],
+    "distortion": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "intrinsics_check": {
+      "method": "supplier ground-distance curves (midrange_camera[0].equation_*m)",
+      "curves": 10,
+      "distances_m": [
+        10.0,
+        20.0,
+        30.0,
+        40.0,
+        50.0,
+        60.0,
+        70.0,
+        80.0,
+        90.0,
+        100.0
+      ],
+      "fits": {
+        "free": {
+          "intrinsics": [
+            1637.05,
+            1851.4,
+            1029.33,
+            495.55
+          ],
+          "rms_px": 0.014,
+          "circle_centre_rear_m": [
+            0.0,
+            7.38
+          ],
+          "ground_z_rear_m": -1.22
+        },
+        "square": {
+          "intrinsics": [
+            1639.36,
+            1639.36,
+            864.27,
+            446.63
+          ],
+          "rms_px": 1.072,
+          "circle_centre_rear_m": [
+            0.806,
+            7.314
+          ],
+          "ground_z_rear_m": -1.588
+        }
+      },
+      "model": "independent fx / fy",
+      "rms_px": 0.014,
+      "camera_height_m": 2.827,
+      "deviation_vs_truck29_defaults": {
+        "fx_pct": -0.34,
+        "fy_pct": -0.22,
+        "cx_px": 58.3,
+        "cy_px": -38.7
+      }
+    },
+    "source": "supplier ground-distance curves equation_*m (independent fx / fy, rms 0.014 px)"
+  },
+  "time_offsets": {
+    "lidar": -0.0151,
+    "lidar_frontend": -0.0026,
+    "camera": 0.0,
+    "rtk_position": 0.025,
+    "ins_attitude": 0.0,
+    "lidar_source": "rear-axle alignment (cross-time consistency vs INS poses)",
+    "source": "import (verify with camera-time / LIO evaluation)",
+    "lidar_frontend_source": "axle: lidar -0.0151 + imu/ins clock lag +0.0125 (corr 0.998); template -0.1250 replaced"
+  }
+}
+```

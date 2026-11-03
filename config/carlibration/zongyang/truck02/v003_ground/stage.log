@@ -1,0 +1,16 @@
+calibration=/home/project/MY-LIVO/config/carlibration/zongyang/truck02/v002_axle/calibration.json
+bag=/home/project/data/haibo/zongyang/02/20261026/ros2bag
+reference=front_lidar
+stationary frames 2..22 (aggregated) for side LiDARs; moving frames 50..90 (per frame) for back LiDAR
+stationary check (front_lidar, first vs last frame of 20): scan displacement median 19.1 cm / P90 58.1 cm (limit 50 cm) -> stationary
+front_right_lidar: stationary aggregated points 16044
+back_lidar: stationary aggregated points 12227
+front_left_lidar: stationary aggregated points 19381
+front_lidar: stationary aggregated points 40151
+front_right_lidar: plane start: own ground vs reference tilt 0.48 deg (fore-aft +0.47, lateral +0.05), height -12.7 cm over 1 plane pair(s) -> start rot deg (x,y,z)=(+0.474,-0.046,-0.004) z -12.7 cm; ground residual 8.48->9.14 cm (n=2913->2937): not used (does not improve the overlap)
+front_right_lidar: yaw/xy solved=False; matches 3011->3033; |res| median 8.48->8.42 cm; ground 8.48->8.44 cm (n=2930); vertical 9.64->9.59 cm (n=57); correction rot deg (x,y,z)=(-0.021,-0.149,+0.000) trans cm=(+0.0,+0.0,+2.9); iters 15  [quality: ok]
+front_left_lidar: yaw/xy solved=False; matches 3504->3504; |res| median 9.04->9.04 cm; ground 9.07->9.07 cm (n=3385); vertical 3.75->3.75 cm (n=25); correction rot deg (x,y,z)=(+0.000,+0.000,+0.000) trans cm=(+0.0,+0.0,+0.0); iters 22  [quality: warn; fine solve regressed the ground residual (9.07->9.09 cm); kept the manual matrix (9.07 cm)]
+back_lidar: plane start: own ground vs reference tilt 1.02 deg (fore-aft +0.29, lateral -0.98), height -3.7 cm over 40 plane pair(s) -> start rot deg (x,y,z)=(+0.289,+0.979,-0.023) z -3.7 cm; ground residual 8.65->7.36 cm (n=26051->26182): used
+back_lidar: (moving, per-frame vs refined sides) yaw/xy solved=False; matches 26082->26326; |res| median 8.65->6.01 cm; ground 8.65->6.01 cm (n=26292); vertical nan->nan cm (n=0); correction rot deg (x,y,z)=(-0.039,+0.456,-0.023) trans cm=(+0.0,+0.0,-5.8); iters 12  [quality: warn; plane start applied (1.02 deg / -3.7 cm): outside the refinement basin of the parent calibration (mount moved or coarse parent file); yaw/x/y are re-checked by the driven stage]
+quality: warn  (front_left_lidar: fine solve regressed the ground residual (9.07->9.09 cm); kept the manual matrix (9.07 cm); back_lidar: plane start applied (1.02 deg / -3.7 cm): outside the refinement basin of the parent calibration (mount moved or coarse parent file); yaw/x/y are re-checked by the driven stage)
+written /home/project/MY-LIVO/config/carlibration/zongyang/truck02/v003_ground/calibration.json

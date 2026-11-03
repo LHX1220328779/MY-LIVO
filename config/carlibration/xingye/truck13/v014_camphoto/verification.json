@@ -1,0 +1,475 @@
+{
+  "closed_loop": {
+    "verdict": "pass",
+    "reasons": [],
+    "common_window": {
+      "t0": 1010,
+      "t1": 1020,
+      "baseline_rear_m": 22.309,
+      "candidate_rear_m": 22.249
+    },
+    "baseline": {
+      "round": "audit_x13_current_full_1028",
+      "mode": "livo",
+      "calibration_id": "xingye/truck13/v011_scan",
+      "duration_s": 1017.6,
+      "scale": 1.0,
+      "median_m": 13.2272,
+      "final_m": 22.3104,
+      "final_xy_m": 4.9951,
+      "yaw_p95_deg": 1.642
+    },
+    "candidate": {
+      "round": "audit_x13_camera_fixed_full_1028",
+      "mode": "livo",
+      "calibration_id": null,
+      "duration_s": 1016.53,
+      "scale": 1.0006,
+      "median_m": 12.5913,
+      "final_m": 22.2513,
+      "final_xy_m": 3.8543,
+      "yaw_p95_deg": 1.4405
+    },
+    "scale_margin": 0.002,
+    "criteria": "scale within baseline+0.2%; rear error at last common window <= 1.10x+0.10 m; yaw P95 <= baseline+0.15 deg; round durations within 10%",
+    "registered_as": "xingye/truck13/v014_camphoto",
+    "candidate_parameters_match_registered": true,
+    "candidate_parameter_file": "/home/project/MY-LIVO/results/audit_x13_camera/candidate_calibration.json"
+  },
+  "rounds": {
+    "audit_x13_current_full_1028": {
+      "complete": true,
+      "run": {
+        "frames": 10176,
+        "duration_s": 1017.6,
+        "distance_m": 2904.8,
+        "native_path_m": 2904.75,
+        "optimized_path_m": 2904.79,
+        "path_length_ratio": 1.0,
+        "frame_dt_median_s": 0.1,
+        "points_per_frame_median": 47887
+      },
+      "headline": {
+        "native": {
+          "median_m": 13.2272,
+          "p95_m": 21.7357,
+          "max_m": 22.3194,
+          "route_le10cm_pct": 0.72,
+          "route_gt20cm_pct": 93.66,
+          "budget": "FAIL",
+          "final_m": 22.3104,
+          "rmse_m": 13.5472,
+          "final_xy_m": 4.9951,
+          "median_xy_m": 5.7613,
+          "final_z_m": 21.744,
+          "median_z_m": 10.4273,
+          "yaw_p95_deg": 1.642,
+          "pitch_p95_deg": 2.0843,
+          "roll_p95_deg": 2.4255,
+          "yaw_drift_end_deg": -0.33,
+          "pitch_drift_end_deg": 1.37,
+          "path_length_ratio": 1.0
+        },
+        "optimized": {
+          "median_m": 0.0099,
+          "p95_m": 0.0243,
+          "max_m": 0.0574,
+          "route_le10cm_pct": 100.0,
+          "route_gt20cm_pct": 0.0,
+          "budget": "PASS",
+          "final_m": 0.0093,
+          "rmse_m": 0.0132,
+          "final_xy_m": 0.0093,
+          "median_xy_m": 0.0073,
+          "final_z_m": 0.0002,
+          "median_z_m": 0.0046,
+          "yaw_p95_deg": 0.2019,
+          "pitch_p95_deg": 0.2244,
+          "roll_p95_deg": 0.1085,
+          "yaw_drift_end_deg": 0.15,
+          "pitch_drift_end_deg": 0.16
+        },
+        "startup": {
+          "length_m": 29.917,
+          "native": {
+            "median_m": 0.05262341046090905,
+            "p95_m": 0.11047573271224746,
+            "max_m": 0.11825000517242086
+          },
+          "fused": {
+            "median_m": 0.010282027323822742,
+            "p95_m": 0.02992367925493494,
+            "max_m": 0.03552380524483482
+          },
+          "opposite_10m": {
+            "opposite": 119,
+            "samples": 278
+          }
+        },
+        "ground_5_20": {
+          "median_before_mm": 21.63,
+          "median_after_mm": 18.94,
+          "within_bound_pct": 92.99,
+          "cells": 13703
+        },
+        "plane_offset_5_20": {
+          "median_raw_mm": 33.9,
+          "median_opt_mm": 24.7,
+          "opt_gt5cm_pct": 22.33
+        },
+        "installation_misalignment_deg": [
+          0.155244,
+          0.0359406,
+          0.024737
+        ],
+        "time_offset_sec": 0.0175
+      },
+      "playback": {
+        "status": "completed",
+        "messages": 479382,
+        "elapsed_s": 925.66,
+        "max_lag_ms": 274.7,
+        "dropped_duplicate": 0,
+        "per_topic": {
+          "imu_data": 101997,
+          "imu_data/navsat_fix": 101997,
+          "imu_data/odometry": 101997,
+          "imu_data/ins_status": 101997,
+          "front_left_lidar": 10198,
+          "back_lidar": 10199,
+          "front_right_lidar": 10198,
+          "front_lidar": 10199,
+          "midrange_camera/ffmpeg": 30600
+        }
+      },
+      "fusion_dir": "/home/project/MY-LIVO/results/audit_x13_current_full_1028/Log/fusion/1793160236830666498",
+      "pole_pairs": {
+        "0_10": {
+          "chunks": [
+            {
+              "chunk": 0,
+              "selected": 0,
+              "shaft": 0,
+              "span_m": 0.0
+            },
+            {
+              "chunk": 10,
+              "selected": 0,
+              "shaft": 0,
+              "span_m": 0.0
+            }
+          ]
+        },
+        "0_5": {
+          "chunks": [
+            {
+              "chunk": 0,
+              "selected": 0,
+              "shaft": 0,
+              "span_m": 0.0
+            },
+            {
+              "chunk": 5,
+              "selected": 0,
+              "shaft": 0,
+              "span_m": 0.0
+            }
+          ]
+        },
+        "5_10": {
+          "chunks": [
+            {
+              "chunk": 5,
+              "selected": 0,
+              "shaft": 0,
+              "span_m": 0.0
+            },
+            {
+              "chunk": 10,
+              "selected": 0,
+              "shaft": 0,
+              "span_m": 0.0
+            }
+          ]
+        }
+      },
+      "pcd": {
+        "map": {
+          "chunks": 110,
+          "points": 84733634,
+          "bytes": 1355759046
+        },
+        "rgb_map": {
+          "chunks": 110,
+          "points": 46906664,
+          "bytes": 750526802
+        }
+      }
+    },
+    "audit_x13_camera_fixed_full_1028": {
+      "complete": true,
+      "run": {
+        "frames": 10113,
+        "duration_s": 1016.53,
+        "distance_m": 2904.4,
+        "native_path_m": 2906.07,
+        "optimized_path_m": 2904.42,
+        "path_length_ratio": 1.0006,
+        "frame_dt_median_s": 0.1,
+        "points_per_frame_median": 47823
+      },
+      "headline": {
+        "native": {
+          "median_m": 12.5913,
+          "p95_m": 21.6529,
+          "max_m": 22.2565,
+          "route_le10cm_pct": 1.72,
+          "route_gt20cm_pct": 93.87,
+          "budget": "FAIL",
+          "final_m": 22.2513,
+          "rmse_m": 13.2202,
+          "final_xy_m": 3.8543,
+          "median_xy_m": 5.3487,
+          "final_z_m": 21.9149,
+          "median_z_m": 9.9177,
+          "yaw_p95_deg": 1.4405,
+          "pitch_p95_deg": 2.1616,
+          "roll_p95_deg": 2.5681,
+          "yaw_drift_end_deg": -0.31,
+          "pitch_drift_end_deg": 1.39,
+          "path_length_ratio": 1.0006
+        },
+        "optimized": {
+          "median_m": 0.0096,
+          "p95_m": 0.026,
+          "max_m": 0.0577,
+          "route_le10cm_pct": 100.0,
+          "route_gt20cm_pct": 0.0,
+          "budget": "PASS",
+          "final_m": 0.01,
+          "rmse_m": 0.0135,
+          "final_xy_m": 0.0096,
+          "median_xy_m": 0.0065,
+          "final_z_m": 0.0028,
+          "median_z_m": 0.0046,
+          "yaw_p95_deg": 0.1975,
+          "pitch_p95_deg": 0.2207,
+          "roll_p95_deg": 0.1111,
+          "yaw_drift_end_deg": 0.15,
+          "pitch_drift_end_deg": 0.15
+        },
+        "startup": {
+          "length_m": 29.827,
+          "native": {
+            "median_m": 0.06580642810715562,
+            "p95_m": 0.10362955227192354,
+            "max_m": 0.11451675633048342
+          },
+          "fused": {
+            "median_m": 0.013311501279379757,
+            "p95_m": 0.03069194980943174,
+            "max_m": 0.03676298315782378
+          },
+          "opposite_10m": {
+            "opposite": 65,
+            "samples": 215
+          }
+        },
+        "ground_5_20": {
+          "median_before_mm": 21.08,
+          "median_after_mm": 18.87,
+          "within_bound_pct": 92.43,
+          "cells": 13284
+        },
+        "plane_offset_5_20": {
+          "median_raw_mm": 34.5,
+          "median_opt_mm": 26.5,
+          "opt_gt5cm_pct": 24.14
+        },
+        "installation_misalignment_deg": [
+          0.154901,
+          0.0367238,
+          0.0186001
+        ],
+        "time_offset_sec": 0.0175
+      },
+      "playback": {
+        "status": "completed",
+        "messages": 479382,
+        "elapsed_s": 1015.63,
+        "max_lag_ms": 4259.6,
+        "dropped_duplicate": 0,
+        "per_topic": {
+          "imu_data": 101997,
+          "imu_data/navsat_fix": 101997,
+          "imu_data/odometry": 101997,
+          "imu_data/ins_status": 101997,
+          "front_left_lidar": 10198,
+          "back_lidar": 10199,
+          "front_right_lidar": 10198,
+          "front_lidar": 10199,
+          "midrange_camera/ffmpeg": 30600
+        }
+      },
+      "fusion_dir": "/home/project/MY-LIVO/results/audit_x13_camera_fixed_full_1028/Log/fusion/1793161525141602679",
+      "pole_pairs": {
+        "0_10": {
+          "chunks": [
+            {
+              "chunk": 0,
+              "selected": 0,
+              "shaft": 0,
+              "span_m": 0.0
+            },
+            {
+              "chunk": 10,
+              "selected": 0,
+              "shaft": 0,
+              "span_m": 0.0
+            }
+          ]
+        },
+        "0_5": {
+          "chunks": [
+            {
+              "chunk": 0,
+              "selected": 0,
+              "shaft": 0,
+              "span_m": 0.0
+            },
+            {
+              "chunk": 5,
+              "selected": 0,
+              "shaft": 0,
+              "span_m": 0.0
+            }
+          ]
+        },
+        "5_10": {
+          "chunks": [
+            {
+              "chunk": 5,
+              "selected": 0,
+              "shaft": 0,
+              "span_m": 0.0
+            },
+            {
+              "chunk": 10,
+              "selected": 0,
+              "shaft": 0,
+              "span_m": 0.0
+            }
+          ]
+        }
+      },
+      "pcd": {
+        "map": {
+          "chunks": 110,
+          "points": 83968550,
+          "bytes": 1343517702
+        },
+        "rgb_map": {
+          "chunks": 110,
+          "points": 46906945,
+          "bytes": 750531296
+        }
+      }
+    }
+  },
+  "actual_photo": [
+    {
+      "window": [
+        18,
+        140
+      ],
+      "baseline_cost": [
+        0.40298345594430585,
+        0.3998514142506583
+      ],
+      "candidate_cost": [
+        0.3026876829341613,
+        0.30664713285831474
+      ],
+      "gain": [
+        0.24888310309196882,
+        0.23309729081992392
+      ]
+    },
+    {
+      "window": [
+        180,
+        310
+      ],
+      "baseline_cost": [
+        0.5371577042804896,
+        0.5388818046448376
+      ],
+      "candidate_cost": [
+        0.4170132210564933,
+        0.4226620796839327
+      ],
+      "gain": [
+        0.2236670576752261,
+        0.2156683041794335
+      ]
+    },
+    {
+      "window": [
+        600,
+        715
+      ],
+      "baseline_cost": [
+        0.4224085534760195,
+        0.4152347039611882
+      ],
+      "candidate_cost": [
+        0.2929354760287035,
+        0.2908781613459838
+      ],
+      "gain": [
+        0.30651149552222856,
+        0.2994849453306483
+      ]
+    },
+    {
+      "window": [
+        750,
+        900
+      ],
+      "baseline_cost": [
+        0.40910738656279094,
+        0.40667995855860645
+      ],
+      "candidate_cost": [
+        0.310726567327842,
+        0.31083349491665485
+      ],
+      "gain": [
+        0.2404767610321531,
+        0.2356803221424033
+      ]
+    },
+    {
+      "window": [
+        930,
+        1000
+      ],
+      "baseline_cost": [
+        0.33885067534022417,
+        0.30828272148696984
+      ],
+      "candidate_cost": [
+        0.20585538888610344,
+        0.2680895665153641
+      ],
+      "gain": [
+        0.3924893651771134,
+        0.13037757931335958
+      ]
+    }
+  ],
+  "actual_photo_all_halves_gain_ge5pct": true,
+  "identical_input_counts": true,
+  "full_tail_window_verified": true,
+  "registered_version": "xingye/truck13/v014_camphoto"
+}

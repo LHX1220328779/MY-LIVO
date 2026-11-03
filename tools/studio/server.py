@@ -196,7 +196,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/body-filter":
             return self._send(200, body_filter.get(
                 q.get("mine"), q.get("truck"), q.get("id"), q.get("dataset"), q.get("topic"),
-                q.get("t"), q.get("max_points", 12000), q.get("parent_id")))
+                q.get("t"), q.get("max_points", 40000), q.get("parent_id")))
         if path == "/api/calibrations/version":
             return self._send(200, calibration.version_detail(q["id"]))
         if path == "/api/calibrations/file":
@@ -236,7 +236,13 @@ class Handler(BaseHTTPRequestHandler):
             info = datasets.describe(p)
             if info.get("error"):
                 raise StudioError(f"数据源不可用：{info['error']}")
-            return self._send(200, {"state": remember_dataset(p), "dataset": info})
+            previous = load_state()["data"].get("dataset")
+            state = remember_dataset(p)
+            if previous != p:
+                summary = datasets.assessment_summary(p) or {}
+                stationary = (summary.get("startup") or {}).get("stationary")
+                state = update_state({"mapping": {"start_offset": stationary["start_s"] if stationary else 0}})
+            return self._send(200, {"state": state, "dataset": info})
         if path == "/api/datasets/assess":
             p = str(common.safe_path(body["path"]))
             if jobs.active("assess"):

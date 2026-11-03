@@ -1,0 +1,15 @@
+calibration=/home/project/MY-LIVO/config/carlibration/wuhu/truck29-0930/v014_ground/calibration.json
+run=/home/project/MY-LIVO/results/calib_truck29-0930_lio_1019_172507/Log/fusion/1792402026393837050
+window 0.0..177.2999393939972 s, lidar_time_offset -0.0322
+pass 1 poses: native frames.csv (6 DoF); pass 2 poses: RTK-optimized trajectory_optimized.txt (tilt about x/y and z of LiDARs with median match time gap > 2.0 s)
+scans used: front_right_lidar:1770, back_lidar:1770, front_left_lidar:1770, front_lidar:1770
+scan source: round archive scans.bin/sources.bin (mapper deskew; returns at scan end, round extrinsics inverted)
+matching: viewing-side consistent (oriented normals)
+reference front_lidar: 1546303 world points
+pairing: same-time for LiDARs overlapping the reference (1.0 s blocks +-0.5 s, 11507993 block points); cross-time LiDARs use the accumulated target (nearest-range voxels)
+front_right_lidar: pass 1 matches 147725->133749 |res| median 2.61->1.15 cm; ground 2.60->1.12 (n=127420); vertical 2.69->2.25 (n=3760); match time gap median 0.6 s; correction rot deg (x,y,z)=(-0.043,-0.100,+0.029) trans cm=(-0.3,+0.9,+2.9); iters 7  [quality: ok]
+front_left_lidar: pass 1 matches 160351->146089 |res| median 4.97->1.55 cm; ground 4.99->1.52 (n=141123); vertical 4.12->2.26 (n=2654); match time gap median 0.6 s; correction rot deg (x,y,z)=(-0.127,+0.049,-0.018) trans cm=(-0.2,+6.0,+6.4); iters 8  [quality: ok]
+back_lidar: pass 1 matches 147428->148627 |res| median 3.16->2.88 cm; ground 3.03->2.72 (n=125414); vertical 3.48->3.39 (n=14431); match time gap median 9.3 s; correction rot deg (x,y,z)=(+0.095,+0.070,-0.041) trans cm=(+2.6,+4.5,+1.6); iters 16
+    pass 2 (cross-time LiDAR, drift-free poses, ground only): ground 3.43->2.34 cm (n=126679); tilt about x/y adjusted by (+0.091,-0.063) deg, z by +0.9 cm; iters 6
+    final correction rot deg (x,y,z)=(+0.185,+0.007,-0.041) trans cm=(+2.6,+4.5,+2.5)  [quality: ok]
+quality: ok

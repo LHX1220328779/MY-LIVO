@@ -1,0 +1,116 @@
+{
+ "method": "multi-view photo-consistency of the round's returns (LCN cross-view variance)",
+ "frames": 8636,
+ "views": 260,
+ "returns": 50000,
+ "cost_zero": [
+  0.18166,
+  0.18223
+ ],
+ "halves": [
+  {
+   "rot_deg": [
+    -0.0232,
+    -0.0841,
+    0.0709
+   ],
+   "dt_s": -0.00388,
+   "train_gain": 0.0167,
+   "test_gain": 0.0055,
+   "intrinsics": {
+    "fx_scale": 1.00057,
+    "fy_scale": 0.9998,
+    "k1": -0.0081,
+    "test_gain": 0.0056
+   }
+  },
+  {
+   "rot_deg": [
+    -0.0128,
+    -0.0187,
+    0.0514
+   ],
+   "dt_s": -0.00355,
+   "train_gain": 0.0126,
+   "test_gain": 0.0087,
+   "intrinsics": {
+    "fx_scale": 0.99945,
+    "fy_scale": 1.0011,
+    "k1": -0.00034,
+    "test_gain": 0.0097
+   }
+  }
+ ],
+ "gate": {
+  "min_test_gain": 0.05,
+  "halves_agree": true,
+  "gain_ok": false,
+  "intrinsics_extra_gain": [
+   0.0001,
+   0.001
+  ],
+  "intrinsics_ok": false
+ },
+ "flat_field": {
+  "halves": [
+   {
+    "coefficients": [
+     0.09524,
+     -0.46355,
+     -0.12561,
+     -0.08977,
+     -0.01309,
+     -0.03573,
+     -0.05498,
+     0.09667
+    ],
+    "test_gain": 0.3057
+   },
+   {
+    "coefficients": [
+     0.1053,
+     -0.48135,
+     -0.11315,
+     -0.08768,
+     -0.04271,
+     -0.01679,
+     -0.05679,
+     0.09188
+    ],
+    "test_gain": 0.3066
+   }
+  ],
+  "gain_map_spread": 0.0151,
+  "y_range": [
+   -0.809,
+   0.829
+  ],
+  "min_test_gain": 0.05,
+  "max_spread": 0.03,
+  "samples": 459758,
+  "applied": true,
+  "coefficients": [
+   0.099224,
+   -0.471582,
+   -0.119058,
+   -0.088122,
+   -0.02713,
+   -0.025911,
+   -0.057104,
+   0.093377
+  ]
+ },
+ "applied": {
+  "rot_delta_deg_cam_xyz": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "camera_time_offset_s": -0.0122,
+  "dt_s": 0.0,
+  "intrinsics": false,
+  "cost_gain_all": 0.0,
+  "rotation_time": false,
+  "flat_field": true
+ }
+}

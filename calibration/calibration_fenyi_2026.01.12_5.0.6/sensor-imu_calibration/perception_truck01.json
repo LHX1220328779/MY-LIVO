@@ -1,0 +1,54 @@
+{
+    "calibration_type": "sensor_to_imu_manual",
+    "schema_version": 2,
+    "source_calibration": "/home/project/groundextractor_1/data/calibration/calibration_fenyi_2026.01.12_5.0.6/calibration/perception_truck01.json",
+    "transforms": {
+        "front_lidar_to_imu": {
+            "source_frame": "front_lidar",
+            "target_frame": "imu",
+            "transform_matrix": [
+                0.016754162259902894,
+                -0.999859604263037,
+                -0.00026421569238880725,
+                0.003,
+                0.9998468282395712,
+                0.016752609322782552,
+                0.00506657084703158,
+                7.195,
+                -0.005061433219812096,
+                -0.0003490613720785324,
+                0.9999871299421408,
+                0.451,
+                0,
+                0,
+                0,
+                1
+            ],
+            "transform_semantics": "front_lidar_to_imu"
+        },
+        "midrange_camera_to_imu": {
+            "derived_from": "front_lidar_to_imu * inverse(midrange_camera[0].tf_lidar_to_camera)",
+            "source_frame": "midrange_camera",
+            "target_frame": "imu",
+            "transform_matrix": [
+                0.9992345373887451,
+                0.015101497633058113,
+                0.03608759453223516,
+                0.035944562539675706,
+                -0.03137576959499978,
+                -0.24159801554995267,
+                0.9698686684046535,
+                6.956421140536674,
+                0.023365159057970274,
+                -0.9702584098027658,
+                -0.24093894106056388,
+                2.4652217847876488,
+                0,
+                0,
+                0,
+                1
+            ],
+            "transform_semantics": "midrange_camera_to_imu"
+        }
+    }
+}

@@ -1,0 +1,65 @@
+{
+ "method": "multi-view photo-consistency of the round's returns (LCN cross-view variance)",
+ "frames": 536,
+ "views": 95,
+ "returns": 50000,
+ "cost_zero": [
+  0.20396,
+  0.20577
+ ],
+ "halves": [
+  {
+   "rot_deg": [
+    0.3061,
+    -0.1432,
+    -0.0263
+   ],
+   "dt_s": -0.0128,
+   "train_gain": 0.2796,
+   "test_gain": 0.2647,
+   "intrinsics": {
+    "fx_scale": 0.99964,
+    "fy_scale": 1.00133,
+    "k1": -0.00595,
+    "test_gain": 0.2706
+   }
+  },
+  {
+   "rot_deg": [
+    0.3063,
+    -0.1526,
+    -0.0218
+   ],
+   "dt_s": -0.01171,
+   "train_gain": 0.2654,
+   "test_gain": 0.2788,
+   "intrinsics": {
+    "fx_scale": 0.99878,
+    "fy_scale": 1.00241,
+    "k1": -0.00878,
+    "test_gain": 0.2783
+   }
+  }
+ ],
+ "gate": {
+  "min_test_gain": 0.05,
+  "halves_agree": true,
+  "gain_ok": true,
+  "intrinsics_extra_gain": [
+   0.0058,
+   -0.0005
+  ],
+  "intrinsics_ok": false
+ },
+ "applied": {
+  "rot_delta_deg_cam_xyz": [
+   0.3057,
+   -0.1478,
+   -0.0251
+  ],
+  "camera_time_offset_s": -0.0122,
+  "dt_s": -0.01218,
+  "intrinsics": false,
+  "cost_gain_all": 0.2723
+ }
+}

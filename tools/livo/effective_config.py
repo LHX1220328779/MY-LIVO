@@ -47,24 +47,33 @@ def write_effective_config(src: str, dst: str, calibration: str, sets: list[str]
         except (OSError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"cannot read calibration {calibration}: {exc}") from exc
         filt = normalize(calib)
+        ov = to_yaml_overrides(filt)
+        ml = params.setdefault("multi_lidar", {})
+        bf = ml.setdefault("body_filter", {})
+        # The calibration is authoritative: a disabled filter must not inherit YAML
+        # rectangles, and an enabled filter must not retain stale per-topic values.
+        for key in list(bf):
+            if key not in ("enabled", "minimum_z"):
+                bf.pop(key)
+        bf["enabled"] = ov["body_filter"]["enabled"]
+        bf["minimum_z"] = ov["body_filter"]["minimum_z"]
         if filt["enabled"]:
-            ov = to_yaml_overrides(filt)
-            ml = params.setdefault("multi_lidar", {})
-            bf = ml.setdefault("body_filter", {})
             for k, v in ov["body_filter"].items():
-                if k != "minimum_z" and isinstance(v, list) and not v:
+                if k in ("enabled", "minimum_z"):
+                    continue
+                if isinstance(v, list) and not v:
                     # ROS 2 cannot infer the type of an empty YAML sequence.  A topic with no
                     # rectangles must have NO parameter at all; remove any production fallback.
                     bf.pop(k, None)
                     logs.append(f"override multi_lidar.body_filter.{k}: disabled (no rectangles)")
                 else:
                     bf[k] = v
-            pre = ml.setdefault("precheck", {})
-            pre["body_box"] = ov["precheck"]["body_box"]
-            logs.append(f"override multi_lidar.body_filter: from calibration {calibration}")
-            logs.append(f"override multi_lidar.precheck.body_box: {ov['precheck']['body_box']}")
+            logs.append(f"override multi_lidar.body_filter: enabled from calibration {calibration}")
         else:
-            logs.append("body_filter disabled in calibration; production yaml fallback retained")
+            logs.append(f"override multi_lidar.body_filter: explicitly disabled by calibration {calibration}")
+        pre = ml.setdefault("precheck", {})
+        pre["body_box"] = ov["precheck"]["body_box"]
+        logs.append(f"override multi_lidar.precheck.body_box: {ov['precheck']['body_box']}")
 
     with open(dst, "w", encoding="utf-8") as f:
         yaml.safe_dump(doc, f, sort_keys=False, allow_unicode=True)

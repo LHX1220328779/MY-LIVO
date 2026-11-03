@@ -1,0 +1,37 @@
+{
+  "verdict": "pass",
+  "reasons": [],
+  "common_window": {
+    "t0": 1010,
+    "t1": 1020,
+    "baseline_rear_m": 22.309,
+    "candidate_rear_m": 22.249
+  },
+  "baseline": {
+    "round": "audit_x13_current_full_1028",
+    "mode": "livo",
+    "calibration_id": "xingye/truck13/v011_scan",
+    "duration_s": 1017.6,
+    "scale": 1.0,
+    "median_m": 13.2272,
+    "final_m": 22.3104,
+    "final_xy_m": 4.9951,
+    "yaw_p95_deg": 1.642
+  },
+  "candidate": {
+    "round": "audit_x13_camera_fixed_full_1028",
+    "mode": "livo",
+    "calibration_id": null,
+    "duration_s": 1016.53,
+    "scale": 1.0006,
+    "median_m": 12.5913,
+    "final_m": 22.2513,
+    "final_xy_m": 3.8543,
+    "yaw_p95_deg": 1.4405
+  },
+  "scale_margin": 0.002,
+  "criteria": "scale within baseline+0.2%; rear error at last common window <= 1.10x+0.10 m; yaw P95 <= baseline+0.15 deg; round durations within 10%",
+  "registered_as": "xingye/truck13/v014_camphoto",
+  "candidate_parameters_match_registered": true,
+  "candidate_parameter_file": "/home/project/MY-LIVO/results/audit_x13_camera/candidate_calibration.json"
+}

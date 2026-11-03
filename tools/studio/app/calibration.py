@@ -188,7 +188,7 @@ def vehicle_status(cat, mine, truck):
         {"key": "rtktime", "label": "RTK 位置关联时间已标定（地图自洽）", "ok": rtk_time_done, "stage": "rtktime", "optional": True},
         {"key": "camtime", "label": "相机时间偏移已确认", "ok": camera_time_ok, "stage": "camtime",
          "value": offsets.get("camera")},
-        {"key": "camlidar", "label": "相机偏航已复核（灯柱投影）", "ok": camera_ext_refined, "stage": "camlidar", "optional": True},
+        {"key": "camlidar", "label": "相机偏航已复核（投影/光度）", "ok": camera_ext_refined, "stage": "camlidar", "optional": True},
         {"key": "camloop", "label": "相机标定已通过闭环验证（原生轨迹）", "ok": camera_loop_done, "stage": "camloop", "optional": True},
     ]
     if not active:
@@ -328,6 +328,9 @@ def _parent(body):
     if not vid:
         raise StudioError("缺少父版本 id")
     calibration_file(vid)
+    mine, truck = vid.split("/")[:2]
+    if (body.get("mine") and body["mine"] != mine) or (body.get("truck") and body["truck"] != truck):
+        raise StudioError(f"父版本 {vid} 不属于当前车辆 {body.get('mine')}/{body.get('truck')}，请重新选择父版本")
     return vid
 
 
@@ -944,9 +947,12 @@ def pipeline_steps(kind, body, mapping_cmd):
     The native odometry scale reacts with ~11 %/deg of camera pitch error and is repeatable to ~0.03 %,
     so it is the acceptance test; edge/pole alignment alone cannot resolve pitch (36-line ring spacing).
     """
+    parent = requested_parent = _parent(body)
+    source_id = body.get("body_filter_source_id")
+    if source_id and source_id.split("/")[:2] != parent.split("/")[:2]:
+        raise StudioError("父版本与车身过滤来源不属于同一车辆，请重新选择父版本")
     if body.get("resume"):
         return _resume_steps(body, mapping_cmd)
-    parent = requested_parent = _parent(body)
     # Any version of the current vehicle can be the parent of an automated pipeline.  The
     # legacy `from_factory` flag is intentionally ignored: the operator now chooses the parent
     # explicitly in Studio, including the factory import when a fresh start is desired.
@@ -981,8 +987,8 @@ def pipeline_steps(kind, body, mapping_cmd):
         "after": lambda ctx, lines: ctx.__setitem__("body_filter_source_id", source_id),
     })
     if body.get("dataset") and not body.get("skip_assess"):
-        # data assessment first (cached per recording): warns about defects calibration cannot compensate and stops
-        # the pipeline before any expensive stage when the recording is unusable
+        # data assessment first (cached per recording): advisory warnings remain visible, and only other
+        # uncorrectable 异常-level alerts stop the pipeline before an expensive stage.
         try:
             base_file = str(calibration_file(parent))
         except Exception:  # noqa: BLE001 - parent without a file: assess without the extrinsic checks

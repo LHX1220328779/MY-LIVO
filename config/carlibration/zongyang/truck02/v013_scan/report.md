@@ -1,0 +1,136 @@
+# zongyang/truck02/v013_scan
+
+- stage: scan (闭环扫描点（临时）)
+- parent: zongyang/truck02/v012_driven
+- lineage: zongyang/truck02/v001_import -> zongyang/truck02/v008_axle -> zongyang/truck02/v009_ground -> zongyang/truck02/v010_axle -> zongyang/truck02/v011_ground -> zongyang/truck02/v012_driven -> zongyang/truck02/v013_scan
+- created: 2026-10-27T13:44:22+08:00
+- note: rtk-time probe point (temporary)
+
+## changes vs parent
+
+```
+{
+  "time_offsets": {
+    "rtk_position": {
+      "from": 0.025,
+      "to": 0.0585
+    }
+  }
+}
+```
+
+## metrics
+
+```
+{
+  "changes": {
+    "time_offsets.rtk_position": 0.0585
+  }
+}
+```
+
+## summary
+
+```
+{
+  "lidars": [
+    {
+      "lidar": "front_right_lidar",
+      "key": "transform_matrix_lidar_1",
+      "t": [
+        2.6732,
+        4.9627,
+        1.8177
+      ],
+      "rpy_deg": [
+        -0.399,
+        -0.102,
+        -2.742
+      ]
+    },
+    {
+      "lidar": "back_lidar",
+      "key": "transform_matrix_lidar_2",
+      "t": [
+        -0.1868,
+        -0.987,
+        0.8357
+      ],
+      "rpy_deg": [
+        0.349,
+        -3.349,
+        -90.324
+      ]
+    },
+    {
+      "lidar": "front_left_lidar",
+      "key": "transform_matrix_lidar_3",
+      "t": [
+        -3.1809,
+        4.8924,
+        1.8327
+      ],
+      "rpy_deg": [
+        -1.846,
+        -0.424,
+        178.169
+      ]
+    },
+    {
+      "lidar": "front_lidar",
+      "key": "transform_matrix_lidar_6",
+      "t": [
+        -0.0705,
+        7.1162,
+        2.4626
+      ],
+      "rpy_deg": [
+        1.039,
+        1.785,
+        90.946
+      ]
+    }
+  ],
+  "camera_to_rear": {
+    "t": [
+      -0.1056,
+      7.1264,
+      2.1813
+    ],
+    "rpy_deg": [
+      -90.039,
+      3.007,
+      -0.068
+    ]
+  },
+  "camera": {
+    "topic": "/midrange_camera/image_raw",
+    "width": 1920,
+    "height": 1080,
+    "intrinsics": [
+      611.054443359375,
+      895.9816284179688,
+      954.4519112515845,
+      541.4709836341353
+    ],
+    "distortion": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "source": "midrange_camera[0].camera_in_params"
+  },
+  "time_offsets": {
+    "lidar": 0.0033,
+    "lidar_frontend": 0.004,
+    "camera": 0.0,
+    "rtk_position": 0.0585,
+    "ins_attitude": 0.0,
+    "lidar_source": "rear-axle alignment (cross-time consistency vs INS poses)",
+    "source": "import (verify with camera-time / LIO evaluation)",
+    "lidar_frontend_source": "axle: lidar -0.0010 + imu/ins clock lag +0.0050 (corr 1.000); template -0.1250 replaced"
+  }
+}
+```

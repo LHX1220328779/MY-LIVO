@@ -23,6 +23,12 @@ which is included as part of this source code package.
 
 namespace
 {
+constexpr int kMultiLidarDisplayColors[][3] = {
+    {0, 113, 227}, {52, 199, 89}, {255, 159, 10}, {175, 82, 222},
+    {255, 45, 85}, {90, 200, 250}, {162, 132, 94}, {48, 176, 199}};
+constexpr std::size_t kMultiLidarDisplayColorCount =
+    sizeof(kMultiLidarDisplayColors) / sizeof(kMultiLidarDisplayColors[0]);
+
 struct DownsampleVoxelKey
 {
   std::int64_t x;
@@ -216,11 +222,56 @@ void LIVMapper::readParameters()
       throw std::runtime_error(
           "multi_lidar.transform_keys contains duplicates.");
 
+    nh.param<bool>("multi_lidar/body_filter/enabled",
+                   multi_lidar_body_exclusion_enabled, true);
     nh.param<double>("multi_lidar/body_filter/minimum_z",
                      multi_lidar_body_exclusion_min_z, -3.0);
     if (!std::isfinite(multi_lidar_body_exclusion_min_z))
       throw std::runtime_error(
           "multi_lidar.body_filter.minimum_z must be finite.");
+
+    vector<double> fused_rectangle_coordinates;
+    nh.param<vector<double>>(
+        "multi_lidar/body_filter/fused_rectangle",
+        fused_rectangle_coordinates, vector<double>{});
+    multi_lidar_body_fused_rectangle_enabled =
+        !fused_rectangle_coordinates.empty();
+    if (multi_lidar_body_fused_rectangle_enabled)
+    {
+      if (fused_rectangle_coordinates.size() != 4)
+        throw std::runtime_error(
+            "multi_lidar.body_filter.fused_rectangle must contain "
+            "x_min,y_min,x_max,y_max.");
+      const double x1 = fused_rectangle_coordinates[0];
+      const double y1 = fused_rectangle_coordinates[1];
+      const double x2 = fused_rectangle_coordinates[2];
+      const double y2 = fused_rectangle_coordinates[3];
+      if (!std::isfinite(x1) || !std::isfinite(y1) ||
+          !std::isfinite(x2) || !std::isfinite(y2))
+        throw std::runtime_error(
+            "multi_lidar.body_filter.fused_rectangle contains a "
+            "non-finite coordinate.");
+      multi_lidar_body_fused_rectangle = {
+          std::min(x1, x2), std::max(x1, x2),
+          std::min(y1, y2), std::max(y1, y2)};
+      if (multi_lidar_body_fused_rectangle.min_x >=
+              multi_lidar_body_fused_rectangle.max_x ||
+          multi_lidar_body_fused_rectangle.min_y >=
+              multi_lidar_body_fused_rectangle.max_y)
+        throw std::runtime_error(
+            "multi_lidar.body_filter.fused_rectangle must have positive "
+            "width and height.");
+      RCLCPP_INFO(
+          node_->get_logger(),
+          "Unified vehicle-body filter: rear-axle XY x=[%.3f, %.3f], "
+          "y=[%.3f, %.3f], z > %.3f m (%s).",
+          multi_lidar_body_fused_rectangle.min_x,
+          multi_lidar_body_fused_rectangle.max_x,
+          multi_lidar_body_fused_rectangle.min_y,
+          multi_lidar_body_fused_rectangle.max_y,
+          multi_lidar_body_exclusion_min_z,
+          multi_lidar_body_exclusion_enabled ? "enabled" : "disabled");
+    }
 
     multi_lidar_body_exclusion_rectangles.clear();
     multi_lidar_body_exclusion_rectangles.resize(
@@ -269,6 +320,24 @@ void LIVMapper::readParameters()
         rectangles.push_back({std::min(x1, x2), std::max(x1, x2),
                               std::min(y1, y2), std::max(y1, y2)});
       }
+      const int *display_color = kMultiLidarDisplayColors[
+          source_index % kMultiLidarDisplayColorCount];
+      if (multi_lidar_body_exclusion_enabled &&
+          !multi_lidar_body_fused_rectangle_enabled && rectangles.empty())
+        RCLCPP_WARN(node_->get_logger(),
+                    "Vehicle-body filter is enabled but %s has no exclusion "
+                    "rectangles; body-return removal cannot be guaranteed.",
+                    multi_lidar_topics[source_index].c_str());
+      RCLCPP_INFO(node_->get_logger(),
+                  "Vehicle-body filter config: %s is %s, mode=%s, "
+                  "%zu per-source rectangle(s), z > %.3f m; "
+                  "RViz source color RGB(%d,%d,%d).",
+                  multi_lidar_topics[source_index].c_str(),
+                  multi_lidar_body_exclusion_enabled ? "enabled" : "disabled",
+                  multi_lidar_body_fused_rectangle_enabled
+                      ? "unified rear-axle" : "legacy source-frame",
+                  rectangles.size(), multi_lidar_body_exclusion_min_z,
+                  display_color[0], display_color[1], display_color[2]);
     }
 
     // Static-start extrinsic self-check: ground overlap with the reference
@@ -363,11 +432,35 @@ void LIVMapper::readParameters()
       throw std::runtime_error("IMU noise parameters must be finite and positive");
   nh.param<double>("imu/maximum_time_gap", imu_max_time_gap, 0.2);
   nh.param<int>("imu/imu_int_frame", imu_int_frame, 3);
+  double imu_sample_interval_sec = 0.0;
+  nh.param<double>("imu/sample_interval_sec", imu_sample_interval_sec, 0.0);
+  nh.param<double>("imu/init_max_speed_mps", imu_init_max_speed_mps_, 0.10);
+  nh.param<bool>("imu/init_require_ins_stationary",
+                 imu_init_require_ins_stationary_, false);
   nh.param<bool>("imu/imu_en", imu_en, false);
   nh.param<bool>("imu/gravity_est_en", gravity_est_en, true);
   nh.param<bool>("imu/ba_bg_est_en", ba_bg_est_en, true);
   if (!std::isfinite(imu_max_time_gap) || imu_max_time_gap <= 0.0)
     throw std::runtime_error("imu.maximum_time_gap must be finite and positive.");
+  if (imu_int_frame <= 0)
+    throw std::runtime_error("imu.imu_int_frame must be positive.");
+  if (!std::isfinite(imu_sample_interval_sec) ||
+      imu_sample_interval_sec < 0.0)
+    throw std::runtime_error(
+        "imu.sample_interval_sec must be finite and nonnegative.");
+  if (!std::isfinite(imu_init_max_speed_mps_) ||
+      imu_init_max_speed_mps_ <= 0.0)
+    throw std::runtime_error(
+        "imu.init_max_speed_mps must be finite and positive.");
+  const double init_pose_window_sec =
+      static_cast<double>(imu_int_frame) * imu_sample_interval_sec;
+  if (!std::isfinite(init_pose_window_sec))
+    throw std::runtime_error(
+        "IMU initialization pose window must be finite.");
+  // Duration recommendations are evaluated in tools/livo/assess.py only.
+  // Runtime IMU initialization uses the configured sample count.
+  imu_init_pose_window_sec_ =
+      init_pose_window_sec > 0.0 ? init_pose_window_sec : 2.0;
 
   nh.param<double>("preprocess/blind", p_pre->blind, 0.01);
   nh.param<double>("preprocess/filter_size_surf", filter_size_surf_min, 0.5);
@@ -440,6 +533,11 @@ void LIVMapper::readParameters()
         "mine.imu_message_format must be standard_rfu or packed_mine_pose.");
   }
   nh.param<bool>("mine/imu_gyro_in_degrees", imu_gyro_in_degrees, true);
+  if (imu_init_require_ins_stationary_ &&
+      (!imu_en || !imu_standard_rfu || ins_odom_topic.empty()))
+    throw std::runtime_error(
+        "imu.init_require_ins_stationary requires imu_en, standard_rfu "
+        "message format, and a configured common.ins_odom_topic.");
   nh.param<bool>("mine/imu_acceleration_gravity_compensated", imu_acceleration_gravity_compensated, true);
   nh.param<double>("mine/imu_acceleration_scale", imu_acceleration_scale, 1.0);
   nh.param<bool>("reference_frame_conversion/enabled", rear_axle_to_imu_enabled, false);
@@ -826,6 +924,11 @@ void LIVMapper::initializeComponents()
   p_imu->set_acc_bias_cov(V3D::Constant(acc_bias_rw_sigma * acc_bias_rw_sigma));
   p_imu->initial_gyr_bias_sigma = initial_gyr_bias_sigma;
   p_imu->set_imu_init_frame_num(imu_int_frame);
+  if (imu_en)
+    RCLCPP_INFO(node_->get_logger(),
+                "IMU initialization will use the configured sample count (%d); "
+                "startup stationary duration is advisory in data assessment.",
+                imu_int_frame);
 
   if (!imu_en) p_imu->disable_imu();
   if (!gravity_est_en) p_imu->disable_gravity_est();
@@ -952,6 +1055,8 @@ void LIVMapper::initializeSubscribersAndPublishers()
 
   pubLaserCloudFullRes = node_->create_publisher<sensor_msgs::PointCloud2>("/cloud_registered", 10);
   pubCurrentFrame = node_->create_publisher<sensor_msgs::PointCloud2>("/cloud_current_frame", 10);
+  pubMultiLidarFilteredColored = node_->create_publisher<sensor_msgs::PointCloud2>(
+      "/multi_lidar/filtered_colored", 10);
   pubNormal = node_->create_publisher<visualization_msgs::MarkerArray>("visualization_marker", 10);
   pubSubVisualMap = node_->create_publisher<sensor_msgs::PointCloud2>("/cloud_visual_sub_map_before", 10);
   pubLaserCloudEffect = node_->create_publisher<sensor_msgs::PointCloud2>("/cloud_effected", 10);
@@ -1001,14 +1106,30 @@ void LIVMapper::gravityAlignment()
   }
 }
 
-void LIVMapper::processImu() 
+void LIVMapper::processImu()
 {
-  // double t0 = omp_get_wtime();
+  if (LidarMeasures.measures.empty())
+    throw std::runtime_error(
+        "Cannot initialize IMU without a synchronized LiDAR measure group.");
 
+  const MeasureGroup &measure = LidarMeasures.measures.back();
+  const double group_time =
+      LidarMeasures.lio_vio_flg == LIO ? measure.lio_time : measure.vio_time;
+  const double startup_time =
+      measure.imu.empty() || !measure.imu.back()
+          ? group_time
+          : stampToSec(measure.imu.back()->header.stamp);
+  if (p_imu->imu_need_init && !std::isfinite(startup_time))
+    throw std::runtime_error(
+        "Startup measure has a non-finite IMU/LiDAR timestamp.");
+
+  // Startup stationary-prefix duration is an assessment advisory only. Keep
+  // the mapper's ordinary configured-count IMU initialization; do not wait
+  // for or reject a run based on a stationary prefix.
   const bool was_initializing = p_imu->imu_need_init;
   p_imu->Process2(LidarMeasures, _state, feats_undistort);
-
   if (gravity_align_en) gravityAlignment();
+
   if (was_initializing && !p_imu->imu_need_init && !mine_frame_initialized)
   {
     // Use the exact measurement-group endpoint that Process2 used to finish
@@ -1030,12 +1151,6 @@ void LIVMapper::processImu()
   state_propagat = _state;
   voxelmap_manager->state_ = _state;
   voxelmap_manager->feats_undistort_ = feats_undistort;
-
-  // double t_prop = omp_get_wtime();
-
-  // std::cout << "[ Mapping ] feats_undistort: " << feats_undistort->size() << std::endl;
-  // std::cout << "[ Mapping ] predict cov: " << _state.cov.diagonal().transpose() << std::endl;
-  // std::cout << "[ Mapping ] predict sta: " << state_propagat.pos_end.transpose() << state_propagat.vel_end.transpose() << std::endl;
 }
 
 void LIVMapper::initializeMineFrame(double initialization_time)
@@ -1044,10 +1159,17 @@ void LIVMapper::initializeMineFrame(double initialization_time)
   Eigen::Vector4d quaternion_sum = Eigen::Vector4d::Zero();
   Eigen::Quaterniond reference = Eigen::Quaterniond::Identity();
   std::size_t sample_count = 0;
+  const double pose_window_start =
+      initialization_time - imu_init_pose_window_sec_;
 
   for (const MinePose &sample : mine_pose_samples)
   {
     if (sample.stamp > initialization_time) break;
+    if (sample.stamp < pose_window_start) continue;
+    if (imu_init_require_ins_stationary_ &&
+        (!sample.velocity_valid || !sample.velocity.allFinite() ||
+         sample.velocity.norm() > 1.5 * imu_init_max_speed_mps_))
+      continue;
     if (rtk_fusion_ && rtk_observations_enabled)
     {
       RtkFusion::Observation quality_checked;
@@ -1133,7 +1255,7 @@ void LIVMapper::initializeMineFrame(double initialization_time)
 
   RCLCPP_INFO(
       node_->get_logger(),
-      "Mine frame initialized from %zu stationary INS samples at [%.3f, %.3f, %.3f]",
+      "Mine frame initialized from %zu valid INS samples at [%.3f, %.3f, %.3f]",
       sample_count, mean_position.x(), mean_position.y(), mean_position.z());
 }
 
@@ -1780,8 +1902,7 @@ void LIVMapper::run(const volatile std::sig_atomic_t &stop_requested)
 
     processImu();
     run_sw.lap("run.imu_process");
-
-    // if (!p_imu->imu_time_init) continue;
+    if (p_imu->imu_need_init) continue;
 
     stateEstimationAndMapping();
     run_sw.restart();  // frame sections are timed inside handleLIO/handleVIO
@@ -2060,10 +2181,14 @@ void LIVMapper::multi_lidar_pcl_cbk(
       throw std::runtime_error(
           source.topic + " has fewer than two valid time-tagged points.");
 
-    // These bounds are expressed in the physical source-LiDAR frame. Apply
-    // them before the source cloud is transformed into the common rear-axle
-    // frame, otherwise the configured rectangles would have the wrong axes.
-    if (!source.body_exclusion_rectangles.empty())
+    // Legacy bounds are expressed in the physical source-LiDAR frame. Keep
+    // them active for older calibrations; a unified rectangle is authoritative
+    // and is applied after transforming points into the rear-axle frame below.
+    const std::size_t points_before_body_filter = points->size();
+    std::size_t removed_body_points = 0;
+    if (multi_lidar_body_exclusion_enabled &&
+        !multi_lidar_body_fused_rectangle_enabled &&
+        !source.body_exclusion_rectangles.empty())
     {
       const auto first_retained = std::remove_if(
           points->points.begin(), points->points.end(),
@@ -2083,11 +2208,12 @@ void LIVMapper::multi_lidar_pcl_cbk(
       points->points.erase(first_retained, points->points.end());
       points->width = static_cast<std::uint32_t>(points->points.size());
       points->height = 1;
-      if (points->size() <= 1)
-        throw std::runtime_error(
-            source.topic +
-            " has fewer than two points after vehicle-body filtering.");
+      removed_body_points += points_before_body_filter - points->size();
     }
+    if (points->size() <= 1)
+      throw std::runtime_error(
+          source.topic +
+          " has fewer than two points after vehicle-body filtering.");
 
     for (PointType &point : points->points)
     {
@@ -2110,6 +2236,47 @@ void LIVMapper::multi_lidar_pcl_cbk(
       point.normal_z =
           static_cast<float>(source.rear_from_lidar_translation.z());
     }
+
+    // The unified exclusion rectangle is defined in the common rear-axle
+    // frame. Apply it only after the source extrinsic has transformed each
+    // point; queued frames then feed the same filtered points to both the
+    // synchronized map input and the static-start extrinsic precheck.
+    if (multi_lidar_body_exclusion_enabled &&
+        multi_lidar_body_fused_rectangle_enabled)
+    {
+      const auto &rectangle = multi_lidar_body_fused_rectangle;
+      const auto first_retained = std::remove_if(
+          points->points.begin(), points->points.end(),
+          [this, &rectangle](const PointType &point) {
+            if (point.z <= multi_lidar_body_exclusion_min_z) return false;
+            return point.x > rectangle.min_x &&
+                   point.x < rectangle.max_x &&
+                   point.y > rectangle.min_y &&
+                   point.y < rectangle.max_y;
+          });
+      points->points.erase(first_retained, points->points.end());
+      points->width = static_cast<std::uint32_t>(points->points.size());
+      points->height = 1;
+    }
+    removed_body_points = points_before_body_filter - points->size();
+    if (!source.body_filter_status_logged)
+    {
+      RCLCPP_INFO(
+          node_->get_logger(),
+          "Vehicle-body filter result: %s enabled=%s mode=%s, "
+          "minimum_z=%.3f m, first frame kept %zu/%zu points (removed %zu).",
+          source.topic.c_str(),
+          multi_lidar_body_exclusion_enabled ? "true" : "false",
+          multi_lidar_body_fused_rectangle_enabled
+              ? "unified rear-axle rectangle" : "legacy source-frame rectangles",
+          multi_lidar_body_exclusion_min_z, points->size(),
+          points_before_body_filter, removed_body_points);
+      source.body_filter_status_logged = true;
+    }
+    if (points->size() <= 1)
+      throw std::runtime_error(
+          source.topic +
+          " has fewer than two points after vehicle-body filtering.");
 
     source.pending_frames.push_back({header_time, points});
     if (extrinsic_precheck_.enabled()) feedExtrinsicPrecheck(source_index);
@@ -2182,23 +2349,46 @@ void LIVMapper::synchronizeMultiLidarFrames()
     for (const auto &source : lidar_sources)
       total_points += source->pending_frames.front().points->size();
     merged->reserve(total_points);
+    const bool publish_colored = pubMultiLidarFilteredColored &&
+        pubMultiLidarFilteredColored->get_subscription_count() > 0;
+    PointCloudXYZRGB::Ptr colored;
+    if (publish_colored)
+    {
+      colored.reset(new PointCloudXYZRGB());
+      colored->reserve(total_points);
+    }
 
     MergedLidarTimestampInfo ts_info;
     ts_info.merged_header_time = 0.0;
     ts_info.start_span_ms = start_span * 1000.0;
-    for (auto &source : lidar_sources)
+    for (std::size_t source_index = 0;
+         source_index < lidar_sources.size(); ++source_index)
     {
-      PendingLidarFrame frame = std::move(source->pending_frames.front());
-      source->pending_frames.pop_front();
+      LidarSource &source = *lidar_sources[source_index];
+      PendingLidarFrame frame = std::move(source.pending_frames.front());
+      source.pending_frames.pop_front();
       const float header_delta_ms = static_cast<float>(
           (frame.header_time - earliest_time) * 1000.0);
+      const int *display_color = kMultiLidarDisplayColors[
+          source_index % kMultiLidarDisplayColorCount];
       for (PointType point : frame.points->points)
       {
+        if (colored)
+        {
+          PointTypeRGB display_point;
+          display_point.x = point.x;
+          display_point.y = point.y;
+          display_point.z = point.z;
+          display_point.r = static_cast<std::uint8_t>(display_color[0]);
+          display_point.g = static_cast<std::uint8_t>(display_color[1]);
+          display_point.b = static_cast<std::uint8_t>(display_color[2]);
+          colored->push_back(display_point);
+        }
         point.curvature += header_delta_ms;
         merged->push_back(point);
       }
       MergedLidarTimestampInfo::SourceInfo src_info;
-      src_info.topic = source->topic;
+      src_info.topic = source.topic;
       src_info.header_time = frame.header_time;
       src_info.point_count = frame.points->size();
       ts_info.sources.push_back(src_info);
@@ -2225,6 +2415,16 @@ void LIVMapper::synchronizeMultiLidarFrames()
       throw std::runtime_error(
           "Merged Multi-LiDAR point times exceed the configured envelope.");
     ts_info.merged_header_time = merged_header_time;
+    if (colored)
+    {
+      sensor_msgs::PointCloud2 colored_message;
+      pcl::toROSMsg(*colored, colored_message);
+      colored_message.header.stamp = stampFromSec(merged_header_time);
+      // The fused points are expressed in the calibrated rear-axle/body frame.
+      // RViz's existing mine -> aft_mapped TF places the filtered diagnostic scan.
+      colored_message.header.frame_id = "aft_mapped";
+      pubMultiLidarFilteredColored->publish(colored_message);
+    }
 
     lid_raw_data_buffer.push_back(merged);
     lid_header_time_buffer.push_back(merged_header_time);
@@ -2505,6 +2705,10 @@ void LIVMapper::ins_odom_cbk(const nav_msgs::Odometry::ConstSharedPtr &msg_in)
       msg_in->pose.pose.orientation.x,
       msg_in->pose.pose.orientation.y,
       msg_in->pose.pose.orientation.z);
+  mine_pose.velocity << msg_in->twist.twist.linear.x,
+                        msg_in->twist.twist.linear.y,
+                        msg_in->twist.twist.linear.z;
+  mine_pose.velocity_valid = mine_pose.velocity.allFinite();
 
   const bool pose_is_finite = std::isfinite(mine_pose.stamp)
       && mine_pose.position.allFinite()
@@ -2678,11 +2882,11 @@ void LIVMapper::imu_cbk(const sensor_msgs::Imu::ConstSharedPtr &msg_in)
     const double gap = timestamp - last_timestamp_imu;
     if (p_imu->imu_need_init)
     {
-      // No cloud is deskewed or inserted into the map during IMU
-      // initialization. A startup delivery discontinuity can therefore be
-      // handled without interpolation: discard the uncommitted prefix and
-      // restart the stationary initializer at the first sample after the
-      // gap. Once initialization finishes, the same condition remains fatal.
+      // No cloud is deskewed or inserted into the map during the ordinary
+      // count-based IMU initialization. A startup delivery discontinuity can
+      // therefore be handled without interpolation: discard the uncommitted
+      // prefix and restart from the first sample after the gap. Once
+      // initialization finishes, the same condition remains fatal.
       RCLCPP_WARN(
           node_->get_logger(),
           "Startup IMU delivery has a %.6f s gap (limit %.6f s) between "

@@ -1,0 +1,147 @@
+# xingye/truck13/v013_scan
+
+- stage: scan (闭环扫描点（临时）)
+- parent: xingye/truck13/v011_scan
+- lineage: xingye/truck13/v001_import -> xingye/truck13/v002_axle -> xingye/truck13/v003_ground -> xingye/truck13/v004_driven -> xingye/truck13/v005_gcons -> xingye/truck13/v008_camtime -> xingye/truck13/v009_camlidar -> xingye/truck13/v011_scan -> xingye/truck13/v013_scan
+- created: 2026-10-28T11:52:45+08:00
+- note: 闭环俯仰扫描点 Δpitch=-0.05°（流水线临时版本，勿激活）
+
+## changes vs parent
+
+```
+{
+  "camera_to_rear": {
+    "dt_cm": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "drpy_deg": [
+      -0.05,
+      0.0,
+      0.0
+    ]
+  }
+}
+```
+
+## metrics
+
+```
+{
+  "changes": {
+    "camera_rot_delta_deg_cam_xyz": [
+      -0.05,
+      0.0,
+      0.0
+    ]
+  }
+}
+```
+
+## summary
+
+```
+{
+  "lidars": [
+    {
+      "lidar": "front_right_lidar",
+      "key": "transform_matrix_lidar_1",
+      "t": [
+        1.9464,
+        7.0057,
+        1.0298
+      ],
+      "rpy_deg": [
+        -1.755,
+        -0.435,
+        14.043
+      ]
+    },
+    {
+      "lidar": "back_lidar",
+      "key": "transform_matrix_lidar_2",
+      "t": [
+        -0.1422,
+        -1.9111,
+        0.4543
+      ],
+      "rpy_deg": [
+        0.043,
+        -3.423,
+        -90.139
+      ]
+    },
+    {
+      "lidar": "front_left_lidar",
+      "key": "transform_matrix_lidar_3",
+      "t": [
+        -1.9445,
+        6.9514,
+        1.0499
+      ],
+      "rpy_deg": [
+        0.796,
+        -0.59,
+        167.928
+      ]
+    },
+    {
+      "lidar": "front_lidar",
+      "key": "transform_matrix_lidar_6",
+      "t": [
+        -0.0002,
+        7.0096,
+        0.6541
+      ],
+      "rpy_deg": [
+        0.426,
+        2.516,
+        90.688
+      ]
+    }
+  ],
+  "camera_to_rear": {
+    "t": [
+      -0.0123,
+      7.0409,
+      1.4569
+    ],
+    "rpy_deg": [
+      -98.775,
+      1.353,
+      -0.512
+    ]
+  },
+  "camera": {
+    "topic": "/midrange_camera/image_raw",
+    "width": 1920,
+    "height": 1080,
+    "intrinsics": [
+      1642.15,
+      1855.56,
+      963.247,
+      544.29
+    ],
+    "distortion": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "source": "midrange_camera[0].camera_in_params"
+  },
+  "time_offsets": {
+    "lidar": -0.0502,
+    "lidar_frontend": -0.0427,
+    "camera": -0.0109,
+    "rtk_position": 0.025,
+    "ins_attitude": 0.0,
+    "lidar_source": "rear-axle alignment (cross-time consistency vs INS poses)",
+    "source": "import (verify with camera-time / LIO evaluation)",
+    "lidar_frontend_source": "axle: lidar -0.0502 + imu/ins clock lag +0.0075 (corr 0.997); template -0.1250 replaced",
+    "camera_source": "optical flow vs gyro on /home/project/data/haibo/xingye/13/20261027/ros2bag (corr 1.00)"
+  }
+}
+```

@@ -88,6 +88,8 @@ public:
     double stamp = 0.0;
     V3D position = V3D::Zero();
     Eigen::Quaterniond orientation = Eigen::Quaterniond::Identity();
+    V3D velocity = V3D::Zero();
+    bool velocity_valid = false;
   };
 
   std::mutex mtx_buffer, mtx_buffer_imu_prop;
@@ -149,6 +151,11 @@ public:
   bool dense_map_en = false;
   bool img_en = true;
   int imu_int_frame = 3;
+  // Look-back span for selecting the INS pose samples associated with the
+  // ordinary count-based IMU initializer; not a stationary-start gate.
+  double imu_init_pose_window_sec_ = 2.0;
+  double imu_init_max_speed_mps_ = 0.10;
+  bool imu_init_require_ins_stationary_ = false;
   bool normal_en = true;
   bool exposure_estimate_en = false;
   double exposure_time_init = 0.0;
@@ -216,6 +223,7 @@ public:
     M3D rear_from_lidar_rotation = M3D::Identity();
     V3D rear_from_lidar_translation = V3D::Zero();
     vector<LidarBodyExclusionRectangle> body_exclusion_rectangles;
+    bool body_filter_status_logged = false;
     deque<PendingLidarFrame> pending_frames;
     double last_header_time = -1.0;
   };
@@ -228,7 +236,10 @@ public:
       multi_lidar_body_exclusion_rectangles;
   vector<std::unique_ptr<LidarSource>> lidar_sources;
   double multi_lidar_sync_tolerance = 0.005;
+  bool multi_lidar_body_exclusion_enabled = true;
   double multi_lidar_body_exclusion_min_z = -3.0;
+  bool multi_lidar_body_fused_rectangle_enabled = false;
+  LidarBodyExclusionRectangle multi_lidar_body_fused_rectangle;
   double lidar_max_point_offset = 0.2;
   std::size_t multi_lidar_queue_size = 5;
   std::size_t multi_lidar_frame_count = 0;
@@ -360,6 +371,8 @@ public:
   rclcpp::Subscription<sensor_msgs::Image>::SharedPtr sub_img;
   rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr pubLaserCloudFullRes;
   rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr pubCurrentFrame;
+  rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr
+      pubMultiLidarFilteredColored;
   rclcpp::Publisher<visualization_msgs::MarkerArray>::SharedPtr pubNormal;
   rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr pubSubVisualMap;
   rclcpp::Publisher<sensor_msgs::PointCloud2>::SharedPtr pubLaserCloudEffect;

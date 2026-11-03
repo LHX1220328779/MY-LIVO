@@ -1,12 +1,20 @@
 {
   "active": {
     "wuhu/truck29": "wuhu/truck29/v118_camloop",
-    "wuhu/truck29raw": "wuhu/truck29raw/v019_gcons",
+    "wuhu/truck29raw": "wuhu/truck29raw/v042_camloop",
     "wuhu/truck05": "wuhu/truck05/v028_driven",
     "zongyang/truck07": "zongyang/truck07/v005_manual",
-    "wuhu/truck28": "wuhu/truck28/v030_gcons",
+    "wuhu/truck28": "wuhu/truck28/v036_gcons",
     "xingye/truck12": "xingye/truck12/v001_import",
-    "xingye/truck06": "xingye/truck06/v001_import"
+    "xingye/truck06": "xingye/truck06/v001_import",
+    "wuhu/truck29-0930": "wuhu/truck29-0930/v010_camlidar",
+    "xingye/truck08": "xingye/truck08/v007_gcons",
+    "wuhu/truck13": "wuhu/truck13/v007_gcons",
+    "wuhu/truck27": "wuhu/truck27/v001_import",
+    "zongyang/truck02": "zongyang/truck02/v015_gcons",
+    "xingye/truck13": "xingye/truck13/v014_camphoto",
+    "dazhou/truck10": "dazhou/truck10/v008_gcons",
+    "huaining/truck03": "huaining/truck03/v011_rtktime"
   },
-  "updated": "2026-10-14T16:56:11+08:00"
+  "updated": "2026-10-30T18:14:43+08:00"
 }

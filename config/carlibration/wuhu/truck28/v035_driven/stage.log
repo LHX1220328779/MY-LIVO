@@ -1,0 +1,17 @@
+warning: window end 40.0 s exceeds available poses (27.7 s); clamping
+calibration=/home/project/MY-LIVO/config/carlibration/wuhu/truck28/v034_ground/calibration.json
+run=/home/project/MY-LIVO/results/calib_truck28_lio_1026_180828/Log/fusion/1793009426586304111
+window 8.0..27.200008153915405 s, lidar_time_offset -0.1559
+pass 1 poses: native frames.csv (6 DoF); pass 2 poses: RTK-optimized trajectory_optimized.txt (tilt about x/y and z of LiDARs with median match time gap > 2.0 s)
+scans used: front_right_lidar:194, back_lidar:194, front_left_lidar:194, front_lidar:194
+scan source: round archive scans.bin/sources.bin (mapper deskew; returns at scan end, round extrinsics inverted)
+matching: viewing-side consistent (oriented normals)
+reference front_lidar: 253681 world points
+pairing: same-time for LiDARs overlapping the reference (1.0 s blocks +-0.5 s, 1743337 block points); cross-time LiDARs use the accumulated target (nearest-range voxels)
+front_right_lidar: pass 1 matches 86477->78195 |res| median 1.20->1.03 cm; ground 1.15->0.98 (n=73895); vertical 2.63->2.61 (n=2155); match time gap median 0.6 s; correction rot deg (x,y,z)=(-0.028,-0.022,+0.074) trans cm=(+2.6,-0.8,+1.0); iters 7  [quality: ok]
+front_left_lidar: pass 1 matches 86858->77052 |res| median 4.74->1.15 cm; ground 4.67->1.12 (n=73590); vertical 6.93->2.63 (n=1665); match time gap median 0.6 s; correction rot deg (x,y,z)=(-0.365,-0.536,+0.338) trans cm=(-4.1,-2.5,+10.2); iters 9  [quality: ok]
+back_lidar: pass 1 matches 15280->15348 |res| median 8.20->1.63 cm; ground 8.39->1.57 (n=14593); vertical 4.47->4.61 (n=393); match time gap median 10.1 s; correction rot deg (x,y,z)=(+0.661,+0.083,-0.096) trans cm=(+0.8,-0.5,+9.8); iters 13
+    pass 2 (cross-time LiDAR, drift-free poses, ground only): ground 1.81->1.54 cm (n=14607); tilt about x/y adjusted by (-0.014,-0.012) deg, z by +0.7 cm; iters 3
+    final correction rot deg (x,y,z)=(+0.647,+0.071,-0.096) trans cm=(+0.8,-0.5,+10.5)  [quality: ok]
+quality: ok
+written /home/project/MY-LIVO/config/carlibration/wuhu/truck28/v035_driven/calibration.json

@@ -4,7 +4,8 @@ import pathlib
 import subprocess
 import threading
 
-from .common import DATASET_TOOL, PY, REPO, STUDIO_DIR, TOOLS, StudioError, now, read_json, safe_path
+from .common import (DATASET_TOOL, PY, REPO, STUDIO_DIR, TOOLS, StudioError, load_state,
+                     now, read_json, safe_path, update_state)
 
 ASSESS_TOOL = TOOLS / "livo" / "assess.py"
 ASSESS_DIR = STUDIO_DIR / "assess"
@@ -153,7 +154,8 @@ def assessment_summary(raw_path):
     alerts = doc.get("alerts") or []
     return {"verdict": doc.get("verdict"), "generated": doc.get("generated"), "alerts": len(alerts),
             "bad_alerts": sum(1 for x in alerts if x.get("status") == "bad"), "counts": doc.get("counts"),
-            "title": (doc.get("outlook") or {}).get("title"), "elapsed_s": doc.get("elapsed_s")}
+            "title": (doc.get("outlook") or {}).get("title"), "elapsed_s": doc.get("elapsed_s"),
+            "startup": doc.get("startup")}
 
 
 def _win_args(window_start, window_duration):
@@ -185,8 +187,12 @@ def assess_cmd(raw_path, calibration_file=None, window_start=None, window_durati
 def assess_result_ctx(report):
     doc = read_json(report) or {}
     alerts = doc.get("alerts") or []
+    stationary = (doc.get("startup") or {}).get("stationary")
+    if stationary and load_state()["data"].get("dataset") == doc.get("dataset", {}).get("path"):
+        update_state({"mapping": {"start_offset": stationary["start_s"]}})
     return {"verdict": doc.get("verdict", "?"), "alerts": len(alerts), "bad_alerts": sum(1 for x in alerts if x.get("status") == "bad"),
-            "title": (doc.get("outlook") or {}).get("title", ""), "report": str(report), "elapsed_s": doc.get("elapsed_s")}
+            "title": (doc.get("outlook") or {}).get("title", ""), "report": str(report), "elapsed_s": doc.get("elapsed_s"),
+            "startup": doc.get("startup")}
 
 
 def assess_pipeline_step(raw_path, calibration_file=None, force=False, window_start=None, window_duration=None):
@@ -194,11 +200,11 @@ def assess_pipeline_step(raw_path, calibration_file=None, force=False, window_st
 
     The report key is derived from path + first/last timestamp + window, so an unchanged recording/window is
     never read twice; a report made without a calibration file is redone once one is available (static extrinsic
-    checks). Returns a job step spec or None (cache hit). The step aborts the pipeline when an *异常*-level
-    metric that calibration cannot compensate is found (warn-level alerts only annotate the job)."""
+    checks). Returns a job step spec or None (cache hit). Only *异常*-level uncorrectable alerts abort the pipeline;
+    advisory warnings (including a short stationary startup prefix) are displayed but do not block it."""
     report, _info = assessment_file(raw_path, window_start, window_duration)
     doc = read_json(report) if report.exists() else None
-    if doc and doc.get("schema") == 2 and not force and (doc.get("calibration") or not calibration_file):
+    if doc and doc.get("schema") == 5 and not force and (doc.get("calibration") or not calibration_file):
         return None
     cmd, report, info = assess_cmd(raw_path, calibration_file, window_start=window_start, window_duration=window_duration)
 

@@ -1,0 +1,15 @@
+calibration=/home/project/MY-LIVO/config/carlibration/xingye/truck08/v003_ground/calibration.json
+run=/home/project/MY-LIVO/results/calib_truck08_lio_1020_165417/Log/fusion/1792486690228625973
+window 8.0..40.0 s, lidar_time_offset 0.0021
+pass 1 poses: native frames.csv (6 DoF); pass 2 poses: RTK-optimized trajectory_optimized.txt (tilt about x/y and z of LiDARs with median match time gap > 2.0 s)
+scans used: front_right_lidar:320, back_lidar:320, front_left_lidar:320, front_lidar:320
+scan source: round archive scans.bin/sources.bin (mapper deskew; returns at scan end, round extrinsics inverted)
+matching: viewing-side consistent (oriented normals)
+reference front_lidar: 222977 world points
+pairing: same-time for LiDARs overlapping the reference (1.0 s blocks +-0.5 s, 1821627 block points); cross-time LiDARs use the accumulated target (nearest-range voxels)
+front_right_lidar: pass 1 matches 119844->111768 |res| median 2.38->1.23 cm; ground 2.34->1.18 (n=103360); vertical 2.69->2.16 (n=3490); match time gap median 0.6 s; correction rot deg (x,y,z)=(-0.092,-0.383,+0.021) trans cm=(+0.0,-1.5,+2.6); iters 11  [quality: ok]
+front_left_lidar: pass 1 matches 157534->148307 |res| median 1.20->1.09 cm; ground 1.15->1.05 (n=139008); vertical 3.17->1.84 (n=5198); match time gap median 0.6 s; correction rot deg (x,y,z)=(-0.024,-0.132,+0.096) trans cm=(+1.6,-2.9,+0.6); iters 9  [quality: ok]
+back_lidar: pass 1 matches 21963->22286 |res| median 6.88->3.26 cm; ground 7.14->3.14 (n=19167); vertical 5.20->4.24 (n=1345); match time gap median 6.3 s; correction rot deg (x,y,z)=(+0.169,-0.219,+0.226) trans cm=(-0.1,+7.4,-2.6); iters 11
+    pass 2 (cross-time LiDAR, drift-free poses, ground only): ground 5.08->2.54 cm (n=16093); tilt about x/y adjusted by (+0.211,-0.114) deg, z by +1.0 cm; iters 6
+    final correction rot deg (x,y,z)=(+0.380,-0.334,+0.226) trans cm=(-0.1,+7.4,-1.6)  [quality: warn; only 1345 vertical planar matches (yaw/x/y weakly observed)]
+quality: warn  (back_lidar: only 1345 vertical planar matches (yaw/x/y weakly observed))

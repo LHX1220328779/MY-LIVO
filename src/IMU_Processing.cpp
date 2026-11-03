@@ -43,6 +43,7 @@ void ImuProcess::Reset()
   init_iter_num = 1;
   IMUpose.clear();
   initial_gravity_covariance.setZero();
+  b_first_frame = true;
   last_imu.reset(new sensor_msgs::Imu());
   cur_pcl_un_.reset(new PointCloudXYZI());
   last_prop_end_time = -1.0;
@@ -102,13 +103,19 @@ void ImuProcess::set_inv_expo_cov(const double &inv_expo) { cov_inv_expo = inv_e
 
 void ImuProcess::set_acc_bias_cov(const V3D &b_a) { cov_bias_acc = b_a; }
 
-void ImuProcess::set_imu_init_frame_num(const int &num) { MAX_INI_COUNT = num; }
+void ImuProcess::set_imu_init_frame_num(const int &num)
+{
+  if (num <= 0)
+    throw std::invalid_argument("IMU initialization frame count must be positive.");
+  MAX_INI_COUNT = num;
+}
 
 void ImuProcess::IMU_init(const MeasureGroup &meas, StatesGroup &state_inout, int &N)
 {
   /** 1. initializing the gravity, gyro bias, acc and gyro covariance
    ** 2. normalize the acceleration measurenments to unit gravity **/
-  ROS_INFO("IMU Initializing: %.1f %%", double(N) / MAX_INI_COUNT * 100);
+  ROS_INFO("IMU Initializing: %.1f %%",
+           std::min(100.0, double(N) / MAX_INI_COUNT * 100.0));
   V3D cur_acc, cur_gyr;
 
   if (b_first_frame)
@@ -146,9 +153,9 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, StatesGroup &state_inout, in
   IMU_mean_acc_norm = mean_acc.norm();
   state_inout.gravity = -mean_acc / mean_acc.norm() * G_m_s2;
   state_inout.rot_end = Eye3d; // Exp(mean_acc.cross(V3D(0, 0, -1 / scale_gravity)));
-  // A stationary gyroscope bias is directly observable during initialization.
-  // Ignoring the mean is especially harmful for the normalized raw CGI-610
-  // channel, where even a small constant rate integrates into attitude drift.
+  // A stationary prefix makes the mean gyro a useful bias estimate; on a
+  // motion-first recording it can include real angular rate. The data-source
+  // assessment reports this as an advisory rather than rejecting the run.
   state_inout.bias_g = mean_gyr;
   state_inout.cov.block<3, 3>(10, 10) =
       initial_gyr_bias_sigma * initial_gyr_bias_sigma * M3D::Identity();
@@ -713,23 +720,33 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, Poin
     double pcl_end_time = lidar_meas.lio_vio_flg == LIO ? meas.lio_time : meas.vio_time;
     // lidar_meas.last_lio_update_time = pcl_end_time;
 
-    if (meas.imu.empty()) { return; };
-    /// The very first lidar frame
+    if (meas.imu.empty()) { return; }
+    const double batch_first_time =
+        stampToSec(meas.imu.front()->header.stamp);
+    const double batch_last_time =
+        stampToSec(meas.imu.back()->header.stamp);
+    if (!std::isfinite(batch_first_time) ||
+        !std::isfinite(batch_last_time) ||
+        batch_last_time < batch_first_time)
+      throw std::runtime_error(
+          "Invalid IMU timestamps during initialization.");
+
+    // The assessed stationary-prefix duration is advisory. The estimator
+    // retains its ordinary configured sample-count initializer.
     IMU_init(meas, stat, init_iter_num);
-
     imu_need_init = true;
-
     last_imu = meas.imu.back();
 
     if (init_iter_num > MAX_INI_COUNT)
     {
-      // cov_acc *= pow(G_m_s2 / mean_acc.norm(), 2);
       imu_need_init = false;
       // The initialized state represents the end of this measurement group.
       // Seed both propagation clocks explicitly; otherwise the first deskewed
       // scan reads an indeterminate last_prop_end_time and mixes time origins.
       last_prop_end_time = pcl_end_time;
       lidar_meas.last_lio_update_time = pcl_end_time;
+      ROS_INFO("IMU initialization complete: %d samples (configured count %d).",
+               std::max(0, init_iter_num - 1), MAX_INI_COUNT);
       ROS_INFO("IMU Initials: Gravity: %.4f %.4f %.4f %.4f; acc covarience: "
                "%.8f %.8f %.8f; gry covarience: %.8f %.8f %.8f \n",
                stat.gravity[0], stat.gravity[1], stat.gravity[2], mean_acc.norm(), cov_acc[0], cov_acc[1], cov_acc[2], cov_gyr[0], cov_gyr[1],
@@ -740,7 +757,6 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, Poin
       // The mapper owns the run-specific log path; never write into the
       // source-tree Log directory from this estimator component.
     }
-
     return;
   }
 

@@ -11,32 +11,46 @@ import yaml
 
 
 def launch_rviz(context, config, current_cloud):
-    # Only the camera display needs a derived config. Keep the installed
-    # default usable for standalone RViz/LIO, and runtime files under results.
-    if LaunchConfiguration("use_camera").perform(context).lower() == "true":
-        with open(config, encoding="utf-8") as stream:
-            settings = yaml.safe_load(stream)
+    use_camera = LaunchConfiguration("use_camera").perform(context).lower() == "true"
+    with open(config, encoding="utf-8") as stream:
+        settings = yaml.safe_load(stream)
+
+    if use_camera:
+        # Preserve the original white current-frame display. Other camera-coloured
+        # point-cloud displays use RGB8; /rtk/map_final keeps its existing transformer.
         for display in settings["Visualization Manager"]["Displays"]:
-            # /rtk/map_final is the intensity (XYZI) voxel map in both modes.
-            if (display.get("Class") == "rviz_default_plugins/PointCloud2" and
-                    display.get("Topic", {}).get("Value") != "/rtk/map_final"):
+            if display.get("Class") != "rviz_default_plugins/PointCloud2":
+                continue
+            topic_name = display.get("Topic", {}).get("Value")
+            if topic_name == "/rtk/cloud_current":
+                display["Color Transformer"] = "Intensity"
+                display["Channel Name"] = "intensity"
+                display["Color"] = "255; 255; 255"
+            elif topic_name not in ("/rtk/map_final", "/multi_lidar/filtered_colored"):
                 display["Color Transformer"] = "RGB8"
                 display["Channel Name"] = "rgb"
-        output = os.path.realpath(LaunchConfiguration("output_directory").perform(context))
-        results = os.path.realpath("/home/project/MY-LIVO/results")
-        if os.path.commonpath([output, results]) != results:
-            raise ValueError("RViz runtime configuration must stay under results/")
-        os.makedirs(output, exist_ok=True)
-        config = os.path.join(output, "camera_display.rviz")
-        with open(config, "w", encoding="utf-8") as stream:
-            yaml.safe_dump(settings, stream, sort_keys=False)
+        runtime_name = "camera_display.rviz"
+    else:
+        # Normal LIO initializes directly in mine. lio_local only exists when
+        # startup has no valid RTK; forcing it here drops every mine-frame message.
+        vm = settings["Visualization Manager"]
+        vm.setdefault("Global Options", {})["Fixed Frame"] = "mine"
+        runtime_name = "lio_display.rviz"
+
+    output = os.path.realpath(LaunchConfiguration("output_directory").perform(context))
+    results = os.path.realpath("/home/project/MY-LIVO/results")
+    if os.path.commonpath([output, results]) != results:
+        raise ValueError("RViz runtime configuration must stay under results/")
+    os.makedirs(output, exist_ok=True)
+    config = os.path.join(output, runtime_name)
+    with open(config, "w", encoding="utf-8") as stream:
+        yaml.safe_dump(settings, stream, sort_keys=False)
     return [Node(
         package="rviz2", executable="rviz2", name="rviz2",
         arguments=["-d", config],
+        parameters=[{"use_sim_time": True}],
         remappings=[("/rtk/cloud_current", current_cloud)], output="screen",
     )]
-
-
 def _fastdds_profile():
     for path in (os.path.join(get_package_share_directory("fast_livo"), "config", "fastdds_livo_shm.xml"),
                  os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "config", "fastdds_livo_shm.xml")):

@@ -1,0 +1,180 @@
+# xingye/truck08/v006_rtktime
+
+- stage: rtktime (RTK 位置关联时间)
+- parent: xingye/truck08/v004_driven
+- lineage: xingye/truck08/v001_import -> xingye/truck08/v002_axle -> xingye/truck08/v003_ground -> xingye/truck08/v004_driven -> xingye/truck08/v006_rtktime
+- created: 2026-10-20T17:03:42+08:00
+- note: RTK position time association +0.0250 -> +0.0182 s (secant of both rounds (measured gain 0.99))
+
+## inputs
+
+- run: /home/project/MY-LIVO/results/calib_truck08_rtk1_1020_165417/Log/fusion/1792486745915508034
+- run2: /home/project/MY-LIVO/results/calib_truck08_rtk2_1020_165417/Log/fusion/1792486875924088073
+
+## changes vs parent
+
+```
+{
+  "time_offsets": {
+    "rtk_position": {
+      "from": 0.025,
+      "to": 0.0182
+    }
+  }
+}
+```
+
+## metrics
+
+```
+{
+  "rtk_time": {
+    "parent": "xingye/truck08/v004_driven",
+    "parent_rtk_position_s": 0.025,
+    "round1": {
+      "run": "/home/project/MY-LIVO/results/calib_truck08_rtk1_1020_165417/Log/fusion/1792486745915508034",
+      "effective_s": 0.0175,
+      "correction_s": -0.006727828301345784,
+      "se_s": 0.0020256620488999307,
+      "observable": true,
+      "frames": 1186,
+      "informative_voxels": 3465
+    },
+    "round2": {
+      "run": "/home/project/MY-LIVO/results/calib_truck08_rtk2_1020_165417/Log/fusion/1792486875924088073",
+      "effective_s": 0.0063,
+      "correction_s": 0.004352140189561081,
+      "se_s": 0.0023422063703515852,
+      "observable": true,
+      "frames": 1186,
+      "informative_voxels": 3481
+    },
+    "method": "secant of both rounds (measured gain 0.99)",
+    "gain": 0.989,
+    "best_effective_s": 0.0107,
+    "best_se_s": 0.00165,
+    "rtk_position_s": {
+      "from": 0.025,
+      "to": 0.0182
+    }
+  }
+}
+```
+
+## summary
+
+```
+{
+  "lidars": [
+    {
+      "lidar": "front_right_lidar",
+      "key": "transform_matrix_lidar_1",
+      "t": [
+        1.8775,
+        6.9056,
+        1.1554
+      ],
+      "rpy_deg": [
+        -1.006,
+        -0.069,
+        14.373
+      ]
+    },
+    {
+      "lidar": "back_lidar",
+      "key": "transform_matrix_lidar_2",
+      "t": [
+        -0.2922,
+        -1.8916,
+        0.5903
+      ],
+      "rpy_deg": [
+        -0.151,
+        -0.397,
+        -89.925
+      ]
+    },
+    {
+      "lidar": "front_left_lidar",
+      "key": "transform_matrix_lidar_3",
+      "t": [
+        -2.0233,
+        6.9151,
+        1.2049
+      ],
+      "rpy_deg": [
+        -0.016,
+        -1.358,
+        166.661
+      ]
+    },
+    {
+      "lidar": "front_lidar",
+      "key": "transform_matrix_lidar_6",
+      "t": [
+        -0.0833,
+        6.9974,
+        0.7941
+      ],
+      "rpy_deg": [
+        1.031,
+        3.331,
+        90.436
+      ]
+    }
+  ],
+  "camera_to_rear": {
+    "t": [
+      -0.1729,
+      6.9547,
+      1.384
+    ],
+    "rpy_deg": [
+      -101.245,
+      2.746,
+      -1.747
+    ]
+  },
+  "camera": {
+    "topic": "/midrange_camera/image_raw",
+    "width": 1920,
+    "height": 1080,
+    "intrinsics": [
+      1642.35,
+      1855.45,
+      959.039,
+      539.189
+    ],
+    "distortion": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "source": "midrange_camera[0].camera_in_params"
+  },
+  "time_offsets": {
+    "lidar": -0.0054,
+    "lidar_frontend": 0.0021,
+    "camera": 0.0,
+    "rtk_position": 0.0182,
+    "ins_attitude": 0.0,
+    "lidar_source": "rear-axle alignment (cross-time consistency vs INS poses)",
+    "source": "import (verify with camera-time / LIO evaluation)",
+    "lidar_frontend_source": "axle: lidar -0.0054 + imu/ins clock lag +0.0075 (corr 0.999); template -0.1250 replaced",
+    "rtk_position_source": "rtk-time: map consistency, secant of both rounds (measured gain 0.99); effective +10.7 ms (se 1.6 ms)"
+  }
+}
+```
+
+## stage report
+
+```
+round 1: effective +17.50 ms -> correction -6.73 ms (se 2.03)
+round 2: effective +6.30 ms -> correction +4.35 ms (se 2.34)
+secant of both rounds (measured gain 0.99): best effective +10.70 ms (se 1.65 ms); rtk_position +0.0250 -> +0.0182 s
+
+RTK time correction -6.73 ms (se 2.03 ms) -> best effective offset +10.77 ms (run +17.50); voxels 4123, informative 3465; observable
+RTK time correction +4.35 ms (se 2.34 ms) -> best effective offset +10.65 ms (run +6.30); voxels 4096, informative 3481; observable
+```

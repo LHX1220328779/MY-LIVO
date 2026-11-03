@@ -1,0 +1,408 @@
+# wuhu/truck29/v069_driven
+
+- stage: driven (行驶段 6-DoF 精修)
+- parent: wuhu/truck29/v068_ground
+- lineage: wuhu/truck29/v055_import -> wuhu/truck29/v056_axle -> wuhu/truck29/v057_ground -> wuhu/truck29/v058_driven -> wuhu/truck29/v059_camtime -> wuhu/truck29/v060_camlidar -> wuhu/truck29/v061_camloop -> wuhu/truck29/v062_manual -> wuhu/truck29/v063_manual -> wuhu/truck29/v065_driven -> wuhu/truck29/v066_driven -> wuhu/truck29/v067_axle -> wuhu/truck29/v068_ground -> wuhu/truck29/v069_driven
+- created: 2026-10-09T08:37:04+08:00
+- note: pipeline: driven
+
+## inputs
+
+- bag: /home/project/data/haibo/wuhu_livo/ros2bag
+- dataset: {'path': '/home/project/data/haibo/wuhu_livo/ros2bag', 'kind': 'raw_split', 'segments': 8, 'duration_s': 120.13, 'has_camera': True}
+- run: /home/project/MY-LIVO/results/calib_truck29_lio_1009_083005/Log/fusion/1791506044750930969
+- window: [8.0, 40.0]
+
+## changes vs parent
+
+```
+{
+  "lidars": {
+    "front_right_lidar": {
+      "dt_cm": [
+        0.8,
+        0.39,
+        0.02
+      ],
+      "drpy_deg": [
+        0.029,
+        -0.111,
+        0.019
+      ]
+    },
+    "back_lidar": {
+      "dt_cm": [
+        -1.88,
+        5.91,
+        -7.55
+      ],
+      "drpy_deg": [
+        -0.079,
+        0.092,
+        0.139
+      ]
+    },
+    "front_left_lidar": {
+      "dt_cm": [
+        -0.4,
+        2.66,
+        -1.04
+      ],
+      "drpy_deg": [
+        -0.101,
+        -0.057,
+        0.024
+      ]
+    }
+  }
+}
+```
+
+## metrics
+
+```
+{
+  "refinement": {
+    "refinement": {
+      "reference": "front_lidar",
+      "corrections": {
+        "front_right_lidar": {
+          "rotvec_deg": [
+            -0.06695738118701218,
+            0.051337761702952546,
+            0.0
+          ],
+          "trans_cm": [
+            0.0,
+            0.0,
+            1.602875424752369
+          ],
+          "yaw_xy_solved": false,
+          "about": "lidar position in rear-axle frame"
+        },
+        "front_left_lidar": {
+          "rotvec_deg": [
+            -0.10549214544698383,
+            -0.007536242945855132,
+            0.0
+          ],
+          "trans_cm": [
+            0.0,
+            0.0,
+            2.1575419065615518
+          ],
+          "yaw_xy_solved": false,
+          "about": "lidar position in rear-axle frame"
+        },
+        "back_lidar": {
+          "rotvec_deg": [
+            -0.13731628844297863,
+            -0.06064644553020404,
+            0.0
+          ],
+          "trans_cm": [
+            0.0,
+            0.0,
+            8.340934852229816
+          ],
+          "yaw_xy_solved": false,
+          "about": "lidar position in rear-axle frame"
+        }
+      },
+      "source": "/home/project/data/haibo/wuhu_livo/ros2bag",
+      "stationary_frames": [
+        2,
+        20
+      ],
+      "moving_frames": [
+        300,
+        40
+      ],
+      "stage2_6dof": {
+        "reference": "front_lidar",
+        "corrections": {
+          "front_right_lidar": {
+            "rotvec_deg": [
+              0.026206173274770685,
+              -0.11156214153770705,
+              0.020722465567726656
+            ],
+            "trans_cm": [
+              0.8027559976155646,
+              0.39188363345936106,
+              0.02348097537067107
+            ],
+            "about": "lidar position in rear-axle frame",
+            "quality": {
+              "level": "ok",
+              "reasons": [],
+              "converged": true,
+              "iterations": 13,
+              "matches": 187329,
+              "vertical_matches": 16471,
+              "median_before_cm": 3.34,
+              "median_after_cm": 3.03,
+              "vertical_before_cm": 3.54,
+              "vertical_after_cm": 3.51,
+              "rotation_deg": 0.116,
+              "translation_cm": 0.9,
+              "match_time_gap_s": 3.05,
+              "pass2": {
+                "ground_before_cm": 3.49,
+                "ground_after_cm": 3.06,
+                "ground_matches": 149109,
+                "delta_rotvec_deg": [
+                  -0.0524,
+                  -0.0313,
+                  0.0
+                ],
+                "delta_trans_cm": [
+                  0.0,
+                  0.0,
+                  2.32
+                ],
+                "iterations": 10
+              }
+            }
+          },
+          "front_left_lidar": {
+            "rotvec_deg": [
+              0.10247982523128099,
+              0.0546252770850977,
+              0.022621761984628588
+            ],
+            "trans_cm": [
+              -0.4064708142297501,
+              2.65576181276113,
+              -1.0431980279365123
+            ],
+            "about": "lidar position in rear-axle frame",
+            "quality": {
+              "level": "ok",
+              "reasons": [],
+              "converged": true,
+              "iterations": 17,
+              "matches": 220314,
+              "vertical_matches": 25966,
+              "median_before_cm": 5.15,
+              "median_after_cm": 4.87,
+              "vertical_before_cm": 3.61,
+              "vertical_after_cm": 3.5,
+              "rotation_deg": 0.118,
+              "translation_cm": 2.9,
+              "match_time_gap_s": 5.38,
+              "pass2": {
+                "ground_before_cm": 5.01,
+                "ground_after_cm": 4.99,
+                "ground_matches": 140982,
+                "delta_rotvec_deg": [
+                  -0.0029,
+                  -0.0228,
+                  0.0
+                ],
+                "delta_trans_cm": [
+                  0.0,
+                  0.0,
+                  0.76
+                ],
+                "iterations": 9
+              }
+            }
+          },
+          "back_lidar": {
+            "rotvec_deg": [
+              0.09330572138634732,
+              0.0768278675351307,
+              0.14043567556254324
+            ],
+            "trans_cm": [
+              -1.8836646370636585,
+              5.911580622806847,
+              -7.5437902807088
+            ],
+            "about": "lidar position in rear-axle frame",
+            "quality": {
+              "level": "warn",
+              "reasons": [
+                "not converged in 25 iterations",
+                "only 1941 vertical planar matches (yaw/x/y weakly observed)"
+              ],
+              "converged": false,
+              "iterations": 25,
+              "matches": 41056,
+              "vertical_matches": 1941,
+              "median_before_cm": 9.96,
+              "median_after_cm": 3.12,
+              "vertical_before_cm": 3.83,
+              "vertical_after_cm": 4.13,
+              "rotation_deg": 0.185,
+              "translation_cm": 9.8,
+              "match_time_gap_s": 10.5,
+              "pass2": {
+                "ground_before_cm": 3.82,
+                "ground_after_cm": 3.09,
+                "ground_matches": 33539,
+                "delta_rotvec_deg": [
+                  -0.0172,
+                  -0.0723,
+                  0.0
+                ],
+                "delta_trans_cm": [
+                  0.0,
+                  0.0,
+                  2.01
+                ],
+                "iterations": 8
+              }
+            }
+          }
+        },
+        "run": "/home/project/MY-LIVO/results/calib_truck29_lio_1009_083005/Log/fusion/1791506044750930969",
+        "window": [
+          8.0,
+          40.0
+        ],
+        "prior": [
+          0.5,
+          0.1
+        ],
+        "poses": {
+          "pass1": "native frames.csv",
+          "pass2": "RTK-optimized trajectory_optimized.txt",
+          "cross_time_s": 2.0
+        },
+        "quality": "warn"
+      }
+    }
+  }
+}
+```
+
+## summary
+
+```
+{
+  "lidars": [
+    {
+      "lidar": "front_right_lidar",
+      "key": "transform_matrix_lidar_1",
+      "t": [
+        2.7639,
+        6.018,
+        1.8252
+      ],
+      "rpy_deg": [
+        -0.983,
+        -3.018,
+        -1.42
+      ]
+    },
+    {
+      "lidar": "back_lidar",
+      "key": "transform_matrix_lidar_2",
+      "t": [
+        -0.1071,
+        -0.1672,
+        0.6368
+      ],
+      "rpy_deg": [
+        -1.06,
+        0.705,
+        -91.303
+      ]
+    },
+    {
+      "lidar": "front_left_lidar",
+      "key": "transform_matrix_lidar_3",
+      "t": [
+        -3.0951,
+        5.8162,
+        1.9615
+      ],
+      "rpy_deg": [
+        -3.467,
+        -0.77,
+        178.621
+      ]
+    },
+    {
+      "lidar": "front_lidar",
+      "key": "transform_matrix_lidar_6",
+      "t": [
+        -0.1094,
+        8.0405,
+        0.051
+      ],
+      "rpy_deg": [
+        1.452,
+        -1.532,
+        89.924
+      ]
+    }
+  ],
+  "camera_to_rear": {
+    "t": [
+      0.0024,
+      8.0426,
+      1.7517
+    ],
+    "rpy_deg": [
+      -96.512,
+      1.62,
+      0.291
+    ]
+  },
+  "camera": {
+    "topic": "/midrange_camera/image_raw",
+    "width": 1920,
+    "height": 1080,
+    "intrinsics": [
+      1642.570556640625,
+      1855.53173828125,
+      971.0083025529602,
+      534.2602337509306
+    ],
+    "distortion": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "source": "defaults (wuhu truck29 yaml)"
+  },
+  "time_offsets": {
+    "lidar": -0.1462,
+    "camera": -0.115,
+    "rtk_position": 0.025,
+    "ins_attitude": 0.0,
+    "lidar_source": "rear-axle alignment (cross-time consistency vs INS poses)",
+    "source": "import (verify with camera-time / LIO evaluation)",
+    "camera_source": "operator set (livo_calib.py set): 时间偏移改回 IMU 硬件对齐对（lidar -0.125 / camera -0.115）：axle 解 -0.1459 含 INS 链路延迟，喂给前端后 21ms 错位打花高角速率段的去畸变与颜色采样（灯柱白度 51.5%→79.3%，牌面着色同步改善）；融合精度在该区间平坦（LIVO 120s xy max 7.12→7.08 cm，达标）。证据链见 docs/mcp-color-regression-time-offsets.md",
+    "lidar_frontend": -0.125
+  }
+}
+```
+
+## stage report
+
+```
+calibration=/home/project/MY-LIVO/config/carlibration/wuhu/truck29/v068_ground/calibration.json
+run=/home/project/MY-LIVO/results/calib_truck29_lio_1009_083005/Log/fusion/1791506044750930969
+window 8.0..40.0 s, lidar_time_offset -0.125
+pass 1 poses: native frames.csv (6 DoF); pass 2 poses: RTK-optimized trajectory_optimized.txt (tilt about x/y and z of LiDARs with median match time gap > 2.0 s)
+scans used: front_right_lidar:322, back_lidar:322, front_left_lidar:322, front_lidar:322
+matching: viewing-side consistent (oriented normals)
+reference front_lidar: 511077 world points
+front_right_lidar: pass 1 matches 187452->187329 |res| median 3.34->3.03 cm; ground 3.27->2.92 (n=152353); vertical 3.54->3.51 (n=16471); match time gap median 3.1 s; correction rot deg (x,y,z)=(+0.079,-0.080,+0.021) trans cm=(+0.8,+0.4,-2.3); iters 13
+    pass 2 (cross-time LiDAR, drift-free poses, ground only): ground 3.49->3.06 cm (n=149109); tilt about x/y adjusted by (-0.052,-0.031) deg, z by +2.3 cm; iters 10
+    final correction rot deg (x,y,z)=(+0.026,-0.112,+0.021) trans cm=(+0.8,+0.4,+0.0)  [quality: ok]
+front_left_lidar: pass 1 matches 220357->220314 |res| median 5.15->4.87 cm; ground 5.21->4.90 (n=143344); vertical 3.61->3.50 (n=25966); match time gap median 5.4 s; correction rot deg (x,y,z)=(+0.105,+0.077,+0.023) trans cm=(-0.4,+2.7,-1.8); iters 17
+    pass 2 (cross-time LiDAR, drift-free poses, ground only): ground 5.01->4.99 cm (n=140982); tilt about x/y adjusted by (-0.003,-0.023) deg, z by +0.8 cm; iters 9
+    final correction rot deg (x,y,z)=(+0.102,+0.055,+0.023) trans cm=(-0.4,+2.7,-1.0)  [quality: ok]
+back_lidar: pass 1 matches 40597->41056 |res| median 9.96->3.12 cm; ground 11.07->2.99 (n=33648); vertical 3.83->4.13 (n=1941); match time gap median 10.5 s; correction rot deg (x,y,z)=(+0.110,+0.149,+0.140) trans cm=(-1.9,+5.9,-9.6); iters 25
+    pass 2 (cross-time LiDAR, drift-free poses, ground only): ground 3.82->3.09 cm (n=33539); tilt about x/y adjusted by (-0.017,-0.072) deg, z by +2.0 cm; iters 8
+    final correction rot deg (x,y,z)=(+0.093,+0.077,+0.140) trans cm=(-1.9,+5.9,-7.5)  [quality: warn; not converged in 25 iterations; only 1941 vertical planar matches (yaw/x/y weakly observed)]
+quality: warn  (back_lidar: not converged in 25 iterations, only 1941 vertical planar matches (yaw/x/y weakly observed))
+written /home/project/MY-LIVO/config/carlibration/wuhu/truck29/v069_driven/calibration.json
+```

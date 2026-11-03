@@ -1,0 +1,26 @@
+{
+    "calibration_type": "lidar_to_imu_manual",
+    "schema_version": 1,
+    "source_calibration": "/home/project/groundextractor_1/data/calibration/calibration_yingde_2025.12.03_v5.0.5/calibration/perception_truck14.json",
+    "source_frame": "front_lidar",
+    "target_frame": "imu",
+    "transform_matrix": [
+        0.0036651483331542334,
+        -0.9999932166879634,
+        0.0003650558257154942,
+        0.36,
+        0.9999837639780865,
+        0.0036667060717661126,
+        0.004362000321143169,
+        6.269,
+        -0.004363309284746571,
+        0.0003490625204548522,
+        0.9999904197978311,
+        0.287,
+        0,
+        0,
+        0,
+        1
+    ],
+    "transform_semantics": "front_lidar_to_imu"
+}

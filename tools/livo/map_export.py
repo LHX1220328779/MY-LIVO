@@ -294,7 +294,12 @@ def voxel_reduce_xyzi(rec, voxel, min_points=1):
     (dust, rain, multipath), and objects that crossed the scene only briefly (passing vehicles, people) - a static
     surface near the route collects tens to hundreds of returns per 5 cm voxel over the scans of the map."""
     if voxel <= 0 or not len(rec):
-        return rec
+        # Spill records also contain range/frame fields. PCD payloads must contain
+        # only the four declared XYZI fields even when voxel filtering is disabled.
+        out = np.empty(len(rec), XYZI)
+        for name in XYZI.names:
+            out[name] = rec[name]
+        return out
     xyz = np.stack([rec["x"], rec["y"], rec["z"]], 1).astype(np.float64)
     v = np.floor(xyz / voxel).astype(np.int64)
     v -= v.min(0)

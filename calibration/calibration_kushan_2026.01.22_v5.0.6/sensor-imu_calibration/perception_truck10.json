@@ -1,0 +1,54 @@
+{
+    "calibration_type": "sensor_to_imu_manual",
+    "schema_version": 2,
+    "source_calibration": "/home/project/groundextractor_1/data/calibration/calibration_kushan_2026.01.22_v5.0.6/calibration/perception_truck10.json",
+    "transforms": {
+        "front_lidar_to_imu": {
+            "source_frame": "front_lidar",
+            "target_frame": "imu",
+            "transform_matrix": [
+                0.013607706599769398,
+                -0.9999047551867694,
+                -0.0023045337882829173,
+                0.028,
+                0.9995076814990379,
+                0.013667393111787107,
+                -0.028241759682175627,
+                7.402,
+                0.028270566770273252,
+                -0.0019190936440466096,
+                0.9995984654520399,
+                0.419,
+                0,
+                0,
+                0,
+                1
+            ],
+            "transform_semantics": "front_lidar_to_imu"
+        },
+        "midrange_camera_to_imu": {
+            "derived_from": "front_lidar_to_imu * inverse(midrange_camera[0].tf_lidar_to_camera)",
+            "source_frame": "midrange_camera",
+            "target_frame": "imu",
+            "transform_matrix": [
+                0.9997945011004566,
+                -0.019955309508373528,
+                0.00365326623986007,
+                -0.07324197693807735,
+                -0.0048392370075273075,
+                -0.05971076894669704,
+                0.9982038181605569,
+                7.370866297077283,
+                -0.019701435954536776,
+                -0.9980164093867887,
+                -0.059795050290513435,
+                2.004454784352967,
+                0,
+                0,
+                0,
+                1
+            ],
+            "transform_semantics": "midrange_camera_to_imu"
+        }
+    }
+}

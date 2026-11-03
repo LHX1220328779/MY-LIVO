@@ -1,0 +1,252 @@
+{
+  "id": "xingye/truck13/v009_camlidar",
+  "mine": "xingye",
+  "truck": "truck13",
+  "version": "v009_camlidar",
+  "stage": "camlidar",
+  "stage_label": "相机-LiDAR 偏航/横滚复核",
+  "advisory": true,
+  "parent": "xingye/truck13/v008_camtime",
+  "lineage": [
+    "xingye/truck13/v001_import",
+    "xingye/truck13/v002_axle",
+    "xingye/truck13/v003_ground",
+    "xingye/truck13/v004_driven",
+    "xingye/truck13/v005_gcons",
+    "xingye/truck13/v008_camtime",
+    "xingye/truck13/v009_camlidar"
+  ],
+  "created": "2026-10-28T11:27:18+08:00",
+  "note": "pole yaw not applied (no lamp/sign posts found in the accumulated scans): extrinsic kept; camera roll kept (15 frames < 20; group spread 1.9 deg > 0.6; groups disagree in sign)",
+  "inputs": {
+    "bag": "/home/project/data/haibo/xingye/13/20261027/ros2bag",
+    "dataset": {
+      "path": "/home/project/data/haibo/xingye/13/20261027/ros2bag",
+      "kind": "raw_split",
+      "segments": 68,
+      "duration_s": 1020.12,
+      "has_camera": true
+    },
+    "run": "/home/project/MY-LIVO/results/calib_truck13_livo_1028_112448/Log/fusion/1793157928269210398",
+    "frames": 30,
+    "window": [
+      5.0,
+      115.0
+    ]
+  },
+  "metrics": {
+    "error": "no lamp/sign posts found in the accumulated scans",
+    "frames_checked": 30,
+    "max_delta_deg": 0.5,
+    "applied": false,
+    "roll_applied": false,
+    "roll": {
+      "roll_deg": 0.3641,
+      "frames": 15,
+      "per_frame_mad_deg": 1.0,
+      "group_roll_deg": [
+        -1.0,
+        0.3,
+        -1.6
+      ],
+      "group_spread_deg": 1.9,
+      "cost_px_at_zero": 13.4836,
+      "cost_px_at_min": 13.306,
+      "curvature_px": 0.0981,
+      "profile": [
+        [
+          -1.6,
+          13.489
+        ],
+        [
+          -1.4,
+          13.4864
+        ],
+        [
+          -1.2,
+          13.5929
+        ],
+        [
+          -1.0,
+          13.542
+        ],
+        [
+          -0.8,
+          13.5399
+        ],
+        [
+          -0.6,
+          13.5981
+        ],
+        [
+          -0.4,
+          13.5718
+        ],
+        [
+          -0.2,
+          13.4804
+        ],
+        [
+          0.0,
+          13.4836
+        ],
+        [
+          0.2,
+          13.421
+        ],
+        [
+          0.4,
+          13.306
+        ],
+        [
+          0.6,
+          13.3871
+        ],
+        [
+          0.8,
+          13.4517
+        ],
+        [
+          1.0,
+          13.3759
+        ],
+        [
+          1.2,
+          13.4567
+        ],
+        [
+          1.4,
+          13.424
+        ],
+        [
+          1.6,
+          13.4262
+        ]
+      ],
+      "method": "sky line: image vs LiDAR top envelope (tools/calib/camera_roll.py)",
+      "frames_checked": 150,
+      "accumulate_s": 1.5,
+      "window_s": [
+        5.0,
+        56.600003719329834
+      ],
+      "overlay_dir": "/home/project/MY-LIVO/config/carlibration/xingye/truck13/v009_camlidar/overlays",
+      "applied": false,
+      "reasons": [
+        "15 frames < 20",
+        "group spread 1.9 deg > 0.6",
+        "groups disagree in sign"
+      ]
+    }
+  },
+  "changes_vs_parent": {},
+  "summary": {
+    "lidars": [
+      {
+        "lidar": "front_right_lidar",
+        "key": "transform_matrix_lidar_1",
+        "t": [
+          1.9464,
+          7.0057,
+          1.0298
+        ],
+        "rpy_deg": [
+          -1.755,
+          -0.435,
+          14.043
+        ]
+      },
+      {
+        "lidar": "back_lidar",
+        "key": "transform_matrix_lidar_2",
+        "t": [
+          -0.1422,
+          -1.9111,
+          0.4543
+        ],
+        "rpy_deg": [
+          0.043,
+          -3.423,
+          -90.139
+        ]
+      },
+      {
+        "lidar": "front_left_lidar",
+        "key": "transform_matrix_lidar_3",
+        "t": [
+          -1.9445,
+          6.9514,
+          1.0499
+        ],
+        "rpy_deg": [
+          0.796,
+          -0.59,
+          167.928
+        ]
+      },
+      {
+        "lidar": "front_lidar",
+        "key": "transform_matrix_lidar_6",
+        "t": [
+          -0.0002,
+          7.0096,
+          0.6541
+        ],
+        "rpy_deg": [
+          0.426,
+          2.516,
+          90.688
+        ]
+      }
+    ],
+    "camera_to_rear": {
+      "t": [
+        -0.0123,
+        7.0409,
+        1.4569
+      ],
+      "rpy_deg": [
+        -98.675,
+        1.353,
+        -0.512
+      ]
+    },
+    "camera": {
+      "topic": "/midrange_camera/image_raw",
+      "width": 1920,
+      "height": 1080,
+      "intrinsics": [
+        1642.15,
+        1855.56,
+        963.247,
+        544.29
+      ],
+      "distortion": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "source": "midrange_camera[0].camera_in_params"
+    },
+    "time_offsets": {
+      "lidar": -0.0502,
+      "lidar_frontend": -0.0427,
+      "camera": -0.0109,
+      "rtk_position": 0.025,
+      "ins_attitude": 0.0,
+      "lidar_source": "rear-axle alignment (cross-time consistency vs INS poses)",
+      "source": "import (verify with camera-time / LIO evaluation)",
+      "lidar_frontend_source": "axle: lidar -0.0502 + imu/ins clock lag +0.0075 (corr 0.997); template -0.1250 replaced",
+      "camera_source": "optical flow vs gyro on /home/project/data/haibo/xingye/13/20261027/ros2bag (corr 1.00)"
+    }
+  },
+  "calibration_file": "/home/project/MY-LIVO/config/carlibration/xingye/truck13/v009_camlidar/calibration.json",
+  "overlays": [
+    "roll_sky_00386.jpg",
+    "roll_sky_00416.jpg",
+    "roll_sky_00449.jpg",
+    "roll_sky_00479.jpg"
+  ]
+}

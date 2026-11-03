@@ -477,26 +477,45 @@ def main():
     idx = np.flatnonzero(np.r_[active, solve_dt])
     info = {n_: float(np.sqrt(max(sol["H"][i, i], 0))) for n_, i in zip(("rx", "ry", "rz", "tx", "ty", "tz", "dt"), range(7)) if i in idx}
     split = None
+    large_translation = np.linalg.norm(dt_full[:2]) / 100 > GATE_MAX_TRANS_M
+    translation_confirmed = False
     if not a.no_split:
         mid = np.median(rel)
         parts = (used[rel <= mid], used[rel > mid])
         def solve_half(i):
             m = np.isin(data["scan"], parts[i])
-            return solve({k: v[m] for k, v in data.items()}, sol["T"], active, solve_dt=solve_dt, gap=a.gap, nq=a.samples // 2,
-                         iters=10, fine=True, seed=1, dt0=float(sol["dt"]))
+            # Large factory corrections need independent starts, not refinements of the full-data solution.
+            return solve({k: v[m] for k, v in data.items()}, T_ref if large_translation else sol["T"], active,
+                         solve_dt=solve_dt, gap=a.gap, nq=a.samples // 2,
+                         iters=MAX_ITERS if large_translation else 10, fine=not large_translation,
+                         seed=1, dt0=float(sol["dt"]))
         halves = parallel_map(solve_half, (0, 1), a.jobs)
         if all(s is not None for s in halves):
             d_rot = np.degrees(R.from_matrix(halves[0]["T"][:3, :3] @ halves[1]["T"][:3, :3].T).as_rotvec())
             d_tr = halves[0]["T"][:3, 3] - halves[1]["T"][:3, 3]
             split = {"rotvec_deg": np.round(d_rot, 3).tolist(), "translation_cm": np.round(100 * d_tr, 1).tolist(),
                      "time_ms": round(1000 * (halves[0]["dt"] - halves[1]["dt"]), 1)}
+            translation_confirmed = (
+                sol["converged"] and all(s["converged"] for s in halves)
+                and np.linalg.norm(d_tr[:2]) <= 0.03
+                and np.linalg.norm(d_rot) <= WARN_SPLIT_ROT_DEG
+                and abs(halves[0]["dt"] - halves[1]["dt"]) <= WARN_SPLIT_DT_S
+                and all(np.linalg.norm((s["T"][:3, 3] - sol["T"][:3, 3])[:2]) <= 0.03
+                        and s["hist"][-1]["median_cm"] <= 3.0 for s in halves)
+                and h1["median_cm"] <= 3.0)
             report.append(f"repeatability (first vs second half of the used scans): rotvec {split['rotvec_deg']} deg, "
                           f"translation {split['translation_cm']} cm, time {split['time_ms']:+.1f} ms")
     # quality verdict
     reasons, level = [], "ok"
     rot_deg, trans_m = float(np.linalg.norm(rv_full)), float(np.linalg.norm(dt_full) / 100)
     if rot_deg > GATE_MAX_ROT_DEG: reasons.append(f"rotation correction {rot_deg:.2f} deg > {GATE_MAX_ROT_DEG}"); level = "fail"
-    if trans_m > GATE_MAX_TRANS_M: reasons.append(f"translation correction {100 * trans_m:.0f} cm > {100 * GATE_MAX_TRANS_M:.0f}"); level = "fail"
+    if trans_m > GATE_MAX_TRANS_M:
+        if translation_confirmed:
+            reasons.append(f"translation correction {100 * trans_m:.0f} cm confirmed by independent halves (<= 3 cm)")
+            level = "warn" if level == "ok" else level
+        else:
+            reasons.append(f"translation correction {100 * trans_m:.0f} cm > {100 * GATE_MAX_TRANS_M:.0f}")
+            level = "fail"
     abs_dt = abs(lidar_off + dt_total) if solve_dt else abs(lidar_off)
     if solve_dt and abs_dt > GATE_MAX_ABS_DT_S:
         reasons.append(f"absolute LiDAR time offset {1000 * abs_dt:.0f} ms implausible (> {1000 * GATE_MAX_ABS_DT_S:.0f})"); level = "fail"

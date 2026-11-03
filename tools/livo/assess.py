@@ -46,6 +46,7 @@ import time
 for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
     os.environ.setdefault(_v, "1")
 import numpy as np
+import yaml
 
 if __package__ in (None, ""):  # executed as a file: make `livo` importable
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
@@ -57,7 +58,7 @@ rosenv.ensure()
 from livo.dataset import Dataset, norm  # noqa: E402
 from livo.body_filter import normalize, rear_axle_mask  # noqa: E402
 
-SCHEMA = 2
+SCHEMA = 5
 DEFAULT_BODY_FILTER = normalize({})
 LIDAR_KEYS = {"front_right_lidar": "transform_matrix_lidar_1", "back_lidar": "transform_matrix_lidar_2",
               "front_left_lidar": "transform_matrix_lidar_3", "front_lidar": "transform_matrix_lidar_6"}
@@ -191,7 +192,7 @@ def verify_parsers(samples):
 
 # ----------------------------------------------------------------------------- metric records
 FIX_LABEL = {"auto": "标定/建图自动补偿", "stage": "需运行离线标定阶段", "procedure": "需调整采集或回放流程",
-             "playback": "调整回放设置（分段 / 倍速）", "none": "标定无法补救"}
+             "playback": "调整回放设置（分段 / 倍速）", "none": "标定无法补救", "advisory": "仅提示"}
 STATUS_ORDER = {"ok": 0, "info": 0, "na": 0, "warn": 1, "bad": 2}
 
 
@@ -274,7 +275,7 @@ class Report:
                 if m["alert"]:
                     alerts.append({"id": m["id"], "group": g["label"], "label": m["label"], "display": m["display"],
                                    "status": m["status"], "fix": m["fix"], "fix_label": m["fix_label"], "note": m["note"]})
-                elif m["status"] in ("warn", "bad"):
+                elif m["status"] in ("warn", "bad") and m["fix"] != "advisory":
                     fixable.append({"id": m["id"], "group": g["label"], "label": m["label"], "display": m["display"],
                                     "status": m["status"], "fix": m["fix"], "fix_label": m["fix_label"], "note": m["note"]})
             g["status"] = worst
@@ -310,6 +311,174 @@ def vehicle_ids(ds, calib_path):
             cal = (m.group(1), int(m.group(2))) if m.re.groups == 2 else (None, int(m.group(1)))
     return data, cal
 
+
+def startup_init_settings(ds, calibration_path):
+    # Resolve production initialization settings for the recording's vehicle.
+    settings = {
+        "duration_sec": 2.0, "window_sec": 0.2, "timeout_sec": 10.0,
+        "max_speed_mps": 0.10, "max_gyro_mean_deg_s": 0.50,
+        "max_gyro_std_deg_s": 0.20, "max_acc_std_mps2": 0.40,
+        "acc_norm_tolerance_mps2": 0.75, "require_ins_stationary": False,
+        "gyro_in_degrees": True, "acc_gravity_compensated": True,
+        "acceleration_scale": 1.0, "acceleration_transform": np.eye(3),
+        "max_time_gap_sec": 0.2, "imu_int_frame": 3,
+        "sample_interval_sec": 0.0, "config_name": "runtime defaults",
+    }
+    data_ids, calibration_id = vehicle_ids(ds, calibration_path)
+    vehicle = None
+    if calibration_id and calibration_id[0] is not None:
+        vehicle = calibration_id
+    elif len(data_ids) == 1:
+        vehicle = next(iter(data_ids))
+    if vehicle is None:
+        return settings
+
+    mine, truck = vehicle
+    project_root = pathlib.Path(__file__).resolve().parents[2]
+    config_path = project_root / "config" / f"{mine}_truck{truck:02d}.yaml"
+    used_studio_default = False
+    if not config_path.is_file():
+        # Studio LIO runs use this production parameter file unless a
+        # vehicle-specific config exists. Do not silently fall back to C++
+        # member defaults (which disagree on gyro units, gravity, INS gate,
+        # IMU sample count and maximum time gap).
+        config_path = project_root / "config" / "wuhu_truck29.yaml"
+        if not config_path.is_file():
+            return settings
+        used_studio_default = True
+    try:
+        document = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return settings
+    params = (document.get("laser_mapping") or {}).get(
+        "ros__parameters", document)
+    imu = params.get("imu") or {}
+    mine_config = params.get("mine") or {}
+    config_label = str(config_path.relative_to(project_root))
+    if used_studio_default:
+        config_label += (
+            f" (Studio mapper default; no {mine}_truck{truck:02d}.yaml)")
+    settings.update({
+        "duration_sec": float(imu.get("init_stationary_duration_sec", 2.0)),
+        "window_sec": float(imu.get("init_stationary_window_sec", 0.2)),
+        "timeout_sec": float(imu.get("init_timeout_sec", 10.0)),
+        "max_speed_mps": float(imu.get("init_max_speed_mps", 0.10)),
+        "max_gyro_mean_deg_s": float(imu.get("init_max_gyro_mean_deg_s", 0.50)),
+        "max_gyro_std_deg_s": float(imu.get("init_max_gyro_std_deg_s", 0.20)),
+        "max_acc_std_mps2": float(imu.get("init_max_acc_std_mps2", 0.40)),
+        "acc_norm_tolerance_mps2": float(
+            imu.get("init_acc_norm_tolerance_mps2", 0.75)),
+        "require_ins_stationary": bool(
+            imu.get("init_require_ins_stationary", False)),
+        "gyro_in_degrees": bool(mine_config.get("imu_gyro_in_degrees", True)),
+        "acc_gravity_compensated": bool(
+            mine_config.get("imu_acceleration_gravity_compensated", True)),
+        "acceleration_scale": float(
+            mine_config.get("imu_acceleration_scale", 1.0)),
+        "max_time_gap_sec": float(imu.get("maximum_time_gap", 0.2)),
+        "imu_int_frame": int(imu.get("imu_int_frame", 3)),
+        "sample_interval_sec": float(imu.get("sample_interval_sec", 0.0)),
+        "config_name": config_label,
+    })
+    transform = mine_config.get("imu_acceleration_transform")
+    if transform is not None:
+        try:
+            settings["acceleration_transform"] = np.asarray(
+                transform, dtype=float).reshape(3, 3)
+        except (TypeError, ValueError):
+            settings["acceleration_transform"] = np.eye(3)
+    count_duration = (
+        max(0, settings["imu_int_frame"] - 1) *
+        settings["sample_interval_sec"])
+    settings["duration_sec"] = max(settings["duration_sec"], count_duration)
+    return settings
+
+
+def startup_stationary_duration(imu_ts, imu_gyro, imu_acc, odo_ts, odo_velocity,
+                                settings, record_ts, origin_ns):
+    ts = np.asarray(imu_ts, dtype=np.int64)
+    if len(ts) < 10 or len(imu_gyro) != len(ts) or len(imu_acc) != len(ts):
+        return 0.0, "fewer than 10 valid IMU samples", None
+    gyro = np.asarray(imu_gyro, dtype=float).reshape(-1, 3)
+    acceleration = np.asarray(imu_acc, dtype=float).reshape(-1, 3)
+    if not settings["gyro_in_degrees"]:
+        gyro = gyro * (180.0 / math.pi)
+    acceleration = ((acceleration @ settings["acceleration_transform"].T) *
+                    settings["acceleration_scale"])
+    odometry_ts = np.asarray(odo_ts, dtype=np.int64)
+    velocities = np.asarray(odo_velocity, dtype=float).reshape(-1, 3)
+    if len(odometry_ts) != len(velocities):
+        return 0.0, "INS velocity/timestamp count mismatch", None
+    if settings["require_ins_stationary"] and not len(odometry_ts):
+        return 0.0, "INS speed samples unavailable", None
+    # Constant-speed driving can look quiet to the IMU: use INS speed whenever available.
+    use_ins = bool(len(odometry_ts))
+    speeds = np.linalg.norm(velocities, axis=1) if use_ins else np.empty(0)
+    start_ns = max(int(ts[0]), int(odometry_ts[0])) if use_ins else int(ts[0])
+    first_index = int(np.searchsorted(ts, start_ns, side="left"))
+    if first_index >= len(ts) - 9:
+        return 0.0, "not enough overlapping IMU/INS samples", None
+
+    window_ns = int(settings["window_sec"] * NS)
+    max_gap_ns = int(settings["max_time_gap_sec"] * NS)
+    deltas = np.diff(ts[first_index:min(len(ts), first_index + 201)])
+    deltas = deltas[(deltas > 0) & (deltas <= max_gap_ns)]
+    tolerance_ns = int(1.5 * np.median(deltas)) if len(deltas) else 0
+    required_s = settings["duration_sec"] + settings["window_sec"]
+    left = first_index
+    run_start = last_good = None
+    prefix_s, prefix_open = 0.0, True
+    prefix_note = "recording remained stationary through the assessed prefix"
+    for index in range(first_index, len(ts) + 1):
+        reason = "end of recording"
+        static = False
+        if index < len(ts):
+            if index > first_index and ts[index] - ts[index - 1] > max_gap_ns:
+                left = index
+                reason = "IMU gap interrupted the stationary interval"
+            else:
+                while left < index and ts[index] - ts[left] > window_ns:
+                    left += 1
+                if ts[index] - ts[left] + tolerance_ns < window_ns or index - left + 1 < 10:
+                    continue
+                gw, aw = gyro[left:index + 1], acceleration[left:index + 1]
+                reason = "IMU motion/stability check failed"
+                if np.isfinite(gw).all() and np.isfinite(aw).all():
+                    gm, am = gw.mean(axis=0), aw.mean(axis=0)
+                    gs = float(np.sqrt(np.mean(np.sum((gw - gm) ** 2, axis=1))))
+                    acs = float(np.sqrt(np.mean(np.sum((aw - am) ** 2, axis=1))))
+                    expected = 0.0 if settings["acc_gravity_compensated"] else 9.80665
+                    static = (np.linalg.norm(gm) <= settings["max_gyro_mean_deg_s"] and
+                              gs <= settings["max_gyro_std_deg_s"] and
+                              acs <= settings["max_acc_std_mps2"] and
+                              abs(np.linalg.norm(am) - expected) <= settings["acc_norm_tolerance_mps2"])
+                if static and use_ins:
+                    lo = np.searchsorted(odometry_ts, ts[left], side="left")
+                    hi = np.searchsorted(odometry_ts, ts[index], side="right")
+                    v = speeds[lo:hi]
+                    static = (len(v) > 0 and np.isfinite(v).all() and
+                              np.median(v) <= settings["max_speed_mps"] and
+                              np.percentile(v, 95) <= 1.5 * settings["max_speed_mps"])
+                    reason = "INS speed exceeds the stationary threshold or is unavailable"
+        if static:
+            if run_start is None:
+                run_start = left
+            last_good = index
+            if prefix_open:
+                prefix_s = max(0.0, (int(ts[index]) - start_ns) / NS)
+            continue
+        if prefix_open:
+            prefix_open = False
+            if index < len(ts):
+                prefix_note = reason
+        if run_start is not None and (int(ts[last_good]) - int(ts[run_start])) / NS >= required_s:
+            # Playback offsets use bag record times, not sensor header stamps.
+            start_s = max(0.0, math.ceil((int(record_ts[run_start]) - origin_ns) / 1e6) / 1000)
+            end_s = (int(record_ts[last_good]) - origin_ns) / NS
+            return prefix_s, prefix_note, {"start_s": start_s, "end_s": round(end_s, 3),
+                                           "duration_s": round(end_s - start_s, 3)}
+        run_start = last_good = None
+    return prefix_s, prefix_note, None
 
 def cloud_xyz(data, max_range=32.0):
     from rclpy.serialization import deserialize_message
@@ -522,7 +691,7 @@ def scan_chunk(job):
     lid_start = {short[t]: [] for t in lidar_topics}
     sample_slots = {}
     slots_eval = []
-    imu_ts, imu_gyro, imu_rec = [], [], []
+    imu_ts, imu_gyro, imu_acc, imu_rec = [], [], [], []
     odo = {"ts": [], "p": [], "q": [], "vb": [], "cov": []}
     st_mode, st_sats, st_ts = [], [], []
     cam_ts, cam_rec, cam_flags, cam_size = [], [], [], []
@@ -577,9 +746,10 @@ def scan_chunk(job):
                     del sample_slots[next_sample_ns]
                     next_sample_ns += sample_every_ns
         elif topic == imu_topic:
-            ts, g, _acc = parse_imu(data)
+            ts, g, acc = parse_imu(data)
             imu_ts.append(ts)
             imu_gyro.append(g)
+            imu_acc.append(acc)
             imu_rec.append(rec_ns - ts)
         elif topic == odom_topic:
             ts, p, q, vb, cov = parse_odometry(data)
@@ -626,7 +796,8 @@ def scan_chunk(job):
         cam_eval.append(m)
 
     return {"empty": False, "lid_ts": lid_ts, "lid_rec": lid_rec, "lid_n": lid_n, "lid_start": lid_start if first else None,
-            "slots_eval": slots_eval, "imu_ts": imu_ts, "imu_gyro": imu_gyro, "imu_rec": imu_rec, "odo": odo,
+            "slots_eval": slots_eval, "imu_ts": imu_ts, "imu_gyro": imu_gyro,
+            "imu_acc": imu_acc, "imu_rec": imu_rec, "odo": odo,
             "st_mode": st_mode, "st_sats": st_sats, "st_ts": st_ts, "cam_ts": cam_ts, "cam_rec": cam_rec,
             "cam_flags": cam_flags, "cam_size": cam_size, "cam_eval": cam_eval, "counters": counters, "dropped": dropped,
             "elapsed": time.time() - t_start}
@@ -670,6 +841,7 @@ def run(a):
     ds = Dataset.open(a.dataset)
     summary = ds.summary()
     calib = load_calibration(a.calibration)
+    startup_settings = startup_init_settings(ds, a.calibration)
     lidar_topics = [t for t in ds.lidar_topics]
     short = {t: t.split("/")[-1] for t in lidar_topics}
     imu_topic = next((t for t in ds.imu_topics), None)
@@ -722,8 +894,11 @@ def run(a):
         lid_ts[t], lid_rec[t], lid_n[t] = m["ts"], m["rec"], m["n"]
         dropped["dropped_duplicate"] += d1
         dropped["dropped_backwards"] += b1
-    m, d1, b1 = _dedup([{"ts": r["imu_ts"], "g": r["imu_gyro"], "rec": r["imu_rec"]} for r in results], "ts", "g", "rec")
-    imu_ts, imu_gyro, imu_rec = m["ts"], m["g"], m["rec"]
+    m, d1, b1 = _dedup([{"ts": r["imu_ts"], "g": r["imu_gyro"],
+                         "acc": r["imu_acc"], "rec": r["imu_rec"]}
+                        for r in results], "ts", "g", "acc", "rec")
+    imu_ts, imu_gyro, imu_acc, imu_rec = (
+        m["ts"], m["g"], m["acc"], m["rec"])
     dropped["dropped_duplicate"] += d1
     dropped["dropped_backwards"] += b1
     m, d1, b1 = _dedup([r["odo"] for r in results], "ts", "p", "q", "vb", "cov")
@@ -1213,15 +1388,66 @@ def run(a):
         R.add(g_cam, "camera_decode", "HEVC 样例解码", 0, "帧", status="warn", display="未采到关键帧样例", fix="none",
               plain="抽到的样例里没遇到关键帧，解码不出来。大概率是关键帧间隔问题，换几个时刻重抽。")
 
+    init_ts, init_gyro, init_acc, init_odo_ts, init_velocity = imu_ts, imu_gyro, imu_acc, odo["ts"], odo["vb"]
+    init_records = [int(t) + int(delay) for t, delay in zip(imu_ts, imu_rec)]
+    if a.window:
+        # Windowed geometry assessment still locates initialization from the WHOLE recording.
+        init_ts, init_gyro, init_acc, init_odo_ts, init_velocity, init_records = [], [], [], [], [], []
+        topics = [t for t in (imu_topic, odom_topic) if t]
+        for topic, data, rec_ns in ds.iter_messages(topics):
+            if topic == imu_topic:
+                stamp_ns, g, acc = parse_imu(data)
+                init_ts.append(stamp_ns); init_gyro.append(g); init_acc.append(acc); init_records.append(rec_ns)
+            elif topic == odom_topic:
+                stamp_ns, _, _, vb, _ = parse_odometry(data)
+                init_odo_ts.append(stamp_ns); init_velocity.append(vb)
+    startup_static_s, startup_static_note, first_stationary = startup_stationary_duration(
+        init_ts, init_gyro, init_acc, init_odo_ts, init_velocity, startup_settings, init_records, ds.start_ns)
+    startup_required_s = (
+        startup_settings["duration_sec"] + startup_settings["window_sec"])
+    startup = {"required_s": startup_required_s, "stationary": first_stationary}
+    R.add(g_route, "mapping_start_offset", "最早可用于初始化的静止段（全程）",
+          first_stationary["start_s"] if first_stationary else None, "s",
+          status="ok" if first_stationary else "warn", fix="playback" if first_stationary else "advisory",
+          display=(f"{first_stationary['start_s']:.3f}–{first_stationary['end_s']:.3f} s；默认建图起始偏移 {first_stationary['start_s']:.3f} s"
+                   if first_stationary else "未找到满足初始化要求的静止段"),
+          plain="从整个数据源寻找第一个足够长的静止段，建图从该段起点回放，保留完整静止初始化时间。",
+          note="按 IMU 陀螺/加速度稳定性、连续性及可用的 INS 速度共同判断；偏移按 bag 录制时间计算。",
+          basis=f"连续静止至少 {startup_required_s:.2f} s；{startup_settings['config_name']}")
+    startup_config_name = startup_settings["config_name"]
+    startup_basis = (
+        f"{startup_config_name}: imu_int_frame={startup_settings['imu_int_frame']} × "
+        f"{startup_settings['sample_interval_sec']:.3f} s; "
+        f"推荐静止前缀 {startup_required_s:.2f} s "
+        f"(初始化 {startup_settings['duration_sec']:.2f} s + 窗口 {startup_settings['window_sec']:.2f} s)")
+    startup_status = "warn" if startup_static_s < startup_required_s else "ok"
+    R.add(g_route, "startup_stationary_init", "起始连续静止时长（IMU 初始化建议）",
+          startup_static_s, "s", ok=startup_required_s,
+          warn=startup_required_s, higher=True, status=startup_status,
+          fix="advisory", display=f"{startup_static_s:.2f} s / 建议 {startup_required_s:.2f} s",
+          limits=f"建议 ≥ {startup_required_s:.2f} s；不足仅提示，不阻断流程",
+          plain="静止起步段越长，IMU 初值越稳；不足只警告，不拦截建图/标定。",
+          note=(f"从录包开头统计连续静止前缀；评估 {startup_settings['window_sec']:.2f} s IMU 窗口、"
+                f"陀螺/加速度稳定性"
+                f"{'、原始加速度近零' if startup_settings['acc_gravity_compensated'] else '、加速度模长近重力'}；"
+                f"{'并检查 INS 速度。' if startup_settings['require_ins_stationary'] else '有 INS 速度时一并检查。'}"
+                f"建议达到 {startup_required_s:.2f} s；不足可能增加初始重力/陀螺偏置不确定性，"
+                f"但本项仅作数据评估警告，不作为运行时门控。 {startup_static_note}。"),
+          basis=startup_basis)
+
     short_recording = span_s < 90.0
     warn_static_s = 0.0 if short_recording else 1.0
     warn_turns = 0 if short_recording else 1
     warn_straight = 0 if short_recording else 1
     # --- route / procedure
     if ref_stats:
-        R.add(g_route, "static_start", "起步前静止时长", static_s, "s", ok=3.0, warn=warn_static_s, higher=True, fix="procedure",
+        R.add(g_route, "static_start", "起步前静止时长", static_s, "s", ok=3.0, warn=warn_static_s, higher=True,
+              fix="playback" if first_stationary else "procedure",
               plain="车子开动前停了几秒。≥3 s 好（够 ground 阶段和起步自检用）；<1 s 静止段无法用。",
-              note="静止外参自检需 ≥5 帧、ground 阶段需 ~2 s 静止；从静止开始录制。", basis="truck29/05 均从静止起步。")
+              note=("静止外参自检需 ≥5 帧、ground 阶段需 ~2 s 静止。" +
+                    (f"已检测到后续静止段，建图默认从 {first_stationary['start_s']:.3f} s 开始。"
+                     if first_stationary else "未找到足够长的静止段，需调整采集或手动选择回放区间。")),
+              basis="truck29/05 均从静止起步。")
         R.add(g_route, "path", "行驶里程 / 时长", ref_stats["path_m"], "m",
               status="ok" if ref_stats["path_m"] >= 200 else "warn", fix="procedure",
               display=f"{ref_stats['path_m']:.0f} m · 行驶 {ref_stats['moving_s']:.0f} s / 总 {span_s:.0f} s · 最高 {ref_stats['speed_max_mps'] * 3.6:.0f} km/h",
@@ -1299,7 +1525,7 @@ def run(a):
                        "has_camera": summary["has_camera"]},
            "window": list(a.window) if a.window else None, "calibration": calib["path"] if calib else None,
            "verdict": verdict, "counts": counts, "alerts": alerts, "fixable": fixable, "outlook": outlook,
-           "groups": R.groups, "reference": ref_stats, "camera_samples": cam_eval,
+           "groups": R.groups, "reference": ref_stats, "startup": startup, "camera_samples": cam_eval,
            "messages": counters["messages"], "bytes": counters["bytes"], "workers": len(specs), "pass_s": round(elapsed_pass, 1)}
     return doc
 

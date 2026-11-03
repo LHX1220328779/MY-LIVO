@@ -151,7 +151,7 @@ class Player:
     def wait_for_subscribers(self):
         timeout = self.args.wait_subscribers
         if timeout <= 0:
-            return
+            return True
         key = [t for t in self.topics if t in self.dataset.imu_topics or t in self.dataset.lidar_topics] or list(self.topics)
         deadline = time.monotonic() + timeout
         log(f"waiting up to {timeout:.0f} s for subscribers on {len(key)} sensor topic(s) ...")
@@ -159,10 +159,12 @@ class Player:
             counts = {t: self.pubs[t].get_subscription_count() for t in key}
             if all(c > 0 for c in counts.values()):
                 log("all sensor topics have subscribers: " + ", ".join(f"{t}={c}" for t, c in counts.items()))
-                return
+                return True
             time.sleep(0.2)
         counts = {t: self.pubs[t].get_subscription_count() for t in key}
-        log("proceeding without full subscriber set: " + ", ".join(f"{t}={c}" for t, c in counts.items()))
+        log(f"ERROR: refusing playback; sensor subscriber preflight timed out after {timeout:.1f} s: "
+            + ", ".join(f"{t}={c}" for t, c in counts.items()))
+        return False
 
     # ------------------------------------------------------------------ main loop
     def run(self):
@@ -181,7 +183,11 @@ class Player:
                 f"LiDAR every {a.stationary_lidar_interval:.1f} s, rate x{a.stationary_rate or 'max'}): " +
                 ", ".join(f"{(f - self.dataset.start_ns) / 1e9:.1f}-{(t - self.dataset.start_ns) / 1e9:.1f} s" for f, t in self.skips))
         self.publish_clock(self.start_ns)
-        self.wait_for_subscribers()
+        if not self.wait_for_subscribers():
+            log("aborting before publishing any bag messages")
+            self.node.destroy_node()
+            self.rclpy.shutdown()
+            return 2
         if a.delay > 0 and not self.stop_requested:
             time.sleep(a.delay)
         stats = {}
@@ -366,7 +372,7 @@ def build_parser():
     ap.add_argument("--no-clock", dest="clock", action="store_false")
     ap.add_argument("--clock-hz", type=float, default=40.0)
     ap.add_argument("--qos", choices=("reliable", "sensor"), default="reliable")
-    ap.add_argument("--wait-subscribers", type=float, default=8.0, help="seconds to wait for sensor subscribers (0 = do not wait)")
+    ap.add_argument("--wait-subscribers", type=float, default=20.0, help="seconds to wait for all sensor subscribers (0 = do not wait; timeout aborts playback)")
     ap.add_argument("--delay", type=float, default=1.0, help="extra settle time before the first message")
     ap.add_argument("--hold", type=float, default=1.0, help="seconds to keep the node alive after the last message")
     ap.add_argument("--progress-interval", type=float, default=5.0)

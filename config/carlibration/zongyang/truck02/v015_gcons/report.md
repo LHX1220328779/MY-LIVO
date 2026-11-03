@@ -1,0 +1,198 @@
+# zongyang/truck02/v015_gcons
+
+- stage: gcons (后向雷达地面一致性（tilt/z）)
+- parent: zongyang/truck02/v014_rtktime
+- lineage: zongyang/truck02/v001_import -> zongyang/truck02/v008_axle -> zongyang/truck02/v009_ground -> zongyang/truck02/v010_axle -> zongyang/truck02/v011_ground -> zongyang/truck02/v012_driven -> zongyang/truck02/v014_rtktime -> zongyang/truck02/v015_gcons
+- created: 2026-10-27T13:47:59+08:00
+- note: agent: start auto calibration after empty body_filter fix
+
+## inputs
+
+- bag: /home/project/data/haibo/zongyang/02/20261026/ros2bag
+- dataset: {'path': '/home/project/data/haibo/zongyang/02/20261026/ros2bag', 'kind': 'raw_split', 'segments': 8, 'duration_s': 239.98, 'has_camera': False}
+- run: /home/project/MY-LIVO/results/calib_truck02_rtk1_1027_133752/Log/fusion/1793079672819270433
+
+## changes vs parent
+
+```
+{
+  "lidars": {
+    "back_lidar": {
+      "dt_cm": [
+        0.0,
+        0.0,
+        -1.38
+      ],
+      "drpy_deg": [
+        0.074,
+        0.196,
+        -0.005
+      ]
+    }
+  }
+}
+```
+
+## metrics
+
+```
+{
+  "ground_consensus": {
+    "corrections": {
+      "back_lidar": {
+        "rotvec_deg": [
+          0.1965,
+          -0.075,
+          0.0
+        ],
+        "trans_cm": [
+          0.0,
+          0.0,
+          -1.38
+        ],
+        "about": "lidar position in rear-axle frame",
+        "quality": {
+          "level": "ok",
+          "reasons": [],
+          "rotation_deg": 0.21,
+          "z_cm": -1.38,
+          "effect_rms_cm": 4.31,
+          "halves_rot_deg": 0.035,
+          "halves_z_cm": 0.01,
+          "median_abs_res_before_cm": 2.47,
+          "median_abs_res_after_cm": 1.27
+        }
+      }
+    },
+    "run": "/home/project/MY-LIVO/results/calib_truck02_rtk1_1027_133752/Log/fusion/1793079672819270433",
+    "targets": [
+      "back_lidar"
+    ],
+    "applied": [
+      "back_lidar"
+    ]
+  }
+}
+```
+
+## summary
+
+```
+{
+  "lidars": [
+    {
+      "lidar": "front_right_lidar",
+      "key": "transform_matrix_lidar_1",
+      "t": [
+        2.6732,
+        4.9627,
+        1.8177
+      ],
+      "rpy_deg": [
+        -0.399,
+        -0.102,
+        -2.742
+      ]
+    },
+    {
+      "lidar": "back_lidar",
+      "key": "transform_matrix_lidar_2",
+      "t": [
+        -0.1868,
+        -0.987,
+        0.8219
+      ],
+      "rpy_deg": [
+        0.423,
+        -3.153,
+        -90.329
+      ]
+    },
+    {
+      "lidar": "front_left_lidar",
+      "key": "transform_matrix_lidar_3",
+      "t": [
+        -3.1809,
+        4.8924,
+        1.8327
+      ],
+      "rpy_deg": [
+        -1.846,
+        -0.424,
+        178.169
+      ]
+    },
+    {
+      "lidar": "front_lidar",
+      "key": "transform_matrix_lidar_6",
+      "t": [
+        -0.0705,
+        7.1162,
+        2.4626
+      ],
+      "rpy_deg": [
+        1.039,
+        1.785,
+        90.946
+      ]
+    }
+  ],
+  "camera_to_rear": {
+    "t": [
+      -0.1056,
+      7.1264,
+      2.1813
+    ],
+    "rpy_deg": [
+      -90.039,
+      3.007,
+      -0.068
+    ]
+  },
+  "camera": {
+    "topic": "/midrange_camera/image_raw",
+    "width": 1920,
+    "height": 1080,
+    "intrinsics": [
+      611.054443359375,
+      895.9816284179688,
+      954.4519112515845,
+      541.4709836341353
+    ],
+    "distortion": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "source": "midrange_camera[0].camera_in_params"
+  },
+  "time_offsets": {
+    "lidar": 0.0033,
+    "lidar_frontend": 0.004,
+    "camera": 0.0,
+    "rtk_position": 0.0669,
+    "ins_attitude": 0.0,
+    "lidar_source": "rear-axle alignment (cross-time consistency vs INS poses)",
+    "source": "import (verify with camera-time / LIO evaluation)",
+    "lidar_frontend_source": "axle: lidar -0.0010 + imu/ins clock lag +0.0050 (corr 1.000); template -0.1250 replaced",
+    "rtk_position_source": "rtk-time: map consistency, secant of both rounds (measured gain 0.48); effective +66.2 ms (se 0.9 ms)"
+  }
+}
+```
+
+## stage report
+
+```
+calibration=/home/project/MY-LIVO/config/carlibration/zongyang/truck02/v014_rtktime/calibration.json
+run=/home/project/MY-LIVO/results/calib_truck02_rtk1_1027_133752/Log/fusion/1793079672819270433
+scan source: round archive scans.bin/sources.bin (mapper deskew)
+window 0.0..237.3 s, stride 4, scans front_right_lidar:591, back_lidar:591, front_left_lidar:591, front_lidar:591; ground-band returns 5194726
+front_right_lidar: ground returns 1318080, median along-track position +9.1 m (kept (overlaps the reference, driven stage))
+back_lidar: ground returns 1038491, median along-track position -8.6 m (rear-facing -> solved)
+front_left_lidar: ground returns 1181818, median along-track position +6.4 m (kept (overlaps the reference, driven stage))
+back_lidar: correction rotvec x +0.196 y -0.075 deg (about the LiDAR, rear-axle frame), z -1.38 cm; own-ground change RMS 4.3 cm; flat-ground |res| median 2.47->1.27 cm (n=981455); signed median by range: 4-10 m +1.8->+0.1, 10-20 m +3.3->+0.0, 20-40 m +6.1->+0.3; halves: 0.035 deg / 0.0 cm  [quality: ok]
+result: applied to back_lidar
+written /home/project/MY-LIVO/config/carlibration/zongyang/truck02/v015_gcons/calibration.json
+```

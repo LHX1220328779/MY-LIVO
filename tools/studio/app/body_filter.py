@@ -1,6 +1,4 @@
-# Studio visual editor for vehicle-specific body-point filters.
-# Reads one real point-cloud sample from a recording, serves it to the browser canvas,
-# and persists the edited rectangles / minimum_z / rear-axle box in calibration.json.
+# Studio visual editor for one body-filter rectangle on the stitched rear-axle cloud.
 from __future__ import annotations
 
 import json
@@ -13,16 +11,22 @@ import numpy as np
 from . import calibration
 from .common import StudioError, load_state, read_json, safe_path
 from livo import rosenv
-from livo.body_filter import (DEFAULT_REAR_AXLE_BOX, LIDAR_TOPICS, lidar_filter_mask,
-                              lidar_transform_matrix, normalize, stamp, to_yaml_overrides,
-                              transform_points)
+from livo.body_filter import (DEFAULT_REAR_AXLE_BOX, LIDAR_TOPICS,
+                              fused_rectangle_mask, lidar_filter_mask,
+                              lidar_transform_matrix, normalize, stamp,
+                              to_yaml_overrides, transform_points)
 from livo.dataset import Dataset
 
-MAX_POINTS = 12000
+MAX_POINTS = 40000
 MULTI_COLORS = ("#0071e3", "#34c759", "#ff9f0a", "#af52de", "#ff2d55",
                 "#5ac8fa", "#a2845e", "#30b0c7")
-MULTI_MAX_POINTS = 12000
-SCAN_MESSAGES = 3
+MULTI_MAX_POINTS = 40000
+# The first four colors intentionally match LIVMapper.cpp's production topic
+# order (front_right, back, front_left, front). Resolve known sources by name,
+# not bag metadata order, so Studio and RViz identify the same LiDAR by color.
+SOURCE_COLOR_BY_TOPIC = {topic: MULTI_COLORS[i]
+                         for i, topic in enumerate(LIDAR_TOPICS)}
+SCAN_MESSAGES = 1
 MAX_RANGE = 30.0
 
 
@@ -170,17 +174,91 @@ def _rect_polygons(rectangles, M):
     return out
 
 
-def _multi_bounds(series, rear_box):
+def _aligned_frame_messages(ds, topics, t_s):
+    """Choose one temporally tight set of LiDAR scans nearest the requested time."""
+    rosenv.ensure()
+    search_radius_ns = int(0.75e9)
+    tolerance_ns = int(0.020e9)  # match config/wuhu_truck29.yaml's 20 ms synchronization window
+    requested_t = max(0.0, min(_finite(t_s, 0.0), max(0.0, ds.duration_s - 0.1)))
+    target_ns = ds.start_ns + int(requested_t * 1e9)
+    start_ns = max(ds.start_ns, target_ns - search_radius_ns)
+    end_ns = min(ds.end_ns, target_ns + search_radius_ns)
+
+    latest = {}
+    best_tight = None
+    best_tight_distance = float("inf")
+    best_tight_span = float("inf")
+    best_any = None
+    best_any_span = float("inf")
+    best_any_distance = float("inf")
+    for topic, data, timestamp_ns in ds.iter_messages(
+            topics, start_ns=start_ns, end_ns=end_ns):
+        latest[topic] = {"data": data, "bag_ns": int(timestamp_ns)}
+        if any(name not in latest for name in topics):
+            continue
+        bag_times = [latest[name]["bag_ns"] for name in topics]
+        span_ns = max(bag_times) - min(bag_times)
+        center_ns = sum(bag_times) / len(bag_times)
+        distance_ns = abs(center_ns - target_ns)
+        candidate = dict(latest)
+        if (span_ns <= tolerance_ns and
+                (distance_ns < best_tight_distance or
+                 (distance_ns == best_tight_distance and span_ns < best_tight_span))):
+            best_tight = candidate
+            best_tight_distance = distance_ns
+            best_tight_span = span_ns
+        if (span_ns < best_any_span or
+                (span_ns == best_any_span and distance_ns < best_any_distance)):
+            best_any = candidate
+            best_any_span = span_ns
+            best_any_distance = distance_ns
+
+    selected = best_tight or best_any
+    if not selected:
+        return {"error": "所选时刻附近没有所有 LiDAR 话题的完整扫描帧", "t_s": requested_t,
+                "requested_t_s": requested_t, "messages": {}, "frame_time_span_ms": None,
+                "aligned": False, "missing_topics": list(topics)}
+
+    rosenv.ensure()
+    from rclpy.serialization import deserialize_message
+    from rosidl_runtime_py.utilities import get_message
+
+    messages, header_times, bag_times = {}, {}, {}
+    for topic in topics:
+        item = selected[topic]
+        msg_type = get_message(ds.topics[topic])
+        msg = deserialize_message(item["data"], msg_type)
+        messages[topic] = msg
+        bag_times[topic] = item["bag_ns"]
+        try:
+            stamp = msg.header.stamp
+            header_time = float(stamp.sec) + float(stamp.nanosec) * 1e-9
+            if not math.isfinite(header_time) or header_time <= 0:
+                header_time = item["bag_ns"] * 1e-9
+        except (AttributeError, TypeError, ValueError):
+            header_time = item["bag_ns"] * 1e-9
+        header_times[topic] = header_time
+
+    span_ms = (max(header_times.values()) - min(header_times.values())) * 1000.0 if header_times else 0.0
+    actual_t = (sum(bag_times.values()) / len(bag_times) - ds.start_ns) * 1e-9
+    return {"messages": messages, "t_s": max(0.0, actual_t),
+            "per_topic_t_s": {topic: (timestamp - ds.start_ns) * 1e-9
+                              for topic, timestamp in bag_times.items()},
+            "header_t_s": {topic: round(timestamp - ds.start_ns * 1e-9, 6)
+                           for topic, timestamp in header_times.items()},
+            "requested_t_s": requested_t, "frame_time_span_ms": span_ms,
+            "bag_time_span_ms": (max(bag_times.values()) - min(bag_times.values())) * 1e-6,
+            "aligned": span_ms <= 20.0, "missing_topics": []}
+
+
+def _multi_bounds(series, fused_rectangle=None):
     xs, ys = [], []
     for item in series:
         for x, y, _z in item.get("points") or []:
             xs.append(float(x)); ys.append(float(y))
-        for poly in item.get("rectangles") or []:
-            for x, y in poly.get("polygon") or []:
-                xs.append(float(x)); ys.append(float(y))
-    for x in (rear_box["x_min"], rear_box["x_max"]):
-        for y in (rear_box["y_min"], rear_box["y_max"]):
-            xs.append(float(x)); ys.append(float(y))
+    if fused_rectangle:
+        xs.extend((float(fused_rectangle["x_min"]), float(fused_rectangle["x_max"])))
+        ys.extend((float(fused_rectangle["y_min"]), float(fused_rectangle["y_max"])))
     if not xs or not ys:
         return {"x_min": -12.0, "x_max": 12.0, "y_min": -12.0, "y_max": 12.0}
     xa, ya = np.asarray(xs, float), np.asarray(ys, float)
@@ -198,58 +276,95 @@ def _multi_bounds(series, rear_box):
 
 
 def _sample_multi_scan(ds, filt, t, max_points, parent_calib):
-    """Sample every LiDAR topic and stitch the points into the rear-axle frame."""
+    """Sample an aligned all-LiDAR frame and stitch it into the rear-axle frame."""
     topics = list(ds.lidar_topics or [])
     if not topics:
-        return {"error": "数据集中没有 LiDAR 点云话题", "series": [], "xy": _multi_bounds([], filt["rear_axle_box"]),
+        return {"error": "数据集中没有 LiDAR 点云话题", "series": [], "xy": _multi_bounds([], filt.get("fused_rectangle")),
                 "raw_points": 0, "sampled_points": 0, "filtered_count": 0, "topics": [],
-                "colors": {}, "rear_axle_box": filt["rear_axle_box"]}
+                "colors": {}, "rear_axle_box": filt["rear_axle_box"],
+                "fused_rectangle": filt.get("fused_rectangle")}
+    frame = _aligned_frame_messages(ds, topics, t)
+    if frame.get("error"):
+        return {"error": frame["error"], "series": [], "xy": _multi_bounds([], filt.get("fused_rectangle")),
+                "raw_points": 0, "sampled_points": 0, "filtered_count": 0, "topics": topics,
+                "colors": {}, "rear_axle_box": filt["rear_axle_box"],
+                "fused_rectangle": filt.get("fused_rectangle"), "t_s": frame["t_s"],
+                "requested_t_s": frame["requested_t_s"], "frame_time_span_ms": None,
+                "aligned": False, "alignment_warning": frame["error"]}
+
+    rosenv.ensure()
+    from sensor_msgs_py import point_cloud2 as pc2
+
     budget = max(1000, min(MULTI_MAX_POINTS, _finite(max_points, MULTI_MAX_POINTS)))
     per_topic = max(1000, budget // len(topics))
     series, colors = [], {}
-    for i, topic in enumerate(topics):
+    next_extra_color = len(LIDAR_TOPICS)
+    for topic in topics:
         key = _key(topic)
-        color = MULTI_COLORS[i % len(MULTI_COLORS)]
+        color = SOURCE_COLOR_BY_TOPIC.get(key)
+        if color is None:
+            color = MULTI_COLORS[next_extra_color % len(MULTI_COLORS)]
+            next_extra_color += 1
         colors[key] = color
         M = lidar_transform_matrix(parent_calib, topic)
         try:
-            one = _sample_scan(ds, topic, filt, t, per_topic)
-            P = np.asarray(one.get("points_full") or one.get("points") or [], dtype=float).reshape(-1, 3)
+            msg = frame["messages"][topic]
+            arr = pc2.read_points(msg, field_names=["x", "y", "z"], skip_nans=True)
+            P = np.stack([arr["x"], arr["y"], arr["z"]], axis=1).astype(np.float64)
+            P = P[(P * P).sum(1) < MAX_RANGE * MAX_RANGE]
+            raw_count = int(len(P))
+            if raw_count > per_topic:
+                rng = np.random.default_rng(20261026 + topics.index(topic))
+                P = P[rng.choice(raw_count, per_topic, replace=False)]
+            legacy_mask = lidar_filter_mask(P, filt, topic)
             Q = transform_points(P, M)
-            filtered = [bool(v) for v in (one.get("filtered") or [])]
+            legacy_filtered = legacy_mask.astype(bool).tolist()
+            filtered = (fused_rectangle_mask(Q, filt).astype(bool).tolist()
+                        if filt.get("fused_rectangle") else legacy_filtered)
+            bag_t_s = frame["per_topic_t_s"][topic]
             series.append({
                 "topic": topic, "topic_key": key, "color": color,
                 "points": Q.round(3).tolist(), "points_local": P.tolist(), "filtered": filtered,
-                "raw_points": int(one.get("raw_points") or 0),
+                "legacy_filtered": legacy_filtered,
+                "raw_points": raw_count,
                 "sampled_points": int(len(Q)),
                 "filtered_count": int(sum(filtered)),
-                "t_s": float(one.get("t_s") or 0.0),
-                "stamps": one.get("stamps") or [],
-                "rectangles": _rect_polygons(filt["lidar_rectangles"].get(key, []), M),
+                "t_s": float(bag_t_s),
+                "stamps": [round(float(bag_t_s), 3)],
+                "header_t_s": frame["header_t_s"][topic],
+                "rectangles": ([] if filt.get("fused_rectangle") else
+                               _rect_polygons(filt["lidar_rectangles"].get(key, []), M)),
                 "transform_identity": bool(np.allclose(M, np.eye(4))),
-                "error": one.get("error"),
+                "error": None,
             })
         except Exception as exc:  # noqa: BLE001 - one bad topic must not hide the others
             series.append({
                 "topic": topic, "topic_key": key, "color": color,
-                "points": [], "points_local": [], "filtered": [], "raw_points": 0, "sampled_points": 0,
-                "filtered_count": 0, "t_s": _finite(t, 0.0), "stamps": [],
+                "points": [], "points_local": [], "filtered": [], "legacy_filtered": [],
+                "raw_points": 0, "sampled_points": 0,
+                "filtered_count": 0, "t_s": float(frame["t_s"]), "stamps": [],
                 "rectangles": _rect_polygons(filt["lidar_rectangles"].get(key, []), M),
                 "transform_identity": bool(np.allclose(M, np.eye(4))),
                 "error": str(exc),
             })
     return {
         "frame": "vehicle_rear_axle", "topics": topics, "colors": colors,
-        "series": series, "xy": _multi_bounds(series, filt["rear_axle_box"]),
+        "series": series, "xy": _multi_bounds(series, filt.get("fused_rectangle")),
         "rear_axle_box": filt["rear_axle_box"],
+        "fused_rectangle": filt.get("fused_rectangle"),
         "raw_points": int(sum(x["raw_points"] for x in series)),
         "sampled_points": int(sum(x["sampled_points"] for x in series)),
         "filtered_count": int(sum(x["filtered_count"] for x in series)),
-        "t_s": float(series[0]["t_s"]) if series else _finite(t, 0.0),
+        "t_s": float(frame["t_s"]), "requested_t_s": float(frame["requested_t_s"]),
+        "frame_time_span_ms": float(frame["frame_time_span_ms"]),
+        "bag_time_span_ms": float(frame["bag_time_span_ms"]),
+        "aligned": bool(frame["aligned"]),
+        "alignment_warning": (None if frame["aligned"] else
+                              f"各 LiDAR header 时间跨度 {frame['frame_time_span_ms']:.3f} ms，超过 20 ms 同步阈值；显示最近的完整帧"),
     }
 
 
-def get(mine=None, truck=None, vid=None, dataset=None, topic=None, t=None, max_points=MAX_POINTS,
+def get(mine=None, truck=None, vid=None, dataset=None, topic=None, t=None, max_points=MULTI_MAX_POINTS,
         parent_id=None):
     mine, truck = _defaults(mine, truck)
     path, version_id = _calibration_file(mine, truck, vid)
@@ -271,30 +386,30 @@ def get(mine=None, truck=None, vid=None, dataset=None, topic=None, t=None, max_p
     else:
         parent_calib = calib
     dataset_path = _dataset_path(dataset)
-    multi_scan = {"error": "数据集未打开", "series": [], "xy": _multi_bounds([], filt["rear_axle_box"]),
+    multi_scan = {"error": "数据集未打开", "series": [], "xy": _multi_bounds([], filt.get("fused_rectangle")),
                   "raw_points": 0, "sampled_points": 0, "filtered_count": 0, "topics": [],
-                  "colors": {}, "rear_axle_box": filt["rear_axle_box"]}
+                  "colors": {}, "rear_axle_box": filt["rear_axle_box"],
+                  "fused_rectangle": filt.get("fused_rectangle")}
     try:
         ds = Dataset.open(dataset_path)
         topics = ds.lidar_topics
         duration_s = float(ds.duration_s)
-        scan = _sample_scan(ds, topic, filt, t, max_points)
-        topic = scan.get("topic") or _pick_topic(ds, topic)
         multi_scan = _sample_multi_scan(ds, filt, t, max_points, parent_calib)
+        scan = {"t_s": multi_scan.get("t_s", _finite(t, 0.0)), "points": [],
+                "filtered": [], "filtered_count": multi_scan.get("filtered_count", 0),
+                "raw_points": multi_scan.get("raw_points", 0)}
+        topic = topics[0] if topics else ""
     except Exception as exc:  # noqa: BLE001 - a bad dataset must not hide the saved parameters
         topics, duration_s = list(LIDAR_TOPICS), 0.0
-        scan = {"error": str(exc), "topic": topic or LIDAR_TOPICS[0],
-                "topic_key": _key(topic or LIDAR_TOPICS[0]), "t_s": _finite(t, 0.0),
-                "stamps": [], "points": [], "filtered": [], "filtered_count": 0, "raw_points": 0,
-                "xy": {"x_min": -10, "x_max": 10, "y_min": -10, "y_max": 10},
-                "xz": {"x_min": -10, "x_max": 10, "y_min": -4, "y_max": 4}}
-        topic = scan["topic"]
+        scan = {"error": str(exc), "t_s": _finite(t, 0.0), "points": [],
+                "filtered": [], "filtered_count": 0, "raw_points": 0}
+        topic = topic or (topics[0] if topics else "")
         multi_scan["error"] = str(exc)
     return {
         "mine": mine, "truck": truck, "id": version_id, "calibration_file": str(path),
         "parent_id": parent_version_id, "parent_calibration_file": str(parent_path),
         "dataset": dataset_path, "duration_s": duration_s, "topics": topics,
-        "topic": topic, "topic_key": scan.get("topic_key") or _key(topic),
+        "topic": topic, "topic_key": _key(topic),
         "body_filter": filt, "yaml_overrides": to_yaml_overrides(filt), "scan": scan,
         "multi_scan": multi_scan,
     }

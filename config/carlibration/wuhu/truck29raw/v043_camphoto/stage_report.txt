@@ -1,0 +1,7 @@
+calibration=/home/project/MY-LIVO/config/carlibration/wuhu/truck29raw/v042_camloop/calibration.json
+run=/home/project/MY-LIVO/results/mcp36_livo_c60b/Log/fusion/1792520245537193957
+collection: 536 frames with an image, 95 views, 50000 returns (>= 3 views), 448938 samples
+half 0: rotation+time rx +0.306 ry -0.143 rz -0.026 deg, dt -12.8 ms: train +28.0 %, held-out +26.5 %; with intrinsics (fx -0.04 %, fy +0.13 %, k1 -0.0060) held-out +27.1 %
+half 1: rotation+time rx +0.306 ry -0.153 rz -0.022 deg, dt -11.7 ms: train +26.5 %, held-out +27.9 %; with intrinsics (fx -0.12 %, fy +0.24 %, k1 -0.0088) held-out +27.8 %
+applied: camera rotation (camera frame) rx +0.306 ry -0.148 rz -0.025 deg, time offset +0.0000 -> -0.0122 s; intrinsics confirmed (unchanged); cost +27.2 % on all returns (138 s)
+written /home/project/MY-LIVO/config/carlibration/wuhu/truck29raw/v043_camphoto/calibration.json

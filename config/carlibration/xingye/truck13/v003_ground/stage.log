@@ -1,0 +1,17 @@
+calibration=/home/project/MY-LIVO/config/carlibration/xingye/truck13/v002_axle/calibration.json
+bag=/home/project/data/haibo/xingye/13/20261027/ros2bag
+reference=front_lidar
+stationary frames 2..22 (aggregated) for side LiDARs; moving frames 6990..7030 (per frame) for back LiDAR
+stationary check (front_lidar, first vs last frame of 20): scan displacement median 8.6 cm / P90 41.6 cm (limit 30 cm) -> stationary
+front_right_lidar: stationary aggregated points 12534
+back_lidar: stationary aggregated points 9992
+front_left_lidar: stationary aggregated points 12447
+front_lidar: stationary aggregated points 21478
+front_right_lidar: plane start: own ground vs reference tilt 0.66 deg (fore-aft +0.64, lateral -0.16), height -7.6 cm over 1 plane pair(s) -> start rot deg (x,y,z)=(+0.643,+0.156,-0.001) z -7.6 cm; ground residual 5.62->3.06 cm (n=2107->2170): used
+front_right_lidar: yaw/xy solved=True; matches 3582->3612; |res| median 4.43->2.04 cm; ground 5.62->1.90 cm (n=2095); vertical 2.55->2.16 cm (n=1337); correction rot deg (x,y,z)=(+0.255,-0.121,-0.062) trans cm=(-2.2,-1.6,-2.9); iters 13  [quality: warn; plane start applied (0.66 deg / -7.6 cm): outside the refinement basin of the parent calibration (mount moved or coarse parent file); yaw/x/y are re-checked by the driven stage]
+front_left_lidar: plane start: own ground vs reference tilt 0.51 deg (fore-aft +0.48, lateral -0.18), height -6.4 cm over 1 plane pair(s) -> start rot deg (x,y,z)=(+0.482,+0.179,-0.001) z -6.4 cm; ground residual 8.11->2.84 cm (n=2089->2106): used
+front_left_lidar: yaw/xy solved=True; matches 3531->3528; |res| median 6.20->2.29 cm; ground 8.11->2.07 cm (n=2099); vertical 4.60->2.46 cm (n=1264); correction rot deg (x,y,z)=(+0.492,+0.041,-0.225) trans cm=(-6.2,+0.6,-6.9); iters 13  [quality: warn; plane start applied (0.51 deg / -6.4 cm): outside the refinement basin of the parent calibration (mount moved or coarse parent file); yaw/x/y are re-checked by the driven stage]
+back_lidar: plane start: own ground vs reference tilt 1.41 deg (fore-aft +1.33, lateral +0.34), height -21.3 cm over 40 plane pair(s) -> start rot deg (x,y,z)=(+1.332,-0.339,+0.016) z -21.3 cm; ground residual 9.09->24.82 cm (n=30880->27721): not used (does not improve the overlap)
+back_lidar: (moving, per-frame vs refined sides) yaw/xy solved=False; matches 41044->41983; |res| median 7.56->5.11 cm; ground 9.09->5.19 cm (n=31771); vertical nan->nan cm (n=0); correction rot deg (x,y,z)=(+0.237,-0.457,+0.000) trans cm=(+0.0,+0.0,-9.0); iters 11  [quality: ok]
+quality: warn  (front_right_lidar: plane start applied (0.66 deg / -7.6 cm): outside the refinement basin of the parent calibration (mount moved or coarse parent file); yaw/x/y are re-checked by the driven stage; front_left_lidar: plane start applied (0.51 deg / -6.4 cm): outside the refinement basin of the parent calibration (mount moved or coarse parent file); yaw/x/y are re-checked by the driven stage)
+written /home/project/MY-LIVO/config/carlibration/xingye/truck13/v003_ground/calibration.json

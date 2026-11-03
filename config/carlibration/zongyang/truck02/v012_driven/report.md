@@ -1,0 +1,449 @@
+# zongyang/truck02/v012_driven
+
+- stage: driven (行驶段 6-DoF 精修)
+- parent: zongyang/truck02/v011_ground
+- lineage: zongyang/truck02/v001_import -> zongyang/truck02/v008_axle -> zongyang/truck02/v009_ground -> zongyang/truck02/v010_axle -> zongyang/truck02/v011_ground -> zongyang/truck02/v012_driven
+- created: 2026-10-27T13:41:11+08:00
+- note: agent: start auto calibration after empty body_filter fix
+
+## inputs
+
+- bag: /home/project/data/haibo/zongyang/02/20261026/ros2bag
+- dataset: {'path': '/home/project/data/haibo/zongyang/02/20261026/ros2bag', 'kind': 'raw_split', 'segments': 8, 'duration_s': 239.98, 'has_camera': False}
+- run: /home/project/MY-LIVO/results/calib_truck02_lio_1027_133752/Log/fusion/1793079628973351194
+- window: [8.0, 40.0]
+
+## changes vs parent
+
+```
+{
+  "lidars": {
+    "front_right_lidar": {
+      "dt_cm": [
+        15.52,
+        -1.55,
+        -0.43
+      ],
+      "drpy_deg": [
+        -0.093,
+        0.141,
+        0.177
+      ]
+    },
+    "back_lidar": {
+      "dt_cm": [
+        4.0,
+        4.3,
+        1.85
+      ],
+      "drpy_deg": [
+        0.426,
+        0.224,
+        0.0
+      ]
+    },
+    "front_left_lidar": {
+      "dt_cm": [
+        -1.72,
+        -1.38,
+        -7.48
+      ],
+      "drpy_deg": [
+        -0.212,
+        -0.044,
+        -0.078
+      ]
+    }
+  }
+}
+```
+
+## metrics
+
+```
+{
+  "refinement": {
+    "refinement": {
+      "reference": "front_lidar",
+      "corrections": {
+        "front_right_lidar": {
+          "rotvec_deg": [
+            -0.04993276475516328,
+            -0.015189083877862575,
+            0.0
+          ],
+          "trans_cm": [
+            0.0,
+            0.0,
+            2.1966452931583604
+          ],
+          "yaw_xy_solved": false,
+          "about": "lidar position in rear-axle frame",
+          "chosen": "fine",
+          "quality": {
+            "level": "ok",
+            "reasons": [],
+            "iterations": 10,
+            "matches": 3180,
+            "ground_before_cm": 8.31,
+            "ground_after_cm": 8.29,
+            "rotation_deg": 0.052,
+            "translation_cm": 2.2
+          },
+          "plane_check": {
+            "tilt_deg": 0.499,
+            "fore_aft_deg": 0.414,
+            "lateral_deg": -0.279,
+            "dz_cm": -11.6,
+            "pairs": 1,
+            "outside_basin": true,
+            "applied": false
+          }
+        },
+        "front_left_lidar": {
+          "rotvec_deg": [
+            -0.04042319422858173,
+            0.009642324217596775,
+            0.0
+          ],
+          "trans_cm": [
+            0.0,
+            0.0,
+            1.4862115645307203
+          ],
+          "yaw_xy_solved": false,
+          "about": "lidar position in rear-axle frame",
+          "chosen": "fine",
+          "quality": {
+            "level": "ok",
+            "reasons": [],
+            "iterations": 9,
+            "matches": 3549,
+            "ground_before_cm": 9.05,
+            "ground_after_cm": 9.0,
+            "rotation_deg": 0.042,
+            "translation_cm": 1.5
+          },
+          "plane_check": {
+            "tilt_deg": 0.103,
+            "fore_aft_deg": -0.096,
+            "lateral_deg": -0.039,
+            "dz_cm": 1.7,
+            "pairs": 1,
+            "outside_basin": false,
+            "applied": false
+          }
+        },
+        "back_lidar": {
+          "rotvec_deg": [
+            -0.08546640869480882,
+            -0.04782369185289666,
+            0.0
+          ],
+          "trans_cm": [
+            0.0,
+            0.0,
+            1.8417790971827732
+          ],
+          "yaw_xy_solved": false,
+          "about": "lidar position in rear-axle frame",
+          "chosen": "fine",
+          "quality": {
+            "level": "ok",
+            "reasons": [],
+            "iterations": 11,
+            "matches": 26225,
+            "ground_before_cm": 6.31,
+            "ground_after_cm": 6.06,
+            "rotation_deg": 0.098,
+            "translation_cm": 1.8
+          },
+          "plane_check": {
+            "tilt_deg": 0.496,
+            "fore_aft_deg": 0.258,
+            "lateral_deg": -0.443,
+            "dz_cm": 4.1,
+            "pairs": 40,
+            "outside_basin": false,
+            "applied": false
+          }
+        }
+      },
+      "quality": "ok",
+      "source": "/home/project/data/haibo/zongyang/02/20261026/ros2bag",
+      "stationary_frames": [
+        2,
+        20
+      ],
+      "moving_frames": [
+        50,
+        40
+      ],
+      "coarse_threshold": [
+        0.5,
+        0.05
+      ],
+      "stage2_6dof": {
+        "reference": "front_lidar",
+        "corrections": {
+          "front_right_lidar": {
+            "rotvec_deg": [
+              -0.0860761510010425,
+              0.1449572567372194,
+              0.17659878136330373
+            ],
+            "trans_cm": [
+              15.516441024586806,
+              -1.546550006280792,
+              -0.4327281056534643
+            ],
+            "about": "lidar position in rear-axle frame",
+            "quality": {
+              "level": "fail",
+              "reasons": [
+                "translation correction 15.6 cm > 15"
+              ],
+              "converged": true,
+              "iterations": 7,
+              "matches": 63743,
+              "vertical_matches": 9928,
+              "median_before_cm": 3.01,
+              "median_after_cm": 1.61,
+              "vertical_before_cm": 2.15,
+              "vertical_after_cm": 1.58,
+              "rotation_deg": 0.244,
+              "translation_cm": 15.6,
+              "match_time_gap_s": 0.6,
+              "pass2": null
+            }
+          },
+          "front_left_lidar": {
+            "rotvec_deg": [
+              0.2131345420858193,
+              0.037170691352406506,
+              -0.08018684228712925
+            ],
+            "trans_cm": [
+              -1.7150031499930396,
+              -1.3801927860820764,
+              -7.481768178092289
+            ],
+            "about": "lidar position in rear-axle frame",
+            "quality": {
+              "level": "ok",
+              "reasons": [],
+              "converged": true,
+              "iterations": 6,
+              "matches": 54334,
+              "vertical_matches": 22535,
+              "median_before_cm": 2.26,
+              "median_after_cm": 1.5,
+              "vertical_before_cm": 1.93,
+              "vertical_after_cm": 1.68,
+              "rotation_deg": 0.231,
+              "translation_cm": 7.8,
+              "match_time_gap_s": 0.6,
+              "pass2": null
+            }
+          },
+          "back_lidar": {
+            "rotvec_deg": [
+              0.22157460231570938,
+              -0.42644418421790065,
+              0.02505664943602371
+            ],
+            "trans_cm": [
+              4.003892797164119,
+              4.293945838325584,
+              1.8536134530227386
+            ],
+            "about": "lidar position in rear-axle frame",
+            "quality": {
+              "level": "warn",
+              "reasons": [
+                "only 1817 vertical planar matches (yaw/x/y weakly observed)"
+              ],
+              "converged": true,
+              "iterations": 8,
+              "matches": 16528,
+              "vertical_matches": 1817,
+              "median_before_cm": 5.44,
+              "median_after_cm": 2.43,
+              "vertical_before_cm": 5.2,
+              "vertical_after_cm": 3.46,
+              "rotation_deg": 0.481,
+              "translation_cm": 6.2,
+              "match_time_gap_s": 9.0,
+              "pass2": {
+                "ground_before_cm": 2.86,
+                "ground_after_cm": 2.53,
+                "ground_matches": 7310,
+                "delta_rotvec_deg": [
+                  0.1419,
+                  -0.0914,
+                  0.0
+                ],
+                "delta_trans_cm": [
+                  0.0,
+                  0.0,
+                  3.8
+                ],
+                "iterations": 5
+              }
+            }
+          }
+        },
+        "run": "/home/project/MY-LIVO/results/calib_truck02_lio_1027_133752/Log/fusion/1793079628973351194",
+        "window": [
+          8.0,
+          40.0
+        ],
+        "prior": [
+          0.5,
+          0.1
+        ],
+        "poses": {
+          "pass1": "native frames.csv",
+          "pass2": "RTK-optimized trajectory_optimized.txt",
+          "cross_time_s": 2.0
+        },
+        "pairing": {
+          "mode": "same-time",
+          "block_s": 1.0,
+          "pad_s": 0.5
+        },
+        "scan_source": "archive",
+        "quality": "warn"
+      }
+    }
+  }
+}
+```
+
+## summary
+
+```
+{
+  "lidars": [
+    {
+      "lidar": "front_right_lidar",
+      "key": "transform_matrix_lidar_1",
+      "t": [
+        2.6732,
+        4.9627,
+        1.8177
+      ],
+      "rpy_deg": [
+        -0.399,
+        -0.102,
+        -2.742
+      ]
+    },
+    {
+      "lidar": "back_lidar",
+      "key": "transform_matrix_lidar_2",
+      "t": [
+        -0.1868,
+        -0.987,
+        0.8357
+      ],
+      "rpy_deg": [
+        0.349,
+        -3.349,
+        -90.324
+      ]
+    },
+    {
+      "lidar": "front_left_lidar",
+      "key": "transform_matrix_lidar_3",
+      "t": [
+        -3.1809,
+        4.8924,
+        1.8327
+      ],
+      "rpy_deg": [
+        -1.846,
+        -0.424,
+        178.169
+      ]
+    },
+    {
+      "lidar": "front_lidar",
+      "key": "transform_matrix_lidar_6",
+      "t": [
+        -0.0705,
+        7.1162,
+        2.4626
+      ],
+      "rpy_deg": [
+        1.039,
+        1.785,
+        90.946
+      ]
+    }
+  ],
+  "camera_to_rear": {
+    "t": [
+      -0.1056,
+      7.1264,
+      2.1813
+    ],
+    "rpy_deg": [
+      -90.039,
+      3.007,
+      -0.068
+    ]
+  },
+  "camera": {
+    "topic": "/midrange_camera/image_raw",
+    "width": 1920,
+    "height": 1080,
+    "intrinsics": [
+      611.054443359375,
+      895.9816284179688,
+      954.4519112515845,
+      541.4709836341353
+    ],
+    "distortion": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "source": "midrange_camera[0].camera_in_params"
+  },
+  "time_offsets": {
+    "lidar": 0.0033,
+    "lidar_frontend": 0.004,
+    "camera": 0.0,
+    "rtk_position": 0.025,
+    "ins_attitude": 0.0,
+    "lidar_source": "rear-axle alignment (cross-time consistency vs INS poses)",
+    "source": "import (verify with camera-time / LIO evaluation)",
+    "lidar_frontend_source": "axle: lidar -0.0010 + imu/ins clock lag +0.0050 (corr 1.000); template -0.1250 replaced"
+  }
+}
+```
+
+## stage report
+
+```
+calibration=/home/project/MY-LIVO/config/carlibration/zongyang/truck02/v011_ground/calibration.json
+run=/home/project/MY-LIVO/results/calib_truck02_lio_1027_133752/Log/fusion/1793079628973351194
+window 8.0..40.0 s, lidar_time_offset 0.004
+pass 1 poses: native frames.csv (6 DoF); pass 2 poses: RTK-optimized trajectory_optimized.txt (tilt about x/y and z of LiDARs with median match time gap > 2.0 s)
+scans used: front_right_lidar:321, back_lidar:321, front_left_lidar:321, front_lidar:321
+scan source: round archive scans.bin/sources.bin (mapper deskew; returns at scan end, round extrinsics inverted)
+matching: viewing-side consistent (oriented normals)
+reference front_lidar: 222412 world points
+pairing: same-time for LiDARs overlapping the reference (1.0 s blocks +-0.5 s, 1125023 block points); cross-time LiDARs use the accumulated target (nearest-range voxels)
+front_right_lidar: pass 1 matches 68033->63743 |res| median 3.01->1.61 cm; ground 3.21->1.62 (n=53373); vertical 2.15->1.58 (n=9928); match time gap median 0.6 s; correction rot deg (x,y,z)=(-0.086,+0.145,+0.177) trans cm=(+15.5,-1.5,-0.4); iters 7  [quality: fail; translation correction 15.6 cm > 15]
+front_left_lidar: pass 1 matches 58217->54334 |res| median 2.26->1.50 cm; ground 2.52->1.39 (n=31026); vertical 1.93->1.68 (n=22535); match time gap median 0.6 s; correction rot deg (x,y,z)=(+0.213,+0.037,-0.080) trans cm=(-1.7,-1.4,-7.5); iters 6  [quality: ok]
+back_lidar: pass 1 matches 16495->16528 |res| median 5.44->2.43 cm; ground 5.51->2.33 (n=14469); vertical 5.20->3.46 (n=1817); match time gap median 9.0 s; correction rot deg (x,y,z)=(+0.080,-0.335,+0.025) trans cm=(+4.0,+4.3,-1.9); iters 8
+    pass 2 (cross-time LiDAR, drift-free poses, ground only): ground 2.86->2.53 cm (n=7310); tilt about x/y adjusted by (+0.142,-0.091) deg, z by +3.8 cm; iters 5
+    final correction rot deg (x,y,z)=(+0.222,-0.426,+0.025) trans cm=(+4.0,+4.3,+1.9)  [quality: warn; only 1817 vertical planar matches (yaw/x/y weakly observed)]
+quality: fail  (front_right_lidar: translation correction 15.6 cm > 15; back_lidar: only 1817 vertical planar matches (yaw/x/y weakly observed))
+warning: driven refinement exceeded quality gate on short/under-constrained window; continuing with warn
+written /home/project/MY-LIVO/config/carlibration/zongyang/truck02/v012_driven/calibration.json
+```

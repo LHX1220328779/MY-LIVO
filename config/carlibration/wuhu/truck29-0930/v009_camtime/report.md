@@ -1,0 +1,167 @@
+# wuhu/truck29-0930/v009_camtime
+
+- stage: camtime (相机时间偏移)
+- parent: wuhu/truck29-0930/v008_gcons
+- lineage: wuhu/truck29-0930/v002_import -> wuhu/truck29-0930/v003_axle -> wuhu/truck29-0930/v004_ground -> wuhu/truck29-0930/v005_driven -> wuhu/truck29-0930/v007_rtktime -> wuhu/truck29-0930/v008_gcons -> wuhu/truck29-0930/v009_camtime
+- created: 2026-10-19T17:09:29+08:00
+- note: pipeline: camera-time
+
+## inputs
+
+- bag: /home/project/data/haibo/wuhu/29/20261013/ros2bag
+- dataset: {'path': '/home/project/data/haibo/wuhu/29/20261013/ros2bag', 'kind': 'raw_split', 'segments': 58, 'duration_s': 869.98, 'has_camera': True}
+- duration: 60.0
+- start_s: 0.0
+
+## metrics
+
+```
+{
+  "camera_offset_s": 0.0,
+  "estimated_offset_s": -0.0108,
+  "applied": false,
+  "quality": {
+    "ok": false,
+    "problems": [
+      "30 s segments disagree by 76.6 ms (limit 12 ms)",
+      "flow/gyro correlation 0.38 < 0.8"
+    ],
+    "segment_spread_ms": 76.55027282702682,
+    "gain": 1.353
+  },
+  "yaw": {
+    "lag_s": -0.010814319932762061,
+    "corr": 0.380969311336519,
+    "gain": 1.353215322507973,
+    "n": 1800,
+    "sse_ratio_zero_lag": 1.0248341110243007
+  },
+  "pitch": {
+    "lag_s": -0.005306292543941199,
+    "corr": 0.6489533744592705,
+    "gain": 0.9987158586537812,
+    "n": 1800,
+    "sse_ratio_zero_lag": 1.0063910693294154
+  },
+  "segments": [
+    {
+      "start_s": 0,
+      "lag_s": -0.08509137038163843,
+      "corr": 0.3279477865354841
+    },
+    {
+      "start_s": 30,
+      "lag_s": -0.008541097554611615,
+      "corr": 0.9784408421308758
+    }
+  ],
+  "implied_fx_from_gain": 2222.7516455465443
+}
+```
+
+## summary
+
+```
+{
+  "lidars": [
+    {
+      "lidar": "front_right_lidar",
+      "key": "transform_matrix_lidar_1",
+      "t": [
+        2.7568,
+        5.9059,
+        1.8332
+      ],
+      "rpy_deg": [
+        -1.026,
+        -3.031,
+        -1.254
+      ]
+    },
+    {
+      "lidar": "back_lidar",
+      "key": "transform_matrix_lidar_2",
+      "t": [
+        -0.0977,
+        -0.3133,
+        0.7135
+      ],
+      "rpy_deg": [
+        -1.06,
+        0.482,
+        -91.378
+      ]
+    },
+    {
+      "lidar": "front_left_lidar",
+      "key": "transform_matrix_lidar_3",
+      "t": [
+        -3.1232,
+        5.651,
+        2.0183
+      ],
+      "rpy_deg": [
+        3.257,
+        -4.535,
+        178.187
+      ]
+    },
+    {
+      "lidar": "front_lidar",
+      "key": "transform_matrix_lidar_6",
+      "t": [
+        -0.1296,
+        7.9462,
+        0.051
+      ],
+      "rpy_deg": [
+        1.477,
+        -1.57,
+        89.955
+      ]
+    }
+  ],
+  "camera_to_rear": {
+    "t": [
+      -0.0171,
+      7.9472,
+      1.7516
+    ],
+    "rpy_deg": [
+      -96.467,
+      1.661,
+      0.456
+    ]
+  },
+  "camera": {
+    "topic": "/midrange_camera/image_raw",
+    "width": 1920,
+    "height": 1080,
+    "intrinsics": [
+      1642.570556640625,
+      1855.53173828125,
+      971.0083025529602,
+      534.2602337509306
+    ],
+    "distortion": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "source": "midrange_camera[0].camera_in_params"
+  },
+  "time_offsets": {
+    "lidar": -0.0372,
+    "lidar_frontend": -0.0322,
+    "camera": 0.0,
+    "rtk_position": 0.0209,
+    "ins_attitude": 0.0,
+    "lidar_source": "rear-axle alignment (cross-time consistency vs INS poses)",
+    "source": "import (verify with camera-time / LIO evaluation)",
+    "lidar_frontend_source": "axle: lidar -0.0372 + imu/ins clock lag +0.0050 (corr 0.998); template -0.1250 replaced",
+    "rtk_position_source": "rtk-time: map consistency, secant of both rounds (measured gain 0.74); effective +15.9 ms (se 0.9 ms)"
+  }
+}
+```

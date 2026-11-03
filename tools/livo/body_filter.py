@@ -1,9 +1,8 @@
 """Vehicle-specific body-point filter stored in calibration.json.
 
-The online mapper keeps body rectangles in each physical LiDAR frame, while the
-offline calibration stages use one rear-axle XY box.  Both live under the
-top-level ``body_filter`` key of the calibration file so they travel with the
-vehicle's extrinsics and time offsets.
+The current filter is one XY rectangle in the stitched rear-axle frame, with a
+shared minimum-z cutoff. Older calibration files may still contain per-LiDAR
+rectangles; those remain supported until a unified rectangle is saved.
 
 Missing/invalid fields fall back to the historical truck29 values, so old
 calibration files keep their previous behaviour.
@@ -77,19 +76,26 @@ def _topic_key(topic: str) -> str:
 def normalize(doc: dict | None) -> dict:
     raw = ((doc or {}).get("body_filter") or {}) if isinstance(doc, dict) else {}
     rear = _rect(raw.get("rear_axle_box") or DEFAULT_REAR_AXLE_BOX) or dict(DEFAULT_REAR_AXLE_BOX)
+    fused = _rect(raw.get("fused_rectangle"))
     rects: dict[str, list[dict]] = {}
     raw_rects = raw.get("lidar_rectangles") or {}
-    for topic in LIDAR_TOPICS:
-        values = raw_rects.get(topic, raw_rects.get(_topic_key(topic), DEFAULT_LIDAR_RECTANGLES[topic]))
-        rects[topic] = [r for r in (_rect(v) for v in values) if r]
-    for topic, values in raw_rects.items():
-        key = _topic_key(topic)
-        if key not in rects:
-            rects[key] = [r for r in (_rect(v) for v in values) if r]
+    if fused:
+        # A saved unified filter is authoritative. Do not carry a confusing set
+        # of dormant per-sensor rectangles into the normalized calibration.
+        rects = {topic: [] for topic in LIDAR_TOPICS}
+    else:
+        for topic in LIDAR_TOPICS:
+            values = raw_rects.get(topic, raw_rects.get(_topic_key(topic), DEFAULT_LIDAR_RECTANGLES[topic]))
+            rects[topic] = [r for r in (_rect(v) for v in values) if r]
+        for topic, values in raw_rects.items():
+            key = _topic_key(topic)
+            if key not in rects:
+                rects[key] = [r for r in (_rect(v) for v in values) if r]
     return {
         "enabled": bool(raw.get("enabled", True)),
         "minimum_z": _finite(raw.get("minimum_z"), DEFAULT_MINIMUM_Z),
         "rear_axle_box": rear,
+        "fused_rectangle": fused,
         "lidar_rectangles": rects,
         "source": str(raw.get("source", "default")),
         "updated": str(raw.get("updated", "")),
@@ -144,9 +150,22 @@ def from_calibration_file(path: str | pathlib.Path) -> dict:
 def rear_axle_mask(Q: np.ndarray, filt: dict) -> np.ndarray:
     if not filt.get("enabled", True) or len(Q) == 0:
         return np.zeros(len(Q), dtype=bool)
+    if filt.get("fused_rectangle"):
+        return fused_rectangle_mask(Q, filt)
     b = filt["rear_axle_box"]
     return ((Q[:, 0] > b["x_min"]) & (Q[:, 0] < b["x_max"]) &
             (Q[:, 1] > b["y_min"]) & (Q[:, 1] < b["y_max"]))
+
+
+def fused_rectangle_mask(Q: np.ndarray, filt: dict) -> np.ndarray:
+    """Mask points already expressed in the stitched rear-axle frame."""
+    Q = np.asarray(Q, dtype=float).reshape(-1, 3)
+    rectangle = filt.get("fused_rectangle")
+    if not filt.get("enabled", True) or not rectangle or len(Q) == 0:
+        return np.zeros(len(Q), dtype=bool)
+    inside = ((Q[:, 0] > rectangle["x_min"]) & (Q[:, 0] < rectangle["x_max"]) &
+              (Q[:, 1] > rectangle["y_min"]) & (Q[:, 1] < rectangle["y_max"]))
+    return inside & (Q[:, 2] > float(filt["minimum_z"]))
 
 
 def lidar_filter_mask(Q: np.ndarray, filt: dict, topic: str) -> np.ndarray:
@@ -161,12 +180,17 @@ def lidar_filter_mask(Q: np.ndarray, filt: dict, topic: str) -> np.ndarray:
 
 def to_yaml_overrides(filt: dict) -> dict:
     """Flatten the calibration schema into ROS 2 parameter overrides."""
-    bf = {"minimum_z": float(filt["minimum_z"])}
-    for topic in sorted(set(LIDAR_TOPICS) | set(filt["lidar_rectangles"])):
-        flat = []
-        for r in filt["lidar_rectangles"].get(topic, []):
-            flat += [r["x_min"], r["y_min"], r["x_max"], r["y_max"]]
-        bf[topic] = flat
+    bf = {"enabled": bool(filt.get("enabled", True)),
+          "minimum_z": float(filt["minimum_z"])}
+    if filt.get("fused_rectangle"):
+        r = filt["fused_rectangle"]
+        bf["fused_rectangle"] = [r["x_min"], r["y_min"], r["x_max"], r["y_max"]]
+    else:
+        for topic in sorted(set(LIDAR_TOPICS) | set(filt["lidar_rectangles"])):
+            flat = []
+            for r in filt["lidar_rectangles"].get(topic, []):
+                flat += [r["x_min"], r["y_min"], r["x_max"], r["y_max"]]
+            bf[topic] = flat
     b = filt["rear_axle_box"]
     return {"body_filter": bf,
             "precheck": {"body_box": [b["x_min"], b["x_max"], b["y_min"], b["y_max"]]}}

@@ -59,6 +59,7 @@ laser_mapping:
         min_apply_rotation_deg: 0.2
         min_apply_height_m: 0.04
       body_filter:
+        enabled: true
         # Each consecutive x1,y1,x2,y2 group defines one rectangle in that
         # physical LiDAR coordinate frame; endpoint order is unrestricted.
         # Remove a point only when it is inside a rectangle and z > minimum_z.
@@ -415,9 +416,18 @@ laser_mapping:
 
     imu:
       imu_en: true
-      # About two seconds at 100 Hz; completes before the sampled motion begins.
+      # Stationary-prefix duration and motion thresholds are used by the data
+      # assessment as advisories only. Runtime initialization uses imu_int_frame.
       imu_int_frame: 200
       sample_interval_sec: 0.01
+      init_stationary_duration_sec: 2.0
+      init_stationary_window_sec: 0.2
+      init_max_speed_mps: 0.10
+      init_max_gyro_mean_deg_s: 0.50
+      init_max_gyro_std_deg_s: 0.20
+      init_max_acc_std_mps2: 0.40
+      init_acc_norm_tolerance_mps2: 0.75
+      init_require_ins_stationary: true
       acc_cov: 0.1
       # Discrete-sample gyro VARIANCE (rad/s)^2, used with dt^2. Local
       # stationary data has std 0.0013..0.0017 rad/s; use conservative 0.005.

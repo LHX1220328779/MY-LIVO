@@ -1,0 +1,10 @@
+calibration=/home/project/MY-LIVO/config/carlibration/wuhu/truck29raw/v034_axle/calibration.json
+bag=/home/project/data/haibo/wuhu/29/20261013/ros2bag
+reference front_lidar (transform_matrix_lidar_6); poses imu_data/odometry (RTK fixed, >= 1.0 m/s, >= 5.0 s after motion start); time offsets lidar -0.0361 s, rtk_position +0.025 s, ins_attitude +0.000 s
+scans read 1446, skipped {'slow': 847, 'startup': 7, 'not_rtk_fixed': 0, 'outside_ins': 2}
+scans used 590 (21.6..842.8 s), points 5549396; dof x; cross-time gap > 1.5 s
+residual median 2.31 -> 2.00 cm (ground 1.90 -> 1.76, n=71384; vertical 3.52 -> 2.99, n=9102); match time gap median 153.6 s; iterations 12
+solution about the LiDAR (rear-axle frame): rotvec x(pitch) +0.006, y(roll) +0.004, z(yaw) -0.041 deg; translation x +2.3, y -2.6 cm
+applied (x): rotvec x(pitch) -0.000, y(roll) -0.000, z(yaw) +0.000 deg; translation x +2.3, y +0.0, z +0.0 cm
+repeatability (first vs second half of the used scans): rotvec [0.031, -0.043, -0.088] deg, translation [-7.0, -4.3, 0.0] cm, time +0.0 ms
+quality: ok

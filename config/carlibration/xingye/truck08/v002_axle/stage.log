@@ -1,0 +1,13 @@
+calibration=/home/project/MY-LIVO/config/carlibration/xingye/truck08/v001_import/calibration.json
+bag=/home/project/data/haibo/xingye/08/20261018/ros2bag
+reference front_lidar (transform_matrix_lidar_6); poses imu_data/odometry (RTK fixed, >= 1.0 m/s, >= 5.0 s after motion start); time offsets lidar -0.1250 s, rtk_position +0.025 s, ins_attitude +0.000 s
+scans read 1495, skipped {'slow': 1060, 'startup': 0, 'not_rtk_fixed': 0, 'outside_ins': 2}
+scans used 433 (13.0..299.7 s), points 3202077; dof rpy_xy + LiDAR time shift; cross-time gap > 1.5 s
+time-offset candidates (exact re-pose baseline + local joint solve): -0.180/-0.064s:3.86cm, -0.150/-0.030s:3.64cm, -0.120/+0.005s:3.36cm, -0.090/+0.040s:3.06cm, -0.060/+0.065s:2.83cm, -0.030/+0.081s:2.79cm, +0.000/+0.093s:2.76cm, +0.030/+0.102s:2.73cm, +0.060/+0.109s:2.54cm, +0.090/+0.116s:2.22cm, +0.120/+0.120s:2.07cm, +0.150/+0.126s:2.21cm
+detected time shift +0.120 s (median 2.07 cm) -> final joint solve
+residual median 2.16 -> 2.06 cm (ground 1.82 -> 1.75, n=53625; vertical 2.96 -> 2.78, n=10758); match time gap median 4.1 s; iterations 15
+solution about the LiDAR (rear-axle frame): rotvec x(pitch) -0.843, y(roll) +0.922, z(yaw) +0.839 deg; translation x -22.3, y +2.1 cm
+applied (rpy_xy): rotvec x(pitch) -0.843, y(roll) +0.922, z(yaw) +0.839 deg; translation x -22.3, y +2.1, z +0.0 cm; LiDAR time shift +119.6 ms -> time_offsets.lidar -0.0054 s
+repeatability (first vs second half of the used scans): rotvec [0.003, -0.088, -0.149] deg, translation [2.4, 8.1, 0.0] cm, time -1.9 ms
+quality: warn  (time shift +120 ms is a large change vs the parent offset (candidates/longer recording confirms it))
+written /home/project/MY-LIVO/config/carlibration/xingye/truck08/v002_axle/calibration.json (194 s)

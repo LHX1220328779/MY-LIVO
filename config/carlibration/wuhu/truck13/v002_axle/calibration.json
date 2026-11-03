@@ -1,0 +1,969 @@
+{
+  "update_time": "2026-07-31",
+  "truck_num": 13,
+  "lidar": [
+    {
+      "transform_matrix_lidar_1": [
+        0.9995966587274494,
+        0.021277324755244045,
+        -0.018809447418194604,
+        2.8382988361080153,
+        -0.02083179172390251,
+        0.9995050414721462,
+        0.023573470795233278,
+        5.6644099347655885,
+        0.019301717915509196,
+        -0.02317212815046687,
+        0.9995451446345425,
+        2.2408831410965577,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "transform_matrix_lidar_2": [
+        -0.02181905809490708,
+        0.9997038513876337,
+        0.010776744618942511,
+        -0.01262281106544206,
+        -0.999083478388524,
+        -0.021405934320555608,
+        -0.037067360129230974,
+        -0.6499828432924581,
+        -0.03682569639446217,
+        -0.011575642383682283,
+        0.9992546585272787,
+        0.8260337250638371,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "transform_matrix_lidar_3": [
+        -0.9993390204958325,
+        -0.002642086683719444,
+        0.0362566061895573,
+        -3.0643755559905492,
+        0.003455602687632753,
+        -0.9997432633047746,
+        0.02239344294170778,
+        5.661033207576774,
+        0.03618813237090521,
+        0.022503929760688567,
+        0.999091583500147,
+        2.2390904957616593,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "transform_matrix_lidar_6": [
+        0.00221828671705783,
+        -0.9999907678546605,
+        0.0036801371557932602,
+        -0.024170428755192607,
+        0.9995647445444441,
+        0.0021090499577880732,
+        -0.029425726364437386,
+        7.750099677175971,
+        0.029417693108741455,
+        0.0037438100539527158,
+        0.9995601948949545,
+        0.45955299999999993,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    }
+  ],
+  "radar": [
+    {
+      "transform_matrix_radar_1": [
+        0.17192918398092988,
+        -0.9851095274535651,
+        -9.31323e-10,
+        0.18708426547501006,
+        0.9849595730605656,
+        0.17190292222127526,
+        0.0174524,
+        7.300337794831509,
+        -0.0171873,
+        -0.00303058,
+        0.999848,
+        -0.54811829,
+        0,
+        0,
+        0,
+        1
+      ],
+      "transform_matrix_radar_2": [
+        -0.01571056537989717,
+        0.9998768804158651,
+        -1.86265e-09,
+        0.19999969538265755,
+        -0.9980119401541265,
+        -0.015674710392147396,
+        0.0610485,
+        -0.0997156486156,
+        0.0610392,
+        0.00106544,
+        0.998135,
+        0.166144,
+        0,
+        0,
+        0,
+        1
+      ],
+      "transform_matrix_radar_3": [
+        -0.19252171077525268,
+        -0.9812925311513138,
+        0,
+        -0.21256605961712538,
+        0.981143480763731,
+        -0.19249297087334868,
+        0.0174524,
+        7.099639968102492,
+        -0.0171318,
+        0.00333007,
+        0.999848,
+        -0.230297,
+        0,
+        0,
+        0,
+        1
+      ],
+      "transform_matrix_radar_4": [
+        -0.0017452024389111877,
+        -0.9999984770173173,
+        0,
+        -0.012915429907647486,
+        0.9999604770751946,
+        -0.0017452687613890919,
+        0.00872654,
+        7.299988729158329,
+        -0.00872654,
+        0,
+        0.999962,
+        -0.698052,
+        0,
+        0,
+        0,
+        1
+      ]
+    }
+  ],
+  "midrange_camera": [
+    {
+      "tf_lidar_to_camera": [
+        -0.0724629,
+        -0.997149,
+        -0.0210467,
+        -0.0421497,
+        -0.236566,
+        0.0376836,
+        -0.970885,
+        1.77488,
+        0.96891,
+        -0.0653742,
+        -0.238622,
+        0.248037,
+        0,
+        0,
+        0,
+        1
+      ],
+      "camera_in_params": [
+        1849.47862,
+        0,
+        1004.25076,
+        0,
+        0,
+        1848.72893,
+        503.038474,
+        0,
+        0,
+        0,
+        1,
+        0
+      ],
+      "distcoeff": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "equation_10m": [
+        -2.86138,
+        -16,
+        -4.57285,
+        -12,
+        2.1304,
+        -8,
+        6.41593,
+        -5,
+        -0.188696,
+        0,
+        820.937,
+        0
+      ],
+      "equation_20m": [
+        -6.2934,
+        -16,
+        6.44813,
+        -14,
+        6.69836,
+        -9,
+        3.47575,
+        -5,
+        -0.105967,
+        0,
+        474.152,
+        0
+      ],
+      "equation_30m": [
+        -5.81466,
+        -16,
+        9.34866,
+        -13,
+        2.78527,
+        -9,
+        2.44263,
+        -5,
+        -0.0779615,
+        0,
+        351.507,
+        0
+      ],
+      "equation_40m": [
+        3.06532,
+        -16,
+        -3.14597,
+        -12,
+        8.98206,
+        -9,
+        1.33446,
+        -5,
+        -0.0623461,
+        0,
+        288.676,
+        0
+      ],
+      "equation_50m": [
+        -4.83191,
+        -17,
+        -8.93871,
+        -13,
+        4.0951,
+        -9,
+        1.30351,
+        -5,
+        -0.0546486,
+        0,
+        250.607,
+        0
+      ],
+      "equation_60m": [
+        1.24306,
+        -15,
+        -6.39633,
+        -12,
+        1.20797,
+        -8,
+        5.37514,
+        -6,
+        -0.047678,
+        0,
+        224.933,
+        0
+      ],
+      "equation_70m": [
+        -2.53427,
+        -16,
+        6.24657,
+        -13,
+        5.8038,
+        -10,
+        1.10403,
+        -5,
+        -0.0453674,
+        0,
+        206.636,
+        0
+      ],
+      "equation_80m": [
+        -5.82216,
+        -16,
+        1.70386,
+        -12,
+        -7.16748,
+        -10,
+        1.01568,
+        -5,
+        -0.0423318,
+        0,
+        192.789,
+        0
+      ],
+      "equation_90m": [
+        8.9133,
+        -16,
+        -4.40574,
+        -12,
+        8.11615,
+        -9,
+        3.63768,
+        -6,
+        -0.0386623,
+        0,
+        181.919,
+        0
+      ],
+      "equation_100m": [
+        -2.9334,
+        -16,
+        6.56954,
+        -13,
+        4.79234,
+        -10,
+        7.42436,
+        -6,
+        -0.0377556,
+        0,
+        173.297,
+        0
+      ],
+      "max_distance": [
+        100
+      ],
+      "max_gap_distance": [
+        10
+      ],
+      "focal_length": [
+        5.83
+      ]
+    }
+  ],
+  "fish_camera": [
+    {
+      "tf_lidar_to_camera": [
+        -0.0678052,
+        -0.997621,
+        0.0124563,
+        -0.0195008,
+        -0.683041,
+        0.0373165,
+        -0.729427,
+        1.11255,
+        0.727226,
+        -0.0579671,
+        -0.683946,
+        0.910665,
+        0,
+        0,
+        0,
+        1
+      ],
+      "camera_in_params": [
+        805.2495633,
+        0,
+        981.09148,
+        0,
+        0,
+        801.7288,
+        577.73939764,
+        0,
+        0,
+        0,
+        1,
+        0
+      ],
+      "distcoeff": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "equation_1m": [
+        0,
+        0,
+        5.6607,
+        -9,
+        -2.09869,
+        -5,
+        0.0311594,
+        0,
+        -21.7693,
+        0,
+        6916.07,
+        0
+      ],
+      "equation_2m": [
+        0,
+        0,
+        4.70455,
+        -10,
+        -1.68414,
+        -6,
+        0.00325154,
+        0,
+        -3.22853,
+        0,
+        1952.25,
+        0
+      ],
+      "equation_3m": [
+        0,
+        0,
+        2.89351,
+        -11,
+        -7.13846,
+        -8,
+        0.000718958,
+        0,
+        -1.27107,
+        0,
+        1209.05,
+        0
+      ],
+      "equation_4m": [
+        0,
+        0,
+        -2.9897,
+        -11,
+        1.32946,
+        -7,
+        0.000286044,
+        0,
+        -0.799136,
+        0,
+        918.36,
+        0
+      ],
+      "equation_5m": [
+        0,
+        0,
+        -3.74276,
+        -11,
+        1.55101,
+        -7,
+        0.000161297,
+        0,
+        -0.59539,
+        0,
+        744.401,
+        0
+      ],
+      "equation_6m": [
+        0,
+        0,
+        -3.68332,
+        -11,
+        1.49745,
+        -7,
+        0.000105734,
+        0,
+        -0.476395,
+        0,
+        622.751,
+        0
+      ],
+      "equation_7m": [
+        0,
+        0,
+        -3.39826,
+        -11,
+        1.36983,
+        -7,
+        7.8559,
+        -5,
+        -0.399044,
+        0,
+        531.785,
+        0
+      ],
+      "equation_8m": [
+        0,
+        0,
+        -3.07076,
+        -11,
+        1.23388,
+        -7,
+        6.33143,
+        -5,
+        -0.343651,
+        0,
+        460.341,
+        0
+      ],
+      "equation_9m": [
+        0,
+        0,
+        -2.82344,
+        -11,
+        1.13103,
+        -7,
+        5.1554,
+        -5,
+        -0.301128,
+        0,
+        402.498,
+        0
+      ],
+      "equation_10m": [
+        0,
+        0,
+        -2.61865,
+        -11,
+        1.04602,
+        -7,
+        4.26345,
+        -5,
+        -0.267434,
+        0,
+        354.545,
+        0
+      ],
+      "max_distance": [
+        10
+      ],
+      "max_gap_distance": [
+        1
+      ],
+      "focal_length": [
+        2.2
+      ]
+    }
+  ],
+  "transform_matrix_all_lidar_to_map": [
+    1,
+    0,
+    0,
+    -0.15,
+    0,
+    1,
+    0,
+    0.35,
+    0,
+    0,
+    1,
+    -2.6,
+    0,
+    0,
+    0,
+    1
+  ],
+  "transform_matrix_v_lidar_to_imu": [
+    0.999943815814,
+    0.00927896057764,
+    -0.00512504697713,
+    -0.1,
+    -0.00921682693096,
+    0.999885315171,
+    0.0120169299668,
+    0.1723,
+    0.00523596383142,
+    -0.0119690181344,
+    0.999914660002,
+    0,
+    0,
+    0,
+    0,
+    1
+  ],
+  "transforms": {
+    "midrange_camera_to_rear_axle": {
+      "source_frame": "midrange_camera",
+      "target_frame": "vehicle_rear_axle",
+      "transform_semantics": "target_from_source",
+      "derived_from": "transform_matrix_lidar_6 * inverse(midrange_camera[0].tf_lidar_to_camera)",
+      "transform_matrix": [
+        0.9969016146243159,
+        -0.04178099189716226,
+        0.0666447257892084,
+        0.07547456427859536,
+        -0.07391507978669912,
+        -0.20781434733345522,
+        0.9753715999671583,
+        7.873901461991633,
+        -0.026902262721848463,
+        -0.9772755730900363,
+        -0.21025870374846695,
+        2.2451178849646554,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ]
+    }
+  },
+  "calibration_reference_lidar": "transform_matrix_lidar_6",
+  "lidar_transform_semantics": "lidar_to_body_rear_axle",
+  "camera": {
+    "topic": "/midrange_camera/image_raw",
+    "width": 1920,
+    "height": 1080,
+    "intrinsics": [
+      1849.47862,
+      1848.72893,
+      1004.25076,
+      503.038474
+    ],
+    "distortion": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "source": "midrange_camera[0].camera_in_params"
+  },
+  "time_offsets": {
+    "lidar": 0.021,
+    "lidar_frontend": 0.036,
+    "camera": 0.0,
+    "rtk_position": 0.025,
+    "ins_attitude": 0.0,
+    "lidar_source": "rear-axle alignment (cross-time consistency vs INS poses)",
+    "source": "import (verify with camera-time / LIO evaluation)",
+    "lidar_frontend_source": "axle: lidar +0.0210 + imu/ins clock lag +0.0150 (corr 0.996); template -0.1250 replaced"
+  },
+  "calibration_type": "supplier_raw_lidar_to_rear_axle+rtk_rear_axle_alignment",
+  "schema_version": 6,
+  "identity": {
+    "id": "wuhu/truck13/v002_axle",
+    "mine": "wuhu",
+    "truck": "truck13",
+    "version": "v002_axle",
+    "stage": "axle",
+    "parent": "wuhu/truck13/v001_import",
+    "created": "2026-10-26T17:23:54+08:00"
+  },
+  "history": [
+    {
+      "stage": "import",
+      "created": "2026-10-26T16:49:39+08:00",
+      "parent": null,
+      "note": "imported from perception_truck13.json",
+      "inputs": {
+        "source": "/home/project/groundextractor_1/data/calibration/calibration_wuhu_2026.09.30_6.3/calibration/perception_truck13.json"
+      },
+      "metrics": {
+        "normalisation": [
+          "transform_matrix_lidar_1: re-orthonormalised (max deviation 1.1e-04)",
+          "transform_matrix_lidar_2: re-orthonormalised (max deviation 3.5e-06)",
+          "transform_matrix_lidar_3: re-orthonormalised (max deviation 9.5e-05)",
+          "transform_matrix_lidar_6: re-orthonormalised (max deviation 9.2e-05)",
+          "raw supplier export: camera->rear-axle derived from transform_matrix_lidar_6 and tf_lidar_to_camera",
+          "rig-to-rear-axle alignment of a supplier file is unverified: run the axle stage next"
+        ]
+      }
+    },
+    {
+      "stage": "axle",
+      "created": "2026-10-26T17:23:54+08:00",
+      "parent": "wuhu/truck13/v001_import",
+      "note": "pipeline: axle",
+      "inputs": {
+        "bag": "/home/project/data/haibo/wuhu/13/1/ros2bag",
+        "dataset": {
+          "path": "/home/project/data/haibo/wuhu/13/1/ros2bag",
+          "kind": "raw_split",
+          "segments": 2,
+          "duration_s": 60.0,
+          "has_camera": false
+        },
+        "window": [
+          0.0,
+          1000000000.0
+        ],
+        "dof": "rpy_xy",
+        "time_offset": "estimated"
+      },
+      "metrics": {
+        "rear_axle_alignment": {
+          "reference": "transform_matrix_lidar_6",
+          "poses": "imu_data/odometry (RTK fixed)",
+          "applied_to": "all LiDARs and the camera (rig correction)",
+          "solution_rotvec_deg": [
+            -0.6901,
+            -0.4695,
+            -0.5174
+          ],
+          "solution_translation_cm": [
+            1.51,
+            24.81,
+            0.0
+          ],
+          "correction_rotvec_deg": [
+            -0.6901,
+            -0.4695,
+            -0.5174
+          ],
+          "correction_translation_cm": [
+            1.51,
+            24.81,
+            0.0
+          ],
+          "correction_matrix": [
+            0.9999256521721785,
+            0.009079812803777385,
+            -0.008139233839289016,
+            -0.04931908259604072,
+            -0.008981127038318411,
+            0.9998866959508094,
+            0.012080340131583014,
+            0.24303579283704746,
+            0.008247998858138459,
+            -0.012006342491429674,
+            0.9998939034991736,
+            0.0904440331681785,
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "time_shift_s": 0.146,
+          "time_offsets_used": {
+            "lidar": -0.125,
+            "rtk_position": 0.025,
+            "ins_attitude": 0.0
+          },
+          "residual_cm": {
+            "before": 1.823,
+            "after": 1.53,
+            "ground_after": 1.513,
+            "vertical_after": 4.505
+          },
+          "sqrt_information": {
+            "rx": 2573.9,
+            "ry": 3735.9,
+            "rz": 343.2,
+            "tx": 13.1,
+            "ty": 13.2,
+            "dt": 246.5
+          },
+          "repeatability_halves": {
+            "rotvec_deg": [
+              0.04,
+              0.205,
+              0.319
+            ],
+            "translation_cm": [
+              4.3,
+              24.2,
+              0.0
+            ],
+            "time_ms": -0.3
+          },
+          "time_profile": [
+            {
+              "baseline_s": -0.18,
+              "dt_s": 0.0826,
+              "median_cm": 2.168,
+              "ground_cm": 2.141
+            },
+            {
+              "baseline_s": -0.15,
+              "dt_s": 0.1013,
+              "median_cm": 1.902,
+              "ground_cm": 1.879
+            },
+            {
+              "baseline_s": -0.12,
+              "dt_s": 0.1165,
+              "median_cm": 1.813,
+              "ground_cm": 1.792
+            },
+            {
+              "baseline_s": -0.09,
+              "dt_s": 0.1291,
+              "median_cm": 1.851,
+              "ground_cm": 1.833
+            },
+            {
+              "baseline_s": -0.06,
+              "dt_s": 0.1372,
+              "median_cm": 1.949,
+              "ground_cm": 1.928
+            },
+            {
+              "baseline_s": -0.03,
+              "dt_s": 0.1389,
+              "median_cm": 2.152,
+              "ground_cm": 2.13
+            },
+            {
+              "baseline_s": 0.0,
+              "dt_s": 0.1385,
+              "median_cm": 2.209,
+              "ground_cm": 2.181
+            }
+          ],
+          "time_profile_min_dt_s": 0.1165,
+          "scans_used": 85,
+          "window_s": [
+            30.9,
+            50.9
+          ],
+          "dof": "rpy_xy",
+          "iterations": 17,
+          "converged": true,
+          "quality": "warn",
+          "reasons": [
+            "halves disagree (few turns/structure: use a longer recording with turns)"
+          ],
+          "runtime_s": 50.0
+        },
+        "frontend_sync": {
+          "imu_ins_lag_s": 0.015000000000000291,
+          "corr": 0.996,
+          "yaw_rms_rad_s": 0.0443,
+          "template": -0.125,
+          "decision": "replaced template with +0.0360"
+        },
+        "lateral": {
+          "decision": "skipped (the window already covers the recording)"
+        }
+      }
+    }
+  ],
+  "refinement": {
+    "rear_axle_alignment": {
+      "reference": "transform_matrix_lidar_6",
+      "poses": "imu_data/odometry (RTK fixed)",
+      "applied_to": "all LiDARs and the camera (rig correction)",
+      "solution_rotvec_deg": [
+        -0.6901,
+        -0.4695,
+        -0.5174
+      ],
+      "solution_translation_cm": [
+        1.51,
+        24.81,
+        0.0
+      ],
+      "correction_rotvec_deg": [
+        -0.6901,
+        -0.4695,
+        -0.5174
+      ],
+      "correction_translation_cm": [
+        1.51,
+        24.81,
+        0.0
+      ],
+      "correction_matrix": [
+        0.9999256521721785,
+        0.009079812803777385,
+        -0.008139233839289016,
+        -0.04931908259604072,
+        -0.008981127038318411,
+        0.9998866959508094,
+        0.012080340131583014,
+        0.24303579283704746,
+        0.008247998858138459,
+        -0.012006342491429674,
+        0.9998939034991736,
+        0.0904440331681785,
+        0.0,
+        0.0,
+        0.0,
+        1.0
+      ],
+      "time_shift_s": 0.146,
+      "time_offsets_used": {
+        "lidar": -0.125,
+        "rtk_position": 0.025,
+        "ins_attitude": 0.0
+      },
+      "residual_cm": {
+        "before": 1.823,
+        "after": 1.53,
+        "ground_after": 1.513,
+        "vertical_after": 4.505
+      },
+      "sqrt_information": {
+        "rx": 2573.9,
+        "ry": 3735.9,
+        "rz": 343.2,
+        "tx": 13.1,
+        "ty": 13.2,
+        "dt": 246.5
+      },
+      "repeatability_halves": {
+        "rotvec_deg": [
+          0.04,
+          0.205,
+          0.319
+        ],
+        "translation_cm": [
+          4.3,
+          24.2,
+          0.0
+        ],
+        "time_ms": -0.3
+      },
+      "time_profile": [
+        {
+          "baseline_s": -0.18,
+          "dt_s": 0.0826,
+          "median_cm": 2.168,
+          "ground_cm": 2.141
+        },
+        {
+          "baseline_s": -0.15,
+          "dt_s": 0.1013,
+          "median_cm": 1.902,
+          "ground_cm": 1.879
+        },
+        {
+          "baseline_s": -0.12,
+          "dt_s": 0.1165,
+          "median_cm": 1.813,
+          "ground_cm": 1.792
+        },
+        {
+          "baseline_s": -0.09,
+          "dt_s": 0.1291,
+          "median_cm": 1.851,
+          "ground_cm": 1.833
+        },
+        {
+          "baseline_s": -0.06,
+          "dt_s": 0.1372,
+          "median_cm": 1.949,
+          "ground_cm": 1.928
+        },
+        {
+          "baseline_s": -0.03,
+          "dt_s": 0.1389,
+          "median_cm": 2.152,
+          "ground_cm": 2.13
+        },
+        {
+          "baseline_s": 0.0,
+          "dt_s": 0.1385,
+          "median_cm": 2.209,
+          "ground_cm": 2.181
+        }
+      ],
+      "time_profile_min_dt_s": 0.1165,
+      "scans_used": 85,
+      "window_s": [
+        30.9,
+        50.9
+      ],
+      "dof": "rpy_xy",
+      "iterations": 17,
+      "converged": true,
+      "quality": "warn",
+      "reasons": [
+        "halves disagree (few turns/structure: use a longer recording with turns)"
+      ],
+      "runtime_s": 50.0
+    }
+  }
+}

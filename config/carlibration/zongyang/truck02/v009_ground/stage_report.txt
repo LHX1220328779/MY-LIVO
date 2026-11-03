@@ -1,0 +1,15 @@
+calibration=/home/project/MY-LIVO/config/carlibration/zongyang/truck02/v008_axle/calibration.json
+bag=/home/project/data/haibo/zongyang/02/20261026/ros2bag
+reference=front_lidar
+stationary frames 2..22 (aggregated) for side LiDARs; moving frames 50..90 (per frame) for back LiDAR
+stationary check (front_lidar, first vs last frame of 20): scan displacement median 19.1 cm / P90 58.1 cm (limit 30 cm) -> stationary
+front_right_lidar: stationary aggregated points 16128
+back_lidar: stationary aggregated points 12222
+front_left_lidar: stationary aggregated points 19419
+front_lidar: stationary aggregated points 40253
+front_right_lidar: yaw/xy solved=False; matches 3125->3144; |res| median 8.45->8.25 cm; ground 8.46->8.31 cm (n=3010); vertical 7.19->7.40 cm (n=74); correction rot deg (x,y,z)=(-0.022,-0.141,+0.000) trans cm=(+0.0,+0.0,+2.9); iters 15  [quality: ok]
+front_left_lidar: plane start: own ground vs reference tilt 0.35 deg (fore-aft -0.33, lateral -0.12), height +10.6 cm over 1 plane pair(s) -> start rot deg (x,y,z)=(-0.332,+0.121,+0.001) z +10.6 cm; ground residual 9.10->9.23 cm (n=3430->3389): not used (does not improve the overlap)
+front_left_lidar: yaw/xy solved=False; matches 3567->3564; |res| median 9.08->9.05 cm; ground 9.10->9.04 cm (n=3428); vertical 2.95->3.35 cm (n=28); correction rot deg (x,y,z)=(-0.046,-0.047,+0.000) trans cm=(+0.0,+0.0,+2.2); iters 17  [quality: ok]
+back_lidar: plane start: own ground vs reference tilt 1.07 deg (fore-aft +0.27, lateral -1.04), height -2.5 cm over 40 plane pair(s) -> start rot deg (x,y,z)=(+0.269,+1.035,-0.025) z -2.5 cm; ground residual 8.98->7.08 cm (n=25911->26089): used
+back_lidar: (moving, per-frame vs refined sides) yaw/xy solved=False; matches 25950->26241; |res| median 8.97->6.08 cm; ground 8.98->6.07 cm (n=26195); vertical nan->nan cm (n=0); correction rot deg (x,y,z)=(-0.030,+0.567,-0.025) trans cm=(+0.0,+0.0,-4.4); iters 13  [quality: warn; plane start applied (1.07 deg / -2.5 cm): outside the refinement basin of the parent calibration (mount moved or coarse parent file); yaw/x/y are re-checked by the driven stage]
+quality: warn  (back_lidar: plane start applied (1.07 deg / -2.5 cm): outside the refinement basin of the parent calibration (mount moved or coarse parent file); yaw/x/y are re-checked by the driven stage)
