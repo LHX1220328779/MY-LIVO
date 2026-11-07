@@ -735,3 +735,10 @@
 - 迁入 Gaussian-LIC CUDA 渲染、增量扩展及优化；默认锁定激光初始化中心，使用真实深度、固定相机位姿和最终逐点校正，独立环境构建。
 - 完成 5 轮真实数据参数/几何迭代，最终 `xingye_13_gaussian_3` 45 秒端到端成功：53.8 万高斯、3 子图、11 留出视角 SSIM 0.212→0.758、显存峰值 2145 MiB。8 块原生完整 PCD 及标准地图落盘，结果已保护；不以渲染指标替代定位精度验收。
 - 使用与验证范围见 `docs/gaussian_mapping.md`；未声称完成整段 1020 秒录制或全部矿区验收。
+
+
+### 2026-11-07：高斯浏览器查看入口
+
+- 实际有界面 Chromium 对照：普通启动 WebGPU adapter 为 null，独立 Vulkan/NVIDIA 配置可显示 537798 个高斯并交互浏览；记录 `browser_gpu_comparison.json`。
+- 新增 `bash scripts/view_gaussian.sh <轮次目录|PLY|ssproj>`，固定依赖、隔离浏览器配置、复用独显窗口，自动导入并恢复/设置车辆视角。已验证首次 ssproj 打开和重复 PLY 导入，均识别 NVIDIA/Lovelace。
+- 操作说明已补入 `docs/gaussian_mapping.md`；建图算法及原有浏览器配置不变。

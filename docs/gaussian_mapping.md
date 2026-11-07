@@ -64,6 +64,26 @@ source /opt/ros/humble/setup.bash
 
 Studio 结果中的“高斯地图”显示 PLY/PCD/元信息链接及留出视角渲染预览。
 
+## 浏览器查看与 Linux 黑屏
+
+推荐使用专用启动命令：
+
+```bash
+bash scripts/view_gaussian.sh results/xingye_13_gaussian_3
+```
+
+参数可以换成其他轮次目录、具体 `point_cloud.ply` 或 `.ssproj` 工程。目录内有 `.ssproj` 时优先恢复其显示方向和初始视角；直接打开本项目 PLY 时，根据 `camera_poses.json` 自动选取车辆视角，并将 Z 向上的地图调整为浏览器导航使用的 Y 向上。这只是显示变换。
+
+首次使用自动在 `build/gaussian/viewer` 安装固定版本 Playwright，并准备其 Chromium；需要 Node.js >=20.19、npm 和网络。本机已配置完成。后续复用该专用浏览器进程，打开其他地图只需再次运行同一命令并更换参数。也可在专用窗口使用“文件 → 打开”恢复 `.ssproj`、“文件 → 导入”选择高斯 PLY。保存为 `.ssproj` 可保留初始视角。
+
+本机已对比实际有界面的 Chromium 启动方式：普通启动能访问 `navigator.gpu`，但 `requestAdapter()` 返回 `null`；专用配置返回 NVIDIA/Lovelace，53.8 万高斯可渲染并支持鼠标导航。当前环境的默认 Vulkan 清单目录缺少 NVIDIA 条目，因此启动器在自己的运行目录生成 NVIDIA ICD 清单，为该浏览器进程配置 Vulkan/WebGPU。普通 Chrome 窗口不会继承这些启动参数，单独在普通窗口再次打开网页可能仍然黑屏。对照记录在 `results/xingye_13_gaussian_3/browser_gpu_comparison.json`。
+
+网格也是 GPU 渲染内容，因此“网格也没有”应先检查浏览器图形链路；PLY 加载完成不代表 WebGPU 渲染设备初始化成功。排查其他浏览器时检查 `chrome://settings/system` 的图形加速、`chrome://gpu` 的 WebGPU/驱动信息，以及控制台中 `navigator.gpu.requestAdapter()` 是否成功。仅检查是否存在 `navigator.gpu` 不足以确认支持。
+
+查看操作：左键拖动旋转、右键拖动平移、滚轮缩放、双击感兴趣的路面或墙面设置观察中心。首次查看用已保存的车辆视角；整体框选后的远距离鸟瞰视角通常看不到与训练视角相同的纹理细节。
+
+此启动器使用独立配置目录，并且只调用本地文件导入接口。网络用于获取 SuperSplat 页面和首次安装查看依赖，不调用地图发布接口。系统 ROS、建图环境及普通浏览器设置不变。
+
 第三方来源及保留的许可见 `gaussian/third_party/gaussian_lic/UPSTREAM.md` 和各源文件、许可文件。
 
 ## 本次实际验证
