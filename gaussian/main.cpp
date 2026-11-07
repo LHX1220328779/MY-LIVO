@@ -54,6 +54,58 @@ void evaluate(const std::shared_ptr<Dataset>& ds, std::shared_ptr<GaussianModel>
             throw std::runtime_error("Cannot save reference");
     }
 }
+
+// Replay actual saved Gaussians for full-map/overlap inspection, with fixed recorded cameras.
+// The caller may select a conservative camera frustum on CPU to fit a long map in GPU memory.
+void renderSavedMap(const std::string& input, const std::string& model, const std::string& output) {
+    torch::NoGradGuard guard;
+    if (fs::exists(output)) throw std::runtime_error("Choose a new render output directory");
+    std::ifstream ply(model, std::ios::binary);
+    std::string line; int64_t count = 0; std::vector<std::string> props;
+    while (std::getline(ply, line) && line != "end_header") {
+        if (line.rfind("element vertex ", 0) == 0) count = std::stoll(line.substr(15));
+        if (line.rfind("property float ", 0) == 0) props.push_back(line.substr(15));
+    }
+    std::vector<std::string> expected = {"x", "y", "z", "f_dc_0", "f_dc_1", "f_dc_2"};
+    for (int i=0; i<45; ++i) expected.push_back("f_rest_"+std::to_string(i));
+    expected.push_back("opacity");
+    for (int i=0; i<3; ++i) expected.push_back("scale_"+std::to_string(i));
+    for (int i=0; i<4; ++i) expected.push_back("rot_"+std::to_string(i));
+    if (!ply || count <= 0 || props != expected) throw std::runtime_error("Replay requires this mapper's binary SH3 PLY schema");
+    std::vector<float> values(count*59);
+    readExact(ply, reinterpret_cast<char*>(values.data()), values.size()*sizeof(float));
+    auto table = torch::from_blob(values.data(), {count,59}, torch::kFloat32).cuda();
+    std::vector<float>().swap(values);
+    Params prm; std::ifstream manifest(input+"/frames.txt");
+    if (!(manifest >> prm.width >> prm.height >> prm.fx >> prm.fy >> prm.cx >> prm.cy)) throw std::runtime_error("Invalid camera manifest");
+    auto pc = std::make_shared<GaussianModel>(prm);
+    pc->xyz_ = table.slice(1,0,3).contiguous();
+    pc->features_dc_ = table.slice(1,3,6).reshape({count,1,3}).contiguous();
+    pc->features_rest_ = table.slice(1,6,51).reshape({count,3,15}).transpose(1,2).contiguous();
+    pc->opacity_ = table.slice(1,51,52).contiguous();
+    pc->scaling_ = table.slice(1,52,55).contiguous();
+    pc->rotation_ = table.slice(1,55,59).contiguous();
+    table = torch::Tensor();
+    auto ds = std::make_shared<Dataset>(prm);
+    std::string name; int validation; size_t n;
+    while (manifest >> name >> validation >> n) {
+        Frame fr; fr.name=name; fr.validation=true;
+        for (int r=0;r<3;++r) for (int c=0;c<3;++c) manifest >> fr.R_wc(r,c);
+        for (int j=0;j<3;++j) manifest >> fr.t_wc(j);
+        if (!manifest || name.find('/') != std::string::npos || name.find("..") != std::string::npos) throw std::runtime_error("Invalid camera record");
+        if (!gs_read_image((input+"/"+name+".png").c_str(), &fr.image) || fr.image.cols!=prm.width || fr.image.rows!=prm.height) throw std::runtime_error("Invalid replay RGB");
+        fr.depth=cv::Mat(prm.height,prm.width,CV_32FC1);
+        std::ifstream data(input+"/"+name+".bin", std::ios::binary);
+        readExact(data,reinterpret_cast<char*>(fr.depth.data),prm.width*prm.height*sizeof(float));
+        ds->addFrame(fr);
+    }
+    if (!manifest.eof() || ds->test_cameras_.empty()) throw std::runtime_error("No valid replay cameras");
+    fs::create_directories(output);
+    std::ofstream metrics(output+"/metrics.csv");
+    metrics << "stage,split,frame,psnr_lidar_region_db,psnr_full_db,ssim_full,depth_mae_m,depth_coverage,depth_30m_mae_m,depth_30m_median_m\n";
+    evaluate(ds,pc,output,"merged",metrics);
+    std::cout << "Rendered saved map: gaussians=" << count << " cameras=" << ds->test_cameras_.size() << std::endl;
+}
 }
 
 int main(int argc, char** argv) {
@@ -62,11 +114,13 @@ int main(int argc, char** argv) {
             std::cout << "MY-LIVO Gaussian-LIC adapter 1" << std::endl;
             return 0;
         }
-        if (argc != 6 && argc != 8 && argc != 9) throw std::runtime_error("Usage: my_livo_gaussian INPUT OUTPUT ITERATIONS REFINE_PASSES MAX_GAUSSIANS [DEPTH_WEIGHT MAX_SCALE [POSITION_LR]]");
+        const bool replay = argc == 5 && std::string(argv[1]) == "--render";
+        if (!replay && argc != 6 && argc != 8 && argc != 9) throw std::runtime_error("Usage: my_livo_gaussian INPUT OUTPUT ITERATIONS REFINE_PASSES MAX_GAUSSIANS [DEPTH_WEIGHT MAX_SCALE [POSITION_LR]]; or --render INPUT MODEL_PLY OUTPUT");
         if (!torch::cuda::is_available()) throw std::runtime_error("CUDA required");
         torch::set_num_threads(1);
         torch::manual_seed(42);
         std::srand(42);
+        if (replay) { renderSavedMap(argv[2],argv[3],argv[4]); return 0; }
         std::string input = argv[1], output = argv[2];
         if (fs::exists(output + "/point_cloud.ply")) throw std::runtime_error("Output already exists; select a new directory");
         fs::create_directories(output);

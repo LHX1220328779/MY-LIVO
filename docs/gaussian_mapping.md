@@ -86,7 +86,7 @@ bash scripts/view_gaussian.sh results/xingye_13_gaussian_3
 
 第三方来源及保留的许可见 `gaussian/third_party/gaussian_lic/UPSTREAM.md` 和各源文件、许可文件。
 
-## 本次实际验证
+## 接入阶段短窗口验证（历史记录）
 
 使用星业 13 号车原始录制 `/home/project/data/haibo/xingye/13/20261027/ros2bag`，标定 `xingye/truck13/v014_camphoto`。原有 LIVO 基准为 `results/gaussian_livo_reference_1107`（45 秒、427 帧、8 个完整几何 PCD 分块）。新模式与基准生成的估计器配置相同，复用同一个原 `fastlivo_mapping` 可执行文件；`src/`、`include/`、根 CMake/package 未改。
 
@@ -117,3 +117,34 @@ bash scripts/view_gaussian.sh results/xingye_13_gaussian_3
 最终默认轮次已完成：426 个原生存档帧、86 个高斯相机帧、3 个子图、537798 个高斯，高斯阶段 40.44 s，整轮 GPU 显存采样峰值 2145 MiB。11 个留出视角平均全图 PSNR 10.35→20.09 dB、SSIM 0.212→0.758，激光覆盖邻域 PSNR 11.35→24.46 dB。全范围渲染深度 MAE 0.697→0.512 m，30 m 内 MAE 0.370→0.307 m；30 m 内中位误差的视角均值 0.061→0.089 m，说明并非所有深度统计均改善。未据此声称新的几何精度达标。
 
 合并 PLY 的 59 个浮点属性全部有限，计数/文件长度正确；合并中心 PCD 完整且与 PLY 坐标逐点一致；实际最大尺度 0.5 m，实际中心学习率 0。原生 8 个 PCD 分块和标准全局几何/RGB 地图均保存，标准地图分别含 2204455 / 2018403 个点。Studio 的实际结果读取确认了高斯数、产品链接及渲染列表。验证摘要为 `results/xingye_13_gaussian_3/validation.json`，该轮次已在结果管理中保护，避免自动清理其完整 PCD。
+
+
+## 2026-11-07 完整录制验证
+
+已完整处理星业 13 号车 1020.12 秒录制，复用同一 `11a0d14` 估计器的 10177 帧最终位姿/原生扫描存档。2036 个相机采样帧覆盖 1017.50 秒有效区间（0.5 秒间隔），1782 帧训练、254 帧留出，51 子图共 13944637 个高斯。全程高斯解码/配对/训练/导出耗时 1068.2 秒，训练显存采样峰值 5275 MiB。原有 126 块完整 PCD 与全局几何/RGB 地图保留，结果已保护。
+
+**完整全局图尚未达到高精细外观验收要求。** 254 个留出视角的单子图平均全图 PSNR 15.107 dB、SSIM 0.593；同一组22个视角从单子图 SSIM 0.594 降到直接拼接后的 0.387。实际存在黑色天空/远景缺失、灯头蓝色光晕、路面扫描线状波纹，跨子图重复叠加进一步恶化。不能用接入阶段的单子图短窗口指标替代完整合并图指标。
+
+额外做了只保留空间单元最近可观测子图的合并试验，平均 SSIM 提升到 0.445，但22视角中9个退化（包括起步厂房），因此没有将其替换为正式输出，也未纳入默认建图算法。失败试验数据保留作分析证据。下一步应在高斯层处理可见性/表面支持与跨子图外观一致性，再处理天空/无深度区域损失和地面法向协方差，保留现有位姿链路。
+
+完整文件：`results/xingye13_livo_1105/Log/fusion/1793847427156913686/gaussian/point_cloud.ply`（约3.065 GiB）。
+
+分析入口：`results/xingye13_livo_1105/full_gaussian_analysis/analysis.md`（中文结论）及 `report.html`（曲线、全程代表/低分视角、22视角合并重渲染对照）。另有 `quality_summary.json`、`merge_comparison.json`、`execution.json` 和完整运行日志。
+
+当前电脑可用区域/子图方式浏览：
+
+```bash
+bash scripts/view_gaussian.sh results/xingye13_livo_1105/full_gaussian_analysis/preview_regions/start
+bash scripts/view_gaussian.sh results/xingye13_livo_1105/Log/fusion/1793847427156913686/gaussian/submap_0025
+```
+
+`preview_regions/start|middle|end` 是从完整合并图选取的62 m空间区域，保留原高斯参数；完整地图没有裁剪替换。各子图已附对应 `camera_poses.json`，查看器可直接恢复车辆视角。
+
+本次新增只读重渲染入口（载入本项目导出的SH3二进制PLY，输入相机/图像/深度沿用配对阶段的格式）：
+
+```bash
+build/gaussian/my_livo_gaussian --render CAMERA_INPUT_DIR SAVED_MODEL.ply NEW_OUTPUT_DIR
+/usr/bin/python3 scripts/analysis/gaussian_full_report.py results/xingye13_livo_1105 --render-merged
+```
+
+`--render-merged` 需要预先保留在 `full_gaussian_analysis/replay_inputs` 的配对输入，本次已保留22个全程分布视角。该重渲染不训练、不改位姿或高斯参数，并以单子图重载前后指标完全一致验证了解码约定。

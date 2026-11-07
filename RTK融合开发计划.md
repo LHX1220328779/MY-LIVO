@@ -742,3 +742,11 @@
 - 实际有界面 Chromium 对照：普通启动 WebGPU adapter 为 null，独立 Vulkan/NVIDIA 配置可显示 537798 个高斯并交互浏览；记录 `browser_gpu_comparison.json`。
 - 新增 `bash scripts/view_gaussian.sh <轮次目录|PLY|ssproj>`，固定依赖、隔离浏览器配置、复用独显窗口，自动导入并恢复/设置车辆视角。已验证首次 ssproj 打开和重复 PLY 导入，均识别 NVIDIA/Lovelace。
 - 操作说明已补入 `docs/gaussian_mapping.md`；建图算法及原有浏览器配置不变。
+
+
+### 2026-11-07：星业13号完整高斯建图与全局效果复核
+
+- 基于同一完整 LIVO/RTK 存档，实际处理 1020.12 秒录制，2036 相机帧、51 子图、13944637 高斯；完整 PCD 保留并保护，训练/解码/导出1068秒、显存峰值5275MiB。
+- 254留出视角单子图 SSIM 均值0.593；同一22视角单子图0.594、直接合并0.387，确认短窗口子图画质不能代表全局外观。新增只读已存PLY重渲染/报告工具；无估计器或训练逻辑变动。
+- 空间单元选子图试验均值0.445但9/22视角退化，未替换正式结果或纳入默认代码。仍需解决全局高斯外观一致性、天空缺失、灯头光晕和地面波纹。
+- 完整分析：`results/xingye13_livo_1105/full_gaussian_analysis/analysis.md` 与 `report.html`；使用范围及局限已更新 `docs/gaussian_mapping.md`。
