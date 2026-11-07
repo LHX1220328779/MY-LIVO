@@ -303,13 +303,14 @@ function liveMonitor() {
   const player = live?.player || {};
   const pct = phase === "done" ? 100 : player.percent != null ? Math.min(99, player.percent) : 0;
   const latest = live?.latest || {};
-  const phaseIdx = PHASES.findIndex((p) => p[0] === phase);
+  const phases = rec?.mode === "gaussian" ? [...PHASES.slice(0, -1), ["gaussian", "高斯优化"], PHASES.at(-1)] : PHASES;
+  const phaseIdx = phases.findIndex((p) => p[0] === phase);
   const stepInfo = j && j.steps.length > 1 ? `<div class="small muted">流水线步骤 ${j.current + 1}/${j.steps.length}：${esc((j.steps[j.current] || {}).title)}</div>` : "";
   const stopBtns = j ? `<div class="row"><button class="btn" data-act="stop" data-mode="finish" ${j.stop_mode ? "disabled" : ""} title="停止回放，让算法完成优化、导出与评估">提前结束并保存</button><button class="btn danger" data-act="stop" data-mode="abort">强制终止</button></div>` : "";
   return `<div id="live-monitor" class="card" style="border:1px solid var(--accent-soft)">
     <div class="card-h"><h2><span class="dot ${j ? "run" : rec?.status === "done" ? "ok" : rec?.status === "failed" ? "bad" : ""}"></span>${esc(round || j?.title || "")} ${rec?.mode || j?.meta?.mode ? `<span class="badge">${esc((rec?.mode || j?.meta?.mode || "").toUpperCase())}</span>` : ""}</h2>${stopBtns}</div>
     ${stepInfo}
-    <div class="phases" style="margin:8px 0 10px">${PHASES.map(([k, l], i) => `<span class="phase ${k === phase ? "on" : i < phaseIdx ? "done" : ""}">${l}</span>`).join("")}${rec?.status === "failed" ? `<span class="phase" style="background:var(--bad-soft);color:var(--bad)">失败</span>` : rec?.status === "incomplete" ? `<span class="phase" style="background:var(--warn-soft, #fff4e5);color:var(--warn)" title="${esc(rec.error || "")}">不完整</span>` : ""}</div>
+    <div class="phases" style="margin:8px 0 10px">${phases.map(([k, l], i) => `<span class="phase ${k === phase ? "on" : i < phaseIdx ? "done" : ""}">${l}</span>`).join("")}${rec?.status === "failed" ? `<span class="phase" style="background:var(--bad-soft);color:var(--bad)">失败</span>` : rec?.status === "incomplete" ? `<span class="phase" style="background:var(--warn-soft, #fff4e5);color:var(--warn)" title="${esc(rec.error || "")}">不完整</span>` : ""}</div>
     <div class="progress"><div style="width:${pct}%"></div></div>
     <div class="row small muted" style="margin-top:6px;justify-content:space-between"><span>${player.t != null ? `回放 ${player.t.toFixed(1)} / ${player.total.toFixed(1)} s · ${player.msgs} 条 · 延迟 ${player.lag_ms} ms` : !round && j ? "当前步骤不是建图轮次（见任务日志）" : phase === "starting" ? "正在启动建图节点…" : ""}</span><span>${rec?.start ? `开始 ${fmtT(rec.start)}` : ""}</span></div>
     ${rec ? `<div class="callout ${rec.error ? "bad" : rec.status === "done" ? "ok" : "warn"}" style="margin-top:8px"><b>状态：</b>${esc(rec.status || phase || "未知")} · <b>错误：</b>${rec.error ? esc(rec.error) : rec.status === "done" ? "无" : "暂未报告"}${rec.map_chunks != null ? ` · 地图 ${rec.map_chunks} 块` : ""}${rec.metrics_complete != null ? ` · 评估 ${rec.metrics_complete ? "完整" : "不完整"}` : ""}</div>` : ""}
@@ -355,7 +356,7 @@ function pageHome() {
   const v = vehicle(); const d = S.dataset; const running = S.job && S.job.status === "running";
   const m = S.state.mapping;
   const canLIVO = d && d.livo_ready, canLIO = d && d.lio_ready;
-  const mode = m.mode === "livo" && !canLIVO ? "lio" : m.mode;
+  const mode = ["livo", "gaussian"].includes(m.mode) && !canLIVO ? "lio" : m.mode;
   const nextBtn = !v ? `<button class="btn primary" data-act="go" data-page="calib">导入出厂标定</button>`
     : v.next.pipeline ? `<button class="btn primary" data-act="pipeline" data-kind="${v.next.pipeline}" ${running ? "disabled" : ""}>${{ lidar: "运行 LiDAR 标定流水线", camera: "运行相机标定流水线", camloop: "运行相机外参闭环微调" }[v.next.pipeline]}</button>`
     : v.next.stage === "import" ? `<button class="btn primary" data-act="go" data-page="calib">导入出厂标定</button>` : `<span class="badge ok">标定完整</span>`;
@@ -371,7 +372,7 @@ function pageHome() {
         ${v?.active ? `<span class="badge dark" title="${esc(v.active)}">${esc(v.active.split("/").pop())}</span>` : '<span class="badge bad">无激活版本</span>'}</div>
       ${checksHtml(v)}<div class="row" style="margin-top:12px;justify-content:space-between"><span class="small muted">${esc(v?.next?.reason || "")}</span>${nextBtn}</div></div>
     <div class="card"><div class="card-h"><h2><span class="stepnum">3</span>一键建图</h2><button class="btn sm" data-act="go" data-page="map">高级设置</button></div>
-      <div class="seg big" style="margin-bottom:12px"><button class="${mode === "lio" ? "active" : ""}" data-act="mode" data-mode="lio" ${canLIO ? "" : "disabled"}>LIO</button><button class="${mode === "livo" ? "active" : ""}" data-act="mode" data-mode="livo" ${canLIVO ? "" : "disabled"}>LIVO（含相机）</button></div>
+      <div class="seg big" style="margin-bottom:12px"><button class="${mode === "lio" ? "active" : ""}" data-act="mode" data-mode="lio" ${canLIO ? "" : "disabled"}>LIO</button><button class="${mode === "livo" ? "active" : ""}" data-act="mode" data-mode="livo" ${canLIVO ? "" : "disabled"}>LIVO（含相机）</button><button class="${mode === "gaussian" ? "active" : ""}" data-act="mode" data-mode="gaussian" ${canLIVO ? "" : "disabled"}>高斯建图</button></div>
       <div class="stack">
         ${toggle("use_rtk", "RTK / INS 融合", m.use_rtk)}${toggle("save_map", "保存地图 (PCD)", m.save_map)}${toggle("rviz", "打开 RViz", m.rviz)}${toggle("evaluate", "结束后自动精度评估", m.evaluate)}
       </div>
@@ -687,12 +688,12 @@ function pageMap() {
   // display the first option (active version) while submitting the stale id. Reset it.
   if (m.calibration_id && S.cal && !versions.some((x) => x.id === m.calibration_id)) { m.calibration_id = ""; S.state.mapping.calibration_id = ""; saveState({ mapping: { calibration_id: "" } }); }
   const canLIVO = d && d.livo_ready, canLIO = d && d.lio_ready;
-  const mode = m.mode === "livo" && !canLIVO ? "lio" : m.mode;
+  const mode = ["livo", "gaussian"].includes(m.mode) && !canLIVO ? "lio" : m.mode;
   return `<h1 style="margin-bottom:6px">建图</h1><div class="muted" style="margin-bottom:18px">一次建图 = 启动 fastlivo_mapping → 按时间戳实时回放原始录制 → 收尾优化导出轨迹/地图 → 自动精度评估。所有输出在 <code>results/&lt;轮次&gt;/</code>（round.json 记录完整参数与阶段）。</div>
   ${liveMonitor()}
   <div class="card" style="margin-top:16px"><div class="card-h"><h2>参数</h2><div class="row"><span class="small muted">数据源</span><b>${esc(d?.name || "未选择")}</b>${datasetBadges(d)}${assessBadgeHome()}<button class="btn sm" data-act="go" data-page="data">更换</button></div></div>
     <div class="form">
-      <div class="field"><label>模式</label><div class="seg"><button class="${mode === "lio" ? "active" : ""}" data-act="mode" data-mode="lio" ${canLIO ? "" : "disabled"}>LIO</button><button class="${mode === "livo" ? "active" : ""}" data-act="mode" data-mode="livo" ${canLIVO ? "" : "disabled"}>LIVO</button></div></div>
+      <div class="field"><label>模式</label><div class="seg"><button class="${mode === "lio" ? "active" : ""}" data-act="mode" data-mode="lio" ${canLIO ? "" : "disabled"}>LIO</button><button class="${mode === "livo" ? "active" : ""}" data-act="mode" data-mode="livo" ${canLIVO ? "" : "disabled"}>LIVO</button><button class="${mode === "gaussian" ? "active" : ""}" data-act="mode" data-mode="gaussian" ${canLIVO ? "" : "disabled"}>高斯建图</button></div></div>
       <div class="field"><label>标定版本</label><select data-act="field" data-section="mapping" data-key="calibration_id"><option value="" ${!m.calibration_id ? "selected" : ""}>自动按当前录制匹配（无匹配时使用激活版本）</option>${versions.map((x) => `<option value="${esc(x.id)}" ${m.calibration_id === x.id ? "selected" : ""} title="标定数据：${esc(x.source_dataset || "未登记")}">${esc(x.version)} · ${esc(x.stage_label)}${x.source_dataset && d?.path && x.source_dataset !== d.path ? " · 其他录制" : ""}</option>`).join("")}</select></div>
 
       <div class="field"><label>回放倍速</label><input type="number" step="0.1" min="0.1" max="4" data-act="field" data-section="mapping" data-key="rate" value="${esc(m.rate)}"></div>
@@ -931,7 +932,10 @@ function mapProductsPanel(r, l) {
   const prods = l.map_products || [];
   const f = S.exportForm || (S.exportForm = { voxel: 0.05, source: "all", tile: 0, keyframes: false, min_points: 1 });
   const rows = prods.map((p) => `<tr><td class="mono">${esc(p.dir)}</td><td>${p.voxel_m === 0 ? "不滤波" : `${(p.voxel_m * 100).toFixed(0)} cm`}</td><td>${p.source === "keyframes" ? "关键帧" : "全部扫描"}${p.min_points > 1 ? ` · ≥${p.min_points} 点` : ""}</td><td>${p.tile_m ? `${p.tile_m} m` : "—"}</td><td>${p.files.map((x) => `<a href="/api/runs/${encodeURIComponent(r.round)}/file?name=${encodeURIComponent(`Log/fusion/${l.fusion_dir.split("/").pop()}/${x.name}`)}" target="_blank">${esc(x.name.split("/").pop())}</a> ${x.points != null ? `${(x.points / 1e6).toFixed(1)} M 点` : ""} · ${x.mb} MB`).join("<br>")}</td><td class="small muted">${esc(fmtT(p.created))}${p.elapsed_s != null ? ` · ${p.elapsed_s} s` : ""}</td></tr>`).join("");
-  return `<details ${prods.length ? "" : "open"}><summary>地图产品（${prods.length}）</summary>
+  const gs = l.gaussian;
+  const gsUrl = (name) => `/api/runs/${encodeURIComponent(r.round)}/file?name=${encodeURIComponent(`Log/fusion/${l.fusion_dir.split("/").pop()}/${name}`)}`;
+  const gaussianPanel = gs ? `<div class="card"><b>高斯地图</b> · ${gs.gaussians.toLocaleString()} 个高斯 · ${gs.frames} 帧 · ${gs.submaps} 子图 · ${num(gs.elapsed_sec, 1)} s<div class="row">${gs.files.map((name) => `<a href="${gsUrl(name)}" target="_blank">${esc(name.split("/").pop())}</a>`).join(" · ")}</div><div class="overlays">${gs.renders.map((name) => `<a href="${gsUrl(name)}" target="_blank"><img loading="lazy" src="${gsUrl(name)}" title="留出视角渲染"></a>`).join("")}</div></div>` : "";
+  return `${gaussianPanel}<details ${prods.length ? "" : "open"}><summary>地图产品（${prods.length}）</summary>
     ${prods.length ? `<table class="tbl small"><thead><tr><th>目录</th><th>体素</th><th>来源</th><th>分块</th><th>文件</th><th>生成</th></tr></thead><tbody>${rows}</tbody></table>` : `<div class="small muted">尚未导出标准地图产品。</div>`}
     ${l.has_archive ? `<div class="row" style="margin-top:8px;gap:10px;flex-wrap:wrap"><label class="small">体素 (m) <input type="number" step="0.01" min="0" max="2" style="width:80px" data-act="export-field" data-key="voxel" value="${esc(f.voxel)}"></label><label class="small">来源 <select data-act="export-field" data-key="source"><option value="all" ${f.source === "all" ? "selected" : ""}>全部扫描</option><option value="keyframes" ${f.source === "keyframes" ? "selected" : ""}>仅关键帧</option></select></label><label class="small">分块 (m) <input type="number" step="10" min="0" style="width:80px" data-act="export-field" data-key="tile" value="${esc(f.tile)}"></label><label class="small">最少点数/体素 <input type="number" step="1" min="1" style="width:60px" data-act="export-field" data-key="min_points" value="${esc(f.min_points ?? 1)}"></label><label class="small"><input type="checkbox" data-act="export-field" data-key="keyframes" ${f.keyframes ? "checked" : ""}> 关键帧点云</label><button class="btn sm" data-act="export-map" data-round="${esc(r.round)}">按此设置重新导出</button></div><div class="small muted">从扫描存档按最终优化位姿重投影（与建图输出一致），不需要重新建图；默认设置写入 map/，其他设置写入独立目录。</div>` : `<div class="small muted">本轮没有扫描存档（scans.bin），无法重新导出。</div>`}
   </details>`;
@@ -960,7 +964,7 @@ const A = {
   async "set-vehicle"(el) { const [mine, truck] = el.value.split("/"); S.state.vehicle = { mine, truck }; S.calibForm.parent = null; S.state.calibration.parent_id = ""; S.state.mapping.calibration_id = ""; await saveState({ vehicle: { mine, truck }, calibration: { parent_id: "" }, mapping: { calibration_id: "" } }); render(); if (S.page === "body") A["bf-load"](); },
   async start() {
     const v = vehicle(); const m = S.state.mapping; const d = S.dataset;
-    const mode = m.mode === "livo" && !d?.livo_ready ? "lio" : m.mode;
+    const mode = ["livo", "gaussian"].includes(m.mode) && !d?.livo_ready ? "lio" : m.mode;
     await act(async () => { const job = await api("/api/mapping/start", "POST", { ...m, mode, dataset: d.path, mine: v.mine, truck: v.truck }); S.job = job; S.jobLog = []; S.jobLogNext = 0; S.live = null; await loadOverview(); render(); }, "建图已启动");
   },
   async stop(el) {

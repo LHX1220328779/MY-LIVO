@@ -201,7 +201,7 @@ def busy():
     active = jobs.active("mapping") or jobs.active("pipeline")
     if active:
         return active
-    if pgrep("fastlivo_mapping"):
+    if pgrep("fastlivo_mapping|my_livo_gaussian|livo/gaussian_map.py"):
         return "external"
     return None
 
@@ -210,10 +210,14 @@ def start(body):
     if busy():
         raise StudioError("已有建图轮次在运行；请先等待其结束或停止它")
     mode = body.get("mode", "livo")
-    if mode not in ("lio", "livo"):
-        raise StudioError("模式必须是 lio 或 livo")
+    if mode not in ("lio", "livo", "gaussian"):
+        raise StudioError("模式必须是 lio、livo 或 gaussian")
+    if mode == "gaussian":
+        if not (REPO / "build/gaussian/my_livo_gaussian").is_file():
+            raise StudioError("请先运行 bash scripts/build_gaussian.sh 编译高斯建图模块")
+        body = {**body, "save_map": True}
     dataset = str(safe_path(body.get("dataset") or ""))
-    datasets.require(dataset, camera=(mode == "livo"))
+    datasets.require(dataset, camera=(mode in ("livo", "gaussian")))
     # 轮次命名规范：<矿区>_<车号>_<模式>_<序号>，序号从 1 起；名称不含日期
     # （开始时间已记录在轮次元数据中）。开发测试轮由脚本手工命名并加 _test 后缀。
     mine_part = re.sub(r"[^A-Za-z0-9]", "", str(body.get("mine") or "")).lower() or "site"
@@ -272,7 +276,7 @@ def start(body):
                                                   "skip_stationary", "stationary_min", "stationary_lidar_interval",
                                                   "loop_closure", "map_priority",
                                                   "map_export", "map_voxel", "map_source", "map_tile", "map_keyframes")}}
-    title = f"{'LIVO' if mode == 'livo' else 'LIO'} 建图 · {round_name}"
+    title = f"{dict(lio='LIO', livo='LIVO', gaussian='高斯')[mode]} 建图 · {round_name}"
     return jobs.start("mapping", title, [{"title": title, "cmd": cmd}], meta=meta)
 
 
@@ -288,7 +292,7 @@ def stop(mode="finish"):
 
 
 def kill_all():
-    subprocess.run(["pkill", "-TERM", "-f", ROS_PROCESS_PATTERN], check=False)
+    subprocess.run(["pkill", "-TERM", "-f", ROS_PROCESS_PATTERN + "|my_livo_gaussian|livo/gaussian_map.py"], check=False)
     return {"ok": True}
 
 
@@ -514,6 +518,11 @@ def live(round_name):
         out["map_size_mb"] = round(sum(m.stat().st_size for m in maps) / 1e6, 1)
         out["rgb_map_chunks"] = len(list(f.glob("rgb_map_*.pcd")))
         out["map_products"] = map_products(f)
+        gaussian = read_json(f / "gaussian/map_info.json", {}) or {}
+        if gaussian.get("status") == "done":
+            out["gaussian"] = {k: gaussian.get(k) for k in ("frames", "gaussians", "submaps", "elapsed_sec")}
+            out["gaussian"]["files"] = [f"gaussian/{n}" for n in ("point_cloud.ply", "gaussian_centers.pcd", "map_info.json")]
+            out["gaussian"]["renders"] = [str(p.relative_to(f)) for p in sorted((f / "gaussian").glob("submap_*/trained_*.png"))[:6]]
         out["has_archive"] = (f / "scans.bin").exists()
         out["loops"] = loop_summary(f)
     # per-frame rear-axle error of the optimized (delivered) and native trajectories vs RTK, written by

@@ -8,7 +8,7 @@
 # root (Perception_*/Camera_* folders) or any single ROS 2 bag folder.
 #
 # Usage (inside container):
-#   bash scripts/run_wuhu_round.sh <round_name> [--mode lio|livo] [--dataset DIR] [--calibration FILE]
+#   bash scripts/run_wuhu_round.sh <round_name> [--mode lio|livo|gaussian] [--dataset DIR] [--calibration FILE]
 #        [--no-rtk] [--no-save-map] [--rviz] [--rate R] [--start-offset S] [--duration D]
 #        [--map-range M] [--rgb-range M]   (saved-map product caps in metres, 0 = keep every return;
 #                                           defaults come from the yaml: rtk.save_map_max_range / save_rgb_max_range)
@@ -82,13 +82,21 @@ while (($#)); do
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
-case "$mode" in lio|livo) ;; *) echo "--mode must be lio or livo" >&2; exit 2 ;; esac
+case "$mode" in lio|livo|gaussian) ;; *) echo "--mode must be lio, livo or gaussian" >&2; exit 2 ;; esac
+# Gaussian mapping uses the unchanged LIVO estimator, then consumes finalized scan/pose archives.
+estimator_mode=$mode
+if [[ "$mode" == gaussian ]]; then
+  estimator_mode=livo
+  [[ -x "$repo/build/gaussian/my_livo_gaussian" ]] || { echo "Build Gaussian mapping first: bash scripts/build_gaussian.sh" >&2; exit 2; }
+  [[ $("$repo/build/gaussian/my_livo_gaussian" --version) == "MY-LIVO Gaussian-LIC adapter 1" ]] || { echo "Rebuild the outdated Gaussian executable: bash scripts/build_gaussian.sh" >&2; exit 2; }
+  [[ "$save_map" == true ]] || { echo "Gaussian mapping requires saved scans/PCD (--no-save-map is incompatible)" >&2; exit 2; }
+fi
 if [[ -n "$calibration" ]]; then
   [[ -f "$calibration" ]] || { echo "calibration file not found: $calibration" >&2; exit 2; }
   sets+=("multi_lidar.calibration_file=$calibration")
 fi
 [[ -d "$dataset" ]] || { echo "dataset directory not found: $dataset" >&2; exit 2; }
-if [[ "$mode" == livo ]] && (( skip_stationary )); then
+if [[ "$estimator_mode" == livo ]] && (( skip_stationary )); then
   # LIVO updates end at camera images; inside a fast-forward window only the HEVC key frames (2 s apart) are
   # decodable and the hardware decoder (hevc_cuvid) releases each one only after the next packets, so the mapper
   # starves (3 player holds and an aborted round on truck29raw 20261013). Standstill skipping is LIO-only.
@@ -137,7 +145,7 @@ export OPENBLAS_NUM_THREADS=1
 if ! /usr/bin/python3 tools/livo/dataset.py "$dataset" --json > "$out/dataset.json" 2> "$out/dataset.err"; then
   echo "dataset not readable: $dataset" >&2; cat "$out/dataset.err" >&2; exit 2
 fi
-ready_key=lio_ready; [[ "$mode" == "livo" ]] && ready_key=livo_ready
+ready_key=lio_ready; [[ "$estimator_mode" == "livo" ]] && ready_key=livo_ready
 if ! /usr/bin/python3 -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get(sys.argv[2]) else 1)" "$out/dataset.json" "$ready_key"; then
   echo "dataset is not $ready_key (mode $mode): $dataset" >&2
   /usr/bin/python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print('topics:', sorted(d['topics']))" "$out/dataset.json" >&2
@@ -290,7 +298,7 @@ if [[ -z "$calibration" ]]; then
   echo "WARNING: no --calibration: the mapper uses the yaml multi_lidar.calibration_file fallback, not a registered calibration version" | tee -a "$out/run.log" >&2
 fi
 
-use_camera=false; [[ "$mode" == "livo" ]] && use_camera=true
+use_camera=false; [[ "$estimator_mode" == "livo" ]] && use_camera=true
 ros2 launch fast_livo wuhu_truck29.launch.py use_camera:=$use_camera use_rtk:=$use_rtk rtk_backend:=$rtk_backend use_rviz:=$use_rviz \
   rear_axle_to_imu:=true save_map:=$save_map output_directory:="$out" config_file:="$config" > "$out/launch.log" 2>&1 &
 launch_pid=$!
@@ -312,7 +320,7 @@ fi
 /usr/bin/python3 tools/livo/resmon.py "$out" --pid "$mapper_pid" --interval 2 > "$out/resmon.log" 2>&1 &
 
 phase playing
-play_args=("$dataset" --preset "$mode" --rate "$rate" --start-offset "$start_offset")
+play_args=("$dataset" --preset "$estimator_mode" --rate "$rate" --start-offset "$start_offset")
 [[ -n "$duration" ]] && play_args+=(--duration "$duration")
 (( skip_stationary )) && play_args+=(--skip-stationary --stationary-min-s "$stationary_min" --stationary-lidar-interval "$stationary_lidar")
 /usr/bin/python3 tools/livo/player.py "${play_args[@]}" > "$out/playback.log" 2>&1 &
@@ -401,6 +409,12 @@ fi
 if [[ -n "$export_pid" ]]; then
   wait "$export_pid"; echo "map export exit=$? at $(date -u +%FT%TZ): $(tail -1 "$out/map_export.log" | cut -c1-300)" >> "$out/run.log"
 fi
+gaussian_exit=0
+if [[ "$mode" == gaussian && $playback_exit -eq 0 && -z "$mapper_error" && -f "$fusion_dir/trajectory_optimized.txt" ]]; then
+  phase gaussian
+  /usr/bin/python3 tools/livo/gaussian_map.py "$out" > "$out/gaussian.log" 2>&1 || gaussian_exit=$?
+  echo "Gaussian mapping exit=$gaussian_exit; log=$out/gaussian.log; products=$fusion_dir/gaussian" >> "$out/run.log"
+fi
 rc=0
 if [[ $playback_exit -ne 0 ]]; then
   playback_error=$(/usr/bin/python3 - "$out/playback.log" "$playback_exit" <<'PY'
@@ -418,6 +432,9 @@ PY
   phase failed status=failed end="\"$(date -u +%FT%TZ)\"" error="$playback_error"
   echo "FAILED: playback exit $playback_exit ($playback_error)" >> "$out/run.log"
   rc=3
+elif [[ $gaussian_exit -ne 0 ]]; then
+  phase failed status=failed end="\"$(date -u +%FT%TZ)\"" error='"Gaussian mapping failed; see gaussian.log (PCD and trajectory retained)"'
+  rc=5
 elif [[ -n "${fusion_dir:-}" && -f "$fusion_dir/trajectory_optimized.txt" && -z "$mapper_error" ]]; then
   phase done status=done end="\"$(date -u +%FT%TZ)\""
 elif [[ -n "${fusion_dir:-}" && -f "$fusion_dir/trajectory_optimized.txt" ]]; then
