@@ -89,7 +89,7 @@ estimator_mode=$mode
 if [[ "$mode" == gaussian ]]; then
   estimator_mode=livo
   [[ -x "$repo/build/gaussian/my_livo_gaussian" ]] || { echo "Build Gaussian mapping first: bash scripts/build_gaussian.sh" >&2; exit 2; }
-  [[ $("$repo/build/gaussian/my_livo_gaussian" --version) == "MY-LIVO Gaussian-LIC adapter 1" ]] || { echo "Rebuild the outdated Gaussian executable: bash scripts/build_gaussian.sh" >&2; exit 2; }
+  [[ $("$repo/build/gaussian/my_livo_gaussian" --version) == "MY-LIVO Gaussian-LIC adapter 5" ]] || { echo "Rebuild the outdated Gaussian executable: bash scripts/build_gaussian.sh" >&2; exit 2; }
   [[ "$save_map" == true ]] || { echo "Gaussian mapping requires saved scan/pose archives (--no-save-map is incompatible)" >&2; exit 2; }
 fi
 if [[ -n "$calibration" ]]; then

@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation, Slerp
@@ -96,7 +97,7 @@ def run(a):
         raise ValueError("Build the Gaussian mapper first: bash scripts/build_gaussian.sh")
     if not a.prepare_only:
         version = subprocess.check_output([str(binary.resolve()), "--version"], text=True).strip()
-        if version != "MY-LIVO Gaussian-LIC adapter 1":
+        if version != "MY-LIVO Gaussian-LIC adapter 5":
             raise ValueError("Gaussian executable is outdated; rebuild with bash scripts/build_gaussian.sh")
     output = Path(a.out).resolve() if a.out else fusion / "gaussian"
     output.mkdir(parents=True, exist_ok=True)
@@ -107,6 +108,7 @@ def run(a):
     scale = a.width / camera["width"]
     width, height = a.width, round(camera["height"] * scale)
     fx, fy, cx, cy = np.array(camera["intrinsics"]) * scale
+    cx += (scale-1)/2; cy += (scale-1)/2  # FFmpeg/OpenCV resize pixel-centre convention
     K = np.array([[fx,0,cx],[0,fy,cy],[0,0,1.]])
     mx, my = cv2.initUndistortRectifyMap(K, np.array(camera["distortion"]), None, K, (width,height), cv2.CV_32FC1)
     valid_pixels = cv2.remap(np.ones((height,width), np.uint8), mx, my, cv2.INTER_NEAREST).astype(bool)
@@ -136,6 +138,17 @@ def run(a):
     if len(chosen) < 4:
         raise ValueError("Need at least four synchronized camera frames")
     archive = np.memmap(fusion / "scans.bin", dtype="<f4", mode="r", offset=8).reshape(-1,5)
+    ordinal={k:i for i,k in enumerate(chosen)}
+
+    def project(world,T):
+        pc=(world-T[:3,3])@T[:3,:3];z=pc[:,2]
+        good=(z>.5)&(z<a.max_depth);world,pc,z=world[good],pc[good],z[good]
+        u=np.rint(pc[:,0]*fx/z+cx).astype(int);v=np.rint(pc[:,1]*fy/z+cy).astype(int)
+        inside=(u>=0)&(v>=0)&(u<width)&(v<height)
+        world,z,u,v=world[inside],z[inside],u[inside],v[inside]
+        valid=valid_pixels[v,u];world,z,u,v=world[valid],z[valid],u[valid],v[valid]
+        order=np.argsort(z,kind="stable");_,first=np.unique((v*width+u)[order],return_index=True);sel=order[first]
+        return world[sel],z[sel],u[sel],v[sel]
     submaps, frame_count, files, poses = [], 0, None, []
     try:
         for k, image in decode_rgb(stream, width, height):
@@ -159,24 +172,12 @@ def run(a):
             native = scan[:,:3] @ (raw_R[j] @ lr).T + raw_R[j] @ lt + raw_t[j]
             ptimes = np.clip(fr["begin"][j] + scan[:,4]/1000, fr["begin"][j], stamps[j])
             world = apply_correction(native, ptimes, corr)
-            pc = (world - T[:3,3]) @ T[:3,:3]
-            z = pc[:,2]
-            good = (z > 0.5) & (z < a.max_depth)
-            world, pc, z = world[good], pc[good], z[good]
-            u = np.rint(pc[:,0]*fx/z+cx).astype(int); v = np.rint(pc[:,1]*fy/z+cy).astype(int)
-            inside = (u>=0) & (v>=0) & (u<width) & (v<height)
-            world,z,u,v = world[inside],z[inside],u[inside],v[inside]
-            valid = valid_pixels[v,u]
-            world,z,u,v = world[valid],z[valid],u[valid],v[valid]
-            # Z-buffer: occluded surfaces must not take the foreground's colour.
-            order = np.argsort(z, kind="stable")
-            _, first = np.unique((v*width+u)[order], return_index=True)
-            sel = order[first]
-            world,z,u,v = world[sel],z[sel],u[sel],v[sel]
+            world,z,u,v=project(world,T)
             if len(z) < 100:
                 continue
             image = cv2.remap(image, mx, my, cv2.INTER_LINEAR)
             depth = np.zeros((height,width), "<f4"); depth[v,u] = z
+            validation=(ordinal[k]%a.submap_frames)%8==4
             points = np.column_stack([world, image[v,u,::-1]/255., z]).astype("<f4")
             if files is None or frame_count % a.submap_frames == 0:
                 if files is not None: files.close()
@@ -184,8 +185,6 @@ def run(a):
                 submaps.append(sub)
                 files = open(sub / "frames.txt", "w")
                 files.write(f"{width} {height} {fx:.12g} {fy:.12g} {cx:.12g} {cy:.12g}\n")
-            local_index = frame_count % a.submap_frames
-            validation = local_index % 8 == 4
             name = f"frame_{frame_count:06d}"
             if not cv2.imwrite(str(sub / (name+".png")), image): raise RuntimeError("Cannot save image")
             with open(sub / (name+".bin"), "wb") as f:
@@ -200,8 +199,27 @@ def run(a):
     if frame_count < 4:
         raise RuntimeError("Too few frames with valid camera/LiDAR coverage")
     (output / "camera_poses.json").write_text(json.dumps(poses, indent=2))
+    (output / "preparation.json").write_text(json.dumps(dict(fusion=str(fusion),dataset=str(bag),
+        calibration=str(calib_path),camera_offset_sec=camera_offset,frames=frame_count,
+        geometry_source="scan proposals; shared mapper associates the global accepted native surface" if a.backend=="shared" else "nearest raw scan",
+        camera_start=poses[0]["stamp"],camera_end=poses[-1]["stamp"],options=vars(a)),indent=2))
     if a.prepare_only:
         print(f"[gaussian] prepared {frame_count} frames in {workspace}", flush=True)
+        return
+    if a.backend == "shared":
+        from livo.gaussian_global import refine
+        shared = output / "shared"
+        info = refine(workspace, shared, binary, voxel=a.voxel, epochs=a.shared_epochs,
+                      sweeps=a.shared_sweeps, batch_frames=a.submap_frames,
+                      max_active=a.max_active, replay_views=a.replay_views,sky_masks=not a.no_sky_masks)
+        for name in ["point_cloud.ply", "gaussian_centers.pcd"]:
+            (shared/name).replace(output/name)
+        info.update(fusion=str(fusion),dataset=str(bag),calibration=str(calib_path),
+                    camera_offset_sec=camera_offset,submaps=1,options=vars(a),
+                    elapsed_sec=time.monotonic()-started)
+        (output/"map_info.json").write_text(json.dumps(info,indent=2,ensure_ascii=False))
+        if not a.keep_inputs: shutil.rmtree(workspace)
+        print(json.dumps({k:info[k] for k in ["status","frames","submaps","gaussians","elapsed_sec"]}),flush=True)
         return
     outputs = []
     for sub in submaps:
@@ -231,6 +249,13 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("run"); ap.add_argument("--dataset"); ap.add_argument("--calibration"); ap.add_argument("--out")
     ap.add_argument("--binary",default=str(REPO/"build/gaussian/my_livo_gaussian"))
+    ap.add_argument("--backend",choices=["shared","legacy"],default="shared",
+                    help="Shared fixed-pose global map (default); legacy reproduces independent submap concatenation")
+    ap.add_argument("--voxel",type=float,default=.08,help="Shared map: measured-anchor association cell in metres")
+    ap.add_argument("--shared-epochs",type=int,default=12);ap.add_argument("--shared-sweeps",type=int,default=2)
+    ap.add_argument("--replay-views",type=int,default=40)
+    ap.add_argument("--no-sky-masks",action="store_true",help="Disable optional local semantic foreground masks")
+    ap.add_argument("--max-active",type=int,default=3000000,help="Shared map: GPU working-set budget; camera batches split when needed")
     ap.add_argument("--width",type=int,default=640); ap.add_argument("--interval",type=float,default=0.5)
     ap.add_argument("--max-depth",type=float,default=120); ap.add_argument("--submap-frames",type=int,default=40)
     ap.add_argument("--iterations",type=int,default=40); ap.add_argument("--refine-passes",type=int,default=15)
@@ -246,6 +271,10 @@ def main():
             and a.refine_passes>=0 and 1000<=a.max_gaussians<=2000000 and a.start>=0 and a.max_depth>1
             and 0<a.depth_weight<=10 and 0<a.max_scale<=1 and 0<=a.position_lr<=0.001 and (a.duration is None or a.duration>0)):
         ap.error("Invalid Gaussian mapping settings")
+    if not (.01<=a.voxel<=.3 and a.shared_epochs>0 and a.shared_sweeps>0 and a.replay_views>=0 and a.max_active>=1000):
+        ap.error("Invalid shared mapping settings")
+    if a.backend=="shared" and a.position_lr!=0:
+        ap.error("Shared surface mapping keeps measured centres fixed (--position-lr 0)")
     run(a)
 
 

@@ -40,7 +40,7 @@ def stats(v):
                 p90=float(np.percentile(a,90)), min=float(a.min()), max=float(a.max()), n=len(a))
 
 
-def make_previews(table,props,poses,out):
+def make_previews(table,props,poses,out,model_info=None):
     """Small unchanged spatial regions for an 8 GB GPU; the complete global PLY remains intact."""
     ordered=list(poses.values());views={"start":ordered[min(60,len(ordered)-1)],"middle":ordered[len(ordered)//2],"end":ordered[-8]}
     records=[]
@@ -50,7 +50,11 @@ def make_previews(table,props,poses,out):
         with open(payload,'wb') as f:
             for start in range(0,len(table),100000):
                 block=table[start:start+100000];delta=block[:,:3]-center
-                chosen=block[(delta*delta).sum(1)<=62**2];chosen.tofile(f);count+=len(chosen)
+                keep=(delta*delta).sum(1)<=62**2
+                if model_info and model_info.get("intrinsics"):
+                    k=model_info["intrinsics"];camera=delta@np.array(pose["T_world_camera"])[:3,:3];z=camera[:,2]
+                    keep|=(z>.2)&(z<120)&(camera[:,0]>-k["cx"]/k["fx"]*z-1.5)&(camera[:,0]<(k["width"]-k["cx"])/k["fx"]*z+1.5)&(camera[:,1]>-k["cy"]/k["fy"]*z-1.5)&(camera[:,1]<(k["height"]-k["cy"])/k["fy"]*z+1.5)
+                chosen=block[keep];chosen.tofile(f);count+=len(chosen)
         model=folder/'point_cloud.ply'
         with open(model,'wb') as f:
             f.write(('ply\nformat binary_little_endian 1.0\nelement vertex '+str(count)+'\n'+''.join('property float '+p+'\n' for p in props)+'end_header\n').encode())
@@ -58,8 +62,10 @@ def make_previews(table,props,poses,out):
                 import shutil
                 shutil.copyfileobj(src,f,4*1024*1024)
         payload.unlink();(folder/'camera_poses.json').write_text(json.dumps([pose],indent=2))
-        record={'region':name,'gaussians':count,'radius_m':62,'stamp':pose['stamp'],'source':'complete global Gaussian map; unchanged selected rows'}
+        record={'region':name,'gaussians':count,'radius_m':62,'forward_context_depth_m':120 if model_info else None,'stamp':pose['stamp'],'source':'complete global Gaussian map; unchanged selected rows'}
         (folder/'region_info.json').write_text(json.dumps(record,indent=2));records.append(record)
+        if model_info:
+            (folder/'map_info.json').write_text(json.dumps({k:model_info[k] for k in ['background_rgb','intrinsics'] if k in model_info},indent=2))
     return records
 
 

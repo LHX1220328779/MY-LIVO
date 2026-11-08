@@ -10,6 +10,7 @@ fi
 if ! "$gs_env/bin/python" -c 'import torch; assert torch.__version__.startswith("2.5.1"); assert torch.cuda.is_available()' 2>/dev/null; then
   "$gs_env/bin/pip" install --no-cache-dir torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124
 fi
+"$gs_env/bin/pip" install transformers==4.46.3 safetensors==0.4.5
 if [[ ! -x "$cuda_prefix/bin/nvcc" ]]; then
   "$conda_exe" create -y -p "$cuda_prefix" --override-channels -c nvidia/label/cuda-12.4.1 -c defaults \
     cuda-nvcc cuda-cudart-dev cuda-cudart-static cuda-cccl cuda-driver-dev

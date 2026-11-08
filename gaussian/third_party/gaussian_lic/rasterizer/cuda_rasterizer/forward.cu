@@ -360,7 +360,7 @@ renderCUDA(
 
 	// what is the number of buckets before me? what is my offset?
 	uint32_t bbm = 0;
-	if (!no_color) 
+	if (!no_color && sampled_T != nullptr)
 	{
 		bbm = tile_id == 0 ? 0 : per_tile_bucket_offset[tile_id - 1];
 		// let's first quickly also write the bucket-to-tile mapping
@@ -413,7 +413,7 @@ renderCUDA(
 		for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++) 
 		{
 			// add incoming T value for every 32nd gaussian
-			if (j % 32 == 0 && !no_color) 
+			if (j % 32 == 0 && !no_color && sampled_T != nullptr)
 			{
 				sampled_T[(bbm * BLOCK_SIZE) + block.thread_rank()] = T;  //
 				for (int ch = 0; ch < CHANNELS; ++ch) 
@@ -470,7 +470,7 @@ renderCUDA(
 		{
 			n_contrib[pix_id] = last_contributor;
 			for (int ch = 0; ch < CHANNELS; ch++) 
-				out_color[ch * H * W + pix_id] = C[ch];
+				out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
 			out_depth[pix_id] = contributor_real ? depth_render / (1 - T) : 0.f;
 		}
 	}

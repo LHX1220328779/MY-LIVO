@@ -187,6 +187,10 @@ public:
     int max_iterations_ = 40;
     int64_t max_gaussians_ = 600000;
     double max_scale_ = 0.5;
+    // Shared-map refinement: fixed measured centres/normals, per-surfel scale bounds.
+    bool surface_mode_ = false;
+    torch::Tensor scale_upper_, scale_lower_;
+    double last_loss_ = 0;
     bool is_init_;
 
     torch::Tensor bg_;

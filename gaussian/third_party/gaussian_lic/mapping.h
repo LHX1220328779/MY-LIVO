@@ -22,7 +22,7 @@ struct Params {
 };
 
 struct Frame {
-    cv::Mat image, depth;
+    cv::Mat image, depth, sky, dynamic;
     Eigen::Matrix3d R_wc;
     Eigen::Vector3d t_wc;
     std::vector<Eigen::Vector3d> points, colors;

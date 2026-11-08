@@ -435,9 +435,9 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 			imgState.ranges);
 	CHECK_CUDA(, debug)
 
-	SampleState sampleState;
+	SampleState sampleState{};
 	unsigned int bucket_sum = 0;
-	if (!no_color) 
+	if (!no_color && sampleBuffer)
 	{
 		int num_tiles = tile_grid.x * tile_grid.y;
 		perTileBucketCount<<<(num_tiles + 255) / 256, 256>>>(num_tiles, imgState.ranges, imgState.bucket_count);
@@ -469,7 +469,7 @@ std::tuple<int,int> CudaRasterizer::Rasterizer::forward(
 		background,
 		out_color, out_final_T, out_depth, no_color), debug)
 
-	if (!no_color) 
+	if (!no_color && sampleBuffer)
 	{
 		// out_color -> imgState.pixel_colors
 		// out_depth -> imgState.pixel_depth

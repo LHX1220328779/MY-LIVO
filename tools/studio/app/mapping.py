@@ -201,7 +201,7 @@ def busy():
     active = jobs.active("mapping") or jobs.active("pipeline")
     if active:
         return active
-    if pgrep("fastlivo_mapping|my_livo_gaussian|livo/gaussian_map.py"):
+    if pgrep("fastlivo_mapping|my_livo_gaussian|livo/gaussian_map.py|livo/gaussian_global.py"):
         return "external"
     return None
 
@@ -292,7 +292,7 @@ def stop(mode="finish"):
 
 
 def kill_all():
-    subprocess.run(["pkill", "-TERM", "-f", ROS_PROCESS_PATTERN + "|my_livo_gaussian|livo/gaussian_map.py"], check=False)
+    subprocess.run(["pkill", "-TERM", "-f", ROS_PROCESS_PATTERN + "|my_livo_gaussian|livo/gaussian_map.py|livo/gaussian_global.py"], check=False)
     return {"ok": True}
 
 
@@ -523,6 +523,10 @@ def live(round_name):
             out["gaussian"] = {k: gaussian.get(k) for k in ("frames", "gaussians", "submaps", "elapsed_sec")}
             out["gaussian"]["files"] = [f"gaussian/{n}" for n in ("point_cloud.ply", "gaussian_centers.pcd", "map_info.json")]
             out["gaussian"]["renders"] = [str(p.relative_to(f)) for p in sorted((f / "gaussian").glob("submap_*/trained_*.png"))[:6]]
+            if not out["gaussian"]["renders"]:
+                for pattern in ["shared/views/batch_*/merged_*.png","views/batch_*/merged_*.png"]:
+                    out["gaussian"]["renders"] = [str(p.relative_to(f)) for p in sorted((f/"gaussian").glob(pattern))[:6]]
+                    if out["gaussian"]["renders"]:break
         out["has_archive"] = (f / "scans.bin").exists()
         out["loops"] = loop_summary(f)
     # per-frame rear-axle error of the optimized (delivered) and native trajectories vs RTK, written by

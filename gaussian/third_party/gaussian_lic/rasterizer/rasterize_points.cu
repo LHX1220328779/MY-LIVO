@@ -106,7 +106,10 @@ RasterizeGaussiansCUDA(
     std::function<char*(size_t)> geomFunc = resizeFunctional(geomBuffer);
     std::function<char*(size_t)> binningFunc = resizeFunctional(binningBuffer);
     std::function<char*(size_t)> imgFunc = resizeFunctional(imgBuffer);
-    std::function<char*(size_t)> sampleFunc = resizeFunctional(sampleBuffer);
+    // The adapter always optimizes opacity during training; sigmoid outputs
+    // require grad there, and are detached by NoGradGuard during replay.
+    std::function<char*(size_t)> sampleFunc;
+    if (opacity.requires_grad()) sampleFunc = resizeFunctional(sampleBuffer);
 
     if(P != 0) 
     {

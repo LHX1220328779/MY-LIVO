@@ -100,8 +100,9 @@ public:
         float zfar = zfar_;
         P.index({0, 0}) = 1.0 / std::tan(FoVx_ / 2);
         P.index({1, 1}) = 1.0 / std::tan(FoVy_ / 2);
-        P.index({0, 2}) = (2 * cx - W) / W;
-        P.index({1, 2}) = (2 * cy - H) / H;
+        // CUDA ndc2Pix maps NDC to integer pixel centres with a -0.5 offset.
+        P.index({0, 2}) = (2 * cx + 1 - W) / W;
+        P.index({1, 2}) = (2 * cy + 1 - H) / H;
         P.index({3, 2}) = 1.0f;
         P.index({2, 2}) = zfar / (zfar - znear);
         P.index({2, 3}) = -(zfar * znear) / (zfar - znear);
@@ -116,6 +117,7 @@ public:
     int image_height_;
     torch::Tensor original_image_;
     torch::Tensor original_depth_;
+    torch::Tensor sky_mask_, dynamic_mask_;
           
     float fx_;
     float fy_;

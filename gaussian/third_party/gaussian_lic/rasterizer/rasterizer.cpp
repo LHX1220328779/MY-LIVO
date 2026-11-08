@@ -96,7 +96,8 @@ GaussianRasterizerFunction::forward(
                             geomBuffer,
                             binningBuffer,
                             imgBuffer,
-                            sampleBuffer});
+                            sampleBuffer,
+                            final_T});
     return {color, radii, depth, final_T};
 }
 
@@ -136,7 +137,11 @@ GaussianRasterizerFunction::backward(
 
     auto dL_dcolor = grad_outputs[0];
     // auto dL_dradii = grad_outputs[1];
-    auto dL_ddepth = grad_outputs[2];
+    // Forward returns E[z] = sum(alpha*T*z) / (1-T_final).
+    // The CUDA depth recurrence uses -E[z]+prefix(sum(alpha*T*z)),
+    // which already includes the quotient's opacity term, but its upstream
+    // derivative must still be divided by the accumulated opacity.
+    auto dL_ddepth = grad_outputs[2] / (1.0f-saved[16]).clamp_min(1e-6f);
     // auto dL_dfinal_T = grad_outputs[3];
     auto rasterization_backward_result = RasterizeGaussiansBackwardCUDA(
         bg,

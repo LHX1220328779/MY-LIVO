@@ -328,6 +328,7 @@ void GaussianModel::saveMap(const std::string& result_path)
 
 void GaussianModel::trainingSetup()
 {
+    GAUSSIAN_MODEL_TENSORS_TO_VEC
     this->sparse_optimizer_.reset(new SparseGaussianAdam(Tensor_vec_xyz_, 0.0, 1e-15));
     sparse_optimizer_->param_groups()[0].options().set_lr(position_lr_);
 
@@ -430,7 +431,8 @@ void extend(const std::shared_ptr<Dataset>& dataset, std::shared_ptr<GaussianMod
 {
     torch::NoGradGuard no_grad;
     torch::Tensor bg;
-    if (pc->white_background_) bg = torch::ones({3}, torch::kFloat32).cuda();
+    if (pc->bg_.defined()) bg=pc->bg_;
+    else if (pc->white_background_) bg = torch::ones({3}, torch::kFloat32).cuda();
     else bg = torch::zeros({3}, torch::kFloat32).cuda();
     std::shared_ptr<Camera> viewpoint_cam = dataset->train_cameras_.back();
     auto render_pkg = render(viewpoint_cam, pc, bg, pc->apply_exposure_, true);
@@ -600,6 +602,10 @@ void decayOptList(int max_iters, const int train_camera_num,
 
 double optimize(const std::shared_ptr<Dataset>& dataset, std::shared_ptr<GaussianModel>& pc)
 {
+    // Shared refinement does not consume the upstream per-operation GPU timers.
+    // Keep work on its CUDA stream rather than synchronizing after every stage.
+    auto sync_for_timing = [&]() { if (!pc->surface_mode_) torch::cuda::synchronize(); };
+    std::vector<torch::Tensor> losses;
     pc->t_start_ = std::chrono::steady_clock::now();
     int updated_num = 0;
     std::vector<int> opt_list;
@@ -622,15 +628,16 @@ double optimize(const std::shared_ptr<Dataset>& dataset, std::shared_ptr<Gaussia
     } 
     if (pc->iteration_decay_) decayOptList(max_iters, train_camera_num, dataset, all_list, opt_list);
     std::shuffle(opt_list.begin(), opt_list.end(), gen);
-    torch::cuda::synchronize();
+    sync_for_timing();
     pc->t_end_ = std::chrono::steady_clock::now();
     pc->t_optlist_ += std::chrono::duration_cast<std::chrono::duration<double>>(pc->t_end_ - pc->t_start_).count();
 
     pc->t_start_ = std::chrono::steady_clock::now();
     torch::Tensor bg;
-    if (pc->white_background_) bg = torch::ones({3}, torch::kFloat32).cuda();
+    if (pc->bg_.defined()) bg=pc->bg_;
+    else if (pc->white_background_) bg = torch::ones({3}, torch::kFloat32).cuda();
     else bg = torch::zeros({3}, torch::kFloat32).cuda();
-    torch::cuda::synchronize();
+    sync_for_timing();
     pc->t_end_ = std::chrono::steady_clock::now();
     pc->t_tocuda_ += std::chrono::duration_cast<std::chrono::duration<double>>(pc->t_end_ - pc->t_start_).count();
     for (int idx : opt_list)
@@ -639,38 +646,83 @@ double optimize(const std::shared_ptr<Dataset>& dataset, std::shared_ptr<Gaussia
         const std::shared_ptr<Camera>& viewpoint_cam = dataset->train_cameras_[idx];
         auto gt_image = viewpoint_cam->original_image_.to(torch::kCUDA, /*non_blocking=*/true);
         auto gt_depth = viewpoint_cam->original_depth_.to(torch::kCUDA, /*non_blocking=*/true);
-        torch::cuda::synchronize();
+        sync_for_timing();
         pc->t_end_ = std::chrono::steady_clock::now();
         pc->t_tocuda_ += std::chrono::duration_cast<std::chrono::duration<double>>(pc->t_end_ - pc->t_start_).count();
         pc->t_start_ = std::chrono::steady_clock::now();
+        if (pc->random_background_) bg=torch::rand({3},torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
         auto render_pkg = render(viewpoint_cam, pc, bg, pc->apply_exposure_);
         auto rendered_image = std::get<0>(render_pkg);
         auto rendered_depth = std::get<1>(render_pkg);
         auto mask = (gt_depth > 0) & (rendered_depth > 0);
-        auto Ll1 = loss_utils::l1_loss(rendered_image, gt_image);
-        auto Ll1_depth = torch::abs(rendered_depth.masked_select(mask) - gt_depth.masked_select(mask)).mean();
+        torch::Tensor dynamic;
+        if (pc->surface_mode_ && viewpoint_cam->dynamic_mask_.defined()) {
+            dynamic=torch::nn::functional::max_pool2d(viewpoint_cam->dynamic_mask_.cuda().reshape({1,1,gt_depth.size(-2),gt_depth.size(-1)}),
+                torch::nn::functional::MaxPool2dFuncOptions(3).stride(1).padding(1)).squeeze()>.5;
+            mask=mask&~dynamic;
+        }
+        torch::Tensor sky;
+        if (pc->surface_mode_ && viewpoint_cam->sky_mask_.defined()) {
+            sky=(viewpoint_cam->sky_mask_.cuda()>.5)&(gt_depth<=0);
+            gt_image=gt_image*(~sky).unsqueeze(0)+bg.reshape({3,1,1})*sky.unsqueeze(0);
+        }
+        torch::Tensor color_mask;
+        if (pc->surface_mode_) {
+            // Missing depth is not a black surface, nor a request to enlarge nearby splats.
+            color_mask = torch::nn::functional::max_pool2d((gt_depth > 0).to(torch::kFloat).reshape({1,1,gt_depth.size(-2),gt_depth.size(-1)}),
+                torch::nn::functional::MaxPool2dFuncOptions(7).stride(1).padding(3)).squeeze() > 0;
+            // Other training scans also provide valid surface coverage here.
+            // Their appearance must be trained even without this scan's return.
+            color_mask = color_mask | ((1.0f-std::get<2>(render_pkg).detach()).squeeze() > 0.5f);
+            if (sky.defined()) color_mask=color_mask&~sky;
+            if (dynamic.defined()) {
+                auto ignored=torch::nn::functional::max_pool2d(dynamic.to(torch::kFloat).reshape({1,1,gt_depth.size(-2),gt_depth.size(-1)}),
+                    torch::nn::functional::MaxPool2dFuncOptions(11).stride(1).padding(5)).squeeze()>0;
+                color_mask=color_mask&~ignored;
+            }
+        }
+        torch::Tensor color_weight;
+        auto Ll1=loss_utils::l1_loss(rendered_image,gt_image);
+        if (pc->surface_mode_) {
+            color_weight=color_mask.to(torch::kFloat);
+            Ll1=((rendered_image-gt_image).abs()*color_weight.unsqueeze(0)).sum()/(3*color_weight.sum().clamp_min(1));
+        }
+        if (sky.defined()) {
+            auto sw=sky.to(torch::kFloat);
+            Ll1=Ll1+.1*((rendered_image-bg.reshape({3,1,1})).abs()*sw.unsqueeze(0)).sum()/(3*sw.sum().clamp_min(1));
+        }
+        auto residual_depth = torch::abs(rendered_depth-gt_depth);
+        // Fixed measured geometry must not be distorted to fit alpha-blended
+        // centre depths, especially on a road seen at grazing incidence.
+        if (pc->surface_mode_) residual_depth=residual_depth/gt_depth.clamp_min(5.0f);
+        auto depth_weight=mask.to(torch::kFloat);
+        auto Ll1_depth = (residual_depth*depth_weight).sum()/depth_weight.sum().clamp_min(1);
         float lambda_dssim = pc->lambda_dssim_;
         float lambda_depth = pc->lambda_depth_;
         torch::Tensor ssim_value;
         torch::Tensor rendered_image_unsq = rendered_image.unsqueeze(0);
         torch::Tensor gt_image_unsq = gt_image.unsqueeze(0);
-        ssim_value = loss_utils::fused_ssim(rendered_image_unsq, gt_image_unsq);
+        if (pc->surface_mode_) {
+            auto ssim_map = loss_utils::FusedSSIMMap::apply(loss_utils::C1, loss_utils::C2, rendered_image_unsq, gt_image_unsq);
+            ssim_value = 1-((1-ssim_map)*color_weight.reshape({1,1,color_mask.size(0),color_mask.size(1)})).sum()/(3*color_weight.sum().clamp_min(1));
+        } else ssim_value = loss_utils::fused_ssim(rendered_image_unsq, gt_image_unsq);
         auto loss = (1.0 - lambda_dssim) * Ll1 + lambda_dssim * (1.0 - ssim_value);
-        if (pc->optimize_depth_ && mask.any().item<bool>()) loss += lambda_depth * Ll1_depth;
-        TORCH_CHECK(torch::isfinite(loss).item<bool>(), "Non-finite Gaussian loss");
-        torch::cuda::synchronize();
+        if (pc->optimize_depth_) loss += lambda_depth * Ll1_depth;
+        losses.push_back(loss.detach());
+        if (!pc->surface_mode_) TORCH_CHECK(torch::isfinite(loss).item<bool>(), "Non-finite Gaussian loss");
+        sync_for_timing();
         pc->t_end_ = std::chrono::steady_clock::now();
         pc->t_forward_ += std::chrono::duration_cast<std::chrono::duration<double>>(pc->t_end_ - pc->t_start_).count();
         
         pc->t_start_ = std::chrono::steady_clock::now();
         loss.backward();
-        torch::cuda::synchronize();
+        sync_for_timing();
         pc->t_end_ = std::chrono::steady_clock::now();
         pc->t_backward_ += std::chrono::duration_cast<std::chrono::duration<double>>(pc->t_end_ - pc->t_start_).count();
 
         pc->t_start_ = std::chrono::steady_clock::now();
         auto visible = std::get<4>(render_pkg);
-        updated_num += visible.sum().item<int>();
+        if (!pc->surface_mode_) updated_num += visible.sum().item<int>();
         pc->sparse_optimizer_->set_visibility_and_N(visible, pc->getXYZ().size(0));
         pc->sparse_optimizer_->step();
         pc->sparse_optimizer_->zero_grad(true);
@@ -678,17 +730,22 @@ double optimize(const std::shared_ptr<Dataset>& dataset, std::shared_ptr<Gaussia
             // Preserve LiDAR-scale detail: large splats must not fill unsupported depth gaps.
             torch::NoGradGuard no_grad;
             pc->scaling_.clamp_(std::log(1e-4), std::log(pc->max_scale_));
+            if (pc->surface_mode_) pc->scaling_.copy_(torch::minimum(torch::maximum(pc->scaling_,pc->scale_lower_),pc->scale_upper_));
         }
         if (pc->apply_exposure_)
         {
             pc->exposure_optimizer_->step();
             pc->exposure_optimizer_->zero_grad(true);
         }
-        torch::cuda::synchronize();
+        sync_for_timing();
         pc->t_end_ = std::chrono::steady_clock::now();
         pc->t_step_ += std::chrono::duration_cast<std::chrono::duration<double>>(pc->t_end_ - pc->t_start_).count();
     }
 
-    return updated_num / opt_list.size();
+    if (!losses.empty()) {
+        pc->last_loss_=torch::stack(losses).mean().item<double>();
+        TORCH_CHECK(std::isfinite(pc->last_loss_), "Non-finite shared Gaussian loss");
+    }
+    return updated_num / std::max<size_t>(1,opt_list.size());
 }
 

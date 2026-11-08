@@ -1,78 +1,91 @@
 # 高斯建图
 
-新增模式名为 `gaussian`，与 `lio`、`livo` 并列。Studio 首页与建图页均可选择。它使用原有 LIVO 估计与 RTK 最终校正，然后运行独立 Gaussian-LIC 建图程序。现有估计器源码、外参、RTK 因子及 LIO/LIVO 参数均不修改。也可以直接读取已有 LIO/LIVO 轮次，完全跳过位姿估计的重跑。
+`gaussian` 与 `lio`、`livo` 并列。高斯模式复用原生 LIVO 和 RTK 最终校正，再独立优化地图外观；相机位姿、高斯中心、原有里程计与标定不进入优化。也可直接读取已有轮次，跳过位姿估计重跑。
 
 ## 环境与构建
 
-本机使用 `/opt/venvs/my-livo-gaussian` 的 PyTorch 2.5.1+cu124、`/opt/cuda-12.4` 编译器和 RTX 4060 8 GB。原有 `data_process` 环境没有 PyTorch，因此另建环境。系统 ROS Python、OpenCV 与原建图程序不变。CUDA 库复用 PyTorch 安装内容。
-
-本机依赖已配置；重新部署需先安装系统 `python3-venv`、`libglm-dev`，并具备原项目的 OpenCV/Eigen/CMake/ROS 与 FFmpeg：
+本机复用 `/opt/venvs/my-livo-gaussian`：PyTorch 2.5.1+cu124、CUDA 12.4、RTX 4060 8 GB。系统 ROS Python/OpenCV 不变。依赖包含固定版本 transformers 4.46.3、safetensors 0.4.5，用于本地天空分割。
 
 ```bash
 bash scripts/setup_gaussian.sh
 bash scripts/build_gaussian.sh
 ```
 
-`GAUSSIAN_ENV`、`GAUSSIAN_CONDA`、`CUDA_HOME` 可改变依赖安装位置；构建时用 `GAUSSIAN_PYTHON` 指定 Python。`GAUSSIAN_CUDA_ARCH` 默认为本机的 `89`，其他 GPU 需指定相应架构。默认单任务编译，避免 LibTorch/CUDA 编译占满内存。构建目录独立为 `build/gaussian`，不向原 ROS CMake 增加 CUDA 依赖。`image_io.cpp` 将系统 OpenCV 的路径字符串留在其自身 ABI 内，兼容 pip LibTorch 的旧字符串 ABI。
+需具备原工程的 OpenCV/Eigen/CMake/FFmpeg，以及 `python3-venv`、`libglm-dev`。`GAUSSIAN_ENV`、`CUDA_HOME` 可指定安装位置；构建使用 `GAUSSIAN_PYTHON`，GPU 架构由 `GAUSSIAN_CUDA_ARCH` 指定（本机 89）。默认单任务编译，独立构建目录为 `build/gaussian`。OpenCV 图像读写保留独立 ABI 边界。
 
 ## 运行
 
-运行一个新轮次（数据、标定仍按原流程选择）：
+新轮次沿用数据和标定选择流程：
 
 ```bash
 bash scripts/run_wuhu_round.sh my_gaussian_1 --mode gaussian \
   --dataset /path/to/ros2bag --calibration /path/to/calibration.json
 ```
 
-`--duration`、`--start-offset`、`--no-rtk` 等原选项仍可使用。高斯模式需要相机与扫描存档，不能搭配 `--no-save-map`。原生完整 PCD、地图导出、轨迹和评估按原流程保留。高斯建图失败时轮次失败且保留已完成的原生地图与轨迹，不将失败伪装为成功。
+2026-11-08 起，运行脚本默认关闭 LIO/LIVO 的分块、全局及彩色建图 PCD，只保留扫描、位姿等存档。原生扫描选点掩码 `map_rows.bin` 独立保存，供高斯几何初始化使用；已有 PCD 不删除。高斯模式仍需要扫描存档，不能使用 `--no-save-map`。此设置只调整结果输出，不改估计器数学逻辑。
 
-从已有结果生成高斯地图，不重跑估计器：
+复用已有结果：
 
 ```bash
 source /opt/ros/humble/setup.bash
-/usr/bin/python3 tools/livo/gaussian_map.py results/<已有轮次>
+/usr/bin/python3 tools/livo/gaussian_map.py results/<已有轮次> \
+  --out results/<已有轮次>/gaussian_shared --keep-inputs
 ```
 
-默认从轮次清单读取原始录制，从运行的 `parameters.txt` 读取实际标定路径和相机偏移。必要时指定 `--dataset`、`--calibration`。输出默认在 `Log/fusion/<run>/gaussian/`；重复实验使用新的 `--out`，避免覆盖已有产品。
+默认从轮次清单读取录制，从 `parameters.txt` 读取实际标定路径和图像时间偏移，也可指定 `--dataset`、`--calibration`。每次使用新的 `--out`，避免覆盖已有地图。高斯阶段失败时保留原生轨迹与存档并报告失败。
 
-调节建图质量及资源使用：
+默认宽 640、采样间隔 0.5 秒、初始化体素 0.08 m。训练用一张共享地图，40 帧为一个工作批次，额外回放最多 40 个具有共同可见表面的训练视角，前后各遍历一次，每批最多 12 轮。`--max-active 3000000` 限制 GPU 内高斯数量，超额时继续拆分图像和相机批次。每批训练只加载相机前方 60 m 的表面；最终导出及留出评估包含完整全局地图，输出不会按此距离截断。
 
 ```bash
 /usr/bin/python3 tools/livo/gaussian_map.py results/<轮次> \
-  --out results/<轮次>/gaussian_high \
-  --width 960 --interval 0.5 --max-depth 120 \
-  --submap-frames 40 --iterations 40 --refine-passes 20
+  --out results/<轮次>/gaussian_shared \
+  --width 640 --interval 0.5 --voxel 0.08 \
+  --shared-epochs 12 --shared-sweeps 2 --max-active 3000000
 ```
 
-默认宽 640、每 0.5 秒一帧、每 40 帧一个子图、每个子图最多 600000 个高斯，15 轮末尾精修，激光最远 120 m。深度损失权重默认 0.1、尺度标准差上限 0.5 m（`--depth-weight` / `--max-scale`）。子图逐个训练释放显存，可覆盖长录制；总输出大小随场景增长。可用 `--start`、`--duration` 指定已有轮次内的时间窗口，单位秒、相对首个存档扫描。`--prepare-only` 仅准备固定相机位姿、RGB、深度和初始化点，`--keep-inputs` 保留这些中间文件。
+`--start`、`--duration` 限制已有轮次内的相机时间窗口；`--prepare-only` 只生成配对输入；`--keep-inputs` 保留输入；`--no-sky-masks` 关闭语义掩码。旧版独立子图拼接仅通过 `--backend legacy` 保留复现实验，其 `--iterations`、`--refine-passes`、`--max-gaussians`、`--position-lr` 等参数不控制共享表面模式。
 
-## 数据与算法边界
+## 算法与数据边界
 
-1. 使用原始 HEVC 的彩色图像，按标定内参缩放并去畸变；使用实际 `effective.img_time_offset_sec`。在原生存档位姿间插值，禁止跨缺失数据外推。
-2. 相机姿态链为 `T_native_imu * T_imu_rear * T_rear_camera`，再左乘最终 `C(t_image)`。扫描点复用 `map_export.py` 的逐点变换：原生扫描末位姿、LiDAR 外参、点时间 `C(t_point)`。相机与高斯统一处于最终地图坐标系。
-3. 使用真实 LiDAR 深度及 Z-buffer，遮挡表面不取前景颜色。迁入原 Gaussian-LIC 的 SH 高斯、可微 CUDA 渲染、alpha 增量扩展、稀疏 Adam、RGB/SSIM/深度约束。相机位姿不进入可训练参数，不回传估计器。默认 `--position-lr 0` 锁定已校正 LiDAR 初始化的高斯中心，优化尺度、方向、透明度和 SH 颜色；显式设置正学习率才允许高斯中心移动，始终不改变相机位姿或原有地图。
-4. 每八帧留出一帧，只用于渲染评估，不加入训练相机或初始化点。`initial` 是所有训练帧 LiDAR/RGB 初始化的未训练高斯模型；`trained` 是训练完成的模型。PSNR 同时记录全图值和 LiDAR 有效像素九像素邻域内的值，SSIM 为全图，深度 MAE 只计算双方有深度的位置，并单独记录覆盖率及 30 m 内深度 MAE/中位数，避免把扩展远景范围带来的深度变化误当成近场退化。
-5. 这是最终轨迹完成后的建图阶段，未声称在线实时。没有接入另一套里程计、相机位姿优化、学习深度补全或 TensorRT/SPNet 权重。相机视场外、超距、天空和动态物体缺少稳定的 LiDAR 几何支持；子图之间也未新增全局外观优化。高斯效果不代表独立验证了全场景厘米级定位指标。
+1. 相机使用原始 HEVC 图像、实际图像时间偏移和现有标定进行缩放、去畸变。缩放和 CUDA 投影统一像素中心约定，不修改标定文件。相机姿态仍为 `C(t_image) * T_native_imu * T_imu_rear * T_rear_camera`；禁止跨存档缺口外推。
+2. 高斯几何复用原生全局选点结果，不再把各图像时刻的原始远距离回波直接拼成地图。优先只读已有 `map/global_map.pcd`；没有 PCD 时按 `map_rows.bin` 从去畸变扫描和最终 `C(t_point)` 重建，在内部缓存为 NPY，不生成原生 PCD。每个 8 cm 单元保留真实表面样本，避免增加一次质心平滑。
+3. 将全局表面投影至训练图像，按像素 Z-buffer 和真实 LiDAR 前景深度检查遮挡。结合原生选点、自车回波、车辆实际通过的内部空间、保守自由空间和语义车辆/人员深度关联，清理跨时段动态残留。地面高度和细长结构保护用于限制误删；全部清理只作用于高斯种子。只使用训练 RGB 初始化颜色，留出 RGB 不参与初始化或优化。全量原生 LiDAR 表面是几何输入，不能把这一评估宣称为完全未观测几何的新场景泛化。
+4. 全局高斯行保持固定身份。每批从共享表读取、训练后写回相同行；相邻时段、重复经过区域都更新同一张地图，不再导出多个独立高斯层后直接叠加。
+5. 局部 PCA 决定表面方向和初始协方差；路面限制法向厚度，细长结构限制横向尺度，不确定邻域采用紧凑尺度。中心和方向固定，仅训练 SH3 外观、透明度和有上下界的尺度。深度项使用相对残差，CUDA 归一化深度梯度包含 alpha 归一化因子，避免以大薄片或厚路面换取 RGB 指标。
+6. 同一个本地 SegFormer 同时提供保守天空掩码和车辆/人员掩码。天空保护图像边缘与真实 LiDAR 像素；车辆/人员需结合深度及离地高度关联，不能把被遮挡的远处静态表面直接当成车辆。训练时屏蔽车辆区域的 RGB/SSIM/深度损失，避免将移动卡车外观写入静态路面。模型和 revision 固定，推理在本机进行；不使用学习深度、第二相机或新位姿源。天空背景色只从训练图像估计；训练使用随机背景减少前景透明度与颜色的歧义。没有几何支持的天空用常量背景表达，不是重建了真实天空纹理。
+7. 每八帧留出一帧，最终从完整保存的 PLY 重渲染。评估包含全图 PSNR/SSIM、真实 LiDAR 覆盖邻域 PSNR、双方有深度处的渲染深度 MAE，以及 30 m 内 MAE/中位数。高斯混合期望深度不同于点云表面误差，这些指标不能替代独立轨迹或灯柱顶部厘米级验收。
 
-## 产品
+这是最终轨迹完成后的离线建图阶段。单中距相机视场外、LiDAR 未观测远景和动态遮挡仍有覆盖限制。
 
-- `point_cloud.ply`：合并的标准 SH 高斯参数，可用支持 3D Gaussian Splatting 的查看器打开；普通点云查看器不能显示其完整外观。
-- `gaussian_centers.pcd`：完整高斯中心与 DC 颜色，便于普通点云工具查看。原有 `map_*.pcd` 和 `map/global_map*.pcd` 是保留的原生几何产品。
-- `submap_*/trained_*.png`、`initial_*.png`、`reference_*.png`：留出视角的训练后、初始化及真实图像。
-- `submap_*/metrics.csv`、`map_info.json`：每视角质量数据、实际选项与数据来源。
-- `camera_poses.json`：仅供高斯建图使用的最终相机位姿和匹配时间，不修改原有轨迹。
+## 产品与评估
 
-Studio 结果中的“高斯地图”显示 PLY/PCD/元信息链接及留出视角渲染预览。
+- `point_cloud.ply`：一张完整的标准 SH3 高斯地图。
+- `gaussian_centers.pcd`：高斯中心和 DC 颜色，属于高斯产品。
+- `camera_poses.json`：实际固定相机位姿与时间。
+- `shared/seed_info.json`、`shared/training.log`、`map_info.json`：几何来源、约束、工作批次和运行参数。
+- `shared/views/batch_*/merged_*.png`、`reference_*.png`、`metrics.csv`：保存地图的留出视角重渲染与原图。
+
+Studio 结果可读取高斯产品和预览。评估旧版完整拼接图与新版时，使用相同相机、相同背景和同一组留出视角：
+
+```bash
+/usr/bin/python3 scripts/analysis/gaussian_compare.py \
+  results/<轮次>/prepared/input results/<轮次>/gaussian_shared NEW_REPORT_DIR \
+  --baseline-model /path/to/old_complete/point_cloud.ply
+```
+
+报告包含逐视角对比和汇总，不用单子图的训练效果替代最终全局地图效果。共享训练在最终重渲染前写入 `trained_pending_replay` 检查点，已完成的视角批次保留。只渲染时不分配反向传播采样缓存，载入 PLY 时也避免复制一整张 GPU 表；这两处降低显存占用而不改变渲染结果。
 
 ## 浏览器查看与 Linux 黑屏
 
 推荐使用专用启动命令：
 
 ```bash
-bash scripts/view_gaussian.sh results/xingye_13_gaussian_3
+bash scripts/view_gaussian.sh results/xingye_13_gaussian_4
 ```
 
 参数可以换成其他轮次目录、具体 `point_cloud.ply` 或 `.ssproj` 工程。目录内有 `.ssproj` 时优先恢复其显示方向和初始视角；直接打开本项目 PLY 时，根据 `camera_poses.json` 自动选取车辆视角，并将 Z 向上的地图调整为浏览器导航使用的 Y 向上。这只是显示变换。
+
+轮次目录包含 `analysis/preview_regions` 时，默认打开起始区域，减少完整大地图的加载时间。可显式指定 `preview_regions/middle`、`end` 或完整 `point_cloud.ply`。区域预览保留周围 62 m 及当前视角前方 120 m 的原高斯参数，避免截掉远处背景；完整地图单独保留。
 
 首次使用自动在 `build/gaussian/viewer` 安装固定版本 Playwright，并准备其 Chromium；需要 Node.js >=20.19、npm 和网络。本机已配置完成。后续复用该专用浏览器进程，打开其他地图只需再次运行同一命令并更换参数。也可在专用窗口使用“文件 → 打开”恢复 `.ssproj`、“文件 → 导入”选择高斯 PLY。保存为 `.ssproj` 可保留初始视角。
 
@@ -148,3 +161,22 @@ build/gaussian/my_livo_gaussian --render CAMERA_INPUT_DIR SAVED_MODEL.ply NEW_OU
 ```
 
 `--render-merged` 需要预先保留在 `full_gaussian_analysis/replay_inputs` 的配对输入，本次已保留22个全程分布视角。该重渲染不训练、不改位姿或高斯参数，并以单子图重载前后指标完全一致验证了解码约定。
+
+
+## 2026-11-08 完整共享表面地图
+
+复用星业13完整1020.12秒录制的同一原生存档，2036个相机帧、1782训练/254留出、114个工作批次，导出15204057个固定中心高斯。位姿和时间戳逐帧等于上一版完整地图，标定等于原生来源版本 `11a0d14`。只调整高斯建图及其查看/输出；新结果无 LIO/LIVO PCD。
+
+| 254 个相同留出视角的平均指标 | 旧完整拼接图 | 新共享地图 |
+|---|---:|---:|
+| 全图 SSIM ↑ | 0.4448 | 0.5446 |
+| 激光覆盖邻域 PSNR ↑ | 15.719 | 18.756 |
+| 全图 PSNR ↑ | 14.137 | 15.839 |
+| 30 m 内渲染深度 MAE / m ↓ | 0.863 | 0.433 |
+| 全范围渲染深度 MAE / m ↓ | 1.599 | 1.098 |
+| 30 m 内深度中位误差的视角均值 / m ↓ | 0.446 | 0.146 |
+| 有真实深度处的渲染深度覆盖率 ↑ | 1.0000 | 0.9861 |
+
+SSIM 改善 228/254 视角，26 个退化，尤其回程厂房近景存在明显条纹/亮斑；退化清单和截图同样保留在分析目录。双方从完整保存 PLY 重渲染，相机/图像/深度/背景相同；旧图52视角复用同条件真实缓存，202视角本次补跑。覆盖率有所降低，且个别深度指标仍会退化，不能据此宣称独立厘米级定位或灯柱高度指标已重新验收。共享训练、导出及新图完整重渲染累计约81.6分钟（复用已准备种子，不含此前准备/排查和旧图对照），训练显存采样峰值5747MiB。
+
+结果：`results/xingye_13_gaussian_4/`；中文分析 `analysis/analysis.md`，254视角对照 `analysis/report.html`，重点视角 `analysis/key_views.png`。完整PLY和高斯中心PCD在 `Log/fusion/1793847427156913686/gaussian/`，已保留训练/恢复日志和参数一致性验证。默认轮次浏览加载起点区域，中段/终点在 `analysis/preview_regions/middle|end`；完整地图独立保留。仍有局部黑点、车辆边缘残留及未观测远景，不宣称照片级重建。

@@ -10,6 +10,8 @@ void Dataset::addFrame(Frame& frame) {
     cam->image_name_ = frame.name;
     cam->original_image_ = tensor_utils::cvMat2TorchTensor_Float32(rgb, torch::kCPU);
     cam->original_depth_ = tensor_utils::cvMat2TorchTensor_Float32(frame.depth, torch::kCPU);
+    if (!frame.sky.empty()) cam->sky_mask_ = tensor_utils::cvMat2TorchTensor_Float32(frame.sky, torch::kCPU);
+    if (!frame.dynamic.empty()) cam->dynamic_mask_ = tensor_utils::cvMat2TorchTensor_Float32(frame.dynamic, torch::kCPU);
     is_keyframe_current_ = !frame.validation;
     if (frame.validation) {
         test_cameras_.push_back(cam);

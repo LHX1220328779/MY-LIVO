@@ -17,6 +17,10 @@ function findMap(input) {
     const projects = fs.readdirSync(p).filter(n => n.endsWith('.ssproj')).sort();
     if (projects.length) return path.join(p, projects[0]);
     if (fs.existsSync(path.join(p, 'point_cloud.ply'))) return path.join(p, 'point_cloud.ply');
+    for (const folder of ['analysis', 'full_gaussian_analysis']) {
+        const preview = path.join(p, folder, 'preview_regions/start/point_cloud.ply');
+        if (fs.existsSync(preview)) return preview;
+    }
     const fusion = path.join(p, 'Log/fusion');
     if (fs.existsSync(fusion)) {
         for (const n of fs.readdirSync(fusion).sort().reverse()) {
@@ -82,7 +86,9 @@ function findMap(input) {
     if (file.toLowerCase().endsWith('.ply')) {
         const poses = path.join(path.dirname(file), 'camera_poses.json');
         const pose = fs.existsSync(poses) ? JSON.parse(fs.readFileSync(poses, 'utf8')) : [];
-        await frame.evaluate(T => {
+        const infoPath = path.join(path.dirname(file), 'map_info.json');
+        const info = fs.existsSync(infoPath) ? JSON.parse(fs.readFileSync(infoPath, 'utf8')) : {};
+        await frame.evaluate(({ T, background, intrinsics }) => {
             const s = window.scene, model = s.elements.find(e => e.numSplats > 0);
             if (!model) throw Error('No Gaussian layer was imported.');
             // MY-LIVO is Z-up; browser navigation is Y-up. This affects the display transform only.
@@ -90,10 +96,19 @@ function findMap(input) {
             if (T) {
                 const p = s.camera.mainCamera.getPosition().clone().set(T[0][3], T[2][3], -T[1][3]);
                 const target = p.clone().set(p.x + 20*T[0][2], p.y + 20*T[2][2], p.z - 20*T[1][2]);
-                s.events.fire('camera.setFov', 75); s.camera.setPose(p, target, 0);
+                const horizontal = s.camera.mainCamera.camera.horizontalFov;
+                const aspect = s.camera.mainCamera.camera.aspectRatio || s.canvas.width / s.canvas.height;
+                const tanH = intrinsics ? intrinsics.width / (2 * intrinsics.fx) : 1;
+                const tanV = intrinsics ? intrinsics.height / (2 * intrinsics.fy) : 1;
+                const halfFov = horizontal ? Math.min(tanH, tanV * aspect) : Math.min(tanV, tanH / aspect);
+                const fov = intrinsics ? 2 * Math.atan(halfFov) * 180 / Math.PI : 75;
+                s.events.fire('camera.setFov', fov); s.camera.setPose(p, target, 0);
             } else s.camera.focus();
+            if (Array.isArray(background) && background.length === 3 && background.every(v => Number.isFinite(v) && v >= 0 && v <= 1)) {
+                s.events.fire('setBgClr', s.camera.mainCamera.camera.clearColor.clone().set(...background, 1));
+            }
             s.events.fire('grid.setVisible', false); s.camera.onUpdate(0); s.forceRender = true;
-        }, pose.length ? pose[Math.floor(pose.length / 2)].T_world_camera : null);
+        }, { T: pose.length ? pose[Math.floor(pose.length / 2)].T_world_camera : null, background: info.background_rgb, intrinsics: info.intrinsics });
     }
     const state = await frame.evaluate(async () => {
         const a = await navigator.gpu.requestAdapter();
