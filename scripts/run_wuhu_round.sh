@@ -21,6 +21,7 @@
 #        [--skip-stationary] [--stationary-min S] [--stationary-lidar-interval S]
 #                                          (LIO only: fast-forward standstills >= S s after the first drive, IMU/INS
 #                                           complete, LiDAR thinned; see tools/livo/motion.py)
+# Native LIO/LIVO PCD export is disabled by default; scan/pose archives are retained.
 #        [--no-map-chunks]                 (archives only, no map_N.pcd / rgb_map_N.pcd: calibration rounds)
 #        [--map-voxel M] [--map-source all|keyframes] [--map-tile M] [--map-min-points N] [--map-keyframes] [--no-map-export]
 #                                          (standard map products in Log/fusion/<run>/map/, see tools/livo/map_export.py:
@@ -43,10 +44,10 @@ repo=/home/project/MY-LIVO
 round=${1:?round name required, e.g. wuhu_rtk_91_ins_attitude}; shift
 mode=lio; use_rtk=true; save_map=true; use_rviz=false; rate=1.0; start_offset=0; duration=""; do_eval=1; quick_eval=0
 skip_stationary=0; stationary_min=30; stationary_lidar=1.0
-map_export=1; map_voxel=0.05; map_source=all; map_tile=0; map_keyframes=0; map_min_points=1
+map_export=0; map_voxel=0.05; map_source=all; map_tile=0; map_keyframes=0; map_min_points=1
 min_free_gb=0
 write_config_only=0
-sets=(); dataset="/home/project/data/haibo/wuhu_livo/ros2bag"; calibration=""
+sets=("rtk.export_map_chunks=false" "pcd_save.pcd_save_en=false"); dataset="/home/project/data/haibo/wuhu_livo/ros2bag"; calibration=""
 while (($#)); do
   case "$1" in
     --mode) mode="$2"; shift 2 ;;
@@ -89,7 +90,7 @@ if [[ "$mode" == gaussian ]]; then
   estimator_mode=livo
   [[ -x "$repo/build/gaussian/my_livo_gaussian" ]] || { echo "Build Gaussian mapping first: bash scripts/build_gaussian.sh" >&2; exit 2; }
   [[ $("$repo/build/gaussian/my_livo_gaussian" --version) == "MY-LIVO Gaussian-LIC adapter 1" ]] || { echo "Rebuild the outdated Gaussian executable: bash scripts/build_gaussian.sh" >&2; exit 2; }
-  [[ "$save_map" == true ]] || { echo "Gaussian mapping requires saved scans/PCD (--no-save-map is incompatible)" >&2; exit 2; }
+  [[ "$save_map" == true ]] || { echo "Gaussian mapping requires saved scan/pose archives (--no-save-map is incompatible)" >&2; exit 2; }
 fi
 if [[ -n "$calibration" ]]; then
   [[ -f "$calibration" ]] || { echo "calibration file not found: $calibration" >&2; exit 2; }

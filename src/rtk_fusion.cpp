@@ -3137,7 +3137,7 @@ void RtkFusion::exportMap()
     frame_index.flush();
     if (color_enabled) color_archive.flush();
     if (color_enabled && export_map_chunks) exportRgbMap();
-    if (export_map_chunks) exportIntensityMap();
+    exportIntensityMap();  // retain accepted scan rows for Gaussian mapping, independently of PCD output
   }
   RCLCPP_INFO(node->get_logger(), "RTK finalized %zu frames, %zu keys, %zu position factors (saved-map range cap %.1f m, rgb %.1f m, 0 = none): %s",
       frames.size(), keyframes.size(), accepted_positions, save_map_max_range, save_rgb_max_range, directory.c_str());
@@ -3148,7 +3148,6 @@ void RtkFusion::exportIntensityMap() const
   std::size_t chunk_index = 0;
     // Intensity delivery and its row mask are independent of the paired-frame RGB product.
     const std::size_t export_batch = 128;
-    if (export_map_chunks)
     {
       // RViz subscribed: also publish a 0.25 m voxel map of the delivered cloud (every 16th row) on /rtk/map_final.
       const bool display = rclcpp::ok() && final_map_publisher->get_subscription_count() > 0;
@@ -3174,7 +3173,6 @@ void RtkFusion::exportIntensityMap() const
       // map_export.py still pair every row with its return.
       std::vector<std::vector<std::uint8_t>> written(export_batch);
       std::ofstream rows_file;
-      if (prioritized || map_filter)
       {
         rows_file.exceptions(std::ios::badbit | std::ios::failbit);
         rows_file.open(directory / "map_rows.bin", std::ios::binary | std::ios::trunc);
@@ -3246,7 +3244,7 @@ void RtkFusion::exportIntensityMap() const
               rows_file.write(reinterpret_cast<const char *>(frame_bits.data()),
                               static_cast<std::streamsize>(frame_bits.size()));
           map_points += cloud.size();
-          if (cloud.empty()) return;
+          if (cloud.empty() || !export_map_chunks) return;
           const auto file = directory / ("map_" + std::to_string(index) + ".pcd");
           if (pcl::io::savePCDFileBinary(file.string(), cloud) != 0)
             throw std::runtime_error("Cannot write optimized point cloud " + file.string());
@@ -3324,9 +3322,9 @@ void RtkFusion::exportIntensityMap() const
       if (!chunk.empty() || !chunk_bits.empty()) write();
       wait(0);
       RCLCPP_INFO(node->get_logger(),
-          "Saved geometry map: %zu of %zu returns within the %.1f m cap selected (%.1f %%; range priority %s: ratio "
+          "Selected geometry surface: %zu of %zu returns within the %.1f m cap selected (%.1f %%; range priority %s: ratio "
           "%.2f, margin %.1f m, %zu cells of %.2f m, %zu seen-free cells of %.2f m from returns within %.1f m, pass 1 "
-          "%.1f s; detail fill %zu rows: %zu ground planes, %zu vegetation cells, pass 2 %.1f s); map_N.pcd %zu rows "
+          "%.1f s; detail fill %zu rows: %zu ground planes, %zu vegetation cells, pass 2 %.1f s); %zu accepted rows "
           "after the %.3f m map filter (nearest return per voxel of a chunk; every scan contributes; "
           "map_rows.bin follows; rtk.save_map_filter, 0 = off); voxel filters %.1f s "
           "in tasks beside the export, which waited %.1f s for them",
