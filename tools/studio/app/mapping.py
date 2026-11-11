@@ -79,7 +79,7 @@ EVENT_KEYS = ("Extrinsic precheck", "[WARN]", "[ERROR]", "[FATAL]", "RTK finaliz
 _EVENT_CACHE = {}
 
 
-def round_cmd(round_name, mode, calibration_file, body, *, force_save_map=False, evaluate=None):
+def round_cmd(round_name, mode, calibration_file, body, *, force_save_map=False, evaluate=None, export_pcd=False):
     dataset = str(safe_path(body.get("dataset") or ""))
     cmd = ["bash", str(ROUND_SCRIPT), round_name, "--mode", mode, "--dataset", dataset]
     if not body.get("use_rtk", True):
@@ -136,11 +136,14 @@ def round_cmd(round_name, mode, calibration_file, body, *, force_save_map=False,
     # saved map: drop far duplicate returns of surfaces another pass saw nearer (on by default)
     cmd.append("--no-map-priority" if body.get("map_priority", True) is False else "--map-priority")
     if body.get("save_map", True) or force_save_map:
+        # Manual mapping explicitly requests its PCDs. Development/calibration rounds
+        # and Gaussian inputs retain the archive-only default.
+        cmd.append("--map-chunks" if export_pcd else "--no-map-chunks")
         voxel, source, tile, kf, min_points = _map_export_args(body, "map_")
-        if body.get("map_export", True) is False:
+        if not export_pcd or body.get("map_export", True) is False:
             cmd.append("--no-map-export")
         else:
-            cmd += ["--map-voxel", f"{voxel:g}", "--map-source", source, "--map-tile", f"{tile:g}",
+            cmd += ["--map-export", "--map-voxel", f"{voxel:g}", "--map-source", source, "--map-tile", f"{tile:g}",
                     "--map-min-points", str(min_points)]
             if kf:
                 cmd.append("--map-keyframes")
@@ -268,7 +271,7 @@ def start(body):
                 f"来自其他矿区的车辆：请先切换到该矿区的车辆（或为当前数据选择正确的标定版本）。"
                 f"跨车标定会让原生轨迹从起步就偏离 RTK 米级")
     calib_file = str(calibration.calibration_file(cid)) if cid else None
-    cmd = round_cmd(round_name, mode, calib_file, body)
+    cmd = round_cmd(round_name, mode, calib_file, body, export_pcd=mode in ("lio", "livo"))
     meta = {"round": round_name, "mode": mode, "dataset": dataset, "calibration_id": cid,
             "options": {k: body.get(k) for k in ("use_rtk", "save_map", "rviz", "rate", "precheck", "frame_divider",
                                                   "evaluate", "extra_sets", "start_offset", "duration", "map_range", "rgb_range",

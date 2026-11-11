@@ -24,6 +24,8 @@ bash scripts/run_wuhu_round.sh my_gaussian_1 --mode gaussian \
 
 2026-11-08 起，运行脚本默认关闭 LIO/LIVO 的分块、全局及彩色建图 PCD，只保留扫描、位姿等存档。原生扫描选点掩码 `map_rows.bin` 独立保存，供高斯几何初始化使用；已有 PCD 不删除。高斯模式仍需要扫描存档，不能使用 `--no-save-map`。此设置只调整结果输出，不改估计器数学逻辑。
 
+2026-11-11：控制台手动执行 LIO/LIVO 并开启“保存地图”时，显式保存分块 PCD；开启“导出标准地图”时，同时生成 `Log/fusion/<stamp>/map/global_map.pcd`（LIVO 另有彩色产品）。脚本手动调用可增加 `--map-chunks --map-export`。开发脚本默认、标定流水线和高斯模式继续只保存原生扫描/位姿存档。
+
 复用已有结果：
 
 ```bash

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One complete, reproducible mapping round inside the calibration container (LIO or LIVO):
 #   launch mapper -> time-ordered real-time playback straight from the raw MCAP recording ->
-#   drain tail -> SIGINT the mapping node (it optimizes, exports trajectories + every map_*.pcd)
+#   drain tail -> SIGINT the mapping node (it optimizes, saves trajectories/archives + requested PCD products)
 #   -> stop launcher -> evaluate.
 # Everything (logs, PCDs, evaluation, effective config, round.json manifest) is written under
 # results/<round>/ only. No prepared/merged bag is required: --dataset accepts the raw recording
@@ -22,8 +22,10 @@
 #                                          (LIO only: fast-forward standstills >= S s after the first drive, IMU/INS
 #                                           complete, LiDAR thinned; see tools/livo/motion.py)
 # Native LIO/LIVO PCD export is disabled by default; scan/pose archives are retained.
+#        [--map-chunks]                    (explicitly save map_N.pcd / rgb_map_N.pcd)
 #        [--no-map-chunks]                 (archives only, no map_N.pcd / rgb_map_N.pcd: calibration rounds)
-#        [--map-voxel M] [--map-source all|keyframes] [--map-tile M] [--map-min-points N] [--map-keyframes] [--no-map-export]
+#        [--map-export] [--no-map-export]   (explicitly enable/disable standard PCD products)
+#        [--map-voxel M] [--map-source all|keyframes] [--map-tile M] [--map-min-points N] [--map-keyframes]
 #                                          (standard map products in Log/fusion/<run>/map/, see tools/livo/map_export.py:
 #                                           voxel-filtered global map (+ RGB), optional tiles and per-keyframe clouds)
 #        [--set laser_mapping.key.subkey=value ...] [--no-eval] [--write-config-only]
@@ -74,7 +76,9 @@ while (($#)); do
     --map-tile) map_tile="$2"; shift 2 ;;
     --map-min-points) map_min_points="$2"; shift 2 ;;
     --map-keyframes) map_keyframes=1; shift ;;
+    --map-export) map_export=1; shift ;;
     --no-map-export) map_export=0; shift ;;
+    --map-chunks) sets+=("rtk.export_map_chunks=true"); shift ;;
     --no-map-chunks) sets+=("rtk.export_map_chunks=false"); shift ;;
     --min-free-gb) min_free_gb="$2"; shift 2 ;;   # below this free space: slim the oldest unprotected rounds first
     --bag|--dataset) dataset="$2"; shift 2 ;;
