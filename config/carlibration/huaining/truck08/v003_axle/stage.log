@@ -1,0 +1,14 @@
+calibration=/home/project/MY-LIVO/config/carlibration/huaining/truck08/v001_import/calibration.json
+bag=/home/project/data/haibo/huaining/08/20261111/ros2bag
+reference front_lidar (transform_matrix_lidar_6); poses imu_data/odometry (RTK fixed, >= 1.0 m/s, >= 5.0 s after motion start); time offsets lidar -0.1250 s, rtk_position +0.025 s, ins_attitude +0.000 s
+scans read 1343, skipped {'slow': 485, 'startup': 15, 'not_rtk_fixed': 0, 'outside_ins': 2}
+quality limits: {"max_abs_time_ms": 250.0, "max_residual_increase_mm": 0.5, "max_rotation_deg": 6.0, "max_translation_cm": 100.0, "warn_split_rotation_deg": 0.2, "warn_split_time_ms": 10.0, "warn_split_translation_cm": 20.0, "warn_time_change_ms": 80.0}
+scans used 421 (37.2..233.7 s), points 3042206; dof rpy_xy + LiDAR time shift; cross-time gap > 1.5 s
+time-offset candidates (exact re-pose baseline + local joint solve): -0.180/-0.073s:5.25cm, -0.150/-0.033s:4.87cm, -0.120/+0.003s:4.49cm, -0.090/+0.026s:4.08cm, -0.060/+0.052s:3.87cm, -0.030/+0.082s:3.57cm, +0.000/+0.105s:3.15cm, +0.030/+0.118s:2.71cm, +0.060/+0.127s:2.37cm, +0.090/+0.130s:2.14cm, +0.120/+0.132s:2.09cm, +0.150/+0.133s:2.08cm, +0.180/+0.135s:2.19cm
+detected time shift +0.133 s (median 2.08 cm) -> final joint solve
+residual median 2.21 -> 2.07 cm (ground 2.09 -> 1.98, n=95339; vertical 2.83 -> 2.49, n=7500); match time gap median 11.0 s; iterations 12
+solution about the LiDAR (rear-axle frame): rotvec x(pitch) -0.813, y(roll) -0.409, z(yaw) +0.193 deg; translation x -6.8, y -76.6 cm
+applied (rpy_xy): rotvec x(pitch) -0.813, y(roll) -0.409, z(yaw) +0.193 deg; translation x -6.8, y -76.6, z +0.0 cm; LiDAR time shift +131.7 ms -> time_offsets.lidar +0.0067 s
+repeatability (first vs second half of the used scans): rotvec [0.024, 0.031, -0.083] deg, translation [-0.4, 1.2, 0.0] cm, time -3.2 ms
+quality: warn  (time shift +131.7 ms > warn_time_change_ms=80 (large change vs parent))
+written /home/project/MY-LIVO/config/carlibration/huaining/truck08/v003_axle/calibration.json (344 s)

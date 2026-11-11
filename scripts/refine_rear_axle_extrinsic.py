@@ -56,6 +56,7 @@ from livo import rosenv as _rosenv  # noqa: E402
 _rosenv.ensure()
 from livo.dataset import Dataset  # noqa: E402
 from livo.body_filter import normalize, rear_axle_mask  # noqa: E402
+from livo.axle_limits import LIMITS, add_arguments, normalize_limits  # noqa: E402
 from rclpy.serialization import deserialize_message  # noqa: E402
 from diagnostic_msgs.msg import DiagnosticArray  # noqa: E402
 from nav_msgs.msg import Odometry  # noqa: E402
@@ -69,13 +70,10 @@ INS_TOPIC, STATUS_TOPIC = "imu_data/odometry", "imu_data/ins_status"
 RTK_FIXED = 4                       # ins_pos_mode of an RTK-fixed INS solution
 BODY_FILTER = normalize({})  # vehicle-specific body box; loaded from calibration.json in main()
 COARSE_ITERS, MAX_ITERS = 8, 24
-# quality gate: a correction beyond these limits is not a calibration but a wrong reference/recording
-GATE_MAX_ROT_DEG, GATE_MAX_TRANS_M, GATE_MAX_DT_S = 6.0, 0.6, 0.08
-GATE_MAX_ABS_DT_S = 0.25   # |final time offset| beyond this is not a calibration but a wrong recording
+# Magnitude gates are configurable for poor supplier initial values; they do not change the solver.
 MIN_USABLE_SCANS = 5
 SHORT_RECORDING_S = 90.0
 PROFILE = tuple(np.arange(-0.18, 0.0001, 0.03))  # candidate time-shift baselines for the auto-detect
-WARN_SPLIT_ROT_DEG, WARN_SPLIT_TRANS_M, WARN_SPLIT_DT_S = 0.2, 0.2, 0.01
 QUERY_WORKERS = -1  # KD-tree query threads of solve() (-1 = all cores; reduced inside parallel workers)
 _FORK = {}
 
@@ -306,6 +304,43 @@ def correction(T_new, T_old):
     return C, np.degrees(R.from_matrix(C[:3, :3]).as_rotvec()), 100 * (T_new[:3, 3] - T_old[:3, 3])
 
 
+def solve_reposed(data, poses, time_base, T0, active, **kwargs):
+    """Recenter a large local time update on exact INS poses before refining it again.
+
+    The local first-order motion model is retained for small updates. A large shift must
+    update both poses and their derivatives; otherwise time and the forward lever arm
+    absorb the stale linearization error, particularly when the parent clock is wrong.
+    Returned dt remains relative to time_base, including every exact re-pose.
+    """
+    sol = solve(data, T0, active, **kwargs)
+    if sol is None:
+        return None
+    base, steps = time_base, []
+    hist = list(sol["hist"])
+    for _ in range(3):
+        if not kwargs["solve_dt"] or abs(sol["dt"]) <= 0.005:
+            break
+        next_base = base + sol["dt"]
+        tt = data["tau"] + next_base
+        margin = max(abs(poses.dt_pos), abs(poses.dt_att)) + 0.05
+        if tt.min() - margin < poses.t[0] or tt.max() + margin > poses.t[-1]:
+            break
+        exact = dict(data)
+        exact["R"], exact["t"] = poses.at(tt)
+        exact["vel"], exact["om"] = poses.rates(tt)
+        refined = solve(exact, sol["T"], active, **{**kwargs, "dt0": 0.0, "fine": True})
+        if refined is None:
+            break
+        base, sol = next_base, refined
+        hist.extend(sol["hist"])
+        steps.append({"base_s": round(base, 7), "local_dt_s": round(sol["dt"], 7),
+                      "median_cm": round(sol["hist"][-1]["median_cm"], 4)})
+    sol["dt"] += base - time_base
+    sol["time_reposes"] = steps
+    sol["hist"] = hist
+    return sol
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--calibration", required=True); ap.add_argument("--bag", required=True)
@@ -329,7 +364,12 @@ def main():
     ap.add_argument("--jobs", type=int, default=default_jobs(),
                     help="worker processes for the independent solves (time-offset candidates, halves); 1 = sequential "
                          "(default: <= 8, limited by the available memory, ~1.5 GB per worker)")
+    add_arguments(ap)
     a = ap.parse_args()
+    try:
+        limits = normalize_limits({key: getattr(a, key) for key in LIMITS})
+    except ValueError as exc:
+        ap.error(str(exc))
     t_start = time.time()
     global BODY_FILTER
     calib = json.load(open(a.calibration))
@@ -343,6 +383,7 @@ def main():
     offs = calib.get("time_offsets") or {}
     lidar_off = float(offs.get("lidar", -0.125)); dt_pos = float(offs.get("rtk_position", 0.025)); dt_att = float(offs.get("ins_attitude", 0.0))
 
+    print(f"axle: reading reference scans and INS poses from {a.bag}", flush=True)
     ins, scans = read_recording(a.bag, lidar_off, a.window, a.voxel, 3.0, a.max_range, a.every)
     poses = InsPoses(ins, dt_pos, dt_att)
     rec_span_s = float(scans[-1][3] - scans[0][3]) if len(scans) >= 2 else 0.0
@@ -367,7 +408,8 @@ def main():
     report = [f"calibration={a.calibration}", f"bag={a.bag}",
               f"reference {REFERENCE_TOPIC} ({REFERENCE_KEY}); poses {INS_TOPIC} (RTK fixed, >= {a.min_speed} m/s, "
               f">= {a.motion_age} s after motion start); time offsets lidar {lidar_off:+.4f} s, rtk_position {dt_pos:+.3f} s, ins_attitude {dt_att:+.3f} s",
-              f"scans read {len(scans)}, skipped {skipped}"]
+              f"scans read {len(scans)}, skipped {skipped}",
+              "quality limits: " + json.dumps(limits, ensure_ascii=False, sort_keys=True)]
     min_scans = MIN_USABLE_SCANS if short_recording else 50
     if data is None or len(np.unique(data["scan"])) < min_scans:
         if short_recording:
@@ -400,6 +442,7 @@ def main():
     # as the documented evidence for the measured value.
     profile, T_start, dt_start, gts_final = [], T_ref, 0.0, 0.0
     if solve_dt and not a.no_profile:
+        print(f"axle: time-offset profile on {len(used)} scans, {len(data['P'])} points", flush=True)
         # Time-offset auto-detection. The first-order time-shift model inside solve() is only valid
         # for |dt| <~ 40 ms (turn curvature), so a far parent offset biases any single solve toward
         # zero. Candidate baselines RE-POSE the points at exactly shifted times and each runs a small
@@ -409,6 +452,7 @@ def main():
             d2 = dict(data)
             Rw2, tw2 = poses.at(data["tau"] + gts)
             d2["R"], d2["t"] = Rw2, tw2
+            d2["vel"], d2["om"] = poses.rates(data["tau"] + gts)
             return d2
         def solve_candidate(gts):
             s_ = solve(shifted(float(gts)), T_ref, active, solve_dt=True, gap=a.gap,
@@ -446,11 +490,15 @@ def main():
                           + ", ".join(f"{p_['baseline_s']:+.3f}/{p_['dt_s']:+.3f}s:{p_['median_cm']:.2f}cm"
                                       for p_ in profile))
             report.append(f"detected time shift {gts_final:+.3f} s (median {best['median_cm']:.2f} cm) -> final joint solve")
-    sol = solve(data, T_start, active, solve_dt=solve_dt, gap=a.gap, nq=a.samples, dt0=dt_start)
-    dt_total = gts_final + sol["dt"] if solve_dt else 0.0
+    print(f"axle: final joint solve at time baseline {gts_final:+.4f} s", flush=True)
+    sol = solve_reposed(data, poses, gts_final, T_start, active,
+                        solve_dt=solve_dt, gap=a.gap, nq=a.samples, dt0=dt_start)
     if sol is None:
         report.append("no planar cross-time matches"); pathlib.Path(a.report).write_text("\n".join(report) + "\n")
         print("\n".join(report)); sys.exit(3)
+    dt_total = gts_final + sol["dt"] if solve_dt else 0.0
+    if sol["time_reposes"]:
+        report.append("exact time re-poses: " + json.dumps(sol["time_reposes"]))
     C_full, rv_full, dt_full = correction(sol["T"], T_ref)
     T_apply = T_ref.copy()
     if a.dof in ("rpy_xy", "rpy"):
@@ -467,7 +515,7 @@ def main():
     h0, h1 = sol["hist"][0], sol["hist"][-1]
     report.append(f"residual median {h0['median_cm']:.2f} -> {h1['median_cm']:.2f} cm (ground {h0['ground_cm']:.2f} -> {h1['ground_cm']:.2f}, "
                   f"n={h1['ground_n']}; vertical {h0['vertical_cm']:.2f} -> {h1['vertical_cm']:.2f}, n={h1['vertical_n']}); "
-                  f"match time gap median {h1['gap_s']:.1f} s; iterations {h1['iter']}{'' if sol['converged'] else ' (NOT converged)'}")
+                  f"match time gap median {h1['gap_s']:.1f} s; iterations {len(sol['hist'])}{'' if sol['converged'] else ' (NOT converged)'}")
     report.append(f"solution about the LiDAR (rear-axle frame): rotvec x(pitch) {rv_full[0]:+.3f}, y(roll) {rv_full[1]:+.3f}, "
                   f"z(yaw) {rv_full[2]:+.3f} deg; translation x {dt_full[0]:+.1f}, y {dt_full[1]:+.1f} cm")
     report.append(f"applied ({a.dof}): rotvec x(pitch) {rv[0]:+.3f}, y(roll) {rv[1]:+.3f}, z(yaw) {rv[2]:+.3f} deg; "
@@ -477,15 +525,18 @@ def main():
     idx = np.flatnonzero(np.r_[active, solve_dt])
     info = {n_: float(np.sqrt(max(sol["H"][i, i], 0))) for n_, i in zip(("rx", "ry", "rz", "tx", "ty", "tz", "dt"), range(7)) if i in idx}
     split = None
-    large_translation = np.linalg.norm(dt_full[:2]) / 100 > GATE_MAX_TRANS_M
+    # Preserve independent starts for large corrections when the acceptance limit is enlarged.
+    large_translation = np.linalg.norm(dt_full[:2]) > min(60.0, limits["max_translation_cm"])
     translation_confirmed = False
     if not a.no_split:
+        print("axle: independent half-recording verification", flush=True)
         mid = np.median(rel)
         parts = (used[rel <= mid], used[rel > mid])
         def solve_half(i):
             m = np.isin(data["scan"], parts[i])
             # Large factory corrections need independent starts, not refinements of the full-data solution.
-            return solve({k: v[m] for k, v in data.items()}, T_ref if large_translation else sol["T"], active,
+            return solve_reposed({k: v[m] for k, v in data.items()}, poses, gts_final,
+                         T_ref if large_translation else sol["T"], active,
                          solve_dt=solve_dt, gap=a.gap, nq=a.samples // 2,
                          iters=MAX_ITERS if large_translation else 10, fine=not large_translation,
                          seed=1, dt0=float(sol["dt"]))
@@ -498,8 +549,8 @@ def main():
             translation_confirmed = (
                 sol["converged"] and all(s["converged"] for s in halves)
                 and np.linalg.norm(d_tr[:2]) <= 0.03
-                and np.linalg.norm(d_rot) <= WARN_SPLIT_ROT_DEG
-                and abs(halves[0]["dt"] - halves[1]["dt"]) <= WARN_SPLIT_DT_S
+                and np.linalg.norm(d_rot) <= limits["warn_split_rotation_deg"]
+                and 1000 * abs(halves[0]["dt"] - halves[1]["dt"]) <= limits["warn_split_time_ms"]
                 and all(np.linalg.norm((s["T"][:3, 3] - sol["T"][:3, 3])[:2]) <= 0.03
                         and s["hist"][-1]["median_cm"] <= 3.0 for s in halves)
                 and h1["median_cm"] <= 3.0)
@@ -508,39 +559,37 @@ def main():
     # quality verdict
     reasons, level = [], "ok"
     rot_deg, trans_m = float(np.linalg.norm(rv_full)), float(np.linalg.norm(dt_full) / 100)
-    if rot_deg > GATE_MAX_ROT_DEG: reasons.append(f"rotation correction {rot_deg:.2f} deg > {GATE_MAX_ROT_DEG}"); level = "fail"
-    if trans_m > GATE_MAX_TRANS_M:
-        if translation_confirmed:
-            reasons.append(f"translation correction {100 * trans_m:.0f} cm confirmed by independent halves (<= 3 cm)")
-            level = "warn" if level == "ok" else level
-        else:
-            reasons.append(f"translation correction {100 * trans_m:.0f} cm > {100 * GATE_MAX_TRANS_M:.0f}")
-            level = "fail"
+    if rot_deg > limits["max_rotation_deg"]:
+        reasons.append(f"旋转修正 {rot_deg:.3f}° > max_rotation_deg={limits['max_rotation_deg']:g}°"); level = "fail"
+    if 100 * trans_m > limits["max_translation_cm"]:
+        confirmation = "独立两半在 3 cm 内确认，仍需手动调整上限" if translation_confirmed else "独立两半未在 3 cm 内确认"
+        reasons.append(f"平移修正 {100 * trans_m:.2f} cm > max_translation_cm={limits['max_translation_cm']:g} cm，{confirmation}")
+        level = "fail"
     abs_dt = abs(lidar_off + dt_total) if solve_dt else abs(lidar_off)
-    if solve_dt and abs_dt > GATE_MAX_ABS_DT_S:
-        reasons.append(f"absolute LiDAR time offset {1000 * abs_dt:.0f} ms implausible (> {1000 * GATE_MAX_ABS_DT_S:.0f})"); level = "fail"
-    if solve_dt and abs(dt_total) > GATE_MAX_DT_S:
-        reasons.append(f"time shift {1000 * dt_total:+.0f} ms is a large change vs the parent offset (candidates/longer recording confirms it)")
+    if solve_dt and 1000 * abs_dt > limits["max_abs_time_ms"]:
+        reasons.append(f"最终 LiDAR 时间偏移绝对值 {1000 * abs_dt:.2f} ms > max_abs_time_ms={limits['max_abs_time_ms']:g} ms"); level = "fail"
+    if solve_dt and 1000 * abs(dt_total) > limits["warn_time_change_ms"]:
+        reasons.append(f"相对父版本的时间修正 {1000 * dt_total:+.1f} ms > warn_time_change_ms={limits['warn_time_change_ms']:g} ms（大幅修正警告）")
         level = "warn" if level == "ok" else level
-    if h1["median_cm"] > h0["median_cm"] + 0.05: reasons.append("residual did not improve"); level = "fail"
+    if h1["median_cm"] > h0["median_cm"] + limits["max_residual_increase_mm"] / 10:
+        reasons.append(f"残差中位数增加 {10 * (h1['median_cm'] - h0['median_cm']):.3f} mm > max_residual_increase_mm={limits['max_residual_increase_mm']:g} mm"); level = "fail"
     if not sol["converged"]:
-        reasons.append(f"not converged in {MAX_ITERS} iterations"); level = "warn" if level == "ok" else level
+        reasons.append(f"最终局部求解未收敛（迭代上限 {MAX_ITERS}）"); level = "warn" if level == "ok" else level
     if split:
-        if np.linalg.norm(split["rotvec_deg"]) > WARN_SPLIT_ROT_DEG or np.linalg.norm(split["translation_cm"][:2]) > 100 * WARN_SPLIT_TRANS_M \
-                or abs(split["time_ms"]) > 1000 * WARN_SPLIT_DT_S:
-            reasons.append("halves disagree (few turns/structure: use a longer recording with turns)")
+        if np.linalg.norm(split["rotvec_deg"]) > limits["warn_split_rotation_deg"] or np.linalg.norm(split["translation_cm"][:2]) > limits["warn_split_translation_cm"] \
+                or abs(split["time_ms"]) > limits["warn_split_time_ms"]:
+            reasons.append("独立两半不一致：旋转 %.3f° / warn_split_rotation_deg=%g°；平移 %.2f cm / warn_split_translation_cm=%g cm；时间 %.1f ms / warn_split_time_ms=%g ms"
+                           % (np.linalg.norm(split["rotvec_deg"]), limits["warn_split_rotation_deg"],
+                              np.linalg.norm(split["translation_cm"][:2]), limits["warn_split_translation_cm"],
+                              abs(split["time_ms"]), limits["warn_split_time_ms"]))
             level = "warn" if level == "ok" else level
-    if level == "fail" and not a.no_gate:
-        if short_recording:
-            reasons.append("short/under-constrained recording: quality gate relaxed to warn")
-            level = "warn"
-        else:
-            print("rear-axle alignment rejected by the quality gate; calibration.json not written (--no-gate overrides)")
-            sys.exit(3)
     report.append(f"quality: {level}" + (f"  ({'; '.join(reasons)})" if reasons else ""))
     pathlib.Path(a.report).parent.mkdir(parents=True, exist_ok=True)
     pathlib.Path(a.report).write_text("\n".join(report) + "\n")
     print("\n".join(report), flush=True)
+    if level == "fail" and not a.no_gate:
+        print("rear-axle alignment rejected; adjust the named limits in Studio or CLI after reviewing stage_report.txt; calibration.json not written")
+        sys.exit(3)
     out = json.loads(json.dumps(calib))
     for entry in out["lidar"]:
         for k in list(entry):
@@ -565,8 +614,12 @@ def main():
         "time_profile": [{k: v for k, v in p_.items() if k != "T"} for p_ in profile],
         "time_profile_min_dt_s": round(gts_final, 4) if profile else None,
         "scans_used": int(len(used)), "window_s": [round(float(rel.min()), 1), round(float(rel.max()), 1)], "dof": a.dof,
-        "iterations": h1["iter"], "converged": sol["converged"], "quality": level, "reasons": reasons,
+        "iterations": len(sol["hist"]), "converged": sol["converged"], "quality": level, "reasons": reasons,
+        "time_reposes": sol["time_reposes"],
+        "large_translation_independent_starts": bool(large_translation),
+        "translation_confirmed_within_3cm": bool(translation_confirmed),
         "runtime_s": round(time.time() - t_start, 1)}
+    out["refinement"]["rear_axle_alignment"]["quality_limits"] = limits
     pathlib.Path(a.output).parent.mkdir(parents=True, exist_ok=True)
     json.dump(out, open(a.output, "w"), indent=2)
     print(f"written {a.output} ({time.time() - t_start:.0f} s)")

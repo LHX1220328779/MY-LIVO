@@ -621,6 +621,17 @@ function fsHtml() {
   return up + here + f.entries.filter((e) => e.dir).map((e) => `<div class="e" data-act="${e.kind ? "select-dataset" : "fs-open"}" data-path="${esc(e.path)}"><span>${e.kind ? "▣" : "▸"}</span><span class="n">${esc(e.name)}</span>${e.kind ? `<span class="badge ${e.kind === "recording" ? "ok" : ""}">${e.kind === "recording" ? "录制" : "bag"}</span>` : ""}</div>`).join("");
 }
 
+function currentAxleLimits(vehicleId = vehicle()?.id) {
+  const saved = S.state?.calibration?.axle_limits_by_vehicle?.[vehicleId] || {};
+  return Object.fromEntries(Object.entries(S.cal?.axle_limits || {}).map(([key, spec]) => [key, saved[key] ?? spec.default]));
+}
+function axleLimitsHtml(vehicleId = vehicle()?.id) {
+  const specs = S.cal?.axle_limits || {}, values = currentAxleLimits(vehicleId);
+  return `<details open style="margin-top:12px"><summary>后轴标定质量门限 · ${esc(vehicleId || "当前车辆")}</summary>
+    <div class="form" style="margin-top:10px">${Object.entries(specs).map(([key, spec]) => `<div class="field"><label>${esc(spec.label)}</label><input type="number" min="0" step="${spec.step}" data-act="axle-limit" data-vehicle="${esc(vehicleId)}" data-key="${key}" value="${esc(values[key])}" title="${key}；默认 ${spec.default}"></div>`).join("")}</div>
+    <div class="small muted">上限用于决定是否拒绝结果；警告阈值用于标记不一致。修改只影响之后启动或续跑的后轴阶段，已完成阶段保持原结果。门限按车辆保存并写入每次标定记录。</div>
+    <button class="btn sm" data-act="reset-axle-limits" data-vehicle="${esc(vehicleId)}">恢复默认门限</button></details>`;
+}
 function pageCalib() {
   const v = vehicle(); const cal = S.cal || { versions: [], active: {}, sources: [] };
   const versions = cal.versions.filter((x) => v && x.mine === v.mine && x.truck === v.truck).sort((a, b) => (a.version > b.version ? -1 : 1));
@@ -648,6 +659,7 @@ function pageCalib() {
     <div class="grid g2" style="margin-top:10px;align-items:end"><div class="field"><label>流水线 / 单步 / 车身过滤拼接的父版本（可选任意版本）</label><select data-act="calib-field" data-key="parent">${parents || "<option>（无）</option>"}</select><div class="small muted">当前选择：<b>${esc(pipelineParent || "—")}</b>；激活版本：${esc(v?.active || "—")}。自动化流水线会先把当前车辆的 body_filter 写入该父版本，再开始各标定阶段。</div></div><div class="small muted">数据源：<b>${esc(d?.name || "未选择")}</b> ${datasetBadges(d)}</div></div>
     <div class="row" style="gap:18px;flex-wrap:wrap;margin-top:4px"><label class="check small">${`<input type="checkbox" data-act="toggle" data-section="calibration" data-key="auto_activate" ${c.auto_activate ? "checked" : ""}><span class="switch"></span><span>流水线完成后自动激活（仅在闭环判定通过时）</span>`}</label><label class="check small">${`<input type="checkbox" data-act="toggle" data-section="calibration" data-key="fast" ${c.fast !== false ? "checked" : ""}><span class="switch"></span><span>快速模式（沿用本车实测俯仰斜率只测零点；本车无斜率或单点拟合被拒时自动转标准扫描；取消勾选＝标准扫描）</span>`}</label><label class="check small">${`<input type="checkbox" data-act="toggle" data-section="calibration" data-key="keep_maps" ${c.keep_maps === true ? "checked" : ""}><span class="switch"></span><span>保留标定轮次的地图与扫描存档（每轮 1–4 GB；默认关闭＝流水线成功后删除 PCD/scans.bin，轨迹与评估保留）</span>`}</label></div>
   </div>
+  <div class="card" style="margin-top:16px">${axleLimitsHtml()}</div>
   <div class="grid" style="grid-template-columns: 1fr 380px; margin-top:16px">
     <div class="card"><div class="card-h"><h2>版本（${versions.length}）</h2><span class="small muted">点击查看详情 · ★ 为激活版本</span></div>
       ${versions.length ? `<table><thead><tr><th>版本</th><th>阶段</th><th>父版本</th><th>创建</th><th>说明</th></tr></thead><tbody>${versions.map((x) => `<tr class="click ${S.versionDetail?.id === x.id ? "sel" : ""}" data-act="open-version" data-id="${esc(x.id)}"><td class="mono nowrap">${x.active ? "★ " : ""}${esc(x.version)}</td><td><span class="badge ${x.advisory ? "warn" : ""}">${esc(x.stage_label)}</span>${x.closed_loop ? `<div class="small"><span class="badge ${x.closed_loop === "pass" ? "ok" : "bad"}" title="LIVO 闭环验证（原生轨迹 A/B）">闭环 ${x.closed_loop === "pass" ? "通过" : "未通过"}</span></div>` : x.advisory ? '<div class="small muted">仅供参考 · 未闭环验证</div>' : ""}</td><td class="mono small muted">${esc(x.parent ? x.parent.split("/").pop() : "—")}${x.parent_missing ? ' <span class="bad">(已删)</span>' : ""}</td><td class="small nowrap">${fmtT(x.created)}</td><td class="small muted" style="max-width:360px">${esc(x.note || "")}</td></tr>`).join("")}</tbody></table>` : '<div class="empty">该车辆还没有标定版本，请先导入出厂标定</div>'}</div>
@@ -800,6 +812,7 @@ function drawerJob() {
   const resHtml = Object.keys(res).length ? `<div class="kv small" style="margin:10px 0">${Object.entries(res).map(([k, v]) => `<div class="k">${esc(k)}</div><div class="mono">${esc(v)}</div></div>`).join("")}</div>` : "";
   return `<div class="drawer-h"><div><h2>${esc(j.title)}</h2><div class="small muted">${fmtT(j.started)} · ${j.status === "running" ? "运行中" : esc(j.status)} · 错误：${j.error ? `<span class="bad">${esc(j.error)}</span>` : j.status === "done" ? "无" : "暂未报告"}</div></div>
     <div class="row">${j.status === "running" ? `<button class="btn" data-act="stop" data-mode="finish">提前结束并保存</button><button class="btn danger" data-act="stop" data-mode="abort">强制终止</button>` : ""}${j.kind === "pipeline" && ["failed", "stopped", "lost"].includes(j.status) ? `<button class="btn" data-act="resumeJob" title="从第一个未完成的步骤继续，已完成的阶段与轮次不再重跑">从失败步骤续跑</button>` : ""}<button class="btn sm" data-act="close">关闭</button></div></div>
+    ${j.kind === "pipeline" && ["failed", "stopped", "lost"].includes(j.status) && j.meta?.kind === "lidar" ? axleLimitsHtml(`${j.meta.mine}/${j.meta.truck}`) : ""}
     ${j.steps.length > 1 ? `<div class="list" id="job-steps">${jobStepsHtml()}</div>` : ""}${resHtml}
     ${res.result_id ? `<div class="row" style="margin-bottom:10px"><button class="btn" data-act="open-version" data-id="${esc(res.result_id)}">查看版本 ${esc(res.result_id.split("/").pop())}</button>${res.camlidar_id ? `<button class="btn" data-act="open-version" data-id="${esc(res.camlidar_id)}">查看相机复核 ${esc(res.camlidar_id.split("/").pop())}</button>` : ""}</div>` : ""}
     ${j.meta?.round || res.round ? `<div class="row" style="margin-bottom:10px"><button class="btn" data-act="open-run" data-round="${esc(res.round || j.meta.round)}">查看轮次 ${esc(res.round || j.meta.round)}</button></div>` : ""}
@@ -974,7 +987,20 @@ const A = {
   },
   async resumeJob() {
     const j = S.job; if (!j) return;
-    await act(async () => { const job = await api("/api/calibrations/pipeline", "POST", { ...(j.meta?.options || {}), kind: j.meta?.kind, resume: j.id }); S.job = job; S.jobLog = []; S.jobLogNext = 0; await loadOverview(); render(); }, "已从失败步骤续跑");
+    await act(async () => { const job = await api("/api/calibrations/pipeline", "POST", { ...(j.meta?.options || {}), axle_limits: currentAxleLimits(`${j.meta.mine}/${j.meta.truck}`), kind: j.meta?.kind, resume: j.id }); S.job = job; S.jobLog = []; S.jobLogNext = 0; await loadOverview(); render(); }, "已从失败步骤续跑");
+  },
+  "axle-limit"(el) {
+    const value = el.value === "" ? S.cal.axle_limits[el.dataset.key].default : Number(el.value);
+    if (!Number.isFinite(value) || value < 0) { el.value = currentAxleLimits(el.dataset.vehicle)[el.dataset.key]; return toast("门限必须是有限非负数", "bad"); }
+    const all = { ...(S.state.calibration.axle_limits_by_vehicle || {}) };
+    all[el.dataset.vehicle] = { ...(all[el.dataset.vehicle] || {}), [el.dataset.key]: value };
+    S.state.calibration.axle_limits_by_vehicle = all;
+    saveState({ calibration: { axle_limits_by_vehicle: all } });
+  },
+  "reset-axle-limits"(el) {
+    const all = { ...(S.state.calibration.axle_limits_by_vehicle || {}) };
+    delete all[el.dataset.vehicle]; S.state.calibration.axle_limits_by_vehicle = all;
+    saveState({ calibration: { axle_limits_by_vehicle: all } }); render();
   },
   async kill() { if (!confirm("清理所有残留的 fastlivo_mapping / 回放 / launch 进程？")) return; await act(() => api("/api/mapping/kill", "POST", {}), "已发送清理信号"); await loadOverview(); render(); },
   async pipeline(el) {
@@ -986,7 +1012,7 @@ const A = {
     const winInfo = w ? `\n时间窗口：${winLabel(S.winCalib, d?.duration_s)}` : "\n时间窗口：自动（按运动窗口）";
     const parent = selectedParent();
     if (!confirm(`运行 ${label}\n父版本：${parent}${parent !== v.active ? `（当前激活 ${v.active}）` : ""}\n数据源：${d?.path}${winInfo}\n流水线包含一次完整回放建图，请勿同时启动其他建图。`)) return;
-    await act(async () => { const job = await api("/api/calibrations/pipeline", "POST", { kind, mine: v.mine, truck: v.truck, id: parent, parent_id: parent, from_factory: false, body_filter_source_id: v.active, dataset: d.path, activate: c.auto_activate !== false, use_rtk: true, rate: 1.0, note: "", mode: c.fast === false ? "standard" : "fast", window_start: w?.start_s ?? null, window_duration: w?.duration_s ?? null, keep_calib_maps: c.keep_maps === true }); S.job = job; S.jobLog = []; S.jobLogNext = 0; S.drawer = "job"; await loadOverview(); render(); }, "流水线已启动");
+    await act(async () => { const job = await api("/api/calibrations/pipeline", "POST", { kind, mine: v.mine, truck: v.truck, id: parent, parent_id: parent, from_factory: false, body_filter_source_id: v.active, dataset: d.path, activate: c.auto_activate !== false, use_rtk: true, rate: 1.0, note: "", mode: c.fast === false ? "standard" : "fast", window_start: w?.start_s ?? null, window_duration: w?.duration_s ?? null, keep_calib_maps: c.keep_maps === true, axle_limits: currentAxleLimits() }); S.job = job; S.jobLog = []; S.jobLogNext = 0; S.drawer = "job"; await loadOverview(); render(); }, "流水线已启动");
   },
   "toggle-import"() { S.showImport = !S.showImport; render(); },
   async import() {
@@ -1011,6 +1037,7 @@ const A = {
     const v = vehicle(); const f = S.calibForm; const d = S.dataset;
     const w = winEffective(S.winCalib, d?.duration_s);
     const body = { stage: f.stage, mine: v?.mine, truck: v?.truck, id: selectedParent(), dataset: d?.path, run: f.run || ($("select[data-key=run]") || {}).value, run_dir: f.run_dir || ($("select[data-key=run_dir]") || {}).value, note: f.note, activate: !!f.activate, frames: f.frames, window_start: w?.start_s ?? null, window_duration: w?.duration_s ?? null };
+    if (f.stage === "axle") body.axle_limits = currentAxleLimits();
     if (f.stage === "manual") { if (f.camera_offset !== "" && f.camera_offset != null) body.camera_offset = Number(f.camera_offset); if (f.lidar_offset !== "" && f.lidar_offset != null) body.lidar_offset = Number(f.lidar_offset); if (f.camera_rot_delta && f.camera_rot_delta.trim()) body.camera_rot_delta = f.camera_rot_delta.trim().split(/[\s,]+/).map(Number); }
     await act(async () => { const job = await api("/api/calibrations/stage", "POST", body); S.job = job; S.jobLog = []; S.jobLogNext = 0; S.drawer = "job"; render(); }, "阶段已启动");
   },

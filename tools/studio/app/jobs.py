@@ -119,9 +119,15 @@ class Job:
                     step["status"] = "stopped" if self.stop_mode == "abort" else "failed"
                     if self.stop_mode != "abort":
                         self.error = f"{step['title']} 退出码 {rc}"
-                        tail = [l for l in lines[-6:] if l.strip()]
-                        if tail:
-                            self.error += "：" + tail[-1][:300]
+                        # Keep the actual gate values/reasons; a generic last line or a 300-character
+                        # cut used to hide both the cause and the retained diagnostic path.
+                        cause = next((l for l in reversed(lines) if l.startswith("stage failed with exit code")), None)
+                        if cause is None:
+                            cause = next((l for l in reversed(lines) if l.startswith("quality: fail")), None)
+                        if cause is None:
+                            cause = next((l for l in reversed(lines[-6:]) if l.strip()), None)
+                        if cause:
+                            self.error += "：" + cause
                     break
                 step["status"] = "done"
                 if spec.get("after"):

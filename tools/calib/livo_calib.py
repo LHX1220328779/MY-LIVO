@@ -54,6 +54,7 @@ import shutil
 import subprocess
 
 import numpy as np
+from livo.axle_limits import LIMITS as AXLE_LIMITS, add_arguments as axle_limit_arguments, command_args as axle_limit_args
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 CAL_ROOT = REPO / "config" / "carlibration"
@@ -168,10 +169,8 @@ def next_version_dir(mine, truck, stage):
     base = CAL_ROOT / mine / truck
     base.mkdir(parents=True, exist_ok=True)
     numbers = [int(m.group(1)) for p in base.iterdir() for m in [re.match(r"v(\d{3})_", p.name)]
-               if m and (p / "calibration.json").exists()]
+               if m and p.is_dir()]
     out = base / f"v{(max(numbers) + 1) if numbers else 1:03d}_{stage}"
-    if out.exists():
-        shutil.rmtree(out)  # leftovers of a failed attempt
     CREATED_DIRS.append(out)
     return out
 
@@ -576,7 +575,9 @@ def run_script(cmd, log_path):
             lines.append(line.rstrip("\n"))
         proc.wait()
     if proc.returncode != 0:
-        sys.exit(f"stage failed with exit code {proc.returncode}; see {log_path}")
+        reason = next((line for line in reversed(lines) if line.startswith("quality: fail")), "")
+        sys.exit(f"stage failed with exit code {proc.returncode}"
+                 + (f" ({reason})" if reason else "") + f"; see {log_path}")
     return lines
 
 
@@ -656,6 +657,7 @@ def cmd_axle(a):
     cmd = ["/usr/bin/python3", str(SCRIPTS / "refine_rear_axle_extrinsic.py"), "--calibration",
            str(pdir / "calibration.json"), "--bag", a.bag, "--output", str(out_dir / "calibration.json"),
            "--report", str(out_dir / "stage_report.txt"), "--window", str(a.window[0]), str(a.window[1]), "--dof", dof]
+    cmd += axle_limit_args({key: getattr(a, key) for key in AXLE_LIMITS})
     if a.keep_time_offset:
         cmd.append("--keep-time-offset")
     lines = run_script(cmd, out_dir / "stage.log")
@@ -2788,6 +2790,7 @@ def main():
     p.set_defaults(func=cmd_import)
 
     p = sub.add_parser("axle", help="reference-LiDAR -> rear-axle alignment from RTK/INS poses (no mapping run)")
+    axle_limit_arguments(p)
     p.add_argument("--bag", required=True, help="recording: raw ROS 2 root (segment folders) or single bag folder")
     p.add_argument("--window", nargs=2, type=float, default=(0.0, 1e9),
                    help="seconds after the first reference scan (default: whole recording; turns improve x/y/roll)")
@@ -2965,9 +2968,16 @@ def main():
     try:
         a.func(a)
     finally:
-        for d in CREATED_DIRS:  # a stage that failed must not leave a half-written version behind
-            if d.exists() and not (d / "calibration.json").exists():
-                shutil.rmtree(d, ignore_errors=True)
+        for d in CREATED_DIRS:
+            if d.exists() and not (d / "meta.json").exists():
+                # Failed attempts are not versions (no calibration/meta), but their evidence must
+                # survive and the error's stage.log link must remain valid on the next retry.
+                partial = d / "calibration.json"
+                if partial.exists():
+                    partial.rename(d / "incomplete_calibration.json")
+                (d / "failed.json").write_text(json.dumps(
+                    {"status": "failed", "created": now(), "error": str(sys.exc_info()[1] or "stage produced no calibration")},
+                    indent=2, ensure_ascii=False) + "\n")
 
 
 if __name__ == "__main__":

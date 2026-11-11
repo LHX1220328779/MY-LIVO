@@ -5,6 +5,7 @@ import json
 import pathlib
 import re
 import threading
+from livo.axle_limits import LIMITS as AXLE_LIMITS, normalize_limits as axle_limits, command_args as axle_limit_args
 
 from . import datasets
 from .common import CALIB_TOOL, CAL_ROOT, PY, REPO, RESULTS, StudioError, read_json, run_tool, safe_path
@@ -119,6 +120,7 @@ def catalogue(refresh=False):
     for v in payload["versions"]:
         v["source_dataset"] = source_dataset(by_id, v["id"])
     payload["sources"] = loose_sources()
+    payload["axle_limits"] = AXLE_LIMITS
     with _lock:
         _cache.update(sig=sig, doc=payload)
     return payload
@@ -412,6 +414,10 @@ def stage_cmd(stage, body):
         if body.get("moving"):
             cmd += ["--moving", *[str(int(v)) for v in body["moving"]]]
     if command == "axle":
+        try:
+            cmd += axle_limit_args(body.get("axle_limits"))
+        except ValueError as exc:
+            raise StudioError(str(exc)) from None
         if body.get("window"):
             cmd += ["--window", *[str(float(v)) for v in body["window"]]]
         elif uw is not None:
@@ -898,6 +904,11 @@ def _resume_steps(body, mapping_cmd):
         raise StudioError("只有失败、终止或中断的流水线任务可以续跑")
     meta = doc.get("meta") or {}
     opts = {k: v for k, v in (meta.get("options") or {}).items() if k != "resume"}
+    if "axle_limits" in body:
+        try:
+            opts["axle_limits"] = axle_limits(body["axle_limits"])
+        except ValueError as exc:
+            raise StudioError(str(exc)) from None
     # the data assessment step only exists when no cached report was present; it is done either way by now
     old = [st for st in doc.get("steps") or [] if not st["title"].startswith((RESUME_PREFIX, "数据评估"))]
     opts["skip_assess"] = True
@@ -983,6 +994,10 @@ def pipeline_steps(kind, body, mapping_cmd):
         raise StudioError("父版本与车身过滤来源不属于同一车辆，请重新选择父版本")
     if body.get("resume"):
         return _resume_steps(body, mapping_cmd)
+    try:
+        body = {**body, "axle_limits": axle_limits(body.get("axle_limits"))}
+    except ValueError as exc:
+        raise StudioError(str(exc)) from None
     # Any version of the current vehicle can be the parent of an automated pipeline.  The
     # legacy `from_factory` flag is intentionally ignored: the operator now chooses the parent
     # explicitly in Studio, including the factory import when a fresh start is desired.
@@ -1040,6 +1055,7 @@ def pipeline_steps(kind, body, mapping_cmd):
         else:
             def _axle_body(ctx):
                 return {"id": parent, "dataset": dataset, "note": body.get("note") or "pipeline: axle",
+                        "axle_limits": body["axle_limits"],
                         "window_start": body.get("window_start"), "window_duration": body.get("window_duration")}
             steps.append({"title": "后轴对齐 (axle：参考雷达→后轴，RTK/INS 位姿，整机刚体修正 + LiDAR 时间偏移)",
                           "build": lambda ctx: stage_cmd("axle", _axle_body(ctx)),
@@ -1137,6 +1153,7 @@ def pipeline_steps(kind, body, mapping_cmd):
         raise StudioError(f"未知流水线 {kind}")
     _cleanup_step(steps, body, truck, stamp)
     return steps, {"mine": mine, "truck": truck, "parent": parent, "requested_parent": requested_parent,
+                   "axle_limits": body["axle_limits"],
                    "body_filter_source_id": source_id, "dataset": dataset,
                    "mode": "standard" if standard else "fast", "mode_note": mode_note,
                    "pitch_slope": None if standard else slope_info["slope"],
