@@ -66,7 +66,7 @@ bash scripts/run_wuhu_round.sh <新轮次名> --mode livo --camera fisheye \
 
 ## D 阶段鱼眼全程重跑（2026-11-24）
 
-用户要求撤掉旧全量观察点云并重新建图。新轮次 `xingye13_fisheye_native_filtered_full_20261124` 使用已暂存 `v015_camselect` 的鱼眼初值（与旧 v016 实际参数相同，未采纳失败精修）。强度输出使用原生距离优先、25 m 看穿、修复后的地面补点及 0.1 m 分块过滤，再按 0.1 m 标准体素导出；RGB 后续也共用强度 D 掩码，再按同帧颜色及 3 cm 体素归约；配置 60 m 上限不能扩大原生 45 m 保留范围。已完成全程重跑并替换工作区和本机主目录的 `results/xingye13_fisheye_pointcloud/` 点云入口。强度 17111311 点（273.8 MB）。后续按用户要求，RGB 也共用强度 D 掩码，当前为 6168672 点（98.7 MB）；见 [彩色 D 掩码更新](rgb-D-shared-mask-20261124.md)。旧5份PCD已清理，扫描、位姿及评估保留。完整来源和验证见 [D 阶段重跑报告](echo-D-fisheye-rebuild-20261124.md)。
+用户要求撤掉旧全量观察点云并重新建图。新轮次 `xingye13_fisheye_native_filtered_full_20261124` 使用已暂存 `v015_camselect` 的鱼眼初值（与旧 v016 实际参数相同，未采纳失败精修）。强度输出使用原生距离优先、25 m 看穿、修复后的地面补点及 0.1 m 分块过滤，再按 0.1 m 标准体素导出；RGB 按用户指定 `8a35515` / `11a0d14` 独立累积同帧有色观测，60 m 上限、3 cm 最优原始点归约；共用强度掩码的尝试已因地面空洞回退。已完成全程重跑并替换工作区和本机主目录的 `results/xingye13_fisheye_pointcloud/` 点云入口。强度 17111311 点（273.8 MB）。后续共用掩码的RGB因地面空洞回退，当前恢复为113530886点（1.816GB）；见 [RGB覆盖恢复](rgb-11a0d14-coverage-restore-20261124.md)。旧5份PCD已清理，扫描、位姿及评估保留。完整来源和验证见 [D 阶段重跑报告](echo-D-fisheye-rebuild-20261124.md)。
 
 ## 证据与限制
 

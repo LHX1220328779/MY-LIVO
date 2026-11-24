@@ -342,8 +342,8 @@ laser_mapping:
       # Production default 45 m (operator asked for more coverage than 30 m): pole shell P90 ~5.5 cm at
       # <=35 m, ~5.9 cm at <=50 m. Console: run_wuhu_round.sh --map-range M / launch save_map_max_range:=M.
       save_map_max_range: 45.0
-      # 彩色地图先使用强度地图的原生行掩码，再保留同帧着色观测。
-      # 距离优先、看穿、地面补点及分块过滤与强度图共用。
+      # 沿用 8a35515 / 11a0d14 的独立彩色地图：连续累积同帧着色观测。
+      # 不套强度行掩码，避免正常地面颜色被强度选点裁掉。
       # RGB 距离从虚拟雷达量起；-1 沿用强度图距离上限，0 不截断。
       save_rgb_max_range: 60.0
       # 全图每体素选最优原始观测（近距离优先，惩罚快速转向），默认 3 厘米。

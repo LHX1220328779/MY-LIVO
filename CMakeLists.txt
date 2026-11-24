@@ -118,7 +118,7 @@ add_executable(rtk_fusion_math EXCLUDE_FROM_ALL tests/rtk_fusion_math.cpp)
 target_include_directories(rtk_fusion_math PRIVATE include)
 target_link_libraries(rtk_fusion_math laser_mapping)
 
-# Regenerate intensity maps or accepted-row RGB maps from archives, without rerunning odometry.
+# Regenerate intensity maps or paired-frame RGB maps from archives, without rerunning odometry.
 add_executable(reexport_intensity EXCLUDE_FROM_ALL scripts/reexport_intensity.cpp)
 target_include_directories(reexport_intensity PRIVATE include)
 target_link_libraries(reexport_intensity laser_mapping)

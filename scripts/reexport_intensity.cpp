@@ -1,4 +1,4 @@
-// Regenerate intensity chunks/row masks, or RGB chunks from existing accepted rows and paired colours.
+// Regenerate intensity chunks/row masks, or independent paired-frame RGB chunks from scan archives.
 // Does not rerun or alter the estimator; rejects an existing output directory.
 #include "rtk_fusion.h"
 #include <fstream>
@@ -75,9 +75,8 @@ int main(int argc, char **argv)
         number("rtk.save_rgb_max_range", fusion.save_rgb_max_range);
         number("rtk.save_rgb_voxel", fusion.save_rgb_voxel);
         if (fusion.save_rgb_max_range < 0) fusion.save_rgb_max_range = fusion.save_map_max_range;
-        if (!std::filesystem::is_regular_file(source / "colors.bin") ||
-            !std::filesystem::is_regular_file(source / "map_rows.bin"))
-          throw std::runtime_error("RGB re-export requires paired colours and the accepted intensity row mask");
+        if (!std::filesystem::is_regular_file(source / "colors.bin"))
+          throw std::runtime_error("RGB re-export requires paired colours");
       }
       // Restore physical mounts in the archived source order, as LIVMapper does.
       if (std::filesystem::exists(source/"sources.bin")) {
@@ -111,8 +110,7 @@ int main(int argc, char **argv)
         std::filesystem::create_symlink(source/file,target);
       }
       if (rgb_only) {
-        std::filesystem::create_symlink(source / "map_rows.bin", output / "map_rows.bin");
-        std::cout<<"Re-exporting "<<fusion.frames.size()<<" saved frames using RtkFusion::exportRgbMap and the existing row mask"<<std::endl;
+        std::cout<<"Re-exporting "<<fusion.frames.size()<<" saved frames using the independent RtkFusion::exportRgbMap"<<std::endl;
         fusion.exportRgbMap();
       } else {
         std::cout<<"Re-exporting "<<fusion.frames.size()<<" saved frames using RtkFusion::exportIntensityMap"<<std::endl;
