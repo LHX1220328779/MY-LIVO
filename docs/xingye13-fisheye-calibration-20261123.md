@@ -66,11 +66,11 @@ bash scripts/run_wuhu_round.sh <新轮次名> --mode livo --camera fisheye \
 
 ## D 阶段鱼眼全程重跑（2026-11-24）
 
-用户要求撤掉旧全量观察点云并重新建图。新轮次 `xingye13_fisheye_native_filtered_full_20261124` 使用已暂存 `v015_camselect` 的鱼眼初值（与旧 v016 实际参数相同，未采纳失败精修）。强度输出使用原生距离优先、25 m 看穿、修复后的地面补点及 0.1 m 分块过滤，再按 0.1 m 标准体素导出；RGB 为独立同帧观测、60 m 范围、3 cm 体素。完成后将替换工作区和本机主目录的 `results/xingye13_fisheye_pointcloud/` 点云入口。扫描、位姿及评估保留，旧 PCD 待清理。
+用户要求撤掉旧全量观察点云并重新建图。新轮次 `xingye13_fisheye_native_filtered_full_20261124` 使用已暂存 `v015_camselect` 的鱼眼初值（与旧 v016 实际参数相同，未采纳失败精修）。强度输出使用原生距离优先、25 m 看穿、修复后的地面补点及 0.1 m 分块过滤，再按 0.1 m 标准体素导出；RGB 为独立同帧观测、60 m 范围、3 cm 体素。已完成全程重跑并替换工作区和本机主目录的 `results/xingye13_fisheye_pointcloud/` 点云入口。强度 17111311 点（273.8 MB），RGB 113530886 点（1.816 GB）。旧5份PCD已清理，扫描、位姿及评估保留。完整来源和验证见 [D 阶段重跑报告](echo-D-fisheye-rebuild-20261124.md)。
 
 ## 证据与限制
 
-旧观察产品（本轮将清理并由 D 重跑产品替换）：此前从全程基线最终存档导出到 [results/xingye13_fisheye_pointcloud/](../results/xingye13_fisheye_pointcloud/)（指向该轮次 `Log/fusion/1795428737334101905/map_observe/`）。`global_map.pcd` 保存 45 m 范围内的全部扫描回波，体素大小 0、关闭距离优先和原行掩码，便于检查重影；`global_map_rgb.pcd` 保存鱼眼配色图，60 m 范围、3 cm 体素选取原始着色观测。均使用最终融合修正及原扫描点时间，无需重新建图。该图采用未精修的鱼眼初值，不是未通过验收的中点实验参数。
+旧观察产品（PCD 已于 2026-11-24 清理，由 D 重跑产品替换；以下仅保留历史导出说明）：此前从全程基线最终存档导出到 [results/xingye13_fisheye_pointcloud/](../results/xingye13_fisheye_pointcloud/)（指向该轮次 `Log/fusion/1795428737334101905/map_observe/`）。`global_map.pcd` 保存 45 m 范围内的全部扫描回波，体素大小 0、关闭距离优先和原行掩码，便于检查重影；`global_map_rgb.pcd` 保存鱼眼配色图，60 m 范围、3 cm 体素选取原始着色观测。均使用最终融合修正及原扫描点时间，无需重新建图。该图采用未精修的鱼眼初值，不是未通过验收的中点实验参数。
 
 - [输入模型核查及叠图](../results/fisheye_audit_20261123/README.md)
 - [前后段分阶段诊断](../results/fisheye_audit_20261123/stages_report.md)
