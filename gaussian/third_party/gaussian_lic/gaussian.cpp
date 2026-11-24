@@ -600,7 +600,8 @@ void decayOptList(int max_iters, const int train_camera_num,
     }
 }
 
-double optimize(const std::shared_ptr<Dataset>& dataset, std::shared_ptr<GaussianModel>& pc)
+double optimize(const std::shared_ptr<Dataset>& dataset, std::shared_ptr<GaussianModel>& pc,
+                double color_prior_weight)
 {
     // Shared refinement does not consume the upstream per-operation GPU timers.
     // Keep work on its CUDA stream rather than synchronizing after every stage.
@@ -615,8 +616,11 @@ double optimize(const std::shared_ptr<Dataset>& dataset, std::shared_ptr<Gaussia
     std::vector<int> all_list(train_camera_num);
     std::iota(all_list.begin(), all_list.end(), 0);
 
-    std::random_device rd;
-    std::mt19937 gen(rd());
+    // Each shared-map process starts the same sequence, while successive
+    // epochs still shuffle differently. torch::manual_seed does not control
+    // the upstream std::random_device engine.
+    static std::mt19937 shared_order(42);
+    std::mt19937 gen(pc->surface_mode_ ? shared_order() : std::random_device{}());
     if (train_camera_num <= max_iters) 
     {
         opt_list = all_list;
@@ -708,6 +712,14 @@ double optimize(const std::shared_ptr<Dataset>& dataset, std::shared_ptr<Gaussia
         } else ssim_value = loss_utils::fused_ssim(rendered_image_unsq, gt_image_unsq);
         auto loss = (1.0 - lambda_dssim) * Ll1 + lambda_dssim * (1.0 - ssim_value);
         if (pc->optimize_depth_) loss += lambda_depth * Ll1_depth;
+        if (pc->surface_mode_ && color_prior_weight>0) {
+            // A DC range prior discourages brightness compensating for low alpha.
+            // Higher-order view-dependent appearance remains trainable.
+            auto dc=pc->features_dc_.squeeze(1)*C0+.5f;
+            auto visible=std::get<4>(render_pkg).to(torch::kFloat).unsqueeze(1);
+            auto excess=torch::relu(dc-1).square()+torch::relu(-dc).square();
+            loss+=color_prior_weight*(excess*visible).sum()/(3*visible.sum().clamp_min(1));
+        }
         losses.push_back(loss.detach());
         if (!pc->surface_mode_) TORCH_CHECK(torch::isfinite(loss).item<bool>(), "Non-finite Gaussian loss");
         sync_for_timing();
@@ -729,8 +741,9 @@ double optimize(const std::shared_ptr<Dataset>& dataset, std::shared_ptr<Gaussia
         {
             // Preserve LiDAR-scale detail: large splats must not fill unsupported depth gaps.
             torch::NoGradGuard no_grad;
-            pc->scaling_.clamp_(std::log(1e-4), std::log(pc->max_scale_));
-            if (pc->surface_mode_) pc->scaling_.copy_(torch::minimum(torch::maximum(pc->scaling_,pc->scale_lower_),pc->scale_upper_));
+            if (pc->surface_mode_) {
+                pc->scaling_.copy_(torch::minimum(torch::maximum(pc->scaling_,pc->scale_lower_),pc->scale_upper_));
+            } else pc->scaling_.clamp_(std::log(1e-4), std::log(pc->max_scale_));
         }
         if (pc->apply_exposure_)
         {

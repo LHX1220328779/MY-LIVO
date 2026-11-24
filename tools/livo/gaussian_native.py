@@ -4,7 +4,9 @@ from pathlib import Path
 import numpy as np
 import cv2
 
-from livo.map_export import read_frames,read_corrections,quat_to_rot,apply_correction
+from livo.map_export import HEADER_SCANS,read_frames,read_corrections,quat_to_rot,apply_correction
+
+ECHO_POLICY = "native_accepted_rows_D_v1"
 
 
 def colour_surface(geometry,tree,frames,header,max_depth=120,sky_masks=True):
@@ -42,9 +44,53 @@ def colour_surface(geometry,tree,frames,header,max_depth=120,sky_masks=True):
 
 def native_surface(fusion,voxel):
     fusion=Path(fusion);pcd=fusion/"map/global_map.pcd"
-    sources=[fusion/n for n in ["frames.csv","corrections.txt","scans.bin","map_rows.bin"] if (fusion/n).exists()]
-    if pcd.exists():sources.append(pcd)
-    signature=dict(voxel=voxel,sources=[dict(path=str(p),size=p.stat().st_size,mtime=p.stat().st_mtime_ns) for p in sources])
+    if not np.isfinite(voxel) or voxel<=0:
+        raise ValueError("Native surface voxel must be finite and positive")
+    accepted_rows=(fusion/"map_rows.bin").is_file()
+    if accepted_rows:
+        params=dict(line.split("=",1) for line in (fusion/"parameters.txt").read_text().splitlines() if "=" in line)
+        selection_values=np.array([float(params.get(key,0)) for key in
+                                   ["rtk.save_map_priority_ratio","rtk.save_map_priority_margin_m",
+                                    "rtk.save_map_priority_voxel_m","rtk.save_map_priority_free_range_m","rtk.save_map_filter"]])
+        if (params.get("rtk.save_map_priority_enabled","false").lower() not in ("true","1") or
+                not np.isfinite(selection_values).all() or not np.array_equal(selection_values[:4],[1.5,2.,.5,25.]) or
+                selection_values[4]<=0 or
+                params.get("rtk.save_map_priority_fill","false").lower() not in ("true","1") or
+                selection_values[0]<1):
+            raise ValueError("Gaussian geometry requires D-stage native selection (ratio 1.5, margin 2 m, cell 0.5 m, seen-free 25 m, detail fill and positive voxel filter)")
+        fr,lt,lr=read_frames(fusion)
+        count_values=np.asarray(fr["count"])
+        counts=count_values.astype(np.int64)
+        if not len(counts) or np.any(counts<0) or np.any(count_values!=counts):
+            raise ValueError("Invalid native surface frame counts")
+        sizes=(counts+7)//8;offsets=8+np.r_[0,np.cumsum(sizes)[:-1]]
+        rows=np.memmap(fusion/"map_rows.bin",mode="r",dtype=np.uint8)
+        if bytes(rows[:8])!=b"LIVOMSK1" or len(rows)!=offsets[-1]+sizes[-1]:
+            raise ValueError("Invalid native surface row selection")
+        scan_bytes=(fusion/"scans.bin").stat().st_size
+        with (fusion/"scans.bin").open("rb") as stream:
+            if stream.read(8)!=HEADER_SCANS or (scan_bytes-8)%20:
+                raise ValueError("Invalid native surface scan archive")
+        frame_offsets=np.asarray(fr["offset_bytes"])
+        if (np.any(frame_offsets<8) or np.any((frame_offsets-8)%20) or
+                np.any(frame_offsets+counts*20>scan_bytes)):
+            raise ValueError("Native surface frames exceed the scan archive")
+        sources=[fusion/n for n in ["frames.csv","corrections.txt","scans.bin","map_rows.bin","parameters.txt"]]
+    else:
+        metadata=pcd.parent/"map_info.json"
+        info=json.loads(metadata.read_text()) if metadata.is_file() else {}
+        priority=info.get("range_priority",{})
+        selection_values=np.array([float(priority.get(key,0)) for key in
+                                   ["ratio","margin_m","cell_m","seen_free_range_m","map_filter_m"]])
+        if (not pcd.is_file() or not np.isfinite(info.get("voxel_m",0)) or info.get("voxel_m",0)<=0 or
+                priority.get("echo_policy")!=ECHO_POLICY or priority.get("detail_fill") is not True or
+                not np.isfinite(selection_values).all() or not np.array_equal(selection_values[:4],[1.5,2.,.5,25.]) or
+                selection_values[4]<=0 or
+                not str(priority.get("rows","")).startswith("map_rows.bin")):
+            raise ValueError("Gaussian geometry requires D-stage native accepted rows or a standard map with complete D-stage selection metadata")
+        sources=[pcd,metadata]
+    signature=dict(echo_policy=ECHO_POLICY,voxel=voxel,
+                   sources=[dict(path=str(p),size=p.stat().st_size,mtime=p.stat().st_mtime_ns) for p in sources])
     cache=fusion/"gaussian_native_cache";cache.mkdir(exist_ok=True)
     name=f"surface_{round(voxel*1000)}mm";path=cache/(name+".npy");metadata=cache/(name+".json")
     if path.exists() and metadata.exists() and json.loads(metadata.read_text())["signature"]==signature:
@@ -62,27 +108,30 @@ def native_surface(fusion,voxel):
         geometry=np.concatenate([geometry,points]);keys=np.concatenate([keys,k]);scores=np.concatenate([scores,score])
         order=np.lexsort((scores,keys));s=keys[order];keep=order[np.r_[True,s[1:]!=s[:-1]]]
         geometry,keys,scores=geometry[keep],keys[keep],scores[keep]
-    if pcd.exists():
+    if not accepted_rows:
         header={}
         with pcd.open("rb") as f:
             while True:
-                line=f.readline().decode().strip();parts=line.split()
+                raw=f.readline()
+                if not raw:raise ValueError("Existing native surface PCD has no DATA header")
+                line=raw.decode().strip();parts=line.split()
                 if parts and not line.startswith("#"):header[parts[0]]=parts[1:]
                 if line.startswith("DATA "):offset=f.tell();break
         if header["DATA"]!=["binary"] or header["SIZE"]!=["4"]*len(header["FIELDS"]) or header["TYPE"]!=["F"]*len(header["FIELDS"]):
             raise ValueError("Existing native surface must be a binary float PCD")
-        n=int(header["POINTS"][0]);data=np.memmap(pcd,mode="r",dtype="<f4",offset=offset,shape=(n,len(header["FIELDS"])))
+        n=int(header["POINTS"][0])
+        if (n<=0 or pcd.stat().st_size!=offset+n*4*len(header["FIELDS"]) or
+                info.get("points",{}).get("global_map.pcd")!=n):
+            raise ValueError("Existing native surface PCD disagrees with its verified map metadata")
+        data=np.memmap(pcd,mode="r",dtype="<f4",offset=offset,shape=(n,len(header["FIELDS"])))
         columns=[header["FIELDS"].index(c) for c in ["x","y","z"]]
         for start in range(0,n,1000000):
             merge(np.asarray(data[start:start+1000000,columns]))
             if start%8000000==0:print(f"[native surface] {min(start+1000000,n)}/{n} accepted points; {len(geometry)} anchors",flush=True)
-        source="existing accepted native map (read only)"
+        source="verified filtered standard map; native accepted-row metadata"
     else:
-        fr,lt,lr=read_frames(fusion);corr=read_corrections(fusion)
+        corr=read_corrections(fusion)
         R=quat_to_rot(np.stack([fr[k] for k in ["qx","qy","qz","qw"]],1));t=np.column_stack([fr[k] for k in ["tx","ty","tz"]])
-        counts=fr["count"].astype(np.int64);sizes=(counts+7)//8;offsets=8+np.r_[0,np.cumsum(sizes)[:-1]]
-        rows=np.memmap(fusion/"map_rows.bin",mode="r",dtype=np.uint8)
-        if bytes(rows[:8])!=b"LIVOMSK1" or len(rows)!=offsets[-1]+sizes[-1]:raise ValueError("Invalid native surface row selection")
         scans=np.memmap(fusion/"scans.bin",mode="r",dtype="<f4",offset=8).reshape(-1,5);pending=[]
         for i,count in enumerate(counts):
             offset=(int(fr["offset_bytes"][i])-8)//20;raw=np.asarray(scans[offset:offset+count],float)
@@ -93,7 +142,7 @@ def native_surface(fusion,voxel):
             if (i+1)%100==0 or i==len(counts)-1:
                 if pending:merge(np.concatenate(pending));pending.clear()
                 if i%1000==999:print(f"[native surface] {i+1}/{len(counts)} scans; {len(geometry)} anchors",flush=True)
-        source="accepted archived native rows; no native PCD written"
+        source="native accepted archived rows; distance, seen-free, detail fill and voxel mask"
     temporary=cache/(name+".tmp")
     with temporary.open("wb") as f:np.save(f,geometry)
     temporary.replace(path)

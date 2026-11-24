@@ -352,7 +352,7 @@ laser_mapping:
       # Per chunk keep the nearest original return per voxel. Every scan contributes: removing whole
       # stationary scans after visibility selection can discard a cell's only chosen observation.
       # map_rows.bin, evaluation and global_map.pcd follow the actual delivered rows; 0 disables voxel filtering.
-      save_map_filter: 0.01
+      save_map_filter: 0.1
       # Range priority of map_N.pcd (and of the standard global_map.pcd): per 0.5 m cell the nearest scan that
       # put >= 2 returns into it sets r_min; returns of that cell farther than max(ratio * r_min, r_min + margin)
       # are not written. Coverage of the 45 m cap stays (a cell seen only from far keeps its far returns); a

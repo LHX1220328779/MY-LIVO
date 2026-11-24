@@ -1,10 +1,14 @@
 """Calibration versions (config/carlibration/<mine>/<truck>/vNNN_<stage>) and the standard
 calibration pipelines. Every mutation is a subprocess of tools/calib/livo_calib.py."""
 import datetime as dt
+import csv
 import json
+import math
 import pathlib
 import re
 import threading
+from livo.camera import (selected_camera, select_camera, camera_transform_key, available_cameras,
+                         fisheye_activation_issues)
 from livo.axle_limits import LIMITS as AXLE_LIMITS, normalize_limits as axle_limits, command_args as axle_limit_args
 
 from . import datasets
@@ -21,6 +25,7 @@ STAGE_FALLBACK = {
     "driven": {"order": 4, "label": "行驶段 6-DoF 精修", "command": "driven", "advisory": False, "mapping": "lio"},
     "rtktime": {"order": 4.5, "label": "RTK 位置关联时间", "command": "rtk-time", "advisory": False, "mapping": "lio"},
     "gcons": {"order": 4.7, "label": "后向雷达地面一致性（tilt/z）", "command": "gcons", "advisory": False, "mapping": "lio"},
+    "camselect": {"order": 4.9, "label": "选择相机 / 导入鱼眼参数", "command": "camera-select", "advisory": True, "mapping": None},
     "camtime": {"order": 5, "label": "相机时间偏移", "command": "camera-time", "advisory": False, "mapping": None},
     "camlidar": {"order": 6, "label": "相机-LiDAR 偏航/横滚复核", "command": "camera-lidar", "advisory": True, "mapping": "livo"},
     "camloop": {"order": 7, "label": "相机外参闭环标定", "command": "set", "advisory": False, "mapping": "livo", "internal": True},
@@ -115,7 +120,10 @@ def catalogue(refresh=False):
         v["dir"] = str(d)
         v["overlays"] = sorted(p.name for p in (d / "overlays").glob("*.*")) if (d / "overlays").is_dir() else []
         cl = read_json(d / "closed_loop.json", None) if (d / "closed_loop.json").is_file() else None
-        v["closed_loop"] = cl.get("verdict") if isinstance(cl, dict) else None
+        doc = read_json(d / "calibration.json", {}) or {}
+        v["camera"] = selected_camera(doc)
+        v["available_cameras"] = available_cameras(doc)
+        v["closed_loop"] = cl.get("verdict") if isinstance(cl, dict) and cl.get("camera", v["camera"]) == v["camera"] else None
     by_id = {v["id"]: v for v in payload["versions"]}
     for v in payload["versions"]:
         v["source_dataset"] = source_dataset(by_id, v["id"])
@@ -155,14 +163,14 @@ def source_dataset(by_id, vid):
     return None
 
 
-def mapping_default(cat, mine, truck, dataset):
+def mapping_default(cat, mine, truck, dataset, camera="midrange"):
     """Prefer an existing final calibration of this recording over another date's vehicle-wide active version."""
     active = cat["active"].get(f"{mine}/{truck}")
     target = str(pathlib.Path(dataset).resolve())
     versions = [v for v in cat["versions"] if v.get("mine") == mine and v.get("truck") == truck]
     by_id = {v["id"]: v for v in versions}
     matches = [v for v in versions if v.get("stage") != "scan" and not v.get("advisory")
-               and source_dataset(by_id, v["id"]) == target]
+               and source_dataset(by_id, v["id"]) == target and v.get("camera", "midrange") == camera]
     if any(v["id"] == active for v in matches):
         return active
     return max(matches, key=lambda v: (v.get("created") or "", v["id"]))["id"] if matches else active
@@ -175,7 +183,7 @@ def factory_root(vid):
     return chain[0] if chain and by_id[chain[0]].get("stage") == "import" else None
 
 
-def vehicle_status(cat, mine, truck):
+def vehicle_status(cat, mine, truck, camera=None):
     """Readiness of one truck: active version, which stages its lineage contains, recommended next step."""
     key = f"{mine}/{truck}"
     versions = [v for v in cat["versions"] if v.get("mine") == mine and v.get("truck") == truck]
@@ -185,7 +193,8 @@ def vehicle_status(cat, mine, truck):
     # Working chain = lineage of the newest leaf (the branch currently being built/tested), not of the
     # active version: a pipeline must light up its checklist the moment its stages land, before
     # activation. Temporary scan versions never pick the tip.
-    eligible = [v for v in versions if v.get("stage") != "scan"]
+    eligible = [v for v in versions if v.get("stage") != "scan"
+                and (camera is None or v.get("camera", "midrange") == camera)]
     eligible_ids = {v["id"] for v in eligible}
     leaves = [v for v in eligible if not any(c in eligible_ids for c in v.get("children", []))]
     tip = max(leaves or eligible, key=lambda v: (v.get("created") or "", v.get("version") or "")) if eligible else None
@@ -195,12 +204,20 @@ def vehicle_status(cat, mine, truck):
     root_ctype = ""
     if work:
         chain = lineage(by_id, work["id"])
-        stages_done = [by_id[i].get("stage") for i in chain]
         calib = read_json(CAL_ROOT.joinpath(*work["id"].split("/")) / "calibration.json", {}) or {}
+        camera_stages = {"camselect", "camtime", "camlidar", "camfocus", "camloop", "camphoto"}
+        stages_done = [by_id[i].get("stage") for i in chain
+                       if by_id[i].get("stage") not in camera_stages
+                       or by_id[i].get("camera", "midrange") == (camera or selected_camera(calib))]
         if chain:
             root_ctype = str((read_json(CAL_ROOT.joinpath(*chain[0].split("/")) / "calibration.json", {}) or {})
                              .get("calibration_type", ""))
     ctype = str(calib.get("calibration_type", ""))
+    if camera and camera != selected_camera(calib) and camera in available_cameras(calib):
+        try:
+            calib = select_camera(calib, camera)
+        except (ValueError, KeyError):
+            pass
     offsets = calib.get("time_offsets") or {}
     # no import is aligned to the rear axle until the axle stage ran (hand-tuned exports included: truck29
     # v001_import was 0.2 deg off the INS)
@@ -208,10 +225,10 @@ def vehicle_status(cat, mine, truck):
     lidar_refined = any(s in ("ground", "driven", "precheck") for s in stages_done) or "refined" in ctype
     driven_done = "driven" in stages_done or "driven" in ctype or "stage2" in ctype
     rtk_time_done = "rtktime" in stages_done or "rtk-time" in str(offsets.get("rtk_position_source", ""))
-    camera_time_ok = isinstance(offsets.get("camera"), (int, float)) and (offsets.get("camera") != 0.0 or "camera_source" in offsets)
-    camera_ext_refined = "camlidar" in stages_done or "camera_lidar" in ctype or "camera_pole_yaw" in ctype
-    camera_loop_failed = bool(work) and work.get("closed_loop") == "fail"
-    camera_loop_done = bool(work) and work.get("closed_loop") == "pass"
+    camera_time_ok = camera_time_confirmed(offsets)
+    camera_ext_refined = "camlidar" in stages_done or "camphoto" in stages_done
+    camera_loop_failed = bool(work) and work.get("camera", "midrange") == (camera or selected_camera(calib)) and work.get("closed_loop") == "fail"
+    camera_loop_done = bool(work) and work.get("camera", "midrange") == (camera or selected_camera(calib)) and work.get("closed_loop") == "pass"
     checks = [
         {"key": "import", "label": "出厂标定已导入", "ok": bool(active), "stage": "import"},
         {"key": "axle", "label": "参考雷达已对齐后轴（RTK/INS 位姿）", "ok": axle_done, "stage": "axle"},
@@ -245,10 +262,18 @@ def vehicle_status(cat, mine, truck):
     else:
         next_step = {"stage": None, "pipeline": None, "reason": "标定完整，可直接建图"}
         level = "livo"
+    if (camera or selected_camera(calib)) == "fisheye":
+        cl = read_json(CAL_ROOT.joinpath(*work["id"].split("/")) / "closed_loop.json", None) if work else None
+        issues = fisheye_activation_issues(calib, cl)
+        checks.append({"key": "fish_validation", "label": "鱼眼多阶段、多包多帧与独立验证已通过",
+                       "ok": not issues, "stage": "camphoto"})
+        if issues and axle_done and lidar_refined and driven_done:
+            next_step = {"stage": "camphoto", "pipeline": "camphoto",
+                         "reason": "鱼眼候选可试验建图，激活前需补齐验收：" + "；".join(issues)}
     return {"mine": mine, "truck": truck, "id": key, "active": active_id, "active_version": active,
             "versions": len(versions), "latest": max((v.get("created") or "" for v in versions), default=""),
             "stages_done": stages_done, "checks": checks, "next": next_step, "ready_level": level,
-            "time_offsets": offsets,
+            "time_offsets": offsets, "camera": camera or selected_camera(calib), "available_cameras": available_cameras(calib),
             "frontier_tip": work["id"] if work else None,
             "frontier_stale": bool(tip and active_id and tip["id"] != active_id),
             "calibration_file": str(CAL_ROOT.joinpath(*active_id.split("/")) / "calibration.json") if active_id else None}
@@ -261,7 +286,13 @@ def vehicles(cat=None):
         if d.is_dir() and d.parent.name not in ("",) and not d.name.startswith("."):
             pairs.append((d.parent.name, d.name))
     pairs = sorted(set(pairs))
-    return [vehicle_status(cat, m, t) for m, t in pairs]
+    out = []
+    for m, t in pairs:
+        status = vehicle_status(cat, m, t)
+        status["camera_statuses"] = {name: vehicle_status(cat, m, t, name)
+                                      for name in status["available_cameras"]}
+        out.append(status)
+    return out
 
 
 def version_detail(vid):
@@ -278,11 +309,23 @@ def version_detail(vid):
     rc, text, validation = run_tool([PY, str(CALIB_TOOL), "validate", "--id", vid], timeout=60)
     if validation is None:
         validation = {"ok": rc == 0, "errors": [text.strip()[-300:]] if rc != 0 else [], "warnings": []}
-    return {"id": vid, "meta": meta, "files": files, "calibration": read_json(d / "calibration.json", {}),
+    doc = read_json(d / "calibration.json", {})
+    reason = camera_activation_block(vid, selected_camera(doc)) if selected_camera(doc) == "fisheye" else None
+    photo = (doc.get("refinement") or {}).get("camera_photometric") or {}
+    # Legacy photo records belong to midrange; selecting another camera does not
+    # make inherited refinement evidence or applied deltas valid for that camera.
+    if photo.get("camera", "midrange") != selected_camera(doc):
+        photo = {}
+    return {"id": vid, "meta": meta, "files": files, "calibration": doc,
+            "camera": by_id.get(vid, {}).get("camera", "midrange"),
+            "available_cameras": by_id.get(vid, {}).get("available_cameras", []),
             "overlays": sorted(p.name for p in (d / "overlays").glob("*.*")) if (d / "overlays").is_dir() else [],
             "closed_loop": read_json(d / "closed_loop.json", None) if (d / "closed_loop.json").is_file() else None,
             "children": by_id.get(vid, {}).get("children", []), "lineage": lineage(by_id, vid),
             "active": cat["active"].get(f"{meta.get('mine')}/{meta.get('truck')}") == vid,
+            "activation": {"allowed": not reason, "reason": reason},
+            "photo_validation": {"model": photo.get("selected_model"), "coverage": photo.get("coverage"),
+                                 "validation": photo.get("validation"), "applied": photo.get("applied")},
             "validation": validation, "stage_info": cat["stages"].get(meta.get("stage"), {}), "dir": str(d)}
 
 
@@ -292,6 +335,11 @@ def version_file(vid, name):
 
 
 def activate(vid):
+    doc = read_json(calibration_file(vid), {})
+    if selected_camera(doc) == "fisheye":
+        reason = camera_activation_block(vid, "fisheye")
+        if reason:
+            raise StudioError(f"鱼眼标定尚不能激活：{reason}")
     rc, text, payload = run_tool([PY, str(CALIB_TOOL), "activate", "--id", vid])
     if rc != 0:
         raise StudioError(text.strip()[-400:] or "激活失败")
@@ -323,6 +371,42 @@ def calibration_file(vid):
     return f
 
 
+def camera_name(body, vid=None):
+    doc = read_json(calibration_file(vid), {}) if vid else None
+    name = body.get("camera") or (selected_camera(doc) if doc else "midrange")
+    if name not in ("midrange", "fisheye"):
+        raise StudioError("相机必须选择中距或鱼眼")
+    if doc:
+        try:
+            select_camera(doc, name)
+        except (ValueError, KeyError) as exc:
+            raise StudioError(f"{vid} 的相机参数不可用：{exc}") from None
+    return name
+
+
+def camera_time_confirmed(offsets):
+    value, source = offsets.get("camera"), str(offsets.get("camera_source") or "").strip().lower()
+    return (isinstance(value, (int, float)) and math.isfinite(value) and bool(source)
+            and not any(marker in source for marker in ("unmeasured", "unverified", "default", "待标定")))
+
+
+def camera_activation_block(vid, camera):
+    try:
+        doc = read_json(calibration_file(vid), {})
+        if selected_camera(doc) != camera:
+            return "结果版本与当前选择的相机不一致"
+        calib = select_camera(doc, camera)
+    except (ValueError, KeyError, StudioError) as exc:
+        return f"相机参数无法校验：{exc}"
+    if camera == "fisheye":
+        issues = fisheye_activation_issues(calib, read_json(calibration_file(vid).parent / "closed_loop.json", None))
+        if issues:
+            return "；".join(issues)
+    if not camera_time_confirmed(calib.get("time_offsets") or {}):
+        return "所选相机时间偏移尚未确认；请完成相机时间标定或通过光度联合标定后再激活"
+    return None
+
+
 def active_id(mine, truck):
     return catalogue()["active"].get(f"{mine}/{truck}")
 
@@ -337,12 +421,14 @@ def import_cmd(body):
     if not src.is_file():
         raise StudioError(f"出厂标定文件不存在：{src}")
     mine, truck = _ident(body)
-    cmd = [PY, str(CALIB_TOOL), "import", "--source", str(src), "--mine", mine, "--truck", truck]
+    camera = camera_name(body)
+    cmd = [PY, str(CALIB_TOOL), "import", "--source", str(src), "--mine", mine, "--truck", truck,
+           "--camera", camera]
     for key, flag in (("lidar_offset", "--lidar-offset"), ("camera_offset", "--camera-offset")):
         if body.get(key) not in (None, ""):
             cmd += [flag, str(body[key])]
     cmd += ["--note", _note(body, f"imported from {src.name}")]
-    if body.get("activate", True):
+    if body.get("activate", True) and camera != "fisheye":
         cmd.append("--activate")
     return cmd
 
@@ -385,17 +471,64 @@ def _run_dir(raw):
     return run
 
 
+def photo_validation_runs(body, camera):
+    raw = body.get("validation_run") or body.get("validation_runs") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    parent = read_json(calibration_file(_parent(body)), {})
+    identity = parent.get("identity") or {}
+    runs = []
+    for value in raw:
+        run = _run_dir(value)
+        manifest = read_json(run.parents[2] / "round.json", {}) or {}
+        if manifest.get("mode") != "livo" or manifest.get("status") != "done":
+            raise StudioError("独立验证需要已完成的 LIVO 轮次")
+        if (manifest.get("camera") or "midrange") != camera:
+            raise StudioError("独立验证轮次必须使用当前选择的相机")
+        if not manifest.get("dataset"):
+            raise StudioError("独立验证轮次没有记录原始数据源")
+        datasets.require(str(safe_path(manifest["dataset"])), camera=camera)
+        snapshot_path = manifest.get("calibration")
+        if not snapshot_path:
+            raise StudioError("独立验证轮次缺少标定快照，无法确认车辆")
+        snapshot = read_json(safe_path(snapshot_path), {}) or {}
+        run_identity = snapshot.get("identity") or {}
+        if any(not identity.get(key) or run_identity.get(key) != identity[key] for key in ("mine", "truck")):
+            raise StudioError("独立验证轮次必须来自同一车辆；可选择同车另一段录制")
+        if not (run / "scans.bin").is_file():
+            raise StudioError(f"独立验证轮次缺少扫描存档：{run}")
+        if str(run) not in runs:
+            runs.append(str(run))
+    return runs
+
+
+def same_camera_model(first, second, camera):
+    a, b = select_camera(first, camera), select_camera(second, camera)
+    keys = ("intrinsics", "distortion", "width", "height", "topic", "stream_topic", "model", "flat_field")
+    return (all(a["camera"].get(key) == b["camera"].get(key) for key in keys)
+            and a["transforms"][camera_transform_key(a)]["transform_matrix"]
+            == b["transforms"][camera_transform_key(b)]["transform_matrix"]
+            and a["time_offsets"]["camera"] == b["time_offsets"]["camera"])
+
+
 def stage_cmd(stage, body):
     """Command line for one calibration stage (also used by the pipelines through `build`)."""
     stages = catalogue()["stages"]
     command = stages.get(stage, {}).get("command", stage)
+    if command not in {s.get("command") for s in stages.values()}:
+        raise StudioError(f"不支持的标定阶段：{stage}")
     if command == "import":
         return import_cmd(body)
     parent = _parent(body)
-    cmd = [PY, str(CALIB_TOOL), command, "--id", parent]
+    cmd = [PY, str(CALIB_TOOL), command, "--parent" if command == "camera-select" else "--id", parent]
+    camera = camera_name(body, parent) if command.startswith("camera-") or command == "set" else None
+    if body.get("activate") and (camera or selected_camera(read_json(calibration_file(parent), {}))) == "fisheye":
+        raise StudioError("鱼眼单步标定仅生成候选版本，不能直接激活；请完成多阶段、多包多帧、独立路段和本版本闭环验证")
+    if command == "camera-select":
+        cmd += ["--camera", camera]
     if command in ("axle", "ground", "driven", "gcons", "camera-time", "camera-lidar", "camera-focus", "camera-photo"):
         dataset = str(safe_path(body.get("dataset") or ""))
-        datasets.require(dataset, camera=command in ("camera-time", "camera-lidar", "camera-focus", "camera-photo"))
+        dataset_info = datasets.require(dataset, camera=camera if command.startswith("camera-") else False)
         cmd += ["--bag", dataset]
     if command in RUN_STAGES:
         # Every run-based stage gets its --run here; an empty selection (the UI lists no finished round of the
@@ -406,7 +539,13 @@ def stage_cmd(stage, body):
                     if command == "rtk-time" else "")
             raise StudioError(f"阶段 {stages.get(stage, {}).get('label', command)} 需要选择一轮已保存地图、"
                               f"状态为完成的 {kind} 建图结果（run）{hint}")
-        cmd += ["--run", str(_run_dir(body["run"]))]
+        run = _run_dir(body["run"])
+        if RUN_STAGES[command] == "livo":
+            manifest = read_json(run.parents[2] / "round.json", {}) or {}
+            run_camera = manifest.get("camera") or (manifest.get("options") or {}).get("camera") or "midrange"
+            if run_camera != camera:
+                raise StudioError(f"相机标定选择 {camera}，但所选建图轮次使用 {run_camera}；请选择同相机的 LIVO 结果")
+        cmd += ["--run", str(run)]
     uw = _user_window(body)
     if command == "ground":
         if body.get("stationary"):
@@ -454,6 +593,25 @@ def stage_cmd(stage, body):
         cmd += ["--frames", str(int(body.get("frames") or 12))]
         if body.get("solve_intrinsics"):
             cmd.append("--solve-intrinsics")
+    if command in ("camera-photo", "camera-focus", "camera-lidar"):
+        if body.get("window"):
+            cmd += ["--window", *[str(float(v)) for v in body["window"]]]
+        elif uw is not None:
+            with (run / "frames.csv").open() as stream:
+                first = next(csv.DictReader(line for line in stream if not line.startswith("#")), None)
+            if first is None:
+                raise StudioError("相机标定轮次没有可用扫描帧")
+            origin = float(first["stamp"]) - float(dataset_info["start_ns"]) / 1e9
+            begin = max(0.0, uw["start_s"] - origin)
+            end = 1e9 if uw["duration_s"] is None else uw["start_s"] + uw["duration_s"] - origin
+            if end <= begin:
+                raise StudioError("相机标定窗口与所选建图轮次没有重叠")
+            cmd += ["--window", str(begin), str(end)]
+    if command == "camera-photo":
+        for validation_run in photo_validation_runs(body, camera):
+            if pathlib.Path(validation_run) == run:
+                raise StudioError("独立验证不能使用参与拟合的同一轮次，请选择另一段 LIVO 数据")
+            cmd += ["--validation-run", validation_run]
     if command == "from-precheck":
         cmd += ["--run-dir", str(safe_path(body.get("run_dir") or ""))]
     if command == "set":
@@ -466,6 +624,8 @@ def stage_cmd(stage, body):
                 cmd += [flag, *[str(v) for v in body[k]]]
         if len(cmd) == 5:
             raise StudioError("手动设置至少需要填写一个字段")
+    if camera and command != "camera-select":
+        cmd += ["--camera", camera]
     if body.get("note"):
         cmd += ["--note", body["note"]]
     if body.get("activate"):
@@ -606,7 +766,7 @@ def _windows_step(steps, dataset, round_duration, body):
 def _camera_key(vid):
     c = read_json(calibration_file(vid), {}) or {}
     offs = c.get("time_offsets") or {}
-    return json.dumps([(c.get("transforms") or {}).get("midrange_camera_to_rear_axle", {}).get("transform_matrix"),
+    return json.dumps([selected_camera(c), (c.get("transforms") or {}).get(camera_transform_key(c), {}).get("transform_matrix"),
                        (c.get("camera") or {}).get("intrinsics"), (c.get("camera") or {}).get("distortion"),
                        offs.get("camera"), offs.get("lidar"), c.get("lidar")], sort_keys=True)
 
@@ -672,7 +832,7 @@ def _camloop_steps(steps, body, mapping_cmd, *, truck, stamp, auto_activate, bas
         # same window is a free zero point; otherwise it is mapped
         def base_build(ctx, rn=rn0):
             if not standard and body.get("reuse_round", True):
-                r = reusable_round(body.get("_parent_id") or "",
+                r = reusable_round(ctx[base_key], camera=body["camera"],
                                    min_duration=float(body.get("min_reuse_s") or (round_duration and round_duration * 0.9) or 55),
                                    start_offset=_round_start(ctx, body) or 0.0)
                 if r:
@@ -704,7 +864,7 @@ def _camloop_steps(steps, body, mapping_cmd, *, truck, stamp, auto_activate, bas
     for sign, tag in ((+1, "up"), (-1, "dn")):
         dp = sign * SCAN_STEP_DEG
         steps.append({"title": f"俯仰扫描点 Δpitch {dp:+.2f}°（临时版本，不导出地图）{skip}", "build": lambda ctx, dp=dp: [
-            PY, str(CALIB_TOOL), "set", "--id", ctx[base_key], "--camera-rot-delta", f"{dp:.3f}", "0", "0",
+            PY, str(CALIB_TOOL), "set", "--id", ctx[base_key], "--camera", body["camera"], "--camera-rot-delta", f"{dp:.3f}", "0", "0",
             "--stage", "scan", "--note", f"闭环俯仰扫描点 Δpitch={dp:+.2f}°（流水线临时版本，勿激活）"]
             if scan_needed(ctx) else ["/bin/echo", "one-point fit accepted: scan point skipped"],
             "after": lambda ctx, lines, tag=tag: ctx.__setitem__(f"scan_{tag}_id", parse_version_id(lines)) if scan_needed(ctx) else None})
@@ -741,13 +901,13 @@ def _camloop_steps(steps, body, mapping_cmd, *, truck, stamp, auto_activate, bas
             note = (f"相机俯仰闭环：原生尺度被 LiDAR 锁定（斜率 {fit['slope_per_deg']:+.4f}/°，俯仰不可经尺度观测），改用原生漂移"
                     f"最小点 {fit.get('drift_vertex_deg', 0):+.4f}°（rmse {fit.get('drift_min_m', 0):.3f} m，{len(fit['points'])} 轮）"
                     + ("，保持当前俯仰" if mode == "keep" else f"，Δpitch={fit['pitch_delta_deg']:+.4f}°"))
-            return [PY, str(CALIB_TOOL), "set", "--id", ctx[base_key], "--camera-rot-delta", f"{fit['pitch_delta_deg']:.4f}",
+            return [PY, str(CALIB_TOOL), "set", "--id", ctx[base_key], "--camera", body["camera"], "--camera-rot-delta", f"{fit['pitch_delta_deg']:.4f}",
                     "0", "0", "--stage", "camloop", "--metrics-json", json.dumps({"pitch_fit": fit}, ensure_ascii=False),
                     "--note", note]
         note = (f"相机俯仰闭环：Δpitch={fit['pitch_delta_deg']:+.3f}°（尺度斜率 {fit['slope_per_deg']:.3f}/°"
                 f"{'，沿用历史值 ' + str(ctx.get('pitch_slope_source') or '模型') if fit.get('slope_source') else ''}"
                 f"，{len(fit['points'])} 轮，预测原生尺度 {fit['predicted_ratio']:.4f}）")
-        return [PY, str(CALIB_TOOL), "set", "--id", ctx[base_key], "--camera-rot-delta", f"{fit['pitch_delta_deg']:.4f}", "0", "0",
+        return [PY, str(CALIB_TOOL), "set", "--id", ctx[base_key], "--camera", body["camera"], "--camera-rot-delta", f"{fit['pitch_delta_deg']:.4f}", "0", "0",
                 "--stage", "camloop", "--metrics-json", json.dumps({"pitch_fit": fit}, ensure_ascii=False), "--note", note]
     def set_after(ctx, lines):
         vid = ctx[base_key] if pitch_mode(ctx) == "kept" else parse_version_id(lines)
@@ -773,15 +933,17 @@ def _camloop_steps(steps, body, mapping_cmd, *, truck, stamp, auto_activate, bas
     steps.append({"title": "校验新版本", "build": lambda ctx: [PY, str(CALIB_TOOL), "validate", "--id", ctx["camloop_id"], "--strict"]})
 
     def activate_ok(ctx):
-        return auto_activate and ctx.get("closed_loop") == "pass"
+        ctx["activation_blocked_reason"] = camera_activation_block(ctx["camloop_id"], body["camera"])
+        return auto_activate and ctx.get("closed_loop") == "pass" and not ctx["activation_blocked_reason"]
 
     def activate_cmd(ctx):
         if activate_ok(ctx):
             return [PY, str(CALIB_TOOL), "activate", "--id", ctx["camloop_id"]]
         why = ("未勾选自动激活" if not auto_activate else
-               "俯仰不可观测，保留当前激活版本" if ctx.get("closed_loop") == "kept" else "闭环未通过")
-        return [PY, "-c", f"print('not activated: {why}; active version unchanged')"]
-    steps.append({"title": "激活闭环版本（仅在闭环通过且勾选自动激活时）", "build": activate_cmd,
+               "俯仰不可观测，保留当前激活版本" if ctx.get("closed_loop") == "kept" else
+               ctx.get("activation_blocked_reason") or "闭环未通过")
+        return ["/bin/echo", f"not activated: {why}; active version unchanged"]
+    steps.append({"title": "激活闭环版本（时间确认、闭环通过；鱼眼还需多阶段及独立多包验证）", "build": activate_cmd,
                   "after": lambda ctx, lines: ctx.__setitem__("activated", activate_ok(ctx))})
 
 
@@ -849,15 +1011,50 @@ def _camphoto_steps(steps, body, mapping_cmd, *, truck, stamp, auto_activate, pa
     if round_duration is not None:
         round_duration = float(round_duration) or None
     rb, rv = f"calib_{truck}_livo_{stamp}_photo", f"calib_{truck}_livo_{stamp}_photo_verify"
-    changed = lambda ctx: ctx.get("photo_id") not in (None, parent)  # noqa: E731
+    base = lambda ctx: ctx.get("camera_parent_id", parent)
+    changed = lambda ctx: ctx.get("photo_id") not in (None, base(ctx))  # noqa: E731
     steps.append({"title": f"LIVO 建图 {rb}（当前版本：光度标定的数据，也是判定的基线）", "retry": 1, "round": rb,
-                  "build": lambda ctx: mapping_cmd(rb, "livo", str(calibration_file(parent)), body,
+                  "build": lambda ctx: mapping_cmd(rb, "livo", str(calibration_file(base(ctx))), body,
                                                    duration=_cam_round_duration(ctx, body, round_duration),
                                                    start_offset=_round_start(ctx, body)),
                   "after": lambda ctx, lines: ctx.update(photo_round=rb, photo_fusion=latest_fusion_dir(rb))})
-    steps.append({"title": "相机光度标定 (camera-photo：多视角光度一致性 → 相机旋转 + 时间偏移、暗角平场，内参复核；无显著改善则沿用父版本)",
-                  "build": lambda ctx: stage_cmd("camera-photo", {"id": parent, "dataset": body.get("dataset"),
-                                                                    "run": ctx["photo_fusion"], "note": body.get("note") or ""}),
+    validation_keys = []
+    for index, original in enumerate(photo_validation_runs(body, body["camera"]), 1):
+        key = f"photo_validation_{index}"
+        validation_keys.append(key)
+        rn = f"calib_{truck}_livo_{stamp}_photo_independent_{index}"
+
+        def validation_build(ctx, original=original, key=key, rn=rn):
+            run = pathlib.Path(original)
+            manifest = read_json(run.parents[2] / "round.json", {}) or {}
+            snapshot = read_json(safe_path(manifest["calibration"]), {}) or {}
+            current = read_json(calibration_file(base(ctx)), {})
+            if same_camera_model(snapshot, current, body["camera"]):
+                ctx[key] = original
+                ctx[key + "_reused"] = True
+                return ["/bin/echo", f"reuse independent baseline with identical camera model: {original}"]
+            ctx[key + "_reused"] = False
+            options = manifest.get("options") or {}
+            if "duration" not in options or "start_offset" not in options:
+                raise StudioError("独立轮次的相机模型已改变，但缺少原起播窗口，无法自动重建")
+            replay = {**body, "dataset": manifest["dataset"], "window_start": None, "window_duration": None,
+                      "skip_stationary": bool(options.get("skip_stationary")), "extra_sets": ""}
+            return mapping_cmd(rn, "livo", str(calibration_file(base(ctx))), replay,
+                               start_offset=float(options["start_offset"] or 0),
+                               duration=float(options["duration"]) if options["duration"] else None)
+
+        def validation_after(ctx, lines, key=key, rn=rn):
+            if not ctx.get(key + "_reused"):
+                ctx[key] = latest_fusion_dir(rn)
+
+        steps.append({"title": f"独立验证基线 {index}（相机模型相同则复用；参数改变则按原录制和窗口重建）",
+                      "retry": 1, "round": rn, "build": validation_build, "after": validation_after})
+    steps.append({"title": "相机光度标定（旋转、时间、内参与残余畸变联合复核；所选独立路段验证固定候选，未通过则保留父参数）",
+                  "build": lambda ctx: stage_cmd("camera-photo", {"id": base(ctx), "camera": body["camera"], "dataset": body.get("dataset"),
+                                                                    "run": ctx["photo_fusion"], "note": body.get("note") or "",
+                                                                    "validation_run": [ctx[key] for key in validation_keys],
+                                                                    "window_start": body.get("window_start"),
+                                                                    "window_duration": body.get("window_duration")}),
                   "after": lambda ctx, lines: ctx.__setitem__("photo_id", parse_version_id(lines))})
     steps.append({"title": f"LIVO 验证建图 {rv}（光度标定版本；沿用父版本时跳过）", "retry": 1, "round": rv,
                   "build": lambda ctx: mapping_cmd(rv, "livo", str(calibration_file(ctx["photo_id"])), body,
@@ -871,17 +1068,21 @@ def _camphoto_steps(steps, body, mapping_cmd, *, truck, stamp, auto_activate, pa
                                         "--scale-margin", "0.002", "--exit-zero"]
                   if changed(ctx) else ["/bin/echo", "camera kept: no verdict needed"],
                   "after": lambda ctx, lines: ctx.update(closed_loop=_verdict(lines) if changed(ctx) else "kept",
-                                                         result_id=ctx["photo_id"] if changed(ctx) else parent)})
+                                                         result_id=ctx["photo_id"] if changed(ctx) else base(ctx))})
     steps.append({"title": "校验结果版本", "build": lambda ctx: [PY, str(CALIB_TOOL), "validate", "--id", ctx["result_id"], "--strict"]})
 
+    def activate_ok(ctx):
+        ctx["activation_blocked_reason"] = camera_activation_block(ctx["result_id"], body["camera"])
+        return auto_activate and changed(ctx) and ctx.get("closed_loop") == "pass" and not ctx["activation_blocked_reason"]
+
     def activate_cmd(ctx):
-        if auto_activate and changed(ctx) and ctx.get("closed_loop") == "pass":
+        if activate_ok(ctx):
             return [PY, str(CALIB_TOOL), "activate", "--id", ctx["photo_id"]]
-        why = ("未勾选自动激活" if not auto_activate else "相机沿用父版本" if not changed(ctx) else "判定未通过")
-        return [PY, "-c", f"print('not activated: {why}; active version unchanged')"]
-    steps.append({"title": "激活光度标定版本（判定通过且勾选自动激活）", "build": activate_cmd,
-                  "after": lambda ctx, lines: ctx.__setitem__("activated", auto_activate and changed(ctx)
-                                                              and ctx.get("closed_loop") == "pass")})
+        why = ("未勾选自动激活" if not auto_activate else "相机沿用父版本" if not changed(ctx) else
+               ctx.get("activation_blocked_reason") or "判定未通过")
+        return ["/bin/echo", f"not activated: {why}; active version unchanged"]
+    steps.append({"title": "激活光度标定版本（时间确认、闭环通过；鱼眼还需多阶段及独立多包验证）", "build": activate_cmd,
+                  "after": lambda ctx, lines: ctx.__setitem__("activated", activate_ok(ctx))})
 
 
 RESUME_PREFIX = "续跑："
@@ -1004,12 +1205,16 @@ def pipeline_steps(kind, body, mapping_cmd):
     dataset = str(safe_path(body.get("dataset") or ""))
     mine, truck = parent.split("/")[:2]
     standard = (body.get("mode") or "standard") != "fast"
-    slope_info = pitch_slope(mine, truck)
+    camera = camera_name(body, parent) if kind != "lidar" else selected_camera(read_json(calibration_file(parent), {}))
+    body = {**body, "camera": camera}
+    if kind == "camphoto" or (kind == "camera" and camera == "fisheye"):
+        body["validation_run"] = photo_validation_runs(body, camera)
+    slope_info = pitch_slope(mine, truck, camera)
     mode_note = None
-    if not standard and slope_info["source"] is None and kind in ("camera", "camloop"):
+    if not standard and slope_info["source"] is None and (kind == "camloop" or (kind == "camera" and camera != "fisheye")):
         # the slope depends on the camera geometry (mount pitch/height, focal length): another truck's value is no
         # prior for this one, so the first closed loop of a vehicle measures it with the standard scan
-        standard, mode_note = True, "本车尚无实测俯仰斜率（其他车的斜率不适用），已自动改用标准扫描"
+        standard, mode_note = True, "本相机尚无实测俯仰斜率（其他相机的斜率不适用），已自动改用标准扫描"
     cam_dur = body.get("cam_round_duration")
     cam_dur = 120.0 if cam_dur in (None, "") else (float(cam_dur) or None)  # sustained driving for scale; 0 = full
     body = {**body, "_parent_id": parent, "pitch_slope": slope_info["slope"], "pitch_slope_source": slope_info["source"],
@@ -1043,6 +1248,11 @@ def pipeline_steps(kind, body, mapping_cmd):
             window_start=body.get("window_start"), window_duration=body.get("window_duration"))
         if step0:
             steps.append(step0)
+    if kind in ("camera", "camphoto", "camloop"):
+        datasets.require(dataset, camera=camera)
+        steps.append({"title": f"选择{'鱼眼' if camera == 'fisheye' else '中距'}相机（独立内外参和时间偏移）",
+                      "build": lambda ctx: [PY, str(CALIB_TOOL), "camera-select", "--parent", parent, "--camera", camera],
+                      "after": lambda ctx, lines: ctx.__setitem__("camera_parent_id", parse_version_id(lines))})
     if kind == "lidar":
         datasets.require(dataset)
         lio_duration = body.get("lidar_round_duration")
@@ -1105,14 +1315,18 @@ def pipeline_steps(kind, body, mapping_cmd):
         if auto_activate:
             # intermediate versions are never activated: a pipeline that stops half-way leaves the vehicle on its
             # previous calibration; only the final version, after validation, is promoted
-            steps.append({"title": "激活最终版本（仅在全部步骤成功后）",
-                          "build": lambda ctx: [PY, str(CALIB_TOOL), "activate", "--id", ctx["result_id"]],
-                          "after": lambda ctx, lines: ctx.__setitem__("activated", ctx["result_id"])})
+            def lidar_activate(ctx):
+                reason = camera_activation_block(ctx["result_id"], camera) if camera == "fisheye" else None
+                ctx.update(activation_blocked_reason=reason, activated=not reason)
+                return (["/bin/echo", f"not activated: {reason}"] if reason else
+                        [PY, str(CALIB_TOOL), "activate", "--id", ctx["result_id"]])
+            steps.append({"title": "激活最终版本（步骤成功；鱼眼还需多阶段和独立路段验收）",
+                          "build": lidar_activate})
     elif kind == "camera":
-        datasets.require(dataset, camera=True)
+        datasets.require(dataset, camera=camera)
         _windows_step(steps, dataset, cam_dur or 60, body)
         def _camtime_body(ctx):
-            b = {"id": parent, "dataset": dataset, "note": body.get("note") or "pipeline: camera-time"}
+            b = {"id": ctx["camera_parent_id"], "camera": camera, "dataset": dataset, "note": body.get("note") or "pipeline: camera-time"}
             if _user_window(body) is not None:
                 # stage_cmd() will inject --start/--duration from the window fields
                 b.update({"window_start": body.get("window_start"), "window_duration": body.get("window_duration")})
@@ -1131,22 +1345,33 @@ def pipeline_steps(kind, body, mapping_cmd):
             "after": lambda ctx, lines: ctx.update(round=round_name, camera_baseline_round=round_name,
                                                     fusion_dir=latest_fusion_dir(round_name))})
         steps.append({"title": "相机-LiDAR 偏航复核 (camera-lidar：灯柱投影列偏差，俯仰不动)", "build": lambda ctx: stage_cmd(
-            "camera-lidar", {"id": ctx["camtime_id"], "dataset": dataset, "run": ctx["fusion_dir"],
-                             "frames": body.get("frames") or 30, "note": body.get("note") or ""}),
+            "camera-lidar", {"id": ctx["camtime_id"], "camera": camera, "dataset": dataset, "run": ctx["fusion_dir"],
+                             "frames": body.get("frames") or 30, "note": body.get("note") or "",
+                             "window_start": body.get("window_start"), "window_duration": body.get("window_duration")}),
             "after": lambda ctx, lines: ctx.update(camlidar_id=parse_version_id(lines), result_id=ctx["camtime_id"])})
-        _camloop_steps(steps, body, mapping_cmd, truck=truck, stamp=stamp, auto_activate=auto_activate,
-                       base_key="camlidar_id", round0_key="round", baseline_key="camera_baseline_round", standard=standard)
+        if camera == "fisheye":
+            steps.append({"title": "鱼眼内参诊断 (camera-focus：多帧光流与LiDAR深度复核焦距及畸变，供联合光度标定对照)",
+                          "build": lambda ctx: stage_cmd("camera-focus", {"id": ctx["camlidar_id"], "camera": camera,
+                                                                        "dataset": dataset, "run": ctx["fusion_dir"],
+                                                                        "window_start": body.get("window_start"),
+                                                                        "window_duration": body.get("window_duration")}),
+                          "after": lambda ctx, lines: ctx.update(camfocus_id=parse_version_id(lines),
+                                                                  camera_parent_id=parse_version_id(lines))})
+            _camphoto_steps(steps, body, mapping_cmd, truck=truck, stamp=stamp, auto_activate=auto_activate, parent=parent)
+        else:
+            _camloop_steps(steps, body, mapping_cmd, truck=truck, stamp=stamp, auto_activate=auto_activate,
+                           base_key="camlidar_id", round0_key="round", baseline_key="camera_baseline_round", standard=standard)
     elif kind == "camphoto":
-        datasets.require(dataset, camera=True)
+        datasets.require(dataset, camera=camera)
         cam_dur_eff = _round_duration(body, cam_dur or 60)
         _windows_step(steps, dataset, cam_dur_eff or 60, body)
         _camphoto_steps(steps, body, mapping_cmd, truck=truck, stamp=stamp, auto_activate=auto_activate, parent=parent)
     elif kind == "camloop":
-        datasets.require(dataset, camera=True)
+        datasets.require(dataset, camera=camera)
         cam_dur_eff = _round_duration(body, cam_dur or 60)
         _windows_step(steps, dataset, cam_dur_eff or 60, body)
         steps.append({"title": "当前版本作为待微调版本", "build": lambda ctx: ["/bin/echo", "base version prepared"],
-                      "after": lambda ctx, lines: ctx.__setitem__("base_id", parent)})
+                      "after": lambda ctx, lines: ctx.__setitem__("base_id", ctx["camera_parent_id"])})
         _camloop_steps(steps, body, mapping_cmd, truck=truck, stamp=stamp, auto_activate=auto_activate,
                        base_key="base_id", round0_key="round", baseline_key="round", standard=standard)
     else:
@@ -1154,7 +1379,7 @@ def pipeline_steps(kind, body, mapping_cmd):
     _cleanup_step(steps, body, truck, stamp)
     return steps, {"mine": mine, "truck": truck, "parent": parent, "requested_parent": requested_parent,
                    "axle_limits": body["axle_limits"],
-                   "body_filter_source_id": source_id, "dataset": dataset,
+                   "body_filter_source_id": source_id, "dataset": dataset, "camera": camera,
                    "mode": "standard" if standard else "fast", "mode_note": mode_note,
                    "pitch_slope": None if standard else slope_info["slope"],
                    "pitch_slope_source": None if standard else slope_info["source"]}
@@ -1164,10 +1389,10 @@ def overlay(body):
     """Render LiDAR->camera projection overlays for a version (optionally with a trial rotation delta / time
     offset) using the scans of a LIVO round; ~10 s. Returns the image list served by /api/overlays/file."""
     vid = body.get("id") or ""
-    calibration_file(vid)
+    camera = camera_name(body, vid)
     run = _run_dir(body.get("run") or "")
     dataset = str(safe_path(body.get("dataset") or ""))
-    datasets.require(dataset, camera=True)
+    datasets.require(dataset, camera=camera)
     times = [float(v) for v in str(body.get("times") or "20,60,100").replace(" ", "").split(",") if v]
     if not times or len(times) > 8:
         raise StudioError("请给出 1–8 个时刻（秒）")
@@ -1176,12 +1401,12 @@ def overlay(body):
         delta = [float(v) for v in delta.replace(",", " ").split()] if delta.strip() else None
     if delta is not None and len(delta) != 3:
         raise StudioError("相机旋转修正需要 3 个角度 rx ry rz（度）")
-    key = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{vid}_{run.name}_{'_'.join(str(t) for t in times)}_"
+    key = re.sub(r"[^A-Za-z0-9_.-]", "_", f"{vid}_{camera}_{run.name}_{'_'.join(str(t) for t in times)}_"
                  f"{'_'.join(str(v) for v in (delta or [0, 0, 0]))}_{body.get('camera_offset') or 'v'}")[:150]
     out = OVERLAY_DIR / key
     if not (out / "index.json").exists():
         out.mkdir(parents=True, exist_ok=True)
-        cmd = [PY, str(CALIB_TOOL), "overlay", "--id", vid, "--bag", dataset, "--run", str(run), "--out", str(out),
+        cmd = [PY, str(CALIB_TOOL), "overlay", "--id", vid, "--camera", camera, "--bag", dataset, "--run", str(run), "--out", str(out),
                "--times", ",".join(str(t) for t in times)]
         if delta is not None and any(abs(v) > 0 for v in delta):
             cmd += ["--camera-rot-delta", *[str(v) for v in delta]]
@@ -1202,20 +1427,22 @@ def overlay_file(key, name):
     return safe_path(OVERLAY_DIR / key / name)
 
 
-def pitch_slope(mine, truck):
+def pitch_slope(mine, truck, camera="midrange"):
     """Slope of the image-scale-vs-camera-pitch relation from the newest version that measured it."""
     root = CAL_ROOT / mine / truck
     for d in sorted(root.glob("v*_*"), reverse=True):
+        if selected_camera(read_json(d / "calibration.json", {}) or {}) != camera:
+            continue
         fit = ((read_json(d / "meta.json", {}) or {}).get("metrics") or {}).get("pitch_fit") or {}
         b = fit.get("slope_per_deg")
         if fit.get("slope_source") or len(fit.get("points") or []) < 3:
             continue  # a fast run records the slope it ASSUMED: only a standard scan measures one
         if isinstance(b, (int, float)) and 0.03 <= b <= 0.4:
             return {"slope": float(b), "source": f"{mine}/{truck}/{d.name}"}
-    return {"slope": DEFAULT_PITCH_SLOPE, "source": None}
+    return {"slope": DEFAULT_PITCH_SLOPE if camera == "midrange" else None, "source": None}
 
 
-def reusable_round(calibration_id, min_duration=110.0, start_offset=None):
+def reusable_round(calibration_id, min_duration=110.0, start_offset=None, camera="midrange"):
     """The newest finished LIVO round that already ran with this calibration: a free zero-pitch point for the
     closed loop (same version, full length), so the fast mode only has to map the verify round. With
     start_offset given, only a round that played the same window qualifies (native scale is window dependent)."""
@@ -1224,7 +1451,7 @@ def reusable_round(calibration_id, min_duration=110.0, start_offset=None):
     for r in mapping_module.list_runs(limit=40):
         if r.get("status") != "done" or r.get("mode") != "livo":
             continue
-        if str(r.get("calibration") or "") != target:
+        if str(r.get("calibration_source") or r.get("calibration") or "") != target or r.get("camera", "midrange") != camera:
             continue
         if start_offset is not None:
             man = read_json(pathlib.Path(r["path"]) / "round.json", {}) or {}

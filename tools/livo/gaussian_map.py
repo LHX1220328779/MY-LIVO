@@ -8,6 +8,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -83,6 +84,8 @@ def merge_binary(paths, output, kind):
 
 
 def run(a):
+    if a.backend != "shared" or a.distant_surface:
+        raise ValueError("D-stage Gaussian mapping requires the shared native accepted surface without distant supplementation")
     started = time.monotonic()
     fusion = resolve_run(a.run)
     round_dir = fusion.parent.parent.parent
@@ -97,7 +100,7 @@ def run(a):
         raise ValueError("Build the Gaussian mapper first: bash scripts/build_gaussian.sh")
     if not a.prepare_only:
         version = subprocess.check_output([str(binary.resolve()), "--version"], text=True).strip()
-        if version != "MY-LIVO Gaussian-LIC adapter 5":
+        if version != "MY-LIVO Gaussian-LIC adapter 8":
             raise ValueError("Gaussian executable is outdated; rebuild with bash scripts/build_gaussian.sh")
     output = Path(a.out).resolve() if a.out else fusion / "gaussian"
     output.mkdir(parents=True, exist_ok=True)
@@ -129,16 +132,54 @@ def run(a):
         raise ValueError("Empty requested mapping interval")
     workspace = output / "input"
     workspace.mkdir()
-    image_stamps, stream = dump_camera_stream(bag, workspace, t_from=begin-camera_offset, t_to=end-camera_offset)
-    eff = image_stamps + camera_offset
-    chosen, last = {}, -np.inf
-    for k, t in enumerate(eff):
-        if begin <= t <= end and t-last >= a.interval - 1e-4:
-            chosen[k] = float(t); last = t
-    if len(chosen) < 4:
-        raise ValueError("Need at least four synchronized camera frames")
     archive = np.memmap(fusion / "scans.bin", dtype="<f4", mode="r", offset=8).reshape(-1,5)
-    ordinal={k:i for i,k in enumerate(chosen)}
+    spans = [(begin, end, None)]
+    if a.intervals:
+        reference = Path(a.reference_poses) if a.reference_poses else fusion / "gaussian" / "camera_poses.json"
+        if not reference.is_file():
+            raise ValueError("Window comparisons need the complete run's --reference-poses camera_poses.json")
+        recorded = json.loads(reference.read_text())
+        names = [row["frame"] for row in recorded]
+        times = np.array([row["stamp"] for row in recorded], dtype=float)
+        if (not len(times) or not np.isfinite(times).all() or np.any(np.diff(times) <= 0) or
+                len(names) != len(set(names)) or not all(re.fullmatch(r"frame_[0-9]+", name) for name in names)):
+            raise ValueError("Invalid reference frame names or timestamps")
+        spans = []
+        for item in a.intervals.split(","):
+            lo, hi = (float(x) for x in item.split(":"))
+            if not (0 <= lo < hi and np.isfinite(hi)):
+                raise ValueError("Intervals must be finite nonnegative START:END seconds")
+            lo, hi = stamps[0] + lo, min(stamps[-1], stamps[0] + hi)
+            if spans and lo < spans[-1][1]:
+                raise ValueError("Intervals must be increasing and non-overlapping")
+            edge_tolerance = 1e-4
+            selected = {row["stamp"]: row for row in recorded if lo-edge_tolerance <= row["stamp"] < hi-edge_tolerance}
+            if not selected:
+                raise ValueError(f"No reference frames in interval {item}")
+            spans.append((lo, hi, selected))
+
+    def selected_images():
+        for lo, hi, expected in spans:
+            if expected is not None:
+                lo, hi = min(expected)-1e-4, max(expected)+1e-4
+            image_stamps, stream = dump_camera_stream(bag, workspace, t_from=lo-camera_offset, t_to=hi-camera_offset)
+            try:
+                chosen, last = {}, -np.inf
+                for index, stamp in enumerate(image_stamps + camera_offset):
+                    if expected is not None:
+                        if stamp in expected:
+                            row = expected[stamp]
+                            chosen[index] = (stamp, row["validation"], row)
+                    elif lo <= stamp <= hi and stamp-last >= a.interval - 1e-4:
+                        chosen[index] = (stamp, (len(chosen) % a.submap_frames) % 8 == 4, None)
+                        last = stamp
+                if expected is not None and len(chosen) != len(expected):
+                    raise ValueError("Reference timestamps do not match this midrange recording and time offset")
+                for index, image in decode_rgb(stream, width, height):
+                    if index in chosen:
+                        yield (*chosen[index], image)
+            finally:
+                stream.unlink(missing_ok=True)
 
     def project(world,T):
         pc=(world-T[:3,3])@T[:3,:3];z=pc[:,2]
@@ -151,10 +192,7 @@ def run(a):
         return world[sel],z[sel],u[sel],v[sel]
     submaps, frame_count, files, poses = [], 0, None, []
     try:
-        for k, image in decode_rgb(stream, width, height):
-            if k not in chosen:
-                continue
-            t = chosen[k]
+        for t, validation, row, image in selected_images():
             j = int(np.argmin(np.abs(stamps-t)))
             if abs(stamps[j]-t) > 0.12:
                 continue  # no pose extrapolation / scanning across a data gap
@@ -164,6 +202,9 @@ def run(a):
             T = T @ imu_rear @ rear_cam
             Rc, tc = correction_at(corr, t)
             T[:3,3] = Rc @ T[:3,3] + tc; T[:3,:3] = Rc @ T[:3,:3]
+            if row is not None and (row["scan_stamp"] != stamps[j] or
+                    not np.allclose(row["T_world_camera"], T, atol=1e-7, rtol=0)):
+                raise ValueError(f"Camera pose or scan differs from reference: {row['frame']}")
             # Every return follows the original mapper's deskewed scan-end pose and per-return C(t).
             n = int(fr["count"][j]); offset = (int(fr["offset_bytes"][j])-8)//20
             scan = np.asarray(archive[offset:offset+n], np.float64)
@@ -177,7 +218,6 @@ def run(a):
                 continue
             image = cv2.remap(image, mx, my, cv2.INTER_LINEAR)
             depth = np.zeros((height,width), "<f4"); depth[v,u] = z
-            validation=(ordinal[k]%a.submap_frames)%8==4
             points = np.column_stack([world, image[v,u,::-1]/255., z]).astype("<f4")
             if files is None or frame_count % a.submap_frames == 0:
                 if files is not None: files.close()
@@ -185,17 +225,18 @@ def run(a):
                 submaps.append(sub)
                 files = open(sub / "frames.txt", "w")
                 files.write(f"{width} {height} {fx:.12g} {fy:.12g} {cx:.12g} {cy:.12g}\n")
-            name = f"frame_{frame_count:06d}"
+            name = row["frame"] if row is not None else f"frame_{frame_count:06d}"
             if not cv2.imwrite(str(sub / (name+".png")), image): raise RuntimeError("Cannot save image")
             with open(sub / (name+".bin"), "wb") as f:
                 depth.tofile(f); points.tofile(f)
             files.write(f"{name} {int(validation)} {len(points)} " + " ".join(f"{x:.16g}" for x in np.r_[T[:3,:3].ravel(),T[:3,3]]) + "\n")
             poses.append({"frame":name, "stamp":t, "scan_stamp":float(stamps[j]), "validation":validation, "T_world_camera":T.tolist()})
             frame_count += 1
-            if frame_count % 10 == 0: print(f"[gaussian] prepared {frame_count}/{len(chosen)} frames", flush=True)
+            if frame_count % 10 == 0: print(f"[gaussian] prepared {frame_count} frames", flush=True)
     finally:
         if files is not None: files.close()
-        stream.unlink(missing_ok=True)
+    if a.intervals and frame_count != sum(len(selected) for _, _, selected in spans):
+        raise ValueError("Some reference frames could not be decoded or have insufficient LiDAR coverage")
     if frame_count < 4:
         raise RuntimeError("Too few frames with valid camera/LiDAR coverage")
     (output / "camera_poses.json").write_text(json.dumps(poses, indent=2))
@@ -211,7 +252,9 @@ def run(a):
         shared = output / "shared"
         info = refine(workspace, shared, binary, voxel=a.voxel, epochs=a.shared_epochs,
                       sweeps=a.shared_sweeps, batch_frames=a.submap_frames,
-                      max_active=a.max_active, replay_views=a.replay_views,sky_masks=not a.no_sky_masks)
+                      max_active=a.max_active, replay_views=a.replay_views,sky_masks=not a.no_sky_masks,
+                      distant_surface=a.distant_surface,training_depth=a.training_depth,replay_reference=a.replay_reference,
+                      surface_scale_factor=a.surface_scale_factor,color_weight=a.color_weight)
         for name in ["point_cloud.ply", "gaussian_centers.pcd"]:
             (shared/name).replace(output/name)
         info.update(fusion=str(fusion),dataset=str(bag),calibration=str(calib_path),
@@ -249,12 +292,17 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("run"); ap.add_argument("--dataset"); ap.add_argument("--calibration"); ap.add_argument("--out")
     ap.add_argument("--binary",default=str(REPO/"build/gaussian/my_livo_gaussian"))
-    ap.add_argument("--backend",choices=["shared","legacy"],default="shared",
-                    help="Shared fixed-pose global map (default); legacy reproduces independent submap concatenation")
+    ap.add_argument("--backend",choices=["shared"],default="shared",
+                    help="Shared fixed-pose global map using the D-stage native accepted surface")
     ap.add_argument("--voxel",type=float,default=.08,help="Shared map: measured-anchor association cell in metres")
     ap.add_argument("--shared-epochs",type=int,default=12);ap.add_argument("--shared-sweeps",type=int,default=2)
     ap.add_argument("--replay-views",type=int,default=40)
+    ap.add_argument("--replay-reference",help="Shared map: reuse training replay lists from an unpartitioned map_info.json")
     ap.add_argument("--no-sky-masks",action="store_true",help="Disable optional local semantic foreground masks")
+    ap.add_argument("--distant-surface",action="store_true",help="Unsupported: D-stage geometry excludes extra distant returns")
+    ap.add_argument("--training-depth",type=float,help="Shared map: maximum training camera depth (default: 60 m)")
+    ap.add_argument("--surface-scale-factor",type=float,help="Shared map: absolute multiplier of PCA-plane tangent upper bounds (default: 1)")
+    ap.add_argument("--color-weight",type=float,default=0.,help="Shared map: soft penalty for DC colors outside [0,1]")
     ap.add_argument("--max-active",type=int,default=3000000,help="Shared map: GPU working-set budget; camera batches split when needed")
     ap.add_argument("--width",type=int,default=640); ap.add_argument("--interval",type=float,default=0.5)
     ap.add_argument("--max-depth",type=float,default=120); ap.add_argument("--submap-frames",type=int,default=40)
@@ -264,6 +312,8 @@ def main():
     ap.add_argument("--max-scale",type=float,default=0.5,help="Maximum Gaussian standard deviation in metres")
     ap.add_argument("--position-lr",type=float,default=0,help="Default 0: preserve measured LiDAR centres")
     ap.add_argument("--start",type=float,default=0); ap.add_argument("--duration",type=float)
+    ap.add_argument("--intervals",help="Select reference frames in comma-separated half-open START:END seconds after trajectory start")
+    ap.add_argument("--reference-poses",help="Complete camera_poses.json for --intervals (default: original fusion/gaussian map)")
     ap.add_argument("--keep-inputs",action="store_true")
     ap.add_argument("--prepare-only",action="store_true",help="Prepare fixed-pose RGB/depth data without CUDA training")
     a = ap.parse_args()
@@ -271,10 +321,19 @@ def main():
             and a.refine_passes>=0 and 1000<=a.max_gaussians<=2000000 and a.start>=0 and a.max_depth>1
             and 0<a.depth_weight<=10 and 0<a.max_scale<=1 and 0<=a.position_lr<=0.001 and (a.duration is None or a.duration>0)):
         ap.error("Invalid Gaussian mapping settings")
-    if not (.01<=a.voxel<=.3 and a.shared_epochs>0 and a.shared_sweeps>0 and a.replay_views>=0 and a.max_active>=1000):
+    if not (.01<=a.voxel<=.3 and a.shared_epochs>0 and a.shared_sweeps>0 and a.replay_views>=0 and a.max_active>=1000
+            and (a.training_depth is None or np.isfinite(a.training_depth) and a.training_depth>1)
+            and (a.surface_scale_factor is None or 1<=a.surface_scale_factor<=2)
+            and 0<=a.color_weight<=1):
         ap.error("Invalid shared mapping settings")
     if a.backend=="shared" and a.position_lr!=0:
         ap.error("Shared surface mapping keeps measured centres fixed (--position-lr 0)")
+    if a.distant_surface:
+        ap.error("D-stage geometry excludes extra distant returns; --distant-surface is unsupported")
+    if a.color_weight and a.backend!="shared":
+        ap.error("--color-weight requires the shared backend")
+    if (a.intervals and (a.start or a.duration)) or (a.reference_poses and not a.intervals):
+        ap.error("Use --intervals with a reference map, separately from --start/--duration")
     run(a)
 
 

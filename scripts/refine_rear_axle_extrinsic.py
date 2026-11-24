@@ -595,15 +595,16 @@ def main():
         for k in list(entry):
             if k.startswith("transform_matrix_lidar_"):
                 entry[k] = (C @ np.asarray(entry[k], float).reshape(4, 4)).reshape(-1).tolist()
-    cam = (out.get("transforms") or {}).get("midrange_camera_to_rear_axle")
-    if cam and cam.get("transform_matrix"):
-        cam["transform_matrix"] = (C @ np.asarray(cam["transform_matrix"], float).reshape(4, 4)).reshape(-1).tolist()
+    for camera_key in ("midrange_camera_to_rear_axle", "fish_camera_to_rear_axle"):
+        cam = (out.get("transforms") or {}).get(camera_key)
+        if cam and cam.get("transform_matrix"):
+            cam["transform_matrix"] = (C @ np.asarray(cam["transform_matrix"], float).reshape(4, 4)).reshape(-1).tolist()
     if solve_dt:
         out.setdefault("time_offsets", {})["lidar"] = round(lidar_off + dt_total, 4)
         out["time_offsets"]["lidar_source"] = "rear-axle alignment (cross-time consistency vs INS poses)"
     out["calibration_type"] = calib.get("calibration_type", "") + "+rtk_rear_axle_alignment"
     out.setdefault("refinement", {})["rear_axle_alignment"] = {
-        "reference": REFERENCE_KEY, "poses": f"{INS_TOPIC} (RTK fixed)", "applied_to": "all LiDARs and the camera (rig correction)",
+        "reference": REFERENCE_KEY, "poses": f"{INS_TOPIC} (RTK fixed)", "applied_to": "all LiDARs and all camera transforms (rig correction)",
         "solution_rotvec_deg": np.round(rv_full, 4).tolist(), "solution_translation_cm": np.round(dt_full, 2).tolist(),
         "correction_rotvec_deg": np.round(rv, 4).tolist(), "correction_translation_cm": np.round(dtcm, 2).tolist(),
         "correction_matrix": C.reshape(-1).tolist(), "time_shift_s": None if a.keep_time_offset else round(dt_total, 4),

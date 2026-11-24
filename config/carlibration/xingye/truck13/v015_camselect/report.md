@@ -1,0 +1,174 @@
+# xingye/truck13/v015_camselect
+
+- stage: camselect (选择相机 / 导入鱼眼参数)
+- parent: xingye/truck13/v014_camphoto
+- lineage: xingye/truck13/v001_import -> xingye/truck13/v002_axle -> xingye/truck13/v003_ground -> xingye/truck13/v004_driven -> xingye/truck13/v005_gcons -> xingye/truck13/v008_camtime -> xingye/truck13/v009_camlidar -> xingye/truck13/v011_scan -> xingye/truck13/v014_camphoto -> xingye/truck13/v015_camselect
+- created: 2026-11-23T17:50:12+08:00
+- note: Select fisheye; independent camera calibration and validation required
+
+## inputs
+
+- camera: fisheye
+
+## changes vs parent
+
+```
+{
+  "camera_to_rear": {
+    "dt_cm": [
+      7.39,
+      -37.28,
+      -16.28
+    ],
+    "drpy_deg": [
+      -8.397,
+      2.282,
+      2.497
+    ]
+  },
+  "time_offsets": {
+    "camera": {
+      "from": -0.0261,
+      "to": 0.0
+    }
+  },
+  "camera": {
+    "intrinsics": {
+      "from": [
+        1642.15,
+        1855.56,
+        963.247,
+        544.29
+      ],
+      "to": [
+        508.7092250434,
+        509.0758442718,
+        945.8638825396,
+        490.9500743882
+      ]
+    }
+  }
+}
+```
+
+## metrics
+
+```
+{
+  "camera_selection": "fisheye"
+}
+```
+
+## summary
+
+```
+{
+  "lidars": [
+    {
+      "lidar": "front_right_lidar",
+      "key": "transform_matrix_lidar_1",
+      "t": [
+        1.9464,
+        7.0057,
+        1.0298
+      ],
+      "rpy_deg": [
+        -1.755,
+        -0.435,
+        14.043
+      ]
+    },
+    {
+      "lidar": "back_lidar",
+      "key": "transform_matrix_lidar_2",
+      "t": [
+        -0.1422,
+        -1.9111,
+        0.4543
+      ],
+      "rpy_deg": [
+        0.043,
+        -3.423,
+        -90.139
+      ]
+    },
+    {
+      "lidar": "front_left_lidar",
+      "key": "transform_matrix_lidar_3",
+      "t": [
+        -1.9445,
+        6.9514,
+        1.0499
+      ],
+      "rpy_deg": [
+        0.796,
+        -0.59,
+        167.928
+      ]
+    },
+    {
+      "lidar": "front_lidar",
+      "key": "transform_matrix_lidar_6",
+      "t": [
+        -0.0002,
+        7.0096,
+        0.6541
+      ],
+      "rpy_deg": [
+        0.426,
+        2.516,
+        90.688
+      ]
+    }
+  ],
+  "camera_to_rear": {
+    "t": [
+      0.0616,
+      6.6681,
+      1.2941
+    ],
+    "rpy_deg": [
+      -106.309,
+      2.943,
+      2.161
+    ]
+  },
+  "camera_selection": "fisheye",
+  "available_cameras": [
+    "midrange",
+    "fisheye"
+  ],
+  "camera": {
+    "topic": "/fish_camera/image_raw",
+    "stream_topic": "/fish_camera/ffmpeg",
+    "width": 1920,
+    "height": 1080,
+    "intrinsics": [
+      508.7092250434,
+      509.0758442718,
+      945.8638825396,
+      490.9500743882
+    ],
+    "distortion": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "model": "pinhole",
+    "source": "fish_camera[0].camera_in_params (supplier rectified projection)"
+  },
+  "time_offsets": {
+    "lidar": -0.0502,
+    "lidar_frontend": -0.0427,
+    "camera": 0.0,
+    "rtk_position": 0.025,
+    "ins_attitude": 0.0,
+    "lidar_source": "rear-axle alignment (cross-time consistency vs INS poses)",
+    "source": "import (verify with camera-time / LIO evaluation)",
+    "lidar_frontend_source": "axle: lidar -0.0502 + imu/ins clock lag +0.0075 (corr 0.997); template -0.1250 replaced",
+    "camera_source": "unmeasured; run camera-time for this camera"
+  }
+}
+```

@@ -129,6 +129,10 @@ LIVMapper::LIVMapper(const rclcpp::Node::SharedPtr &node)
           {"effective.imu_to_rear_axle", lever_text.str()},
           {"effective.camera_mode", img_en ? (vio_ekf_update_en ? "livo" : "colour_only") : "off"},
           {"effective.camera_frame_divider", std::to_string(camera_frame_divider)},
+          {"effective.camera_selection", camera_selection_},
+          {"effective.camera_projection_model", camera_projection_model_},
+          {"effective.camera_input_rectification", camera_rectify_x_.empty() ? "none" : "brown_same_K"},
+          {"effective.camera_image_topic", img_topic},
           {"effective.vio_lidar_parity_ratio", num(vio_lidar_parity_ratio)},
           {"calibration.file", calibration_file_},
           {"calibration.id", calibration_identity_}});
@@ -684,11 +688,15 @@ void LIVMapper::loadMultiLidarCalibration()
 
   // VIO consumes virtual-lidar(rear axle)->camera.  The same external file
   // stores camera->rear axle, so invert that rigid transform here.
+  camera_selection_ = calibration.get("camera_selection", "midrange").asString();
+  if (camera_selection_ != "midrange" && camera_selection_ != "fisheye")
+    throw std::runtime_error("camera_selection must be midrange or fisheye");
+  const string camera_transform_key = camera_selection_ == "fisheye"
+      ? "fish_camera_to_rear_axle" : "midrange_camera_to_rear_axle";
   const Json::Value &rear_from_camera_values =
-      calibration["transforms"]["midrange_camera_to_rear_axle"]
-                 ["transform_matrix"];
+      calibration["transforms"][camera_transform_key]["transform_matrix"];
   const Eigen::Matrix4d rear_from_camera = parse_rigid_transform(
-      rear_from_camera_values, "midrange_camera_to_rear_axle");
+      rear_from_camera_values, camera_transform_key);
   rear_from_camera_ = rear_from_camera;
   calibration_file_ = calibration_path.string();
   if (calibration.isMember("identity") && calibration["identity"].isObject() &&
@@ -733,6 +741,15 @@ void LIVMapper::loadMultiLidarCalibration()
   if (calibration.isMember("camera") && calibration["camera"].isObject())
   {
     const Json::Value &camera = calibration["camera"];
+    camera_projection_model_ = camera.get("model", "pinhole").asString();
+    if (camera_projection_model_ != "pinhole" && camera_projection_model_ != "rectified_pinhole")
+      throw std::runtime_error("Unsupported camera.model: " + camera_projection_model_ +
+                               "; provide calibrated pinhole input before VIO");
+    if (camera.isMember("topic")) img_topic = camera["topic"].asString();
+    if (img_topic.empty()) throw std::runtime_error("camera.topic must not be empty");
+    RCLCPP_INFO(node_->get_logger(), "Selected camera: %s, image %s, transform %s, model %s",
+                camera_selection_.c_str(), img_topic.c_str(), camera_transform_key.c_str(),
+                camera_projection_model_.c_str());
     if (camera.isMember("intrinsics"))
       camera_intrinsics = read_numbers(camera["intrinsics"], 4, "camera.intrinsics");
     if (camera.isMember("distortion"))
@@ -882,12 +899,64 @@ void LIVMapper::initializeComponents()
           ? "gravity-free; restoring gravity"
           : "specific force with gravity");
 
+  if (camera_width <= 0 || camera_height <= 0)
+    throw std::runtime_error("Camera width and height must be positive.");
   if (camera_intrinsics.size() != 4 || camera_distortion.size() != 5)
     throw std::runtime_error("Camera intrinsics must be [fx, fy, cx, cy] and distortion must contain five values.");
+  if (camera_intrinsics[0] <= 0 || camera_intrinsics[1] <= 0)
+    throw std::runtime_error("Camera focal lengths must be positive.");
   cv::Mat distortion(1, 5, CV_64F, camera_distortion.data());
+  // Keep the estimator coefficients separate: assigning Mat::zeros to a
+  // shallow alias may overwrite the calibrated input D before map creation.
+  cv::Mat estimator_distortion = distortion.clone();
+  if (camera_selection_ == "fisheye")
+  {
+    // The supplied wide-angle stream is already a pinhole projection. A fitted
+    // residual Brown model is applied once at input, preserving the original K,
+    // frame size and exposure timestamp used by the unchanged VIO projection.
+    estimator_distortion = cv::Mat::zeros(1, 5, CV_64F);
+    if (cv::norm(distortion) != 0.0)
+    {
+      const cv::Mat K = (cv::Mat_<double>(3, 3) <<
+          camera_intrinsics[0], 0.0, camera_intrinsics[2],
+          0.0, camera_intrinsics[1], camera_intrinsics[3], 0.0, 0.0, 1.0);
+      cv::initUndistortRectifyMap(K, distortion, cv::Mat::eye(3, 3, CV_64F), K,
+                                cv::Size(camera_width, camera_height), CV_32FC1,
+                                camera_rectify_x_, camera_rectify_y_);
+      if (!cv::checkRange(camera_rectify_x_) || !cv::checkRange(camera_rectify_y_))
+        throw std::runtime_error("Camera residual distortion produces non-finite rectification coordinates");
+      double min_x, max_x, min_y, max_y;
+      cv::minMaxLoc(camera_rectify_x_, &min_x, &max_x);
+      cv::minMaxLoc(camera_rectify_y_, &min_y, &max_y);
+      constexpr double bounds_tolerance = 1e-3;
+      if (min_x < -bounds_tolerance || min_y < -bounds_tolerance ||
+          max_x > camera_width - 1.0 + bounds_tolerance || max_y > camera_height - 1.0 + bounds_tolerance)
+        throw std::runtime_error("Camera residual distortion leaves the input image; fit a full-frame valid model before mapping");
+      for (int v = 0; v + 1 < camera_height; ++v)
+      {
+        const float *x = camera_rectify_x_.ptr<float>(v);
+        const float *y = camera_rectify_y_.ptr<float>(v);
+        const float *next_x = camera_rectify_x_.ptr<float>(v + 1);
+        const float *next_y = camera_rectify_y_.ptr<float>(v + 1);
+        for (int u = 0; u + 1 < camera_width; ++u)
+        {
+          const float dxdu = x[u + 1] - x[u];
+          const float dxdv = next_x[u] - x[u];
+          const float dydu = y[u + 1] - y[u];
+          const float dydv = next_y[u] - y[u];
+          if (dxdu * dydv - dxdv * dydu <= 0.0f)
+            throw std::runtime_error("Camera residual Brown model folds inside the image; calibration rejected");
+        }
+      }
+      RCLCPP_INFO(node_->get_logger(),
+                  "Camera input rectification: residual Brown distortion, same K and %dx%d size; "
+                  "source bounds x [%.3f, %.3f], y [%.3f, %.3f]; VIO uses zero distortion",
+                  camera_width, camera_height, min_x, max_x, min_y, max_y);
+    }
+  }
   camera_model = std::make_unique<vk::PinholeCamera>(
       camera_width, camera_height, camera_intrinsics[0], camera_intrinsics[1],
-      camera_intrinsics[2], camera_intrinsics[3], distortion);
+      camera_intrinsics[2], camera_intrinsics[3], estimator_distortion);
   vio_manager->cam = camera_model.get();
 
   vio_manager->grid_size = grid_size;
@@ -1963,6 +2032,7 @@ void LIVMapper::printCalibrationSummary(const char *stage) const
     out << "   " << std::left << std::setw(40) << "camera -> rear axle" << std::right
         << std::setprecision(3) << std::setw(9) << t.x() << std::setw(10) << t.y() << std::setw(10) << t.z()
         << std::setw(10) << rpy.x() << std::setw(11) << rpy.y() << std::setw(10) << rpy.z() << "\n";
+    out << "   camera " << camera_selection_ << " (" << camera_projection_model_ << "), topic " << img_topic << "\n";
     out << "   camera intrinsics fx " << std::setprecision(2) << camera_intrinsics[0] << " fy " << camera_intrinsics[1]
         << " cx " << camera_intrinsics[2] << " cy " << camera_intrinsics[3] << " (" << camera_width << "x" << camera_height
         << "), distortion [" << std::setprecision(4) << camera_distortion[0] << " " << camera_distortion[1] << " "
@@ -2937,6 +3007,16 @@ cv::Mat LIVMapper::getImageFromMsg(const sensor_msgs::ImageConstPtr &img_msg)
 {
   cv::Mat img;
   img = cv_bridge::toCvCopy(img_msg, "bgr8")->image;
+  if (img.cols != camera_width || img.rows != camera_height)
+    throw std::runtime_error("Camera image size " + std::to_string(img.cols) + "x" + std::to_string(img.rows) +
+                             " differs from calibration " + std::to_string(camera_width) + "x" +
+                             std::to_string(camera_height));
+  if (!camera_rectify_x_.empty())
+  {
+    cv::Mat rectified;
+    cv::remap(img, rectified, camera_rectify_x_, camera_rectify_y_, cv::INTER_LINEAR);
+    return rectified;
+  }
   return img;
 }
 

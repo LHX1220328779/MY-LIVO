@@ -37,7 +37,8 @@ if __package__ in (None, ""):  # executed as a file: make `livo` importable
 
 LIO_TOPICS = ("front_left_lidar", "back_lidar", "front_right_lidar", "front_lidar",
               "imu_data", "imu_data/odometry", "imu_data/ins_status", "imu_data/navsat_fix")
-CAMERA_TOPICS = ("midrange_camera/ffmpeg",)
+CAMERA_STREAM_TOPICS = {"midrange": "midrange_camera/ffmpeg", "fisheye": "fish_camera/ffmpeg"}
+CAMERA_TOPICS = (CAMERA_STREAM_TOPICS["midrange"],)
 PRESETS = {"lio": LIO_TOPICS, "livo": LIO_TOPICS + CAMERA_TOPICS, "all": None}
 LIDAR_TYPE = "sensor_msgs/msg/PointCloud2"
 IMU_TYPE = "sensor_msgs/msg/Imu"
@@ -207,6 +208,8 @@ class Dataset:
             "size_bytes": self.size_bytes, "size_gb": round(self.size_bytes / 1e9, 2),
             "topics": {n: {"type": t, "messages": self.counts.get(n, 0)} for n, t in sorted(self.topics.items())},
             "lidar_topics": lidars, "imu_topics": self.imu_topics, "camera_topics": self.camera_topics,
+            "camera_streams": {name: matches[0] for name, topic in CAMERA_STREAM_TOPICS.items()
+                               if (matches := self.resolve_topics([topic]))},
             "has_camera": self.has_camera, "has_imu": bool(self.imu_topics), "has_lidar": bool(lidars),
             "has_ins": any(n.endswith("imu_data/odometry") for n in self.topics),
             "lio_ready": bool(lidars) and bool(self.imu_topics),

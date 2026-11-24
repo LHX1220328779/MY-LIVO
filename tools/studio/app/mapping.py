@@ -18,7 +18,7 @@ def _map_export_args(body, prefix=""):
     same without the map_ prefix for the results-page re-export)."""
     g = lambda k, d=None: body.get(prefix + k, d)  # noqa: E731
     try:
-        voxel = float(g("voxel", 0.05) if g("voxel", 0.05) not in (None, "") else 0.05)
+        voxel = float(g("voxel", 0.1) if g("voxel", 0.1) not in (None, "") else 0.1)
         tile = float(g("tile", 0) or 0)
     except (TypeError, ValueError):
         raise StudioError("地图导出参数必须是数字") from None
@@ -27,8 +27,8 @@ def _map_export_args(body, prefix=""):
         min_points = int(g("min_points", 1) or 1)
     except (TypeError, ValueError):
         raise StudioError("地图导出：每体素最少点数必须是整数") from None
-    if not (0 <= voxel <= 2.0) or not (0 <= tile <= 2000) or source not in ("all", "keyframes") or not 1 <= min_points <= 1000:
-        raise StudioError("地图导出：体素 0–2 m（0 = 不滤波）、分块 0–2000 m、来源 all/keyframes、每体素最少点数 1–1000")
+    if not (0 < voxel <= 2.0) or not (0 <= tile <= 2000) or source not in ("all", "keyframes") or not 1 <= min_points <= 1000:
+        raise StudioError("地图导出：强度体素须大于 0 且不超过 2 m（默认 0.1 m）、分块 0–2000 m、来源 all/keyframes、每体素最少点数 1–1000")
     return voxel, source, tile, bool(g("keyframes", False)), min_points
 
 
@@ -43,7 +43,7 @@ def export_map(round_name, body):
         raise StudioError("已有地图导出任务在运行")
     voxel, source, tile, kf, min_points = _map_export_args(body)
     fusion = runs[-1]
-    name = "map" if (voxel == 0.05 and source == "all" and not tile and not kf and min_points == 1) else \
+    name = "map" if (voxel == 0.1 and source == "all" and not tile and not kf and min_points == 1) else \
         f"map_{voxel * 100:g}cm_{source}{f'_tile{tile:g}' if tile else ''}{'_kf' if kf else ''}" \
         f"{f'_min{min_points}' if min_points > 1 else ''}"
     cmd = [PY, str(MAP_EXPORT_TOOL), str(fusion), "--voxel", f"{voxel:g}", "--source", source, "--tile", f"{tile:g}",
@@ -82,6 +82,11 @@ _EVENT_CACHE = {}
 def round_cmd(round_name, mode, calibration_file, body, *, force_save_map=False, evaluate=None, export_pcd=False):
     dataset = str(safe_path(body.get("dataset") or ""))
     cmd = ["bash", str(ROUND_SCRIPT), round_name, "--mode", mode, "--dataset", dataset]
+    if mode in ("livo", "gaussian"):
+        camera = calibration.camera_name(body)
+        if mode == "gaussian" and camera == "fisheye":
+            raise StudioError("高斯建图目前仅支持中距相机；鱼眼请选择 LIVO 模式")
+        cmd += ["--camera", camera]
     if not body.get("use_rtk", True):
         cmd.append("--no-rtk")
     if not (force_save_map or body.get("save_map", True)):
@@ -113,14 +118,13 @@ def round_cmd(round_name, mode, calibration_file, body, *, force_save_map=False,
         if not math.isfinite(voxel) or not 0 <= voxel <= 0.5:
             raise StudioError("彩色点云体素必须是 0 到 0.5 m 之间的数（0 表示保留每一行）")
         cmd += ["--rgb-voxel", str(voxel)]
-    if body.get("map_filter") not in (None, ""):
-        try:
-            value = float(body["map_filter"])
-        except (TypeError, ValueError):
-            raise StudioError("强度点云过滤值必须是 0 到 0.1 m 之间的数（0 表示不过滤）") from None
-        if not math.isfinite(value) or not 0 <= value <= 0.1:
-            raise StudioError("强度点云过滤值必须是 0 到 0.1 m 之间的数（0 表示不过滤）")
-        cmd += ["--map-filter", str(value)]
+    try:
+        value = float(body.get("map_filter") if body.get("map_filter") not in (None, "") else 0.1)
+    except (TypeError, ValueError):
+        raise StudioError("强度点云过滤值须大于 0 且不超过 0.1 m（默认 0.1 m）") from None
+    if not math.isfinite(value) or not 0 < value <= 0.1:
+        raise StudioError("强度点云过滤值须大于 0 且不超过 0.1 m（默认 0.1 m）")
+    cmd += ["--map-filter", str(value)]
     if body.get("skip_stationary"):
         try:
             smin = float(body.get("stationary_min") or 30)
@@ -134,7 +138,7 @@ def round_cmd(round_name, mode, calibration_file, body, *, force_save_map=False,
         # finalize-time submap loop closure over revisited sections (on by default)
         cmd += ["--set", "rtk.loop_closure_enabled=false"]
     # saved map: drop far duplicate returns of surfaces another pass saw nearer (on by default)
-    cmd.append("--no-map-priority" if body.get("map_priority", True) is False else "--map-priority")
+    cmd.append("--map-priority")
     if body.get("save_map", True) or force_save_map:
         # Manual mapping explicitly requests its PCDs. Development/calibration rounds
         # and Gaussian inputs retain the archive-only default.
@@ -216,11 +220,14 @@ def start(body):
     if mode not in ("lio", "livo", "gaussian"):
         raise StudioError("模式必须是 lio、livo 或 gaussian")
     if mode == "gaussian":
+        if calibration.camera_name(body) == "fisheye":
+            raise StudioError("高斯建图目前仅支持中距相机；鱼眼请选择 LIVO 模式")
         if not (REPO / "build/gaussian/my_livo_gaussian").is_file():
             raise StudioError("请先运行 bash scripts/build_gaussian.sh 编译高斯建图模块")
         body = {**body, "save_map": True}
     dataset = str(safe_path(body.get("dataset") or ""))
-    datasets.require(dataset, camera=(mode in ("livo", "gaussian")))
+    camera = calibration.camera_name(body)
+    datasets.require(dataset, camera=camera if mode in ("livo", "gaussian") else False)
     # 轮次命名规范：<矿区>_<车号>_<模式>_<序号>，序号从 1 起；名称不含日期
     # （开始时间已记录在轮次元数据中）。开发测试轮由脚本手工命名并加 _test 后缀。
     mine_part = re.sub(r"[^A-Za-z0-9]", "", str(body.get("mine") or "")).lower() or "site"
@@ -236,7 +243,7 @@ def start(body):
     cid = body.get("calibration_id") or ""
     if cid == "active" or not cid:
         cid = calibration.mapping_default(calibration.catalogue(), body.get("mine") or "",
-                                          body.get("truck") or "", dataset) or ""
+                                          body.get("truck") or "", dataset, camera) or ""
     if not cid:
         # Without a version the mapper silently fell back to config/wuhu_truck29.yaml's calibration_file, a hand-tuned
         # file of the 2026-08 truck29 data: truck29raw 20261013 rounds wuhu_29_livo_4..6 ran with front_left_lidar
@@ -271,9 +278,11 @@ def start(body):
                 f"来自其他矿区的车辆：请先切换到该矿区的车辆（或为当前数据选择正确的标定版本）。"
                 f"跨车标定会让原生轨迹从起步就偏离 RTK 米级")
     calib_file = str(calibration.calibration_file(cid)) if cid else None
+    if mode in ("livo", "gaussian"):
+        calibration.camera_name({"camera": camera}, cid)
     cmd = round_cmd(round_name, mode, calib_file, body, export_pcd=mode in ("lio", "livo"))
-    meta = {"round": round_name, "mode": mode, "dataset": dataset, "calibration_id": cid,
-            "options": {k: body.get(k) for k in ("use_rtk", "save_map", "rviz", "rate", "precheck", "frame_divider",
+    meta = {"round": round_name, "mode": mode, "camera": camera, "dataset": dataset, "calibration_id": cid,
+            "options": {k: body.get(k) for k in ("camera", "use_rtk", "save_map", "rviz", "rate", "precheck", "frame_divider",
                                                   "evaluate", "extra_sets", "start_offset", "duration", "map_range", "rgb_range",
                                                   "rgb_voxel", "map_filter",
                                                   "skip_stationary", "stationary_min", "stationary_lidar_interval",
@@ -355,14 +364,20 @@ def round_record(p, budget=None):
     status = manifest.get("status") or ("done" if kv.get("end") else ("running" if kv.get("start") else "unknown"))
     if status == "running" and not pgrep("run_wuhu_round.sh " + re.escape(p.name)):
         status = "lost"
+    snapshot = read_json(p / "calibration.json", {}) or {}
+    identity = snapshot.get("identity") or {}
     return {"round": p.name, "path": str(p), "mode": manifest.get("mode") or kv.get("mode", ""),
+            "camera": manifest.get("camera") or (manifest.get("options") or {}).get("camera") or kv.get("camera") or "midrange",
+            "vehicle": f"{identity['mine']}/{identity['truck']}" if identity.get("mine") and identity.get("truck") else None,
             "start": manifest.get("start") or kv.get("start", ""), "end": manifest.get("end") or kv.get("end", ""),
             "status": status, "phase": manifest.get("phase"), "error": manifest.get("error"),
             "overrides": manifest.get("overrides") or kv.get("overrides", ""),
             "dataset": manifest.get("dataset") or kv.get("dataset") or kv.get("bag", ""),
             "calibration": manifest.get("calibration") or kv.get("calibration", ""),
+            "calibration_source": manifest.get("calibration_source") or manifest.get("calibration") or kv.get("calibration", ""),
             "options": manifest.get("options"), "commit": manifest.get("commit") or kv.get("commit", ""),
             "fusion_dir": str(fusion[-1]).rstrip("/") if fusion else "",
+            "has_archive": bool(fusion and (fusion[-1] / "scans.bin").is_file()),
             "map_chunks": manifest.get("map_chunks"), "evaluated": evaluated, "metrics": metrics,
             "metrics_complete": complete, "evaluation_error": bool(evaluated and not complete),
             "precheck": (p / "Log" / "extrinsic_precheck.json").exists(),

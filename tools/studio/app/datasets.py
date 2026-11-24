@@ -69,8 +69,15 @@ def require(raw_path, camera=False):
         raise StudioError(f"数据源不可用：{info['error']}")
     if not info.get("lio_ready"):
         raise StudioError("数据源缺少 LiDAR/IMU 话题，无法用于建图或标定")
-    if camera and not info.get("livo_ready"):
-        raise StudioError("数据源没有相机话题（midrange_camera/ffmpeg）：LIVO / 相机标定需要包含 Camera_* 分段的原始录制目录")
+    if camera:
+        name = "midrange" if camera is True else camera
+        if name not in ("midrange", "fisheye"):
+            raise StudioError("相机必须选择中距或鱼眼")
+        topic = "fish_camera/ffmpeg" if name == "fisheye" else "midrange_camera/ffmpeg"
+        topics = {t.lstrip("/") for t in info.get("camera_topics", [])}
+        if topic not in topics:
+            label = "鱼眼" if name == "fisheye" else "中距"
+            raise StudioError(f"数据源没有{label}相机话题（{topic}）；请选择包含该相机 Camera_* 分段的原始录制目录")
     return info
 
 

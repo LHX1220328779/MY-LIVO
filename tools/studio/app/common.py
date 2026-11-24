@@ -29,13 +29,13 @@ DEFAULT_STATE = {
     "data": {"dataset": DEFAULT_DATASET, "recent": [DEFAULT_DATASET]},
     "calibration": {"source_file": str(CAL_ROOT / "perception_truck29.json"), "parent_id": "", "run": "",
                     "lidar_offset": -0.125, "camera_offset": -0.115, "auto_activate": True, "fast": True,
-                    "from_factory": False},
-    "mapping": {"round_prefix": "studio", "mode": "livo", "use_rtk": True, "save_map": True, "rviz": False,
+                    "from_factory": False, "camera": "midrange", "validation_run": ""},
+    "mapping": {"round_prefix": "studio", "mode": "livo", "camera": "midrange", "use_rtk": True, "save_map": True, "rviz": False,
                 "rate": 1.0, "calibration_id": "", "precheck": True, "frame_divider": 1, "evaluate": True,
                 "extra_sets": "", "start_offset": 0, "duration": "", "map_range": 45.0, "rgb_range": 60.0,
-                "rgb_voxel": 0.035, "map_filter": 0.01,
+                "rgb_voxel": 0.03, "map_filter": 0.1, "echo_policy": "D",
                 "skip_stationary": True, "stationary_min": 30, "stationary_lidar_interval": 1.0, "loop_closure": True, "map_priority": True,
-                "map_export": True, "map_voxel": 0.05, "map_source": "all", "map_tile": 0, "map_keyframes": False,
+                "map_export": True, "map_voxel": 0.1, "map_source": "all", "map_tile": 0, "map_keyframes": False,
                 "auto_cleanup": True, "auto_cleanup_free_gb": 50, "map_min_points": 1},
     "ui": {"page": "home"},
 }
@@ -49,6 +49,7 @@ def now():
 
 def load_state():
     state = json.loads(json.dumps(DEFAULT_STATE))
+    saved = {}
     if STATE_FILE.exists():
         try:
             saved = json.loads(STATE_FILE.read_text())
@@ -75,6 +76,15 @@ def load_state():
         if data["dataset"] not in recent:
             recent.insert(0, data["dataset"])
         data["recent"] = recent[:12]
+    mapping = state["mapping"]
+    if saved.get("mapping", {}).get("echo_policy") != "D":
+        for key, old_default in (("map_filter", 0.01), ("map_voxel", 0.05)):
+            if mapping.get(key) in (None, "", 0, old_default):
+                mapping[key] = 0.1
+        if mapping.get("rgb_voxel") == 0.035:
+            mapping["rgb_voxel"] = 0.03
+    mapping["echo_policy"] = "D"
+    mapping["map_priority"] = True
     return state
 
 

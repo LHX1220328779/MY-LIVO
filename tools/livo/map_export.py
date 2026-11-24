@@ -8,7 +8,7 @@ point = native scan-end pose * LiDAR extrinsic * p, delivered point = C(t) * nat
 (Lie) interpolation of the correction knots (held before the first / after the last knot).
 
 Products (default <fusion_run>/map/):
-  global_map.pcd          voxel-filtered geometry map (centroid of every voxel; x y z intensity), binary PCD
+  global_map.pcd          native accepted rows, reduced to 10 cm voxels by default (centroid; x y z intensity)
   global_map_rgb.pcd      independent paired-frame camera map: every original coloured return before geometry
                           row masks / range priority; one nearest/slowest original observation per 3 cm voxel
                           (LIVORGB2 current scans, or LIVORGB1 older coloured observations)
@@ -16,16 +16,16 @@ Products (default <fusion_run>/map/):
   keyframes/              optional (--keyframe-clouds): per-keyframe body-frame clouds + poses.txt (TUM)
   map_info.json           frame, voxel size, source, ranges, counts, bounds, time span, inputs, calibration
 
-Source: --source all (every scan, densest) | keyframes (only the scans at backend keyframes: ~5x lighter,
-same surfaces). --voxel 0 keeps every return (no filtering).
-Range priority (same rule as the mapper's map_N.pcd, default from the round's rtk.save_map_priority_*, off when
-the round's rtk.save_map_priority_enabled is false): per
-0.5 m cell the nearest scan with >= 2 returns there sets r_min; returns farther than max(ratio * r_min,
-r_min + margin) are dropped before the voxel filter (--priority-ratio 0 = off). With the round's settings
-(no --max-range / --min-range / --priority-*) and its map_rows.bin, the rows are taken from map_rows.bin, i.e.
-exactly the mapper's decision including its seen-free cells (rtk.save_map_priority_free_range_m).
+Source: --source all (every scan) | keyframes (only the scans at backend keyframes: ~5x lighter,
+same surfaces). Standard intensity products require a positive voxel size and map_rows.bin from a D-stage run:
+native range priority enabled, ratio 1.5, margin 2 m, cell 0.5 m, seen-free range 25 m, detail fill enabled and
+a finite positive native map filter. They always preserve the mapper's accepted-row decision.
+--max-range / --min-range only further crop these rows; --priority-* must match the source run and cannot
+disable its selection. Raw/full-return intensity export is not supported.
+The independent RGB product retains its own paired-frame observations and 3 cm voxel; --rgb-only does not
+require an intensity row mask.
 
-    /usr/bin/python3 tools/livo/map_export.py results/<round> [--voxel 0.05] [--source all] [--tile 100]
+    /usr/bin/python3 tools/livo/map_export.py results/<round> [--voxel 0.1] [--source all] [--tile 100]
 """
 import argparse
 import datetime as dt
@@ -394,8 +394,7 @@ def _project_frames(job):
             if rows is not None:   # the mapper's decision (its float32 cap, range priority, seen-free cells)
                 s0 = int(c["rows_start"][i])
                 keep &= np.unpackbits(rows[s0:s0 + (cnt + 7) // 8], bitorder="little")[:cnt].astype(bool)
-            else:
-                keep = in_cap
+            keep &= in_cap  # explicit distance limits can only crop the accepted native surface
             if a.min_range > 0:
                 keep &= rng >= a.min_range
             begin, stamp = fr["begin"][i], fr["stamp"][i]
@@ -509,6 +508,8 @@ def _colour_tile(tile_id):
 
 def export(a):
     import multiprocessing as mp
+    if not a.rgb_only and (not np.isfinite(a.voxel) or a.voxel <= 0):
+        raise SystemExit("Standard intensity maps require --voxel > 0 (default 0.1 m); full-return export is disabled")
     t_start = time.time()
     run = resolve_run(a.run)
     out = pathlib.Path(a.out) if a.out else run / "map"
@@ -547,36 +548,53 @@ def export(a):
             rgb_range = -1.0
         if rgb_range < 0:
             rgb_range = max_range
-    priority = []
-    for name, key, default in (("priority_ratio", "rtk.save_map_priority_ratio", 1.5),
-                               ("priority_margin", "rtk.save_map_priority_margin_m", 2.0),
-                               ("priority_cell", "rtk.save_map_priority_voxel_m", 0.5)):
-        value = getattr(a, name)
-        if value is None:
-            try:
-                value = float(prm.get(key, default))
-            except ValueError:
-                value = default
-        priority.append(float(value))
-    # The round's switch rtk.save_map_priority_enabled (off = every return, as its map_N.pcd). Rounds without the
-    # switch: on if they had the rule's parameters (0aee860 .. 10-20, rule on by default), else off (older rounds).
-    enabled = prm.get("rtk.save_map_priority_enabled", "true" if "rtk.save_map_priority_ratio" in prm else "false")
-    if a.priority_ratio is None and str(enabled).lower() in ("false", "0"):
-        priority[0] = 0.0
-    if priority[0] != 0 and (priority[0] < 1 or priority[1] < 0 or priority[2] <= 0):
-        raise SystemExit("range priority: ratio 0 (off) or >= 1, margin >= 0, cell > 0")
-    # The round's settings + map_rows.bin: take the mapper's own row decision (incl. its seen-free cells).
+    priority = [0.0, 2.0, 0.5]  # RGB-only observations do not use intensity range priority.
+    native_selection = dict(echo_policy=None, seen_free_range_m=None, detail_fill=None, map_filter_m=None)
     rows_path, rows_start = run / "map_rows.bin", None
-    if (not a.rgb_only and rows_path.exists() and a.max_range is None and a.min_range <= 0 and a.priority_ratio is None
-            and a.priority_margin is None and a.priority_cell is None):
+    if not a.rgb_only:
+        enabled = prm.get("rtk.save_map_priority_enabled", "false")
+        if str(enabled).lower() not in ("true", "1"):
+            raise SystemExit("Standard intensity maps require a source run with native range priority enabled")
+        priority = []
+        for name, key in (("priority_ratio", "rtk.save_map_priority_ratio"),
+                          ("priority_margin", "rtk.save_map_priority_margin_m"),
+                          ("priority_cell", "rtk.save_map_priority_voxel_m")):
+            if key not in prm:
+                raise SystemExit(f"D-stage source selection is not recorded: {key}")
+            try:
+                native = float(prm[key])
+            except ValueError:
+                raise SystemExit(f"Invalid native range-priority setting: {key}") from None
+            requested = getattr(a, name)
+            if requested is not None and requested != native:
+                raise SystemExit(f"--{name.replace('_', '-')} must match the source run ({native:g}); "
+                                 "native accepted-row selection cannot be overridden")
+            priority.append(native)
+        if not np.isfinite(priority).all() or priority != [1.5, 2.0, 0.5]:
+            raise SystemExit("D-stage intensity maps require native ratio 1.5, margin 2 m and cell 0.5 m")
+        try:
+            free_range = float(prm.get("rtk.save_map_priority_free_range_m", "0"))
+            native_filter = float(prm.get("rtk.save_map_filter", "0"))
+        except ValueError:
+            raise SystemExit("Invalid native seen-free range or map filter") from None
+        detail_fill = str(prm.get("rtk.save_map_priority_fill", "false")).lower() in ("true", "1")
+        if not np.isfinite(free_range) or free_range != 25.0 or not detail_fill:
+            raise SystemExit("D-stage intensity maps require a native 25 m seen-free range and enabled detail fill")
+        if not np.isfinite(native_filter) or native_filter <= 0:
+            raise SystemExit("D-stage intensity maps require a finite positive native map filter")
+        native_selection = dict(echo_policy="native_accepted_rows_D_v1", seen_free_range_m=free_range,
+                                detail_fill=detail_fill, map_filter_m=native_filter)
+        if not rows_path.is_file():
+            raise SystemExit(f"Standard intensity maps require {rows_path}; occupied-cell fallback cannot reproduce native accepted rows")
+        if n_frames == 0:
+            raise SystemExit("The source run has no archived frames")
+        # Always preserve the mapper's decision, including with explicit crop/priority arguments.
         counts = fr["count"].astype(np.int64)
         rows_start = 8 + np.concatenate([[0], np.cumsum((counts + 7) // 8)[:-1]])
         head = np.fromfile(rows_path, dtype=np.uint8, count=8)
         if bytes(head) != b"LIVOMSK1" or rows_path.stat().st_size != int(rows_start[-1] + (counts[-1] + 7) // 8):
             raise SystemExit(f"{rows_path} does not match frames.csv")
     tile = a.tile if a.tile > 0 else 50.0
-    if priority[0] > 0 and a.voxel > 0 and abs(tile / priority[2] - round(tile / priority[2])) > 1e-9:
-        raise SystemExit("range priority: the tile size must be a multiple of the priority cell")
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="map_export_", dir=out))
     for d in ("geo", "rgb", "red"):
         (tmp / d).mkdir()
@@ -672,8 +690,9 @@ def export(a):
         "rgb_voxel_m": a.rgb_voxel if rgb_wanted else None,
         "range_m": {"min": a.min_range, "max": max_range or 0.0, "rgb_max": rgb_range if rgb_wanted else None},
         "range_priority": {"ratio": priority[0], "margin_m": priority[1], "cell_m": priority[2],
+                           **native_selection,
                            "rows": "map_rows.bin (mapper decision incl. seen-free cells)" if rows_start is not None
-                           else "recomputed here (occupied-cell rule)",
+                           else "not applied to independent RGB observations",
                            "returns_in": stats["returns_in_cap"] if rows_start is not None else stats["returns_kept"],
                            "returns_kept": stats["returns_range_priority"]},
         "tile_m": a.tile if a.tile > 0 else None, "tiles": tile_counts or None,
@@ -715,16 +734,16 @@ def build_parser():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("run", help="round directory (results/<round>) or fusion run directory (Log/fusion/<stamp>)")
     ap.add_argument("--out", help="output directory (default <fusion_run>/map)")
-    ap.add_argument("--voxel", type=float, default=0.05, help="geometry voxel size in m (0 = keep every return)")
+    ap.add_argument("--voxel", type=float, default=0.1, help="standard intensity voxel size in m (> 0; default 0.1)")
     ap.add_argument("--source", choices=("all", "keyframes"), default="all",
                     help="all scans (densest) or only the scans of backend keyframes (~5x fewer, same surfaces)")
     ap.add_argument("--min-range", type=float, default=0.0, help="drop returns closer than this to the LiDAR (m)")
     ap.add_argument("--max-range", type=float, default=None,
                     help="drop returns farther than this (m, 0 = none; default: the round's rtk.save_map_max_range)")
     ap.add_argument("--priority-ratio", type=float, default=None,
-                    help="range priority: keep r <= max(ratio*r_min, r_min+margin) per cell (0 = off; default: the round's)")
-    ap.add_argument("--priority-margin", type=float, default=None, help="range priority margin (m; default: the round's)")
-    ap.add_argument("--priority-cell", type=float, default=None, help="range priority cell (m; default: the round's)")
+                    help="native range-priority ratio (must match the source run; cannot disable filtering)")
+    ap.add_argument("--priority-margin", type=float, default=None, help="native range-priority margin (m; must match the source run)")
+    ap.add_argument("--priority-cell", type=float, default=None, help="native range-priority cell (m; must match the source run)")
     ap.add_argument("--tile", type=float, default=0.0, help="also write square tiles of this size (m, 0 = global file only)")
     ap.add_argument("--min-points", type=int, default=1,
                     help="drop geometry voxels with fewer returns (noise / briefly seen moving objects; 1 = keep all)")
@@ -743,8 +762,9 @@ def build_parser():
 
 def main(argv=None):
     a = build_parser().parse_args(argv)
-    if a.voxel < 0 or a.rgb_voxel <= 0 or a.tile < 0 or a.min_range < 0 or a.min_points < 1:
-        raise SystemExit("--voxel >= 0, --rgb-voxel > 0, --tile >= 0, --min-range >= 0")
+    if ((not a.rgb_only and (not np.isfinite(a.voxel) or a.voxel <= 0)) or a.rgb_voxel <= 0 or
+            a.tile < 0 or a.min_range < 0 or a.min_points < 1):
+        raise SystemExit("--voxel > 0 for intensity maps, --rgb-voxel > 0, --tile >= 0, --min-range >= 0, --min-points >= 1")
     export(a)
     return 0
 

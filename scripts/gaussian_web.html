@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <title>MY-LIVO | Gaussian Map</title>
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="./index.css">
+    <style>html,body { height:100%; margin:0; overflow:hidden } [role=alert] { margin:1rem; font:1rem system-ui }</style>
+</head>
+<body>
+    <script type="module">
+        import { createViewer } from './index.js';
+        async function readJson(file) {
+            const response = await fetch(file);
+            if (!response.ok) throw Error(`${file}: HTTP ${response.status}`);
+            return response.json();
+        }
+        try {
+            const query = new URLSearchParams(location.search);
+            const { settings, horizontalFov } = await readJson('./map-view.json');
+            const initial = settings.cameras[0].initial;
+            if (query.has('frame')) {
+                const frame = query.get('frame');
+                const views = await readJson('./views.json');
+                if (!Object.hasOwn(views, frame)) throw Error(`Unknown recorded frame: ${frame}`);
+                Object.assign(initial, views[frame]);
+            }
+            if (innerWidth > innerHeight) initial.fov = horizontalFov;
+            const budget = query.has('budget') ? Number(query.get('budget')) : matchMedia('(pointer: coarse)').matches ? 1 : 2;
+            if (!(budget >= 0.25 && budget <= 8)) throw Error('Splat budget must be 0.25 to 8 million');
+            const viewer = await createViewer({ container: document.body, contentUrl: './lod-meta.json', settings,
+                renderer: query.has('webgpu') ? 'webgpu' : 'webgl', budget, noanim: true, exposeGlobals: true });
+            const orbit = () => { viewer.state.cameraMode = 'orbit'; };
+            if (viewer.state.loaded) orbit(); else viewer.events.once('loaded:changed', orbit);
+        } catch (error) {
+            const message = document.createElement('p');
+            message.setAttribute('role', 'alert');
+            message.textContent = `Map unavailable: ${error.message}`;
+            document.body.replaceChildren(message);
+        }
+    </script>
+</body>
+</html>

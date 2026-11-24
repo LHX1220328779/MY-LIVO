@@ -9,15 +9,15 @@
 #
 # Usage (inside container):
 #   bash scripts/run_wuhu_round.sh <round_name> [--mode lio|livo|gaussian] [--dataset DIR] [--calibration FILE]
+#        [--camera midrange|fisheye]       (default: selected camera in calibration, legacy files: midrange)
 #        [--no-rtk] [--no-save-map] [--rviz] [--rate R] [--start-offset S] [--duration D]
 #        [--map-range M] [--rgb-range M]   (saved-map product caps in metres, 0 = keep every return;
 #                                           defaults come from the yaml: rtk.save_map_max_range / save_rgb_max_range)
 #        [--rgb-voxel M]                   (rgb_map_N.pcd: one point per M m voxel of the whole map, 0 = every
 #                                           coloured row; default rtk.save_rgb_voxel)
 #        [--map-filter M]                  (map_N.pcd: per chunk the nearest return per M m voxel, every scan
-#                                           contributes; 0 = off, useful 0..0.10; default rtk.save_map_filter)
-#        [--no-map-priority]               (map_N.pcd range priority + seen-free check OFF: every return within the
-#                                           cap; default on, rtk.save_map_priority_enabled; --map-priority = on)
+#                                           contributes; default 0.10 m)
+#        [--map-priority]                  (D-stage range priority, seen-free check and detail fill stay enabled)
 #        [--skip-stationary] [--stationary-min S] [--stationary-lidar-interval S]
 #                                          (LIO only: fast-forward standstills >= S s after the first drive, IMU/INS
 #                                           complete, LiDAR thinned; see tools/livo/motion.py)
@@ -46,10 +46,10 @@ repo=/home/project/MY-LIVO
 round=${1:?round name required, e.g. wuhu_rtk_91_ins_attitude}; shift
 mode=lio; use_rtk=true; save_map=true; use_rviz=false; rate=1.0; start_offset=0; duration=""; do_eval=1; quick_eval=0
 skip_stationary=0; stationary_min=30; stationary_lidar=1.0
-map_export=0; map_voxel=0.05; map_source=all; map_tile=0; map_keyframes=0; map_min_points=1
+map_export=0; map_voxel=0.1; map_source=all; map_tile=0; map_keyframes=0; map_min_points=1
 min_free_gb=0
 write_config_only=0
-sets=("rtk.export_map_chunks=false" "pcd_save.pcd_save_en=false"); dataset="/home/project/data/haibo/wuhu_livo/ros2bag"; calibration=""
+sets=("rtk.export_map_chunks=false" "pcd_save.pcd_save_en=false"); dataset="/home/project/data/haibo/wuhu_livo/ros2bag"; calibration=""; camera=""
 while (($#)); do
   case "$1" in
     --mode) mode="$2"; shift 2 ;;
@@ -65,7 +65,7 @@ while (($#)); do
     --rgb-voxel) sets+=("rtk.save_rgb_voxel=$2"); shift 2 ;;   # rgb_map_N.pcd: one point per voxel [m], 0 = every coloured row
     --map-filter) sets+=("rtk.save_map_filter=$2"); shift 2 ;;   # map_N.pcd: nearest return per voxel [m], 0 = off
     --map-priority) sets+=("rtk.save_map_priority_enabled=true"); shift ;;   # far duplicate returns not written (default)
-    --no-map-priority) sets+=("rtk.save_map_priority_enabled=false"); shift ;;   # every return within the cap
+    --no-map-priority) echo "D-stage surface selection must remain enabled; full-return maps are disabled" >&2; exit 2 ;;
     --no-eval) do_eval=0; shift ;;
     --quick-eval) quick_eval=1; shift ;;   # trajectory + summary only (scan rounds of the closed loop)
     --skip-stationary) skip_stationary=1; shift ;;
@@ -83,17 +83,24 @@ while (($#)); do
     --min-free-gb) min_free_gb="$2"; shift 2 ;;   # below this free space: slim the oldest unprotected rounds first
     --bag|--dataset) dataset="$2"; shift 2 ;;
     --calibration) calibration="$2"; shift 2 ;;
+    --camera) camera="$2"; shift 2 ;;
     --write-config-only) write_config_only=1; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 case "$mode" in lio|livo|gaussian) ;; *) echo "--mode must be lio, livo or gaussian" >&2; exit 2 ;; esac
+# Keep the selected D-stage surface rule after caller overrides. Scan archives and
+# paired-frame RGB observations remain complete; only geometry products are selected.
+sets+=("rtk.save_map_priority_enabled=true" "rtk.save_map_priority_ratio=1.5"
+       "rtk.save_map_priority_margin_m=2" "rtk.save_map_priority_voxel_m=0.5"
+       "rtk.save_map_priority_free_range_m=25" "rtk.save_map_priority_fill=true")
+case "$camera" in ""|midrange|fisheye) ;; *) echo "--camera must be midrange or fisheye" >&2; exit 2 ;; esac
 # Gaussian mapping uses the unchanged LIVO estimator, then consumes finalized scan/pose archives.
 estimator_mode=$mode
 if [[ "$mode" == gaussian ]]; then
   estimator_mode=livo
   [[ -x "$repo/build/gaussian/my_livo_gaussian" ]] || { echo "Build Gaussian mapping first: bash scripts/build_gaussian.sh" >&2; exit 2; }
-  [[ $("$repo/build/gaussian/my_livo_gaussian" --version) == "MY-LIVO Gaussian-LIC adapter 5" ]] || { echo "Rebuild the outdated Gaussian executable: bash scripts/build_gaussian.sh" >&2; exit 2; }
+  [[ $("$repo/build/gaussian/my_livo_gaussian" --version) == "MY-LIVO Gaussian-LIC adapter 8" ]] || { echo "Rebuild the outdated Gaussian executable: bash scripts/build_gaussian.sh" >&2; exit 2; }
   [[ "$save_map" == true ]] || { echo "Gaussian mapping requires saved scan/pose archives (--no-save-map is incompatible)" >&2; exit 2; }
 fi
 if [[ -n "$calibration" ]]; then
@@ -146,9 +153,37 @@ export FASTDDS_BUILTIN_TRANSPORTS=SHM
 export FASTRTPS_DEFAULT_PROFILES_FILE="${FASTRTPS_DEFAULT_PROFILES_FILE:-$repo/config/fastdds_livo_shm.xml}"
 export OPENBLAS_NUM_THREADS=1
 
+# Bind the selected image stream, intrinsics, extrinsics and time offset to this round.
+# Preserve the source calibration for provenance; the mapper reads the resolved snapshot.
+calibration_source="$calibration"
+if [[ "$estimator_mode" == livo && -z "$calibration_source" ]]; then
+  calibration_source=$(/usr/bin/python3 -c 'import sys,yaml; print(yaml.safe_load(open(sys.argv[1]))["laser_mapping"]["ros__parameters"]["multi_lidar"]["calibration_file"])' "$repo/config/wuhu_truck29.yaml") || exit 2
+fi
+camera_stream_topic=/midrange_camera/ffmpeg
+camera_image_topic=/midrange_camera/image_raw
+if [[ -n "$calibration_source" ]]; then
+  camera_args=(--input "$calibration_source" --output "$out/calibration.json")
+  [[ -n "$camera" ]] && camera_args+=(--camera "$camera")
+  /usr/bin/python3 "$repo/tools/livo/camera.py" "${camera_args[@]}" || exit 2
+  calibration="$out/calibration.json"
+  sets+=("multi_lidar.calibration_file=$calibration")
+  camera_info=$(/usr/bin/python3 -c 'import json,sys; c=json.load(open(sys.argv[1])); n=c.get("camera_selection", "midrange"); p="fish_camera" if n=="fisheye" else "midrange_camera"; print(n); print(c["camera"].get("stream_topic", "/"+p+"/ffmpeg")); print(c["camera"].get("topic", "/"+p+"/image_raw"))' "$calibration") || exit 2
+  mapfile -t camera_fields <<< "$camera_info"
+  camera="${camera_fields[0]}"; camera_stream_topic="${camera_fields[1]}"; camera_image_topic="${camera_fields[2]}"
+fi
+camera="${camera:-midrange}"
+if [[ "$mode" == gaussian && "$camera" == fisheye ]]; then
+  echo "Gaussian mapping currently requires the midrange camera; use --mode livo for fisheye mapping" >&2
+  exit 2
+fi
+
 # Describe and validate the dataset (raw split recording or single bag) without converting it.
 if ! /usr/bin/python3 tools/livo/dataset.py "$dataset" --json > "$out/dataset.json" 2> "$out/dataset.err"; then
   echo "dataset not readable: $dataset" >&2; cat "$out/dataset.err" >&2; exit 2
+fi
+if [[ "$estimator_mode" == livo ]] && ! /usr/bin/python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); t=sys.argv[2].lstrip("/"); sys.exit(0 if t in d["camera_topics"] else 1)' "$out/dataset.json" "$camera_stream_topic"; then
+  echo "selected $camera camera stream is missing: $camera_stream_topic (dataset $dataset)" >&2
+  exit 2
 fi
 ready_key=lio_ready; [[ "$estimator_mode" == "livo" ]] && ready_key=livo_ready
 if ! /usr/bin/python3 -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d.get(sys.argv[2]) else 1)" "$out/dataset.json" "$ready_key"; then
@@ -178,6 +213,7 @@ PY
 }
 skip_arg=""; (( skip_stationary )) && skip_arg="$stationary_min"
 MAP_EXPORT=$map_export MAP_VOXEL=$map_voxel MAP_SOURCE=$map_source MAP_TILE=$map_tile MAP_KF=$map_keyframes \
+ROUND_CAMERA=$camera ROUND_CAMERA_STREAM=$camera_stream_topic ROUND_CAMERA_IMAGE=$camera_image_topic ROUND_CALIBRATION_SOURCE=$calibration_source \
 /usr/bin/python3 - "$manifest" "$round" "$mode" "$dataset" "$calibration" "$use_rtk" "$save_map" "$use_rviz" "$rate" "$start_offset" "$duration" "$do_eval" "$skip_arg" "${sets[@]}" <<'PY'
 import json, sys, datetime, subprocess, os
 path, round_name, mode, dataset, calibration, use_rtk, save_map, use_rviz, rate, start_offset, duration, do_eval, skip, *sets = sys.argv[1:]
@@ -188,11 +224,15 @@ def git(*args):
         return ""
 binary = "/home/project/MY-LIVO/install/fast_livo/lib/fast_livo/fastlivo_mapping"
 doc = {"round": round_name, "mode": mode, "dataset": dataset, "calibration": calibration or None,
+       "calibration_source": os.environ.get("ROUND_CALIBRATION_SOURCE") or None,
+       "camera": os.environ.get("ROUND_CAMERA") if mode != "lio" else None,
+       "camera_stream_topic": os.environ.get("ROUND_CAMERA_STREAM") if mode != "lio" else None,
+       "camera_image_topic": os.environ.get("ROUND_CAMERA_IMAGE") if mode != "lio" else None,
        "options": {"use_rtk": use_rtk == "true", "save_map": save_map == "true", "rviz": use_rviz == "true",
                    "rate": float(rate), "start_offset": float(start_offset),
                    "duration": float(duration) if duration else None, "evaluate": do_eval == "1",
                    "skip_stationary": float(skip) if skip else None,
-                   "map_export": {"voxel_m": float(os.environ.get("MAP_VOXEL", "0.05")), "source": os.environ.get("MAP_SOURCE", "all"),
+                   "map_export": {"voxel_m": float(os.environ.get("MAP_VOXEL", "0.1")), "source": os.environ.get("MAP_SOURCE", "all"),
                                   "tile_m": float(os.environ.get("MAP_TILE", "0")), "keyframe_clouds": os.environ.get("MAP_KF") == "1"}
                    if os.environ.get("MAP_EXPORT") == "1" and save_map == "true" else None},
        "overrides": sets, "start": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -259,6 +299,18 @@ fi
 config="$out/config.yaml"
 /usr/bin/python3 "$repo/tools/livo/effective_config.py" \
   "$repo/config/wuhu_truck29.yaml" "$config" "$calibration" "${sets[@]}" | tee -a "$out/run.log"
+if ! /usr/bin/python3 - "$config" "$map_voxel" <<'PY'
+import math, sys, yaml
+rtk = yaml.safe_load(open(sys.argv[1]))["laser_mapping"]["ros__parameters"]["rtk"]
+for name, value, upper in (("rtk.save_map_filter", rtk["save_map_filter"], 0.5),
+                           ("map voxel", sys.argv[2], 2.0)):
+    value = float(value)
+    if not math.isfinite(value) or not 0 < value <= upper:
+        sys.exit(f"{name} must be finite and positive (default 0.1 m, maximum {upper:g} m)")
+PY
+then
+  exit 2
+fi
 
 if (( write_config_only )); then
   echo "write-config-only: effective config written to $config"
@@ -281,7 +333,7 @@ fi
 {
 echo "round=$round"; echo "mode=$mode use_rtk=$use_rtk save_map=$save_map rviz=$use_rviz rate=$rate start_offset=$start_offset duration=${duration:-all} skip_stationary=${skip_arg:-off}"
 echo "overrides=${sets[*]:-none}"
-echo "bag=$dataset"; echo "dataset=$dataset"; echo "calibration=${calibration:-yaml}"; echo "ros_domain_id=$ROS_DOMAIN_ID"
+echo "bag=$dataset"; echo "dataset=$dataset"; echo "calibration=${calibration:-yaml}"; echo "calibration_source=${calibration_source:-yaml}"; echo "camera=$camera stream=$camera_stream_topic image=$camera_image_topic"; echo "ros_domain_id=$ROS_DOMAIN_ID"
 echo "start=$(date -u +%FT%TZ)"; echo "commit=$(git rev-parse --short HEAD 2>/dev/null)"; echo "branch=$(git branch --show-current 2>/dev/null)"
 git status --short -- src include config launch scripts tools CMakeLists.txt 2>/dev/null | sed 's/^/dirty: /'
 } > "$out/run.log"
@@ -305,6 +357,7 @@ fi
 
 use_camera=false; [[ "$estimator_mode" == "livo" ]] && use_camera=true
 ros2 launch fast_livo wuhu_truck29.launch.py use_camera:=$use_camera use_rtk:=$use_rtk rtk_backend:=$rtk_backend use_rviz:=$use_rviz \
+  camera_stream_topic:="$camera_stream_topic" camera_image_topic:="$camera_image_topic" \
   rear_axle_to_imu:=true save_map:=$save_map output_directory:="$out" config_file:="$config" > "$out/launch.log" 2>&1 &
 launch_pid=$!
 for i in $(seq 1 60); do
@@ -315,24 +368,40 @@ sleep 3
 # Use the PID reported by this launcher in its own PID namespace. /proc-based
 # pgrep can return host PIDs inside a sandbox and fail to signal/export the map.
 mapper_pid=$(sed -n 's/.*fastlivo_mapping.*process started with pid \[\([0-9][0-9]*\)\].*/\1/p' "$out/launch.log" | head -1)
-echo "launch_pid=$launch_pid mapper_pid=${mapper_pid:-none}" >> "$out/run.log"
+decoder_pid=$(sed -n 's/.*\[republish-[0-9]*\]: process started with pid \[\([0-9][0-9]*\)\].*/\1/p' "$out/launch.log" | head -1)
+echo "launch_pid=$launch_pid mapper_pid=${mapper_pid:-none} decoder_pid=${decoder_pid:-none}" >> "$out/run.log"
 if [[ -z "${mapper_pid:-}" ]]; then
   echo "mapper did not start" | tee -a "$out/run.log"; phase failed status=failed error='"mapper did not start"'
   kill -INT "$launch_pid" 2>/dev/null; sleep 1; stop_round_rviz; exit 2
+fi
+if [[ "$use_camera" == true ]] && { [[ -z "$decoder_pid" ]] || ! kill -0 "$decoder_pid" 2>/dev/null; }; then
+  echo "camera decoder did not start" | tee -a "$out/run.log"
+  phase failed status=failed error='"camera decoder did not start"'
+  kill -INT "$mapper_pid" 2>/dev/null
+  kill -TERM "$launch_pid" 2>/dev/null
+  stop_round_rviz
+  exit 2
 fi
 
 # Resource / throughput monitor (resources.csv: fps, real-time factor, RSS/CPU of mapper, decoder, player).
 /usr/bin/python3 tools/livo/resmon.py "$out" --pid "$mapper_pid" --interval 2 > "$out/resmon.log" 2>&1 &
 
 phase playing
-play_args=("$dataset" --preset "$estimator_mode" --rate "$rate" --start-offset "$start_offset")
+play_args=("$dataset" --preset "$estimator_mode" --rate "$rate" --start-offset "$start_offset" --camera "$camera" --camera-topic "$camera_stream_topic")
 [[ -n "$duration" ]] && play_args+=(--duration "$duration")
 (( skip_stationary )) && play_args+=(--skip-stationary --stationary-min-s "$stationary_min" --stationary-lidar-interval "$stationary_lidar")
 /usr/bin/python3 tools/livo/player.py "${play_args[@]}" > "$out/playback.log" 2>&1 &
 player_pid=$!
+decoder_failed=0
 # A mapper that stopped (FATAL input gap, OOM kill) consumes nothing more: stop the playback instead of
 # replaying the remaining minutes into nothing. Background jobs ignore SIGINT here, hence SIGTERM.
 while kill -0 "$player_pid" 2>/dev/null; do
+  if [[ "$use_camera" == true ]] && { ! kill -0 "$decoder_pid" 2>/dev/null || grep -q '\[republish-[0-9]*\]: process has died' "$out/launch.log"; }; then
+    echo "camera decoder exited during playback; stopping incomplete round at $(date -u +%FT%TZ)" >> "$out/run.log"
+    decoder_failed=1
+    kill -TERM "$player_pid" 2>/dev/null
+    break
+  fi
   if ! kill -0 "$mapper_pid" 2>/dev/null; then
     echo "mapper exited during playback at $(date -u +%FT%TZ); stopping the player" >> "$out/run.log"
     kill -TERM "$player_pid" 2>/dev/null; break
@@ -341,6 +410,8 @@ while kill -0 "$player_pid" 2>/dev/null; do
 done
 wait "$player_pid"
 playback_exit=$?
+if [[ "$use_camera" == true ]] && grep -q '\[republish-[0-9]*\]: process has died' "$out/launch.log"; then decoder_failed=1; fi
+if (( decoder_failed )); then playback_exit=4; fi
 echo "playback_exit=$playback_exit at $(date -u +%FT%TZ)" >> "$out/run.log"
 
 # Drain: wait until the mapper has caught up with the played data (tail processed). With save_map the fusion
@@ -398,7 +469,7 @@ phase exported fusion_dir="\"${fusion_dir%/}\"" map_chunks="$map_chunks"
 
 # Standard map products (voxel-filtered global map, optional tiles / keyframe clouds, map_info.json) from the
 # archived scans and the final corrections; runs next to the evaluation (both read the archive only).
-export_pid=""
+export_pid=""; export_exit=0
 if [[ $playback_exit -eq 0 && $save_map == true && $map_export -eq 1 && -n "${fusion_dir:-}" && -f "$fusion_dir/scans.bin" && -f "$fusion_dir/corrections.txt" ]]; then
   export_args=("$fusion_dir" --voxel "$map_voxel" --source "$map_source" --tile "$map_tile" --min-points "$map_min_points")
   (( map_keyframes )) && export_args+=(--keyframe-clouds)
@@ -412,16 +483,21 @@ if [[ $playback_exit -eq 0 && $do_eval -eq 1 && -n "${fusion_dir:-}" && -f "$fus
   bash scripts/evaluate_wuhu_round.sh "$round" "${eval_args[@]}" >> "$out/run.log" 2>&1
 fi
 if [[ -n "$export_pid" ]]; then
-  wait "$export_pid"; echo "map export exit=$? at $(date -u +%FT%TZ): $(tail -1 "$out/map_export.log" | cut -c1-300)" >> "$out/run.log"
+  wait "$export_pid"; export_exit=$?
+  echo "map export exit=$export_exit at $(date -u +%FT%TZ): $(tail -1 "$out/map_export.log" | cut -c1-300)" >> "$out/run.log"
 fi
 gaussian_exit=0
-if [[ "$mode" == gaussian && $playback_exit -eq 0 && -z "$mapper_error" && -f "$fusion_dir/trajectory_optimized.txt" ]]; then
+if [[ "$mode" == gaussian && $playback_exit -eq 0 && $export_exit -eq 0 && -z "$mapper_error" && -f "$fusion_dir/trajectory_optimized.txt" ]]; then
   phase gaussian
   /usr/bin/python3 tools/livo/gaussian_map.py "$out" > "$out/gaussian.log" 2>&1 || gaussian_exit=$?
   echo "Gaussian mapping exit=$gaussian_exit; log=$out/gaussian.log; products=$fusion_dir/gaussian" >> "$out/run.log"
 fi
 rc=0
-if [[ $playback_exit -ne 0 ]]; then
+if (( decoder_failed )); then
+  phase failed status=failed end="\"$(date -u +%FT%TZ)\"" error='"camera decoder exited during playback; incomplete round (see launch.log)"'
+  echo "FAILED: camera decoder exited during playback" >> "$out/run.log"
+  rc=4
+elif [[ $playback_exit -ne 0 ]]; then
   playback_error=$(/usr/bin/python3 - "$out/playback.log" "$playback_exit" <<'PY'
 import json, sys
 path, code = sys.argv[1:]
@@ -437,6 +513,9 @@ PY
   phase failed status=failed end="\"$(date -u +%FT%TZ)\"" error="$playback_error"
   echo "FAILED: playback exit $playback_exit ($playback_error)" >> "$out/run.log"
   rc=3
+elif [[ $export_exit -ne 0 ]]; then
+  phase failed status=failed end="\"$(date -u +%FT%TZ)\"" error='"Standard map export failed; see map_export.log (scan/pose archives retained)"'
+  rc=6
 elif [[ $gaussian_exit -ne 0 ]]; then
   phase failed status=failed end="\"$(date -u +%FT%TZ)\"" error='"Gaussian mapping failed; see gaussian.log (PCD and trajectory retained)"'
   rc=5

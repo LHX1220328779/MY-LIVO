@@ -48,6 +48,15 @@ void evaluate(const std::shared_ptr<Dataset>& ds, std::shared_ptr<GaussianModel>
         cv::cvtColor(rgb, bgr, cv::COLOR_RGB2BGR);
         if (!gs_write_image((output + "/" + stage + "_" + cam->image_name_ + ".png").c_str(), &bgr))
             throw std::runtime_error("Cannot save render");
+        auto alpha_cpu = (1.0f-std::get<2>(pkg)).squeeze().clamp(0,1).mul(65535).to(torch::kInt32).cpu().contiguous();
+        cv::Mat alpha32(cam->image_height_,cam->image_width_,CV_32SC1,alpha_cpu.data_ptr<int32_t>()), alpha16;
+        alpha32.convertTo(alpha16,CV_16U);
+        if (!gs_write_image((output + "/" + stage + "_" + cam->image_name_ + "_alpha.png").c_str(), &alpha16))
+            throw std::runtime_error("Cannot save render alpha");
+        auto depth_cpu=depth.to(torch::kFloat32).cpu().contiguous();
+        std::ofstream depth_file(output + "/" + stage + "_" + cam->image_name_ + "_depth.bin",std::ios::binary);
+        depth_file.write(reinterpret_cast<const char*>(depth_cpu.data_ptr<float>()),depth_cpu.numel()*sizeof(float));
+        if (!depth_file) throw std::runtime_error("Cannot save render depth");
         auto gt_cpu = gt.detach().permute({1,2,0}).mul(255).to(torch::kUInt8).cpu().contiguous();
         cv::Mat gt_rgb(cam->image_height_, cam->image_width_, CV_8UC3, gt_cpu.data_ptr<uint8_t>());
         cv::cvtColor(gt_rgb, bgr, cv::COLOR_RGB2BGR);
@@ -150,6 +159,18 @@ void refineSavedMap(const std::string& input, const std::string& model, const st
             auto bt=torch::from_blob(bounds.data(),{pc->xyz_.size(0),6},torch::kFloat32).cuda();
             pc->scale_lower_=bt.slice(1,0,3).contiguous();
             pc->scale_upper_=bt.slice(1,3,6).contiguous();
+            TORCH_CHECK(torch::isfinite(bt).all().item<bool>() &&
+                        (pc->scale_lower_<=pc->scale_upper_).all().item<bool>(),
+                        "Invalid per-surface scale bounds");
+            torch::NoGradGuard guard;
+            pc->scaling_.copy_(torch::minimum(torch::maximum(pc->scaling_,pc->scale_lower_),pc->scale_upper_));
+        }
+        double color_weight=0;
+        std::ifstream regularization(input+"/appearance_regularization.txt");
+        if (regularization) {
+            if (!(regularization>>color_weight) || !std::isfinite(color_weight) ||
+                    color_weight<0 || color_weight>1 || !surface)
+                throw std::runtime_error("Invalid surface appearance regularization");
         }
         pc->trainingSetup();
         pc->max_iterations_ = ds->train_cameras_.size();
@@ -160,14 +181,15 @@ void refineSavedMap(const std::string& input, const std::string& model, const st
             // Warm up a fresh map without repeatedly disabling coefficients
             // already shared with neighbouring/revisited working sets.
             pc->sh_degree_=fresh_appearance?std::min(3,1+pass/std::max(1,epochs/3)):3;
-            optimize(ds,pc);
+            optimize(ds,pc,color_weight);
             epochs_run=pass+1;
             if (pc->last_loss_<best_loss*.995) { best_loss=pc->last_loss_;stale=0; } else ++stale;
             std::cout << " shared refinement epoch=" << epochs_run << '/' << epochs << " gaussians=" << pc->xyz_.size(0) << " loss=" << pc->last_loss_ << std::endl;
             const int warmup=fresh_appearance?std::max(8,2*(epochs/3)+3):8;
             if (surface && epochs_run>=warmup && stale>=3) break;
         }
-        std::ofstream(output+"/training_info.json") << "{\"epochs\":" << epochs_run << ",\"loss\":" << pc->last_loss_ << "}\n";
+        std::ofstream(output+"/training_info.json") << "{\"epochs\":" << epochs_run << ",\"loss\":" << pc->last_loss_
+                << ",\"color_weight\":" << color_weight << "}\n";
         torch::NoGradGuard guard;
         pc->saveMap(output);
     }
@@ -181,7 +203,7 @@ void refineSavedMap(const std::string& input, const std::string& model, const st
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string(argv[1]) == "--version") {
-            std::cout << "MY-LIVO Gaussian-LIC adapter 5" << std::endl;
+            std::cout << "MY-LIVO Gaussian-LIC adapter 8" << std::endl;
             return 0;
         }
         const bool replay = argc == 5 && std::string(argv[1]) == "--render";

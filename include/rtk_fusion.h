@@ -279,7 +279,7 @@ struct RtkFusion
   double save_rgb_voxel = 0.03;
   // Map filter of map_N.pcd (intensity map): per chunk one return per save_map_filter cube, the one nearest to
   // its LiDAR; every scan participates, including stationary scans. map_rows.bin follows. 0 = off.
-  double save_map_filter = 0.01;
+  double save_map_filter = 0.1;
   // Saved geometry map (map_N.pcd): range priority. Per save_map_priority_voxel cell the nearest supported
   // observation r_min (a scan with >= 2 returns in the cell) is found first; returns of that cell farther than
   // max(save_map_priority_ratio * r_min, r_min + save_map_priority_margin) are not written. A far scan therefore

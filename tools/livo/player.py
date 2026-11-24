@@ -26,7 +26,7 @@ import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from livo import rosenv  # noqa: E402
-from livo.dataset import Dataset, PRESETS  # noqa: E402
+from livo.dataset import Dataset, PRESETS, LIO_TOPICS, CAMERA_STREAM_TOPICS  # noqa: E402
 from livo import motion  # noqa: E402
 
 # Flow control: the mapper counts as drained when its progress is within this many seconds of the previous
@@ -40,12 +40,26 @@ def log(msg):
     print(f"[player] {msg}", flush=True)
 
 
+def selected_topics(args, dataset):
+    """Keep exactly one camera stream in a LIVO round, with a clear missing-stream error."""
+    if args.topics:
+        return args.topics
+    if args.preset != "livo":
+        return args.preset
+    requested = (args.camera_topic or CAMERA_STREAM_TOPICS[args.camera]).lstrip("/")
+    matches = dataset.resolve_topics([requested])
+    if len(matches) != 1 or matches[0] not in dataset.camera_topics:
+        raise SystemExit(f"selected {args.camera} camera stream is missing or ambiguous: {requested}; "
+                         f"available: {dataset.camera_topics}")
+    return LIO_TOPICS + (matches[0],)
+
+
 class Player:
     def __init__(self, args):
         self.args = args
         self.stop_requested = False
         self.dataset = Dataset.open(args.dataset)
-        topics = args.topics if args.topics else args.preset
+        topics = selected_topics(args, self.dataset)
         self.topics = self.dataset.resolve_topics(topics)
         if not self.topics:
             raise SystemExit(f"dataset has none of the requested topics ({topics}): {self.dataset.root}")
@@ -365,6 +379,8 @@ def build_parser():
     ap.add_argument("--preset", choices=sorted(PRESETS), default="livo",
                     help="topic set: lio (LiDAR+IMU+INS), livo (lio + camera), all")
     ap.add_argument("--topics", nargs="*", help="explicit topic list (overrides --preset)")
+    ap.add_argument("--camera", choices=tuple(CAMERA_STREAM_TOPICS), default="midrange")
+    ap.add_argument("--camera-topic", help="selected calibration stream topic (LIVO only)")
     ap.add_argument("--rate", type=float, default=1.0)
     ap.add_argument("--start-offset", type=float, default=0.0, help="seconds skipped at the beginning")
     ap.add_argument("--duration", type=float, default=None, help="seconds of data to play (default: all)")
@@ -412,9 +428,10 @@ def main(argv=None):
         raise SystemExit("--stationary-lidar-interval >= 0.1 s, --stationary-rate >= 0, --stationary-min-s >= 10 s")
     if args.dry_run:
         ds = Dataset.open(args.dataset)
-        topics = ds.resolve_topics(args.topics if args.topics else args.preset)
+        topics = ds.resolve_topics(selected_topics(args, ds))
         doc = {"dataset": str(ds.root), "kind": ds.kind, "segments": [s.name for s in ds.segments],
-               "duration_s": round(ds.duration_s, 2), "topics": topics, "has_camera": ds.has_camera}
+               "duration_s": round(ds.duration_s, 2), "topics": topics, "has_camera": ds.has_camera,
+               "camera": args.camera if args.preset == "livo" else None}
         if args.skip_stationary:
             end_s = None if args.duration is None else args.start_offset + args.duration
             doc["stationary_skips"] = motion.standstill_skips(

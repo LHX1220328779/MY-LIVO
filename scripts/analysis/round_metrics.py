@@ -44,6 +44,8 @@ def stats(values):
 # ----------------------------------------------------------------------------- round identity
 def read_round(rd):
     info = {"round": rd.name, "mode": None, "dataset": None, "calibration": None, "options": None,
+            "calibration_source": None, "calibration_id": None, "calibration_id_source": None,
+            "camera": None, "camera_stream_topic": None, "camera_image_topic": None,
             "start": None, "end": None, "status": None, "commit": None, "fusion_dir": None, "map_chunks": None}
     rj = rd / "round.json"
     if rj.is_file():
@@ -57,16 +59,52 @@ def read_round(rd):
     rl = rd / "run.log"
     if rl.is_file():
         t = rl.read_text(errors="replace")
-        for k in ("mode", "dataset", "calibration", "commit"):
+        for k in ("mode", "dataset", "calibration", "calibration_source", "commit"):
             if not info.get(k):
                 g = rx(r"^%s=(.+)$" % k, t)
                 if g:
                     info[k] = g[0].strip()
-    cal = info.get("calibration")
-    if isinstance(cal, str) and "carlibration" in cal:
-        parts = pathlib.Path(cal).parts
-        if len(parts) >= 4:
-            info["calibration_id"] = "/".join(parts[-4:-1])
+    # The round-local snapshot is the calibration actually consumed by mapping.
+    # Its parent version cannot be inferred from results/<round>/calibration.json.
+    info["calibration_id"] = None
+    info["calibration_id_source"] = None
+    camera_from_snapshot = False
+    candidates = [(rd / "calibration.json", "snapshot.identity.id")]
+    for key in ("calibration", "calibration_source"):
+        if info.get(key):
+            path = pathlib.Path(info[key])
+            if not path.is_absolute() and not path.is_file():
+                path = rd / path
+            candidates.append((path, f"{key}.identity.id"))
+    for path, origin in candidates:
+        try:
+            cal = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        identity = cal.get("identity") or {}
+        if not info["calibration_id"] and identity.get("id"):
+            info["calibration_id"] = identity["id"]
+            info["calibration_id_source"] = origin
+        if info.get("mode") != "lio":
+            camera = cal.get("camera") or {}
+            if not camera_from_snapshot and origin != "calibration_source.identity.id":
+                info["camera"] = cal.get("camera_selection", "midrange")
+                info["camera_stream_topic"] = camera.get("stream_topic") or info["camera_stream_topic"]
+                info["camera_image_topic"] = camera.get("topic") or info["camera_image_topic"]
+                camera_from_snapshot = True
+            else:
+                info["camera"] = info["camera"] or cal.get("camera_selection", "midrange")
+                info["camera_stream_topic"] = info["camera_stream_topic"] or camera.get("stream_topic")
+                info["camera_image_topic"] = info["camera_image_topic"] or camera.get("topic")
+    if not info["calibration_id"]:
+        for key in ("calibration_source", "calibration"):
+            parts = pathlib.Path(info[key]).parts if info.get(key) else ()
+            if "carlibration" in parts:
+                i = parts.index("carlibration")
+                if len(parts) >= i + 5:
+                    info["calibration_id"] = "/".join(parts[i + 1:i + 4])
+                    info["calibration_id_source"] = f"{key}.version_path"
+                    break
     return info
 
 
@@ -91,7 +129,9 @@ def read_parameters(fd):
             "rtk.time_offset_sec", "rtk.attitude_time_offset_sec", "rtk.attitude_enabled", "rtk.frontend_attitude_aiding",
             "multi_lidar.precheck.enabled", "multi_lidar.precheck.apply", "vio.ekf_update_en",
             "effective.lidar_time_offset_sec", "effective.img_time_offset_sec", "effective.rtk_reference_time_shift_sec",
-            "effective.camera_mode", "effective.camera_frame_divider", "calibration.id")
+            "effective.camera_mode", "effective.camera_frame_divider", "effective.camera_selection",
+            "effective.camera_projection_model", "effective.camera_input_rectification", "effective.camera_image_topic",
+            "calibration.id")
     out = {k: p[k] for k in keep if k in p}
     out["time_offset_sec"] = fnum(p.get("rtk.time_offset_sec"))
     out["attitude_time_offset_sec"] = fnum(p.get("rtk.attitude_time_offset_sec"))
@@ -506,6 +546,12 @@ def build(rd):
     fd = fusion_dir(rd, info)
     ev = rd / "evaluation"
     prm = read_parameters(fd)
+    if not info["calibration_id"] and prm.get("calibration.id"):
+        info["calibration_id"] = prm["calibration.id"]
+        info["calibration_id_source"] = "parameters.calibration.id"
+    if info.get("mode") != "lio":
+        info["camera"] = info["camera"] or prm.get("effective.camera_selection")
+        info["camera_image_topic"] = info["camera_image_topic"] or prm.get("effective.camera_image_topic")
     traj, startup, mp = parse_trajectory_log(ev / "trajectory.log")
     summ = parse_summary(ev / "summary.txt")
     launch = parse_launch(rd)
@@ -516,6 +562,9 @@ def build(rd):
         "generated": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
         "round": info["round"], "mode": info.get("mode"), "dataset": info.get("dataset"),
         "calibration": info.get("calibration"), "calibration_id": info.get("calibration_id"),
+        "calibration_source": info.get("calibration_source"), "calibration_id_source": info.get("calibration_id_source"),
+        "camera": info.get("camera"), "camera_stream_topic": info.get("camera_stream_topic"),
+        "camera_image_topic": info.get("camera_image_topic"),
         "commit": info.get("commit"), "start": info.get("start"), "end": info.get("end"),
         "fusion_dir": str(fd) if fd else None,
         "parameters": prm,

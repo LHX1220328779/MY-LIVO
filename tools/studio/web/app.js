@@ -161,6 +161,23 @@ function patchLive() {
 // ------------------------------------------------------------------ shared components
 function calibFlags() { return (S.state && S.state.calibration) || {}; }
 function vehicle() { const v = S.state?.vehicle || {}; return S.vehicles.find((x) => x.mine === v.mine && x.truck === v.truck) || null; }
+function cameraLabel(name) { return name === "fisheye" ? "鱼眼相机" : "中距相机"; }
+function hasCamera(dataset, name) {
+  const topic = name === "fisheye" ? "fish_camera/ffmpeg" : "midrange_camera/ffmpeg";
+  return !!dataset?.camera_topics?.some((t) => t.replace(/^\//, "") === topic);
+}
+function cameraSelector(section, name) {
+  name = name || "midrange";
+  return `<div class="field"><label>${section === "calibration" ? "标定相机" : "LIVO 相机"}</label><select data-act="field" data-section="${section}" data-key="camera"><option value="midrange" ${name === "midrange" ? "selected" : ""}>中距相机</option><option value="fisheye" ${name === "fisheye" ? "selected" : ""} ${section === "mapping" && S.state.mapping.mode === "gaussian" ? "disabled" : ""}>鱼眼相机（LIVO）</option></select><div class="small ${hasCamera(S.dataset, name) ? "muted" : "warn"}">${hasCamera(S.dataset, name) ? "数据源已包含该相机" : "当前数据源未包含该相机话题"} · 初始参数读取同一出厂标定文件${section === "mapping" && S.state.mapping.mode === "gaussian" ? " · 高斯建图目前仅支持中距" : ""}</div></div>`;
+}
+function cameraVehicle(v, camera) {
+  if (v?.camera_statuses?.[camera || "midrange"]) return v.camera_statuses[camera || "midrange"];
+  if (!v || (v.camera || "midrange") === (camera || "midrange")) return v;
+  return { ...v, ready_level: v.active ? "lio" : v.ready_level,
+    checks: v.checks.map((c) => c.key.startsWith("cam") ? { ...c, ok: false, value: null } : c),
+    stages_done: v.stages_done.filter((stage) => !stage.startsWith("cam")),
+    next: { stage: "camtime", pipeline: "camera", reason: `${cameraLabel(camera)}需要独立标定与闭环验收` } };
+}
 function selectedParent() {
   const v = vehicle();
   const versions = (S.cal?.versions || []).filter((x) => x.mine === v?.mine && x.truck === v?.truck);
@@ -222,7 +239,7 @@ function checksHtml(v) {
 }
 function stepperHtml(v) {
   const done = new Set(v?.stages_done || []);
-  const hasRun = (mode) => S.runs.some((r) => r.mode === mode && r.status === "done");
+  const hasRun = (mode) => S.runs.some((r) => r.mode === mode && r.status === "done" && (mode !== "livo" || (r.camera || "midrange") === (S.state.calibration.camera || "midrange")));
   const items = [
     ["import", "导入出厂标定", done.has("import")], ["axle", "后轴对齐", !!(v?.checks || []).find((c) => c.key === "axle")?.ok],
     ["ground", "静止地面精修", done.has("ground") || done.has("precheck")],
@@ -230,8 +247,9 @@ function stepperHtml(v) {
     ["rtktime", "RTK 关联时间", done.has("rtktime")],
     ["camtime", "相机时间偏移", !!(v?.checks || []).find((c) => c.key === "camtime")?.ok],
     ["livo", "LIVO 建图", hasRun("livo") || done.has("camlidar")], ["camlidar", "相机外参复核", done.has("camlidar"), true],
-    ["active", "激活生产版本", !!v?.active],
+    ["active", "激活生产版本", !!v?.active && (v.active_version?.camera || "midrange") === (v.camera || "midrange")],
   ];
+  if (v?.camera === "fisheye") { items.splice(items.length - 1, 0, ["camfocus", "多帧内参诊断", done.has("camfocus")], ["camphoto", "联合与独立验证", !!(v.checks || []).find((c) => c.key === "fish_validation")?.ok]); }
   const nextKey = v?.next?.stage === "import" ? "import" : v?.next?.pipeline === "lidar" ? (v.next.stage || "ground") : v?.next?.pipeline === "camera" ? "camtime" : v?.next?.pipeline === "camloop" ? "camloop" : null;
   return `<div class="stepper">${items.map(([k, l, ok, opt], i) => `<div class="step ${ok ? "done" : ""} ${k === nextKey ? "next" : ""} ${opt ? "optional" : ""}"><div class="n">${ok ? "✓" : i + 1}</div><div class="l">${l}</div><div class="d">${opt ? "可选 · 人工确认" : ""}</div></div>`).join("")}</div>`;
 }
@@ -331,7 +349,7 @@ function liveMonitor() {
   </div>`;
 }
 
-function modeLabel(r) { const m = (r?.mode || "").toUpperCase(); return r?.options?.use_rtk === false ? m : (m ? m + "+RTK" : m); }
+function modeLabel(r) { const m = (r?.mode || "").toUpperCase() + (["livo", "gaussian"].includes(r?.mode) ? ` · ${cameraLabel(r.camera)}` : ""); return r?.options?.use_rtk === false ? m : (m ? m + "+RTK" : m); }
 
 // ------------------------------------------------------------------ pages
 function render() {
@@ -357,9 +375,10 @@ function pageHome() {
   const m = S.state.mapping;
   const canLIVO = d && d.livo_ready, canLIO = d && d.lio_ready;
   const mode = ["livo", "gaussian"].includes(m.mode) && !canLIVO ? "lio" : m.mode;
-  const nextBtn = !v ? `<button class="btn primary" data-act="go" data-page="calib">导入出厂标定</button>`
-    : v.next.pipeline ? `<button class="btn primary" data-act="pipeline" data-kind="${v.next.pipeline}" ${running ? "disabled" : ""}>${{ lidar: "运行 LiDAR 标定流水线", camera: "运行相机标定流水线", camloop: "运行相机外参闭环微调" }[v.next.pipeline]}</button>`
-    : v.next.stage === "import" ? `<button class="btn primary" data-act="go" data-page="calib">导入出厂标定</button>` : `<span class="badge ok">标定完整</span>`;
+  const cv = cameraVehicle(v, S.state.calibration.camera);
+  const nextBtn = !cv ? `<button class="btn primary" data-act="go" data-page="calib">导入出厂标定</button>`
+    : cv.next.pipeline ? `<button class="btn primary" data-act="pipeline" data-kind="${cv.next.pipeline}" ${running ? "disabled" : ""}>${{ lidar: "运行 LiDAR 标定流水线", camera: "运行相机标定流水线", camloop: "运行相机外参闭环微调" }[cv.next.pipeline]}</button>`
+    : cv.next.stage === "import" ? `<button class="btn primary" data-act="go" data-page="calib">导入出厂标定</button>` : `<span class="badge ok">标定完整</span>`;
   return `
   <div class="hero" style="margin-bottom:18px"><div><h1>工作台</h1><div class="muted">标准流程：① 选择原始录制 → ② 确认车辆标定 → ③ 一键建图，结果自动评估并归档到 results/&lt;轮次&gt;/。原始 ROS 2 mcap 直接使用，不需要转换。</div></div></div>
   ${liveMonitor()}
@@ -370,14 +389,15 @@ function pageHome() {
     <div class="card"><div class="card-h"><h2><span class="stepnum ${v?.ready_level === "livo" ? "done" : v?.active ? "warn" : ""}">2</span>车辆与标定</h2><button class="btn sm" data-act="go" data-page="calib">管理</button></div>
       <div class="row" style="margin-bottom:8px"><select data-act="set-vehicle" style="max-width:220px">${S.vehicles.map((x) => `<option value="${x.id}" ${v && x.id === v.id ? "selected" : ""}>${esc(x.mine)} / ${esc(x.truck)}</option>`).join("")}${S.vehicles.length ? "" : "<option>（无车辆）</option>"}</select>
         ${v?.active ? `<span class="badge dark" title="${esc(v.active)}">${esc(v.active.split("/").pop())}</span>` : '<span class="badge bad">无激活版本</span>'}</div>
-      ${checksHtml(v)}<div class="row" style="margin-top:12px;justify-content:space-between"><span class="small muted">${esc(v?.next?.reason || "")}</span>${nextBtn}</div></div>
+      ${checksHtml(cameraVehicle(v, S.state.calibration.camera))}<div class="row" style="margin-top:12px;justify-content:space-between"><span class="small muted">${esc(cv?.next?.reason || "")}</span>${nextBtn}</div></div>
     <div class="card"><div class="card-h"><h2><span class="stepnum">3</span>一键建图</h2><button class="btn sm" data-act="go" data-page="map">高级设置</button></div>
-      <div class="seg big" style="margin-bottom:12px"><button class="${mode === "lio" ? "active" : ""}" data-act="mode" data-mode="lio" ${canLIO ? "" : "disabled"}>LIO</button><button class="${mode === "livo" ? "active" : ""}" data-act="mode" data-mode="livo" ${canLIVO ? "" : "disabled"}>LIVO（含相机）</button><button class="${mode === "gaussian" ? "active" : ""}" data-act="mode" data-mode="gaussian" ${canLIVO ? "" : "disabled"}>高斯建图</button></div>
+      <div class="seg big" style="margin-bottom:12px"><button class="${mode === "lio" ? "active" : ""}" data-act="mode" data-mode="lio" ${canLIO ? "" : "disabled"}>LIO</button><button class="${mode === "livo" ? "active" : ""}" data-act="mode" data-mode="livo" ${canLIVO ? "" : "disabled"}>LIVO（含相机）</button><button class="${mode === "gaussian" ? "active" : ""}" data-act="mode" data-mode="gaussian" ${canLIVO && m.camera !== "fisheye" ? "" : "disabled"} title="高斯建图目前仅支持中距相机">高斯建图</button></div>
+      ${mode !== "lio" ? cameraSelector("mapping", m.camera) : ""}
       <div class="stack">
         ${toggle("use_rtk", "RTK / INS 融合", m.use_rtk)}${toggle("save_map", "保存地图 (PCD)", m.save_map)}${toggle("rviz", "打开 RViz", m.rviz)}${toggle("evaluate", "结束后自动精度评估", m.evaluate)}
       </div>
       <div class="small muted" style="margin:10px 0 12px">标定：${esc(v?.active || "未激活")}${m.calibration_id && m.calibration_id !== v?.active ? ` → 指定 ${esc(m.calibration_id)}` : ""}</div>
-      <button class="btn primary big" style="width:100%" data-act="start" ${running || !canLIO || !v?.active ? "disabled" : ""}>${running ? "建图进行中…" : `开始 ${mode.toUpperCase()} 建图`}</button>
+      <button class="btn primary big" style="width:100%" data-act="start" ${running || !canLIO || !v?.active || (mode !== "lio" && !hasCamera(d, m.camera || "midrange")) || (mode === "gaussian" && m.camera === "fisheye") ? "disabled" : ""}>${running ? "建图进行中…" : `开始 ${mode.toUpperCase()} 建图`}</button>
       ${!v?.active ? '<div class="small bad" style="margin-top:6px">请先在“标定”页导入并激活一个标定版本</div>' : ""}
     </div>
   </div>
@@ -641,28 +661,33 @@ function pageCalib() {
   const info = S.stages[f.stage] || {};
   const needs = info.needs || [];
   const modeForRun = info.mapping;
-  const runOpts = S.runs.filter((r) => r.fusion_dir && r.status === "done" && (!modeForRun || modeForRun === "any" || r.mode === modeForRun));
+  const runOpts = S.runs.filter((r) => r.fusion_dir && r.status === "done" && (!modeForRun || modeForRun === "any" || r.mode === modeForRun) && (modeForRun !== "livo" || (r.camera || "midrange") === (c.camera || "midrange")));
+  const validationSelected = Array.isArray(c.validation_run) ? c.validation_run : c.validation_run ? [c.validation_run] : [];
+  const validationOpts = S.runs.filter((r) => r.fusion_dir && r.has_archive && r.status === "done" && r.mode === "livo" && (r.camera || "midrange") === (c.camera || "midrange") && r.vehicle === v?.id);
   const pipelineParent = selectedParent();
-  const parents = versions.map((x) => `<option value="${esc(x.id)}" ${pipelineParent === x.id ? "selected" : ""}>${esc(x.version)} · ${esc(x.stage_label)}${x.active ? " ★" : ""}</option>`).join("");
-  return `<h1 style="margin-bottom:6px">标定</h1><div class="muted" style="margin-bottom:18px">每辆车的标定按 <code>config/carlibration/&lt;矿山&gt;/&lt;车辆&gt;/vNNN_&lt;阶段&gt;/</code> 版本化保存；每个阶段都以父版本为输入生成新版本，绝不覆盖。SLAM 只读取“激活”的版本。</div>
+  const cameraReady = hasCamera(d, c.camera || "midrange");
+  const parents = versions.map((x) => `<option value="${esc(x.id)}" ${pipelineParent === x.id ? "selected" : ""}>${esc(x.version)} · ${esc(x.stage_label)} · ${cameraLabel(x.camera)}${x.active ? " ★" : ""}</option>`).join("");
+  return `<h1 style="margin-bottom:6px">标定</h1><div class="muted" style="margin-bottom:18px">每辆车的标定按 <code>config/carlibration/&lt;矿山&gt;/&lt;车辆&gt;/vNNN_&lt;阶段&gt;/</code> 版本化保存；每个阶段都以父版本为输入生成新版本，绝不覆盖。建图按当前录制与相机匹配版本，也可显式指定。</div>
   <div class="card"><div class="card-h"><h2>车辆 &nbsp;<select data-act="set-vehicle">${S.vehicles.map((x) => `<option value="${x.id}" ${v && x.id === v.id ? "selected" : ""}>${esc(x.mine)} / ${esc(x.truck)}</option>`).join("")}</select></h2>
     <div class="row">${v?.active ? `<span class="badge dark">激活：${esc(v.active.split("/").pop())}</span>` : '<span class="badge bad">无激活版本</span>'}<button class="btn sm" data-act="toggle-import">${S.showImport ? "收起" : "新建车辆 / 导入出厂标定"}</button></div></div>
     ${S.showImport || !S.vehicles.length ? importForm(c) : ""}
-    ${stepperHtml(v)}
+    ${stepperHtml(cameraVehicle(v, c.camera))}
     ${windowWidget("winCalib", "标定时间窗口", "标定只使用窗口内的数据；窗口从行驶中开始时，建图轮次自动从窗口前最近的静止处起播（IMU 需静止初始化），窗口内没有静止段时地面静止帧取窗口前的静止段。")}
+    <div class="form" style="margin-top:12px">${cameraSelector("calibration", c.camera)}<div class="small muted">中距与鱼眼分别保存时间、内外参和验证状态。切换相机后先导入该相机参数；相机标定、投影复核和验证建图使用同一个选择。</div></div>
     <div class="grid g2" style="margin-top:8px">
       <div class="stat" style="padding:14px"><div class="row" style="justify-content:space-between"><div><b>LiDAR 标定流水线</b><div class="small muted">后轴对齐（RTK/INS 位姿，参考雷达→后轴，整机修正）→ 静止地面精修 → LIO 建图（保存地图）→ 行驶段 6-DoF 精修 → 校验${c.auto_activate ? " → 激活" : ""}</div><div class="small muted">180 s 窗口实测 7–10 分钟（2–3 轮 LIO 回放，2.5 倍速；RTK 关联时间已自洽时省掉探测轮）· 需要 LiDAR/IMU/INS 数据源 · 父版本可在下方选择（任意版本）</div></div><button class="btn primary" data-act="pipeline" data-kind="lidar" ${running || !v?.active || !d?.lio_ready ? "disabled" : ""}>运行</button></div></div>
-      <div class="stat" style="padding:14px"><div class="row" style="justify-content:space-between"><div><b>相机标定流水线</b><div class="small muted">相机时间偏移 → LIVO 建图 A（基线）→ 偏航复核（灯柱投影列偏差，俯仰不动）→ 俯仰闭环（标准＝±0.05° 扫描两轮拟合斜率；快速＝沿用历史斜率 0.105/°，只测零点）→ 闭环版本 → LIVO 验证建图 → 闭环判定 A/验证 → 校验${c.auto_activate ? " → 通过则激活" : ""}</div><div class="small muted">默认每轮 120 s（受所选窗口限制），按运动量选窗；俯仰不可观测时保留原激活版本· 需要含相机的数据源 · 未通过闭环的版本不会被激活</div></div><button class="btn primary" data-act="pipeline" data-kind="camera" ${running || !v?.active || !d?.livo_ready ? "disabled" : ""}>运行</button></div></div>
-      <div class="stat" style="padding:14px"><div class="row" style="justify-content:space-between"><div><b>相机外参闭环微调（日常，最快）</b><div class="small muted">以当前激活版本为起点：<b>复用最近一次同版本 LIVO 轮次</b>作为零俯仰点（无需重跑）→ 用已知斜率算出过零点 → 闭环版本 → 一轮 LIVO 验证 → 闭环判定${c.auto_activate ? " → 通过则激活" : ""}</div><div class="small muted">快速 ≈4–5 min（1 次回放）· 标准 ≈15 min（4 次回放）· 复用要求同窗口、同版本且已评估，时长至少覆盖本次窗口的 90%</div></div><button class="btn primary" data-act="pipeline" data-kind="camloop" ${running || !v?.active || !d?.livo_ready ? "disabled" : ""}>运行</button></div></div>
-      <div class="stat" style="padding:14px"><div class="row" style="justify-content:space-between"><div><b>相机光度标定（内参复核 + 外参/时间精修 + 暗角）</b><div class="small muted">以当前激活版本为起点：LIVO 建图 → 多视角光度一致性（同一回波在 2–60 m 外多帧图像里的纹理和亮度应一致）求相机旋转与时间偏移、画面暗角（平场，彩色点云取色时除掉），两半数据交叉验证；内参 fx/fy/k1 同时复核，留出数据显著改善才修改 → 光度标定版本 → LIVO 验证建图 → 判定（原生里程尺度 / 后轴误差 / 偏航不变差）${c.auto_activate ? " → 通过则激活" : ""}</div><div class="small muted">默认 2 次 120 s 回放 + 光度计算· 需要含相机的数据源 · 在相机标定流水线之后运行（重跑相机流水线会回到它自己的结果）· truck29raw 实测：俯仰 +0.3°、时间 −12~−16 ms，光度一致性 +27~29 %，内参复核不变；画面左右边缘暗 15–25 %，校正后地面视锥波纹消失</div></div><button class="btn primary" data-act="pipeline" data-kind="camphoto" ${running || !v?.active || !d?.livo_ready ? "disabled" : ""}>运行</button></div></div>
+      <div class="stat" style="padding:14px"><div class="row" style="justify-content:space-between"><div><b>相机标定流水线</b><div class="small muted">${c.camera === "fisheye" ? "鱼眼时间偏移 → LIVO 基线 → 灯柱偏航复核 → 多帧内参诊断 → 新基线建图 → 旋转/时间/内参/残余畸变联合标定 → 独立多包路段验证 → LIVO 验证建图 → 闭环判定" : "相机时间偏移 → LIVO 建图 A（基线）→ 偏航复核（俯仰不动）→ 俯仰闭环（标准 ±0.05° 扫描；快速沿用同相机实测斜率）→ 验证建图 → 闭环判定 → 校验"}${c.auto_activate ? " → 通过则激活" : ""}</div><div class="small muted">${c.camera === "fisheye" ? "鱼眼完整流程使用下方所选独立验证轮次；不选仍可诊断和试验建图，但不能采纳激活。各阶段及独立验证均使用多数据包、多帧证据" : "默认每轮 120 s（受所选窗口限制），按运动量选窗；俯仰不可观测时保留原激活版本；未通过闭环不会激活"}</div></div><button class="btn primary" data-act="pipeline" data-kind="camera" ${running || !v?.active || !cameraReady ? "disabled" : ""}>运行</button></div></div>
+      <div class="stat" style="padding:14px"><div class="row" style="justify-content:space-between"><div><b>相机外参闭环微调（日常，最快）</b><div class="small muted">以当前激活版本为起点：<b>复用最近一次同版本 LIVO 轮次</b>作为零俯仰点（无需重跑）→ 用已知斜率算出过零点 → 闭环版本 → 一轮 LIVO 验证 → 闭环判定${c.auto_activate ? " → 通过则激活" : ""}</div><div class="small muted">快速 ≈4–5 min（1 次回放）· 标准 ≈15 min（4 次回放）· 复用要求同窗口、同版本且已评估，时长至少覆盖本次窗口的 90%</div></div><button class="btn primary" data-act="pipeline" data-kind="camloop" ${running || !v?.active || !cameraReady ? "disabled" : ""}>运行</button></div></div>
+      <div class="stat" style="padding:14px"><div class="row" style="justify-content:space-between"><div><b>相机光度标定（内参复核 + 外参/时间精修 + 暗角）</b><div class="small muted">以所选父版本为起点：LIVO 基线建图 → 多视角光度一致性联合复核旋转、时间、内参与残余畸变 → 留出数据及所选独立路段验证 → LIVO 验证建图 → 原生轨迹闭环判定。中距和鱼眼均可微调；只有通过验证的候选参数才写入新版本${c.auto_activate ? " → 通过则激活" : ""}</div><div class="small muted">默认 2 次 120 s 回放 + 光度计算；可复用下方另一段已有 LIVO 扫描存档检验固定候选。鱼眼自动激活还要求多阶段及独立多包验证全部通过</div></div><button class="btn primary" data-act="pipeline" data-kind="camphoto" ${running || !v?.active || !cameraReady ? "disabled" : ""}>运行</button></div></div>
     </div>
+    <div class="field" style="margin-top:12px"><label>光度标定的独立路段验证（可多选，流水线和单步共用）</label><select multiple size="4" data-act="photo-validation"><option value="" ${!validationSelected.length ? "selected" : ""}>不指定：仅生成诊断候选，鱼眼不可激活</option>${validationSelected.filter((value) => !validationOpts.some((r) => r.fusion_dir === value)).map((value) => `<option value="${esc(value)}" selected>所选轮次已不可用，请取消并重新选择</option>`).join("")}${validationOpts.map((r) => `<option value="${esc(r.fusion_dir)}" ${validationSelected.includes(r.fusion_dir) ? "selected" : ""}>${esc(r.round)} · ${esc(baseName(r.dataset))} · ${cameraLabel(r.camera)}</option>`).join("")}</select><div class="small muted">可选择同车、同相机的其他路段或录制，按 Ctrl / Command 多选。流水线会核对已有轮次的相机模型，参数改变时按原录制窗口重建验证基线。验证数据不参与拟合；鱼眼拟合及每个验证轮次均需 ≥2 个相机数据包、≥50 帧、≥3 个视角，另需时间、偏航、内参诊断、光度联合标定及当前版本的 LIVO 闭环通过。单帧或缺独立验证只能试验建图，不能激活。</div></div>
     <div class="grid g2" style="margin-top:10px;align-items:end"><div class="field"><label>流水线 / 单步 / 车身过滤拼接的父版本（可选任意版本）</label><select data-act="calib-field" data-key="parent">${parents || "<option>（无）</option>"}</select><div class="small muted">当前选择：<b>${esc(pipelineParent || "—")}</b>；激活版本：${esc(v?.active || "—")}。自动化流水线会先把当前车辆的 body_filter 写入该父版本，再开始各标定阶段。</div></div><div class="small muted">数据源：<b>${esc(d?.name || "未选择")}</b> ${datasetBadges(d)}</div></div>
-    <div class="row" style="gap:18px;flex-wrap:wrap;margin-top:4px"><label class="check small">${`<input type="checkbox" data-act="toggle" data-section="calibration" data-key="auto_activate" ${c.auto_activate ? "checked" : ""}><span class="switch"></span><span>流水线完成后自动激活（仅在闭环判定通过时）</span>`}</label><label class="check small">${`<input type="checkbox" data-act="toggle" data-section="calibration" data-key="fast" ${c.fast !== false ? "checked" : ""}><span class="switch"></span><span>快速模式（沿用本车实测俯仰斜率只测零点；本车无斜率或单点拟合被拒时自动转标准扫描；取消勾选＝标准扫描）</span>`}</label><label class="check small">${`<input type="checkbox" data-act="toggle" data-section="calibration" data-key="keep_maps" ${c.keep_maps === true ? "checked" : ""}><span class="switch"></span><span>保留标定轮次的地图与扫描存档（每轮 1–4 GB；默认关闭＝流水线成功后删除 PCD/scans.bin，轨迹与评估保留）</span>`}</label></div>
+    <div class="row" style="gap:18px;flex-wrap:wrap;margin-top:4px"><label class="check small">${`<input type="checkbox" data-act="toggle" data-section="calibration" data-key="auto_activate" ${c.auto_activate ? "checked" : ""}><span class="switch"></span><span>流水线完成后自动激活（相机需闭环通过，鱼眼还需多阶段及独立多包验证）</span>`}</label><label class="check small">${`<input type="checkbox" data-act="toggle" data-section="calibration" data-key="fast" ${c.fast !== false ? "checked" : ""}><span class="switch"></span><span>快速模式（沿用本相机实测俯仰斜率只测零点；本相机无斜率或单点拟合被拒时自动转标准扫描；取消勾选＝标准扫描）</span>`}</label><label class="check small">${`<input type="checkbox" data-act="toggle" data-section="calibration" data-key="keep_maps" ${c.keep_maps === true ? "checked" : ""}><span class="switch"></span><span>保留标定轮次的地图与扫描存档（每轮 1–4 GB；默认关闭＝流水线成功后删除 PCD/scans.bin，轨迹与评估保留）</span>`}</label></div>
   </div>
   <div class="card" style="margin-top:16px">${axleLimitsHtml()}</div>
   <div class="grid" style="grid-template-columns: 1fr 380px; margin-top:16px">
     <div class="card"><div class="card-h"><h2>版本（${versions.length}）</h2><span class="small muted">点击查看详情 · ★ 为激活版本</span></div>
-      ${versions.length ? `<table><thead><tr><th>版本</th><th>阶段</th><th>父版本</th><th>创建</th><th>说明</th></tr></thead><tbody>${versions.map((x) => `<tr class="click ${S.versionDetail?.id === x.id ? "sel" : ""}" data-act="open-version" data-id="${esc(x.id)}"><td class="mono nowrap">${x.active ? "★ " : ""}${esc(x.version)}</td><td><span class="badge ${x.advisory ? "warn" : ""}">${esc(x.stage_label)}</span>${x.closed_loop ? `<div class="small"><span class="badge ${x.closed_loop === "pass" ? "ok" : "bad"}" title="LIVO 闭环验证（原生轨迹 A/B）">闭环 ${x.closed_loop === "pass" ? "通过" : "未通过"}</span></div>` : x.advisory ? '<div class="small muted">仅供参考 · 未闭环验证</div>' : ""}</td><td class="mono small muted">${esc(x.parent ? x.parent.split("/").pop() : "—")}${x.parent_missing ? ' <span class="bad">(已删)</span>' : ""}</td><td class="small nowrap">${fmtT(x.created)}</td><td class="small muted" style="max-width:360px">${esc(x.note || "")}</td></tr>`).join("")}</tbody></table>` : '<div class="empty">该车辆还没有标定版本，请先导入出厂标定</div>'}</div>
+      ${versions.length ? `<table><thead><tr><th>版本</th><th>阶段</th><th>父版本</th><th>创建</th><th>说明</th></tr></thead><tbody>${versions.map((x) => `<tr class="click ${S.versionDetail?.id === x.id ? "sel" : ""}" data-act="open-version" data-id="${esc(x.id)}"><td class="mono nowrap">${x.active ? "★ " : ""}${esc(x.version)}<div class="small muted">${cameraLabel(x.camera)}</div></td><td><span class="badge ${x.advisory ? "warn" : ""}">${esc(x.stage_label)}</span>${x.closed_loop ? `<div class="small"><span class="badge ${x.closed_loop === "pass" ? "ok" : "bad"}" title="LIVO 闭环验证（原生轨迹 A/B）">闭环 ${x.closed_loop === "pass" ? "通过" : "未通过"}</span></div>` : x.advisory || x.stage?.startsWith("cam") ? '<div class="small muted">未闭环验证</div>' : ""}</td><td class="mono small muted">${esc(x.parent ? x.parent.split("/").pop() : "—")}${x.parent_missing ? ' <span class="bad">(已删)</span>' : ""}</td><td class="small nowrap">${fmtT(x.created)}</td><td class="small muted" style="max-width:360px">${esc(x.note || "")}</td></tr>`).join("")}</tbody></table>` : '<div class="empty">该车辆还没有标定版本，请先导入出厂标定</div>'}</div>
     <div class="card"><div class="card-h"><h2>单步执行（高级）</h2></div>
       <div class="stack">
         <div class="field"><label>阶段</label><select data-act="calib-stage">${stageOpts.map(([k, s]) => `<option value="${k}" ${f.stage === k ? "selected" : ""}>${s.order}. ${esc(s.label)}</option>`).join("")}</select>
@@ -674,7 +699,7 @@ function pageCalib() {
         ${f.stage === "manual" ? `<div class="form"><div class="field"><label>相机时间偏移 (s)</label><input type="number" step="0.001" data-act="calib-field" data-key="camera_offset" value="${esc(f.camera_offset ?? "")}"></div><div class="field"><label>LiDAR 时间偏移 (s)</label><input type="number" step="0.001" data-act="calib-field" data-key="lidar_offset" value="${esc(f.lidar_offset ?? "")}"></div><div class="field wide"><label>相机旋转修正 rx ry rz (deg, 相机系)</label><input type="text" data-act="calib-field" data-key="camera_rot_delta" value="${esc(f.camera_rot_delta ?? "")}" placeholder="0 0 0"></div></div>` : ""}
         ${f.stage === "camlidar" ? `<div class="field"><label>检查的图像帧数（其中含灯柱的帧参与偏航估计）</label><input type="number" data-act="calib-field" data-key="frames" value="${esc(f.frames ?? 30)}"></div>` : ""}
         <div class="field"><label>说明</label><input type="text" data-act="calib-field" data-key="note" value="${esc(f.note ?? "")}" placeholder="可选备注，写入版本记录"></div>
-        <label class="check"><input type="checkbox" data-act="calib-field" data-key="activate" ${f.activate ? "checked" : ""}><span class="switch"></span><span>完成后激活</span></label>
+        <label class="check"><input type="checkbox" data-act="calib-field" data-key="activate" ${c.camera === "fisheye" ? "disabled" : f.activate ? "checked" : ""}><span class="switch"></span><span>${c.camera === "fisheye" ? "鱼眼单步仅生成候选，完成独立验收后再激活" : "完成后激活"}</span></label>
         <button class="btn primary" data-act="run-stage" ${running || !versions.length ? "disabled" : ""}>执行 ${esc(info.label || "")}</button>
       </div></div>
   </div>`;
@@ -705,32 +730,33 @@ function pageMap() {
   ${liveMonitor()}
   <div class="card" style="margin-top:16px"><div class="card-h"><h2>参数</h2><div class="row"><span class="small muted">数据源</span><b>${esc(d?.name || "未选择")}</b>${datasetBadges(d)}${assessBadgeHome()}<button class="btn sm" data-act="go" data-page="data">更换</button></div></div>
     <div class="form">
-      <div class="field"><label>模式</label><div class="seg"><button class="${mode === "lio" ? "active" : ""}" data-act="mode" data-mode="lio" ${canLIO ? "" : "disabled"}>LIO</button><button class="${mode === "livo" ? "active" : ""}" data-act="mode" data-mode="livo" ${canLIVO ? "" : "disabled"}>LIVO</button><button class="${mode === "gaussian" ? "active" : ""}" data-act="mode" data-mode="gaussian" ${canLIVO ? "" : "disabled"}>高斯建图</button></div></div>
-      <div class="field"><label>标定版本</label><select data-act="field" data-section="mapping" data-key="calibration_id"><option value="" ${!m.calibration_id ? "selected" : ""}>自动按当前录制匹配（无匹配时使用激活版本）</option>${versions.map((x) => `<option value="${esc(x.id)}" ${m.calibration_id === x.id ? "selected" : ""} title="标定数据：${esc(x.source_dataset || "未登记")}">${esc(x.version)} · ${esc(x.stage_label)}${x.source_dataset && d?.path && x.source_dataset !== d.path ? " · 其他录制" : ""}</option>`).join("")}</select></div>
+      <div class="field"><label>模式</label><div class="seg"><button class="${mode === "lio" ? "active" : ""}" data-act="mode" data-mode="lio" ${canLIO ? "" : "disabled"}>LIO</button><button class="${mode === "livo" ? "active" : ""}" data-act="mode" data-mode="livo" ${canLIVO ? "" : "disabled"}>LIVO</button><button class="${mode === "gaussian" ? "active" : ""}" data-act="mode" data-mode="gaussian" ${canLIVO && m.camera !== "fisheye" ? "" : "disabled"} title="高斯建图目前仅支持中距相机">高斯建图</button></div></div>
+      ${mode !== "lio" ? cameraSelector("mapping", m.camera) : ""}
+      <div class="field"><label>标定版本</label><select data-act="field" data-section="mapping" data-key="calibration_id"><option value="" ${!m.calibration_id ? "selected" : ""}>自动按当前录制匹配（无匹配时使用激活版本）</option>${versions.map((x) => `<option value="${esc(x.id)}" ${m.calibration_id === x.id ? "selected" : ""} title="标定数据：${esc(x.source_dataset || "未登记")}">${esc(x.version)} · ${esc(x.stage_label)} · ${cameraLabel(x.camera)}${x.source_dataset && d?.path && x.source_dataset !== d.path ? " · 其他录制" : ""}</option>`).join("")}</select></div>
 
       <div class="field"><label>回放倍速</label><input type="number" step="0.1" min="0.1" max="4" data-act="field" data-section="mapping" data-key="rate" value="${esc(m.rate)}"></div>
       <div class="field"><label>起始偏移 (s)</label><input type="number" step="0.001" min="0" data-act="field" data-section="mapping" data-key="start_offset" value="${esc(m.start_offset ?? 0)}"><div class="small muted">数据评估后自动填入全程最早可用静止段的起点，可手动修改。${S.assessSummary?.startup?.stationary ? `检测静止段：${num(S.assessSummary.startup.stationary.start_s, 3)}–${num(S.assessSummary.startup.stationary.end_s, 3)} s。` : ""}</div></div>
       <div class="field"><label>回放时长 (s，空=全部)</label><input type="number" step="1" min="0" data-act="field" data-section="mapping" data-key="duration" value="${esc(m.duration ?? "")}"></div>
       <div class="field"><label>几何点云截取距离 (m)</label><input type="number" step="1" min="0" data-act="field" data-section="mapping" data-key="map_range" value="${esc(m.map_range ?? 45)}" ${m.save_map ? "" : "disabled"}></div>
-      <div class="field"><label>强度点云过滤值 (m，0 = 不过滤，0–0.1)</label><input type="number" step="0.005" min="0" max="0.1" data-act="field" data-section="mapping" data-key="map_filter" value="${esc(m.map_filter ?? 0.01)}" ${m.save_map ? "" : "disabled"} title="map_N.pcd：每个分块里每个该尺寸的小格保留离雷达最近的一个原始回波。所有扫描均参与，包括停车帧，避免覆盖判定与实际写出不一致造成空洞；值越大重复点越少、文件越小。0 关闭此体素过滤，距离优先规则仍单独生效。"></div>
+      <div class="field"><label>强度点云过滤值 (m，默认 0.1)</label><input type="number" step="0.005" min="0.005" max="0.1" data-act="field" data-section="mapping" data-key="map_filter" value="${esc(m.map_filter ?? 0.1)}" ${m.save_map ? "" : "disabled"} title="map_N.pcd：每个分块里每个该尺寸的小格保留离雷达最近的一个原始回波。所有扫描均参与，包括停车帧，避免覆盖判定与实际写出不一致造成空洞；值越大重复点越少、文件越小。距离优先、看穿和地面细节补点保持启用。"></div>
       <div class="field"><label>颜色来源截取距离 (m，LIVO 生效)</label><input type="number" step="1" min="0" data-act="field" data-section="mapping" data-key="rgb_range" value="${esc(m.rgb_range ?? 60)}" ${m.save_map ? "" : "disabled"} title="只限制给点着色的相机观测距离；rgb_map_N.pcd 由 map_N.pcd 中能找到颜色的行按下方体素抽稀而成。LIO 模式不生成彩色点云，这里的值会保存并在下次 LIVO 建图时使用"></div>
-      <div class="field"><label>彩色点云体素 (m，0 = 每行保留，LIVO 生效)</label><input type="number" step="0.01" min="0" max="0.5" data-act="field" data-section="mapping" data-key="rgb_voxel" value="${esc(m.rgb_voxel ?? 0.035)}" ${m.save_map ? "" : "disabled"} title="rgb_map_N.pcd：全图每个该尺寸的体素只保留一个点（取色视角最近的那一行，先到的分块写入；停车、回头路不重复）。3.5 cm 时路面点密度与最初版彩色点云相当；0 = 每帧每个能着色的行都保留"></div>
+      <div class="field"><label>彩色点云体素 (m，0 = 每行保留，LIVO 生效)</label><input type="number" step="0.01" min="0" max="0.5" data-act="field" data-section="mapping" data-key="rgb_voxel" value="${esc(m.rgb_voxel ?? 0.03)}" ${m.save_map ? "" : "disabled"} title="rgb_map_N.pcd：全图每个该尺寸的体素只保留一个点（取色视角最近的那一行，先到的分块写入；停车、回头路不重复）。默认 3 cm，按全图最优原始着色观测去重；0 = 每帧每个能着色的行都保留"></div>
       <div class="field"><label>相机帧抽稀 (frame_divider)</label><input type="number" step="1" min="1" max="10" data-act="field" data-section="mapping" data-key="frame_divider" value="${esc(m.frame_divider ?? 1)}"></div>
       <div class="field"><label>静止跳过：最短静止时长 (s)</label><input type="number" step="5" min="10" data-act="field" data-section="mapping" data-key="stationary_min" value="${esc(m.stationary_min ?? 30)}" ${m.skip_stationary ? "" : "disabled"} title="起步后、持续时间不短于该值的静止段被快进；起步前的静止段始终正常回放（IMU 初始化、外参自检）"></div>
       <div class="field"><label>静止跳过：快进期激光间隔 (s)</label><input type="number" step="0.5" min="0.2" max="5" data-act="field" data-section="mapping" data-key="stationary_lidar_interval" value="${esc(m.stationary_lidar_interval ?? 1)}" ${m.skip_stationary ? "" : "disabled"} title="快进期间每隔多少秒保留一帧激光（IMU/INS 全量回放）"></div>
-      <div class="field"><label>地图导出：体素 (m，0 = 不滤波)</label><input type="number" step="0.01" min="0" max="2" data-act="field" data-section="mapping" data-key="map_voxel" value="${esc(m.map_voxel ?? 0.05)}" ${m.save_map && m.map_export !== false ? "" : "disabled"} title="global_map.pcd 的体素边长；每个体素输出质心与平均强度"></div>
+      <div class="field"><label>强度地图导出：体素 (m，默认 0.1)</label><input type="number" step="0.01" min="0.01" max="2" data-act="field" data-section="mapping" data-key="map_voxel" value="${esc(m.map_voxel ?? 0.1)}" ${m.save_map && m.map_export !== false ? "" : "disabled"} title="global_map.pcd 的体素边长；每个体素输出质心与平均强度"></div>
       <div class="field"><label>地图导出：点云来源</label><select data-act="field" data-section="mapping" data-key="map_source" ${m.save_map && m.map_export !== false ? "" : "disabled"}><option value="all" ${(m.map_source || "all") === "all" ? "selected" : ""}>全部扫描（最密）</option><option value="keyframes" ${m.map_source === "keyframes" ? "selected" : ""}>仅后端关键帧（约 1/5 数据量）</option></select></div>
       <div class="field"><label>地图导出：分块 (m，0 = 仅整图)</label><input type="number" step="10" min="0" data-act="field" data-section="mapping" data-key="map_tile" value="${esc(m.map_tile ?? 0)}" ${m.save_map && m.map_export !== false ? "" : "disabled"}></div>
       <div class="field"><label>地图导出：每体素最少点数 (1 = 全保留)</label><input type="number" step="1" min="1" max="1000" data-act="field" data-section="mapping" data-key="map_min_points" value="${esc(m.map_min_points ?? 1)}" ${m.save_map && m.map_export !== false ? "" : "disabled"} title="少于该点数的体素视为噪点/短暂出现的移动物体而剔除（如 3）；静止结构在 5 cm 体素内通常累积数十至数百个回波"></div>
       <div class="field wide"><label>额外参数覆盖（空格分隔 key=value，例如 vio.img_point_cov=100 time_offset.img_time_offset=-0.115）</label><input type="text" class="mono" data-act="field" data-section="mapping" data-key="extra_sets" value="${esc(m.extra_sets || "")}"></div>
     </div>
     <div class="small muted" style="margin-top:10px">截取距离仅控制导出的 PCD 范围，0 表示不限距离。彩色点云是几何点云中能着色的点（按彩色点云体素抽稀），颜色来源距离单独设置；彩色点云只在 LIVO 模式生成，在 LIO 模式下也可以预先设置。</div>
-    <div class="row" style="margin-top:14px;gap:22px">${toggle("use_rtk", "RTK / INS 融合", m.use_rtk)}${toggle("save_map", "保存地图 (PCD/扫描存档)", m.save_map)}${toggle("rviz", "RViz", m.rviz)}${toggle("precheck", "起步静止外参自检", m.precheck)}${toggle("evaluate", "自动评估", m.evaluate)}${toggle("skip_stationary", "长时间静止跳过（仅 LIO）", m.skip_stationary)}${toggle("loop_closure", "回环检测（收尾，需保存地图）", m.loop_closure !== false)}${toggle("map_priority", "地图距离优先（去掉被别处更近看到的远处回波，分块只剩近处）", m.map_priority !== false)}${toggle("map_export", "导出标准地图", m.map_export !== false)}${toggle("map_keyframes", "导出关键帧点云", m.map_keyframes)}${toggle("auto_cleanup", "磁盘不足时自动精简旧轮次", m.auto_cleanup !== false)}</div>
+    <div class="row" style="margin-top:14px;gap:22px">${toggle("use_rtk", "RTK / INS 融合", m.use_rtk)}${toggle("save_map", "保存地图 (PCD/扫描存档)", m.save_map)}${toggle("rviz", "RViz", m.rviz)}${toggle("precheck", "起步静止外参自检", m.precheck)}${toggle("evaluate", "自动评估", m.evaluate)}${toggle("skip_stationary", "长时间静止跳过（仅 LIO）", m.skip_stationary)}${toggle("loop_closure", "回环检测（收尾，需保存地图）", m.loop_closure !== false)}<label><input type="checkbox" checked disabled>距离优先与看穿检查</label>${toggle("map_export", "导出标准地图", m.map_export !== false)}${toggle("map_keyframes", "导出关键帧点云", m.map_keyframes)}${toggle("auto_cleanup", "磁盘不足时自动精简旧轮次", m.auto_cleanup !== false)}</div>
     <div class="row" style="margin-top:8px;gap:10px"><label class="small">自动精简阈值：可用空间低于 <input type="number" min="15" step="5" style="width:70px" data-act="field" data-section="mapping" data-key="auto_cleanup_free_gb" value="${esc(m.auto_cleanup_free_gb ?? 50)}" ${m.auto_cleanup !== false ? "" : "disabled"}> GB 时，开跑前按时间从旧到新精简未保护的历史轮次（见 系统 › 磁盘与历史数据）</label></div>
     <div class="small muted" style="margin-top:6px">地图产品（保存地图时生成，<code>Log/fusion/&lt;运行&gt;/map/</code>）：<b>global_map.pcd</b> 体素滤波整图（全部扫描或仅关键帧）、LIVO 另有 <b>global_map_rgb.pcd</b>；可选分块 tiles/ 与关键帧点云 keyframes/（机体系点云 + poses.txt）；<b>map_info.json</b> 记录坐标系、体素、范围、点数与输入。原始时间序分块 map_N.pcd（评估用）与扫描存档始终保留，可在结果页按其他体素/来源重新导出而无需重新建图。</div>
     <div class="small muted" style="margin-top:6px">长时间静止跳过（仅 LIO）：起步后的长静止段（停车等待）只快进中段——前 3 s 与重新起步前 5 s 照常回放，快进期间 IMU/INS 全量连续、激光按间隔抽稀；状态估计与 RTK/INS 关联保持连续，地图不重复累积静止帧。LIVO 轮次忽略此选项、照常回放（相机硬解码输出有延迟，快进后视觉更新会中断）。</div>
     <div class="sep"></div>
-    <div class="row" style="justify-content:space-between"><div class="small muted">启动前会校验数据源话题与标定版本；进行中可“提前结束并保存”（停止回放，保留优化/导出/评估）。</div><button class="btn primary big" data-act="start" ${running || !canLIO || !v?.active ? "disabled" : ""}>${running ? "建图进行中…" : `开始 ${mode.toUpperCase()} 建图`}</button></div>
+    <div class="row" style="justify-content:space-between"><div class="small muted">启动前会校验数据源话题与标定版本；进行中可“提前结束并保存”（停止回放，保留优化/导出/评估）。</div><button class="btn primary big" data-act="start" ${running || !canLIO || !v?.active || (mode !== "lio" && !hasCamera(d, m.camera || "midrange")) || (mode === "gaussian" && m.camera === "fisheye") ? "disabled" : ""}>${running ? "建图进行中…" : `开始 ${mode.toUpperCase()} 建图`}</button></div>
   </div>`;
 }
 
@@ -822,7 +848,7 @@ function drawerVersion() {
   const d = S.versionDetail; if (!d) return `<div class="empty">加载中…</div>`;
   const m = d.meta || {}; const sum = m.summary || {}; const ch = m.changes_vs_parent || {}; const val = d.validation || {};
   const lidars = (sum.lidars || []).map((l) => `<tr><td>${esc(l.lidar)}</td><td class="mono small">${l.t.map((x) => x.toFixed(3)).join(", ")}</td><td class="mono small">${l.rpy_deg.map((x) => x.toFixed(2)).join(", ")}</td><td class="mono small">${ch.lidars?.[l.lidar] ? `Δt ${ch.lidars[l.lidar].dt_cm.join("/")} cm · Δrpy ${ch.lidars[l.lidar].drpy_deg.join("/")}°` : '<span class="faint">无变化</span>'}</td></tr>`).join("");
-  const cam = sum.camera_to_rear ? `<tr><td>camera→rear</td><td class="mono small">${sum.camera_to_rear.t.map((x) => x.toFixed(3)).join(", ")}</td><td class="mono small">${sum.camera_to_rear.rpy_deg.map((x) => x.toFixed(2)).join(", ")}</td><td class="mono small">${ch.camera_to_rear ? `Δt ${ch.camera_to_rear.dt_cm.join("/")} cm · Δrpy ${ch.camera_to_rear.drpy_deg.join("/")}°` : '<span class="faint">无变化</span>'}</td></tr>` : "";
+  const cam = sum.camera_to_rear ? `<tr><td>${cameraLabel(d.camera)}→rear</td><td class="mono small">${sum.camera_to_rear.t.map((x) => x.toFixed(3)).join(", ")}</td><td class="mono small">${sum.camera_to_rear.rpy_deg.map((x) => x.toFixed(2)).join(", ")}</td><td class="mono small">${ch.camera_to_rear ? `Δt ${ch.camera_to_rear.dt_cm.join("/")} cm · Δrpy ${ch.camera_to_rear.drpy_deg.join("/")}°` : '<span class="faint">无变化</span>'}</td></tr>` : "";
   const offs = sum.time_offsets || {};
   const tsrc = (d.calibration && d.calibration.time_offsets) || {};
   const offHtml = Object.entries(offs).filter(([k, v]) => typeof v === "number").map(([k, v]) => {
@@ -832,22 +858,24 @@ function drawerVersion() {
   const metrics = m.metrics && Object.keys(m.metrics).length ? `<details><summary>阶段指标</summary><pre class="small">${esc(JSON.stringify(m.metrics, null, 1))}</pre></details>` : "";
   const stage = d.stage_info || {};
   const cl = d.closed_loop;
-  const closedLoop = cl ? `<div class="callout ${cl.verdict === "pass" ? "ok" : "bad"}" style="margin:10px 0"><b>LIVO 闭环验证${cl.verdict === "pass" ? "通过" : "未通过"}</b>（原生轨迹 A/B：${esc(cl.baseline?.round || "")} → ${esc(cl.candidate?.round || "")}）<div class="small" style="margin-top:4px">原生里程尺度 ${cl.baseline?.scale != null ? (cl.baseline.scale * 100).toFixed(2) + "%" : "—"} → ${cl.candidate?.scale != null ? (cl.candidate.scale * 100).toFixed(2) + "%" : "—"}${cl.common_window ? ` · 后轴误差@${cl.common_window.t0}–${cl.common_window.t1} s ${f2(cl.common_window.baseline_rear_m)} → ${f2(cl.common_window.candidate_rear_m)} m` : ""} · 偏航 P95 ${f2(cl.baseline?.yaw_p95_deg)} → ${f2(cl.candidate?.yaw_p95_deg)}°${cl.reasons?.length ? `<br>原因：${esc(cl.reasons.join("；"))}` : ""}${cl.verdict !== "pass" ? "<br><b>请勿激活该版本</b>；继续使用基线版本。" : ""}</div></div>` : (stage.advisory ? `<div class="callout warn" style="margin:10px 0">该版本仅供参考，尚未做 LIVO 闭环验证：投影对齐只用于偏航/横滚复核；俯仰需有充分运动的闭环或多视角光度标定确认。请通过相机闭环或光度流水线验证后再激活。</div>` : "");
+  const photo = d.photo_validation || {}, coverage = photo.coverage || {}, independent = photo.validation || {};
+  const photoEvidence = d.camera === "fisheye" ? `<div class="callout ${d.activation?.allowed ? "ok" : "warn"}" style="margin:10px 0"><b>鱼眼激活验收：${d.activation?.allowed ? "通过" : "尚未通过"}</b>${d.activation?.reason ? `<div class="small">${esc(d.activation.reason)}</div>` : ""}<div class="small">联合模型：${esc(photo.model || "未完成")} · 拟合覆盖 ${coverage.camera_segment_count ?? 0} 个相机包 / ${coverage.frames ?? 0} 帧 / ${coverage.views ?? 0} 视角</div><div class="small">独立固定候选验证：${independent.passed === true && independent.refitted === false ? "通过" : "未完成或未通过"} · ${(independent.runs || []).length} 轮</div>${(independent.runs || []).map((r) => `<div class="small">${esc(baseName(r.run))} · ${r.coverage?.camera_segment_count ?? 0} 个包 / ${r.coverage?.frames ?? 0} 帧 / ${r.coverage?.views ?? 0} 视角 · ${r.passed ? "通过" : "未通过"}${r.gains ? ` · 两半光度增益 ${r.gains.map((g) => `${(100 * g).toFixed(2)}%`).join(" / ")}` : ""}${r.reason ? ` · ${esc(r.reason)}` : ""}</div>`).join("")}</div>` : "";
+  const closedLoop = cl ? `<div class="callout ${cl.verdict === "pass" ? "ok" : "bad"}" style="margin:10px 0"><b>${cameraLabel(d.camera)} LIVO 闭环验证${cl.verdict === "pass" ? "通过" : "未通过"}</b>（原生轨迹 A/B：${esc(cl.baseline?.round || "")} → ${esc(cl.candidate?.round || "")}）<div class="small" style="margin-top:4px">原生里程尺度 ${cl.baseline?.scale != null ? (cl.baseline.scale * 100).toFixed(2) + "%" : "—"} → ${cl.candidate?.scale != null ? (cl.candidate.scale * 100).toFixed(2) + "%" : "—"}${cl.common_window ? ` · 后轴误差@${cl.common_window.t0}–${cl.common_window.t1} s ${f2(cl.common_window.baseline_rear_m)} → ${f2(cl.common_window.candidate_rear_m)} m` : ""} · 偏航 P95 ${f2(cl.baseline?.yaw_p95_deg)} → ${f2(cl.candidate?.yaw_p95_deg)}°${cl.reasons?.length ? `<br>原因：${esc(cl.reasons.join("；"))}` : ""}${cl.verdict !== "pass" ? "<br><b>请勿激活该版本</b>；继续使用基线版本。" : ""}</div></div>` : (stage.advisory || m.stage?.startsWith("cam") ? `<div class="callout warn" style="margin:10px 0">该版本仅供参考，尚未做 LIVO 闭环验证：投影对齐只用于偏航/横滚复核；俯仰需有充分运动的闭环或多视角光度标定确认。请通过相机闭环或光度流水线验证后再激活。</div>` : "");
   const files = Object.entries(d.files || {}).map(([n, t]) => `<details><summary>${esc(n)}</summary><pre class="small" style="max-height:300px;overflow:auto">${esc(t)}</pre></details>`).join("");
   const overlays = d.overlays.length ? `<div class="sep"></div><h3>阶段叠加图（${d.overlays.length}）</h3><div class="small muted" style="margin:4px 0 8px">偏航复核阶段的灯柱裁剪图：红＝按父版本外参投影的 LiDAR 灯柱轴线，绿＝图像中量得的灯柱中心列；两者的列偏差（像素）÷ 焦距即偏航修正量（0.1° ≈ 3 px）。</div><div class="overlays">${d.overlays.map((n) => `<a href="/api/calibrations/file?id=${encodeURIComponent(d.id)}&name=overlays/${encodeURIComponent(n)}" target="_blank"><img loading="lazy" src="/api/calibrations/file?id=${encodeURIComponent(d.id)}&name=overlays/${encodeURIComponent(n)}" title="${esc(n)}"><div class="small muted ellipsis">${esc(n)}</div></a>`).join("")}</div>` : "";
   return `<div class="drawer-h"><div><h2>${esc(d.id)} ${d.active ? '<span class="badge dark">激活</span>' : ""}</h2><div class="small muted">${esc(m.stage_label || stage.label || m.stage)}${stage.advisory && cl?.verdict !== "pass" ? ' · <span class="warn">仅供参考</span>' : ""} · ${fmtT(m.created)} · 父版本 ${esc(m.parent || "无")}</div></div>
-    <div class="row"><button class="btn primary" data-act="activate" data-id="${esc(d.id)}" ${d.active || m.stage === "scan" ? "disabled" : ""} title="${m.stage === "scan" ? "临时扫描点不能激活" : ""}">激活</button><button class="btn" data-act="validate" data-id="${esc(d.id)}">校验</button><button class="btn" data-act="use-parent" data-id="${esc(d.id)}">作为父版本</button><button class="btn danger sm" data-act="delete-version" data-id="${esc(d.id)}" ${d.active || d.children.length ? "disabled" : ""} title="${d.children.length ? "存在子版本" : d.active ? "激活中" : ""}">删除</button><button class="btn sm" data-act="close">关闭</button></div></div>
+    <div class="row"><button class="btn primary" data-act="activate" data-id="${esc(d.id)}" ${d.active || m.stage === "scan" || d.activation?.allowed === false ? "disabled" : ""} title="${esc(d.activation?.reason || (m.stage === "scan" ? "临时扫描点不能激活" : ""))}">激活</button><button class="btn" data-act="validate" data-id="${esc(d.id)}">校验</button><button class="btn" data-act="use-parent" data-id="${esc(d.id)}">作为父版本</button><button class="btn danger sm" data-act="delete-version" data-id="${esc(d.id)}" ${d.active || d.children.length ? "disabled" : ""} title="${d.children.length ? "存在子版本" : d.active ? "激活中" : ""}">删除</button><button class="btn sm" data-act="close">关闭</button></div></div>
     <div class="callout ${val.ok ? (val.warnings?.length ? "warn" : "ok") : "bad"}">${val.ok ? "校验通过" : "校验失败"}${(val.errors || []).map((e) => `<div>✕ ${esc(e)}</div>`).join("")}${(val.warnings || []).map((e) => `<div>△ ${esc(e)}</div>`).join("")}</div>
-    <div class="kv small" style="margin:12px 0"><div class="k">说明</div><div>${esc(m.note || "")}</div><div class="k">阶段</div><div>${esc(stage.input || "")} → ${esc(stage.output || "")}</div><div class="k">谱系</div><div class="mono">${(d.lineage || []).map((x) => x.split("/").pop()).join(" → ")}</div><div class="k">输入</div><div class="mono">${esc(JSON.stringify(m.inputs || {}))}</div><div class="k">文件</div><div class="mono">${esc(m.calibration_file || d.dir)}</div></div>
+    <div class="kv small" style="margin:12px 0"><div class="k">相机</div><div>${cameraLabel(d.camera)} · ${esc(d.calibration?.camera?.topic || "")}<br>同文件可用：${(d.available_cameras || []).map(cameraLabel).join("、")}</div><div class="k">说明</div><div>${esc(m.note || "")}</div><div class="k">阶段</div><div>${esc(stage.input || "")} → ${esc(stage.output || "")}</div><div class="k">谱系</div><div class="mono">${(d.lineage || []).map((x) => x.split("/").pop()).join(" → ")}</div><div class="k">输入</div><div class="mono">${esc(JSON.stringify(m.inputs || {}))}</div><div class="k">文件</div><div class="mono">${esc(m.calibration_file || d.dir)}</div></div>
     <h3>外参摘要（后轴系，t 单位 m，rpy 单位 °）</h3>
     <table style="margin:6px 0 10px"><thead><tr><th>传感器</th><th>t (x,y,z)</th><th>rpy</th><th>相对父版本</th></tr></thead><tbody>${lidars}${cam}</tbody></table>
     <div class="row">${offHtml}${sum.camera?.intrinsics ? `<span class="badge">fx/fy/cx/cy ${sum.camera.intrinsics.map((x) => x.toFixed(1)).join(" / ")}</span>` : ""}</div>
-    ${closedLoop}<div class="sep"></div>${overlayPanel(d)}${metrics}${files}${overlays}`;
+    ${photoEvidence}${closedLoop}<div class="sep"></div>${overlayPanel(d)}${metrics}${files}${overlays}`;
 }
 function overlayPanel(d) {
   const f = S.overlayForm; const ds = S.dataset; const o = S.overlay && S.overlay.id === d.id ? S.overlay : null;
-  const runs = S.runs.filter((r) => r.fusion_dir && r.status === "done" && r.mode === "livo");
-  const run = f.run || (runs.find((r) => r.calibration_id === d.id) || runs[0] || {}).fusion_dir || "";
+  const runs = S.runs.filter((r) => r.fusion_dir && r.status === "done" && r.mode === "livo" && (r.camera || "midrange") === (d.camera || "midrange"));
+  const run = (runs.some((r) => r.fusion_dir === f.run) ? f.run : "") || (runs.find((r) => r.calibration_id === d.id) || runs[0] || {}).fusion_dir || "";
   const deltaVals = (f.delta || "").trim().split(/[\s,]+/).map(Number);
   const hasDelta = deltaVals.length === 3 && deltaVals.every(Number.isFinite) && deltaVals.some((v) => v !== 0);
   return `<details class="overlay-tool" ${o ? "open" : ""}><summary><b>目视复核：LiDAR 点云投影到相机图像</b> <span class="small muted">（用一次 LIVO 建图的扫描存档，约 10 s；用于确认外参没有粗大错误，不作为标定手段——肉眼分辨约 2–3 px ≈ 0.1°，而尺度漂移要求 0.02°）</span></summary>
@@ -943,14 +971,14 @@ function drawerRun() {
 function mapProductsPanel(r, l) {
   if (!l.fusion_dir) return "";
   const prods = l.map_products || [];
-  const f = S.exportForm || (S.exportForm = { voxel: 0.05, source: "all", tile: 0, keyframes: false, min_points: 1 });
+  const f = S.exportForm || (S.exportForm = { voxel: 0.1, source: "all", tile: 0, keyframes: false, min_points: 1 });
   const rows = prods.map((p) => `<tr><td class="mono">${esc(p.dir)}</td><td>${p.voxel_m === 0 ? "不滤波" : `${(p.voxel_m * 100).toFixed(0)} cm`}</td><td>${p.source === "keyframes" ? "关键帧" : "全部扫描"}${p.min_points > 1 ? ` · ≥${p.min_points} 点` : ""}</td><td>${p.tile_m ? `${p.tile_m} m` : "—"}</td><td>${p.files.map((x) => `<a href="/api/runs/${encodeURIComponent(r.round)}/file?name=${encodeURIComponent(`Log/fusion/${l.fusion_dir.split("/").pop()}/${x.name}`)}" target="_blank">${esc(x.name.split("/").pop())}</a> ${x.points != null ? `${(x.points / 1e6).toFixed(1)} M 点` : ""} · ${x.mb} MB`).join("<br>")}</td><td class="small muted">${esc(fmtT(p.created))}${p.elapsed_s != null ? ` · ${p.elapsed_s} s` : ""}</td></tr>`).join("");
   const gs = l.gaussian;
   const gsUrl = (name) => `/api/runs/${encodeURIComponent(r.round)}/file?name=${encodeURIComponent(`Log/fusion/${l.fusion_dir.split("/").pop()}/${name}`)}`;
   const gaussianPanel = gs ? `<div class="card"><b>高斯地图</b> · ${gs.gaussians.toLocaleString()} 个高斯 · ${gs.frames} 帧 · ${gs.submaps} 子图 · ${num(gs.elapsed_sec, 1)} s<div class="row">${gs.files.map((name) => `<a href="${gsUrl(name)}" target="_blank">${esc(name.split("/").pop())}</a>`).join(" · ")}</div><div class="overlays">${gs.renders.map((name) => `<a href="${gsUrl(name)}" target="_blank"><img loading="lazy" src="${gsUrl(name)}" title="留出视角渲染"></a>`).join("")}</div></div>` : "";
   return `${gaussianPanel}<details ${prods.length ? "" : "open"}><summary>地图产品（${prods.length}）</summary>
     ${prods.length ? `<table class="tbl small"><thead><tr><th>目录</th><th>体素</th><th>来源</th><th>分块</th><th>文件</th><th>生成</th></tr></thead><tbody>${rows}</tbody></table>` : `<div class="small muted">尚未导出标准地图产品。</div>`}
-    ${l.has_archive ? `<div class="row" style="margin-top:8px;gap:10px;flex-wrap:wrap"><label class="small">体素 (m) <input type="number" step="0.01" min="0" max="2" style="width:80px" data-act="export-field" data-key="voxel" value="${esc(f.voxel)}"></label><label class="small">来源 <select data-act="export-field" data-key="source"><option value="all" ${f.source === "all" ? "selected" : ""}>全部扫描</option><option value="keyframes" ${f.source === "keyframes" ? "selected" : ""}>仅关键帧</option></select></label><label class="small">分块 (m) <input type="number" step="10" min="0" style="width:80px" data-act="export-field" data-key="tile" value="${esc(f.tile)}"></label><label class="small">最少点数/体素 <input type="number" step="1" min="1" style="width:60px" data-act="export-field" data-key="min_points" value="${esc(f.min_points ?? 1)}"></label><label class="small"><input type="checkbox" data-act="export-field" data-key="keyframes" ${f.keyframes ? "checked" : ""}> 关键帧点云</label><button class="btn sm" data-act="export-map" data-round="${esc(r.round)}">按此设置重新导出</button></div><div class="small muted">从扫描存档按最终优化位姿重投影（与建图输出一致），不需要重新建图；默认设置写入 map/，其他设置写入独立目录。</div>` : `<div class="small muted">本轮没有扫描存档（scans.bin），无法重新导出。</div>`}
+    ${l.has_archive ? `<div class="row" style="margin-top:8px;gap:10px;flex-wrap:wrap"><label class="small">体素 (m) <input type="number" step="0.01" min="0.01" max="2" style="width:80px" data-act="export-field" data-key="voxel" value="${esc(f.voxel)}"></label><label class="small">来源 <select data-act="export-field" data-key="source"><option value="all" ${f.source === "all" ? "selected" : ""}>全部扫描</option><option value="keyframes" ${f.source === "keyframes" ? "selected" : ""}>仅关键帧</option></select></label><label class="small">分块 (m) <input type="number" step="10" min="0" style="width:80px" data-act="export-field" data-key="tile" value="${esc(f.tile)}"></label><label class="small">最少点数/体素 <input type="number" step="1" min="1" style="width:60px" data-act="export-field" data-key="min_points" value="${esc(f.min_points ?? 1)}"></label><label class="small"><input type="checkbox" data-act="export-field" data-key="keyframes" ${f.keyframes ? "checked" : ""}> 关键帧点云</label><button class="btn sm" data-act="export-map" data-round="${esc(r.round)}">按此设置重新导出</button></div><div class="small muted">从扫描存档按最终优化位姿重投影（与建图输出一致），不需要重新建图；默认设置写入 map/，其他设置写入独立目录。</div>` : `<div class="small muted">本轮没有扫描存档（scans.bin），无法重新导出。</div>`}
   </details>`;
 }
 
@@ -973,7 +1001,7 @@ const A = {
   async "open-job"(el) { const id = el.dataset.id; S.job = { id, status: "loading", steps: [], meta: {}, results: {} }; S.jobLog = []; S.jobLogNext = 0; S.drawer = "job"; renderDrawer(); await pollJob(); renderDrawer(); },
   mode(el) { S.state.mapping.mode = el.dataset.mode; saveState({ mapping: { mode: el.dataset.mode } }); render(); },
   toggle(el) { const sec = el.dataset.section, key = el.dataset.key; S.state[sec][key] = el.checked; saveState({ [sec]: { [key]: el.checked } }); if (sec === "calibration" || (sec === "mapping" && key === "save_map")) render(); },
-  field(el) { const sec = el.dataset.section, key = el.dataset.key; const v = el.type === "number" ? (el.value === "" ? "" : Number(el.value)) : el.value; S.state[sec][key] = v; saveState({ [sec]: { [key]: v } }); if (el.tagName === "SELECT") render(); },
+  field(el) { const sec = el.dataset.section, key = el.dataset.key; const v = el.type === "number" ? (el.value === "" ? "" : Number(el.value)) : el.value; S.state[sec][key] = v; const patch = { [key]: v }; if (sec === "calibration" && key === "camera") { S.state.calibration.validation_run = ""; patch.validation_run = ""; } saveState({ [sec]: patch }); if (el.tagName === "SELECT") render(); },
   async "set-vehicle"(el) { const [mine, truck] = el.value.split("/"); S.state.vehicle = { mine, truck }; S.calibForm.parent = null; S.state.calibration.parent_id = ""; S.state.mapping.calibration_id = ""; await saveState({ vehicle: { mine, truck }, calibration: { parent_id: "" }, mapping: { calibration_id: "" } }); render(); if (S.page === "body") A["bf-load"](); },
   async start() {
     const v = vehicle(); const m = S.state.mapping; const d = S.dataset;
@@ -1007,22 +1035,23 @@ const A = {
     const v = vehicle(); const d = S.dataset; const kind = el.dataset.kind; const c = S.state.calibration;
     if (!v?.active) return toast("请先导入并激活一个标定版本", "bad");
     const std = c.fast === false;
-    const label = { lidar: "LiDAR 标定流水线（后轴对齐 → 地面精修 → LIO 建图 → 行驶段精修 → 校验）", camera: `相机标定流水线（时间偏移 → LIVO 建图 A → 灯柱偏航复核 → 俯仰闭环${std ? "扫描" : "（快速）"} → 验证建图 → 闭环判定）`, camloop: `相机外参闭环微调（${std ? "标准" : "快速"}：${std ? "两轮扫描" : "复用已有轮次 + 一轮验证"} → 闭环判定）`, camphoto: "相机光度标定（LIVO 建图 → 光度一致性求旋转/时间、暗角，内参复核 → 验证建图 → 判定）" }[kind];
+    const label = { lidar: "LiDAR 标定流水线（后轴对齐 → 地面精修 → LIO 建图 → 行驶段精修 → 校验）", camera: c.camera === "fisheye" ? "鱼眼完整标定（时间 → 基线 → 偏航 → 内参诊断 → 新基线 → 联合光度标定 → 独立多包验证 → 建图闭环）" : `相机标定流水线（时间偏移 → LIVO 建图 A → 灯柱偏航复核 → 俯仰闭环${std ? "扫描" : "（快速）"} → 验证建图 → 闭环判定）`, camloop: `相机外参闭环微调（${std ? "标准" : "快速"}：${std ? "两轮扫描" : "复用已有轮次 + 一轮验证"} → 闭环判定）`, camphoto: "相机光度标定（基线建图 → 旋转/时间/内参与畸变联合复核 → 独立验证 → 验证建图 → 判定）" }[kind];
     const w = winEffective(S.winCalib, d?.duration_s);
     const winInfo = w ? `\n时间窗口：${winLabel(S.winCalib, d?.duration_s)}` : "\n时间窗口：自动（按运动窗口）";
     const parent = selectedParent();
-    if (!confirm(`运行 ${label}\n父版本：${parent}${parent !== v.active ? `（当前激活 ${v.active}）` : ""}\n数据源：${d?.path}${winInfo}\n流水线包含一次完整回放建图，请勿同时启动其他建图。`)) return;
-    await act(async () => { const job = await api("/api/calibrations/pipeline", "POST", { kind, mine: v.mine, truck: v.truck, id: parent, parent_id: parent, from_factory: false, body_filter_source_id: v.active, dataset: d.path, activate: c.auto_activate !== false, use_rtk: true, rate: 1.0, note: "", mode: c.fast === false ? "standard" : "fast", window_start: w?.start_s ?? null, window_duration: w?.duration_s ?? null, keep_calib_maps: c.keep_maps === true, axle_limits: currentAxleLimits() }); S.job = job; S.jobLog = []; S.jobLogNext = 0; S.drawer = "job"; await loadOverview(); render(); }, "流水线已启动");
+    if (!confirm(`运行 ${label}${kind !== "lidar" ? `（${cameraLabel(c.camera)}）` : ""}\n父版本：${parent}${parent !== v.active ? `（当前激活 ${v.active}）` : ""}\n数据源：${d?.path}${winInfo}\n流水线包含一次完整回放建图，请勿同时启动其他建图。`)) return;
+    await act(async () => { const job = await api("/api/calibrations/pipeline", "POST", { kind, camera: c.camera || "midrange", mine: v.mine, truck: v.truck, id: parent, parent_id: parent, from_factory: false, body_filter_source_id: v.active, dataset: d.path, activate: c.auto_activate !== false, use_rtk: true, rate: 1.0, note: "", mode: c.fast === false ? "standard" : "fast", window_start: w?.start_s ?? null, window_duration: w?.duration_s ?? null, keep_calib_maps: c.keep_maps === true, validation_run: (kind === "camphoto" || (kind === "camera" && c.camera === "fisheye")) ? c.validation_run || [] : [], axle_limits: currentAxleLimits() }); S.job = job; S.jobLog = []; S.jobLogNext = 0; S.drawer = "job"; await loadOverview(); render(); }, "流水线已启动");
   },
   "toggle-import"() { S.showImport = !S.showImport; render(); },
   async import() {
-    const body = { mine: $("#imp-mine").value.trim(), truck: $("#imp-truck").value.trim(), source: $("#imp-source").value.trim(), note: $("#imp-note").value.trim(), activate: true };
+    const body = { camera: S.state.calibration.camera || "midrange", mine: $("#imp-mine").value.trim(), truck: $("#imp-truck").value.trim(), source: $("#imp-source").value.trim(), note: $("#imp-note").value.trim(), activate: true };
     const lidar = ($("#imp-lidar").value || "").trim();
     const camera = ($("#imp-camera").value || "").trim();
     if (lidar !== "") body.lidar_offset = lidar;  // 留空 = 不传，程序自动检测时间偏移
     if (camera !== "") body.camera_offset = camera;
     await act(async () => { const job = await api("/api/calibrations/import", "POST", body); S.state.vehicle = { mine: body.mine, truck: body.truck }; S.calibForm.parent = null; S.state.calibration.parent_id = ""; S.state.mapping.calibration_id = ""; await saveState({ vehicle: S.state.vehicle, mapping: { calibration_id: "" }, calibration: { parent_id: "", source_file: body.source, lidar_offset: lidar === "" ? null : Number(lidar), camera_offset: camera === "" ? null : Number(camera) } }); S.drafts = {}; S.job = job; S.jobLog = []; S.jobLogNext = 0; S.drawer = "job"; S.showImport = false; render(); }, "导入已开始");
   },
+  "photo-validation"(el) { const values = Array.from(el.selectedOptions, (o) => o.value).filter(Boolean); S.state.calibration.validation_run = values; saveState({ calibration: { validation_run: values } }); },
   "calib-stage"(el) { S.calibForm.stage = el.value; render(); },
   "calib-field"(el) {
     const k = el.dataset.key;
@@ -1036,8 +1065,9 @@ const A = {
   async "run-stage"() {
     const v = vehicle(); const f = S.calibForm; const d = S.dataset;
     const w = winEffective(S.winCalib, d?.duration_s);
-    const body = { stage: f.stage, mine: v?.mine, truck: v?.truck, id: selectedParent(), dataset: d?.path, run: f.run || ($("select[data-key=run]") || {}).value, run_dir: f.run_dir || ($("select[data-key=run_dir]") || {}).value, note: f.note, activate: !!f.activate, frames: f.frames, window_start: w?.start_s ?? null, window_duration: w?.duration_s ?? null };
+    const body = { stage: f.stage, camera: S.state.calibration.camera || "midrange", mine: v?.mine, truck: v?.truck, id: selectedParent(), dataset: d?.path, run: f.run || ($("select[data-key=run]") || {}).value, run_dir: f.run_dir || ($("select[data-key=run_dir]") || {}).value, note: f.note, activate: S.state.calibration.camera === "fisheye" ? false : !!f.activate, frames: f.frames, window_start: w?.start_s ?? null, window_duration: w?.duration_s ?? null };
     if (f.stage === "axle") body.axle_limits = currentAxleLimits();
+    if (f.stage === "camphoto") body.validation_run = S.state.calibration.validation_run || [];
     if (f.stage === "manual") { if (f.camera_offset !== "" && f.camera_offset != null) body.camera_offset = Number(f.camera_offset); if (f.lidar_offset !== "" && f.lidar_offset != null) body.lidar_offset = Number(f.lidar_offset); if (f.camera_rot_delta && f.camera_rot_delta.trim()) body.camera_rot_delta = f.camera_rot_delta.trim().split(/[\s,]+/).map(Number); }
     await act(async () => { const job = await api("/api/calibrations/stage", "POST", body); S.job = job; S.jobLog = []; S.jobLogNext = 0; S.drawer = "job"; render(); }, "阶段已启动");
   },
@@ -1048,7 +1078,7 @@ const A = {
     const delta = (f.delta || "").trim() ? f.delta.trim().split(/[\s,]+/).map(Number) : null;
     S.overlayBusy = true; renderDrawer();
     try {
-      S.overlay = await api("/api/calibrations/overlay", "POST", { id: el.dataset.id, run, dataset: d?.path, times: f.times, camera_rot_delta: delta });
+      S.overlay = await api("/api/calibrations/overlay", "POST", { id: el.dataset.id, camera: S.versionDetail?.camera || "midrange", run, dataset: d?.path, times: f.times, camera_rot_delta: delta });
       S.overlay.id = el.dataset.id;
     } catch (e) { toast(e.message || String(e), "bad"); }
     S.overlayBusy = false; renderDrawer();
@@ -1057,7 +1087,7 @@ const A = {
     const f = S.overlayForm; const delta = f.delta.trim().split(/[\s,]+/).map(Number);
     if (delta.length !== 3 || !delta.every(Number.isFinite)) return toast("旋转修正需要 3 个数", "bad");
     if (!confirm(`以 ${el.dataset.id.split("/").pop()} 为父版本生成手动版本：相机旋转修正 ${delta.join(" / ")}°？\n该版本不会自动激活，请先用“相机外参闭环微调”或一轮 LIVO 建图验证。`)) return;
-    await act(async () => { const job = await api("/api/calibrations/stage", "POST", { stage: "manual", id: el.dataset.id, camera_rot_delta: delta, note: `目视复核后的相机旋转修正 ${delta.join("/")}°（未闭环验证）` }); S.job = job; S.jobLog = []; S.jobLogNext = 0; S.drawer = "job"; render(); }, "已生成手动版本任务");
+    await act(async () => { const job = await api("/api/calibrations/stage", "POST", { stage: "manual", id: el.dataset.id, camera: S.versionDetail?.camera || "midrange", camera_rot_delta: delta, note: `目视复核后的相机旋转修正 ${delta.join("/")}°（未闭环验证）` }); S.job = job; S.jobLog = []; S.jobLogNext = 0; S.drawer = "job"; render(); }, "已生成手动版本任务");
   },
   async "open-version"(el) { const id = el.dataset.id; S.drawer = "version"; S.versionDetail = null; renderDrawer(); await act(async () => { S.versionDetail = await api(`/api/calibrations/version?id=${encodeURIComponent(id)}`); render(); }); },
   async activate(el) {
@@ -1487,7 +1517,7 @@ function pageBody() {
   const b = S.body, f = b && b.body_filter, v = vehicle(), d = S.dataset;
   const m = (b && b.multi_scan) || {}, series = m.series || [], rect = f && f.fused_rectangle;
   const parentVersions = bfParentVersions(), parentId = (b && b.parent_id) || bfCurrentParentId();
-  const parentOptions = parentVersions.map((x) => `<option value="${esc(x.id)}" ${parentId === x.id ? "selected" : ""}>${esc(x.version)} · ${esc(x.stage_label)}${x.active ? " ★" : ""}</option>`).join("");
+  const parentOptions = parentVersions.map((x) => `<option value="${esc(x.id)}" ${parentId === x.id ? "selected" : ""}>${esc(x.version)} · ${esc(x.stage_label)} · ${cameraLabel(x.camera)}${x.active ? " ★" : ""}</option>`).join("");
   const legacyCount = Object.values((f && f.lidar_rectangles) || {}).reduce((n, rs) => n + (rs || []).length, 0);
   const err = (b && b.error) || (m && m.error), dur = (b && b.duration_s) || 0;
   const modeNote = bfBodyModeNote(f);

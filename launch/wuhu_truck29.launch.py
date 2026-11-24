@@ -61,17 +61,20 @@ def _fastdds_profile():
 
 def hevc_decoders():
     """Decoder preference of the camera stream. hevc_cuvid (NVDEC) is tried first only when the CUDA driver
-    answers: with the GPU in a fault state (kernel Xid 31/154 "reboot required", cuInit -> CUDA_ERROR_UNKNOWN)
+    and NVDEC library answer: with the GPU in a fault state (kernel Xid 31/154 "reboot required", cuInit -> CUDA_ERROR_UNKNOWN)
     the republish node segfaults inside the cuvid decoder instead of falling back, and a LIVO round then ends
     with zero frames. Without a working driver the stream is decoded in software (1080p HEVC at 30 fps fits
     on a few cores)."""
     import ctypes
     try:
+        # CUDA compute visibility does not imply video decode capability in a
+        # container. Selecting cuvid without this library crashes the plugin.
+        ctypes.CDLL("libnvcuvid.so.1")
         if ctypes.CDLL("libcuda.so.1").cuInit(0) == 0:
             return "hevc_cuvid,hevc_qsv,hevc_v4l2m2m,hevc"
         print("[wuhu_truck29.launch] CUDA driver unavailable (cuInit failed): camera stream decoded in software")
-    except OSError:
-        print("[wuhu_truck29.launch] libcuda.so.1 not found: camera stream decoded in software")
+    except OSError as exc:
+        print(f"[wuhu_truck29.launch] CUDA/NVDEC unavailable ({exc}): camera stream decoded in software")
     return "hevc"
 
 
@@ -105,7 +108,7 @@ def generate_launch_description():
     decoder = Node(
         package="image_transport",
         executable="republish",
-        name="midrange_camera_decoder",
+        name="mapping_camera_decoder",
         condition=IfCondition(use_camera),
         arguments=["ffmpeg", "raw"],
         parameters=[{
@@ -114,8 +117,8 @@ def generate_launch_description():
         # In Humble the executable creates the suffixed input endpoint before
         # base-name remapping, so remap the concrete transport topic.
         remappings=[
-            ("in/ffmpeg", "/midrange_camera/ffmpeg"),
-            ("out", "/midrange_camera/image_raw"),
+            ("in/ffmpeg", LaunchConfiguration("camera_stream_topic")),
+            ("out", LaunchConfiguration("camera_image_topic")),
         ],
         output="screen",
     )
@@ -171,6 +174,8 @@ def generate_launch_description():
         SetEnvironmentVariable(name="FASTRTPS_DEFAULT_PROFILES_FILE",
                                value=os.environ.get("FASTRTPS_DEFAULT_PROFILES_FILE") or _fastdds_profile()),
         DeclareLaunchArgument("use_camera", default_value="false"),
+        DeclareLaunchArgument("camera_stream_topic", default_value="/midrange_camera/ffmpeg"),
+        DeclareLaunchArgument("camera_image_topic", default_value="/midrange_camera/image_raw"),
         DeclareLaunchArgument("use_rviz", default_value="false"),
         DeclareLaunchArgument("use_rtk", default_value="true"),
         DeclareLaunchArgument("rtk_backend", default_value=""),

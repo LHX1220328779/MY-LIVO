@@ -261,6 +261,10 @@ public:
   vector<double> cameraextrinR;
   vector<double> camera_intrinsics;
   vector<double> camera_distortion;
+  string camera_selection_ = "midrange";
+  string camera_projection_model_ = "pinhole";
+  cv::Mat camera_rectify_x_;
+  cv::Mat camera_rectify_y_;
   int camera_width = 1920;
   int camera_height = 1080;
   double IMG_POINT_COV;

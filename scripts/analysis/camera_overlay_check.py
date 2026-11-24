@@ -14,6 +14,7 @@ import numpy as np
 REPO = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "tools" / "calib"))
 from livo_calib import dump_camera_stream, decode_hevc, read_run_frames  # noqa: E402
+from livo.camera import camera_transform_key, select_camera  # noqa: E402
 
 
 def main():
@@ -33,11 +34,11 @@ def main():
     for line in (fusion / "parameters.txt").read_text().splitlines():
         k, _, v = line.partition("="); params.setdefault(k, v)
     cam_offset = a.camera_offset if a.camera_offset is not None else float(params.get("effective.img_time_offset_sec", 0.0))
-    calib = json.loads(pathlib.Path(a.calibration).read_text())
+    calib = select_camera(json.loads(pathlib.Path(a.calibration).read_text()))
     cam = calib["camera"]; fx, fy, cx, cy = cam["intrinsics"]; dist = np.array(cam.get("distortion", [0] * 5), float)
     s = a.scale
     K = np.array([[fx * s, 0, cx * s], [0, fy * s, cy * s], [0, 0, 1]])
-    T_rear_cam = np.asarray(calib["transforms"]["midrange_camera_to_rear_axle"]["transform_matrix"], float).reshape(4, 4)
+    T_rear_cam = np.asarray(calib["transforms"][camera_transform_key(calib)]["transform_matrix"], float).reshape(4, 4)
     if any(a.rot_delta):
         D = np.eye(4); D[:3, :3] = R.from_euler("xyz", a.rot_delta, degrees=True).as_matrix(); T_rear_cam = T_rear_cam @ D
     T_cam_rear = np.linalg.inv(T_rear_cam)
@@ -52,7 +53,10 @@ def main():
     if round_json.exists():
         rj = json.loads(round_json.read_text())
         start_rel = float((rj.get("options") or {}).get("start_offset") or 0.0)
-    img_stamps, stream = dump_camera_stream(pathlib.Path(a.bag), a.out_dir, duration=stamps[-1] - stamps[0] + 6.0, start=max(0.0, start_rel - 3.0))
+    img_stamps, stream = dump_camera_stream(pathlib.Path(a.bag), a.out_dir, duration=stamps[-1] - stamps[0] + 6.0,
+                                           start=max(0.0, start_rel - 3.0), camera=cam)
+    if not len(img_stamps):
+        sys.exit("selected camera stream has no decodable frames in the run window")
     eff = img_stamps + cam_offset
     want = {}
     for t_rel in a.times:
@@ -60,7 +64,7 @@ def main():
         k = int(np.argmin(np.abs(eff - t)))
         want[k] = t_rel
     print(f"camera offset in effect {cam_offset:+.4f} s; images {sorted(want)}")
-    for k, img in decode_hevc(stream, s, keep=set(want)):
+    for k, img in decode_hevc(stream, s, keep=set(want), camera=cam):
         t = eff[k]; h, w = img.shape
         sel = np.flatnonzero(np.abs(stamps - t) <= a.accumulate / 2)
         pts = []

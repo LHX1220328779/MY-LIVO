@@ -54,6 +54,8 @@ import shutil
 import subprocess
 
 import numpy as np
+from livo.camera import (CAMERAS, available_cameras, camera_transform_key, select_camera,
+                         selected_camera, sync_camera_profile, fisheye_activation_issues)
 from livo.axle_limits import LIMITS as AXLE_LIMITS, add_arguments as axle_limit_arguments, command_args as axle_limit_args
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
@@ -70,6 +72,9 @@ DEFAULT_TIME_OFFSETS = {"lidar": -0.125, "lidar_frontend": -0.125, "camera": 0.0
 # Operator-facing catalogue: the version suffix is the stage key. `mapping` tells which mapping
 # run the stage needs beforehand; `advisory` stages must be inspected before activation.
 STAGES = {
+    "camselect": {"order": 4.9, "label": "选择相机 / 导入鱼眼参数", "command": "camera-select",
+                  "input": "同一出厂标定文件中的中距/鱼眼参数", "output": "独立相机内外参及时间基线",
+                  "needs": [], "mapping": None, "advisory": True, "seconds": 1},
     "import": {"order": 1, "label": "导入出厂标定", "command": "import",
                "input": "厂家感知标定 JSON", "output": "LiDAR/相机外参基线 + 默认时间偏移",
                "needs": [], "mapping": None, "advisory": False, "seconds": 1},
@@ -130,10 +135,37 @@ def require_dataset(bag, *, camera=False, what="stage"):
     if not info.get("lio_ready"):
         sys.exit(f"{what}: recording {bag} lacks LiDAR/IMU topics (has {sorted(ds.topics)})")
     if camera and not info.get("livo_ready"):
-        sys.exit(f"{what}: recording {bag} has no camera topic (midrange_camera/ffmpeg); "
+        sys.exit(f"{what}: recording {bag} has no camera topic; "
                  "use the raw recording root that contains the Camera_* segments")
+    if isinstance(camera, dict):
+        topic = camera.get("stream_topic", "/midrange_camera/ffmpeg").lstrip("/")
+        if topic not in ds.topics:
+            sys.exit(f"{what}: selected camera topic {topic} is missing from {bag}")
     return ds, {"path": str(bag), "kind": info.get("kind"), "segments": len(info.get("segments", [])),
                 "duration_s": info.get("duration_s"), "has_camera": bool(info.get("has_camera"))}
+
+
+def require_camera_segments(bag, calib, *, start=None, end=None, run=None, window=None):
+    """Require multiple recorded camera bags inside the actual calibration window."""
+    from livo.dataset import Dataset
+    ds = Dataset.open(bag)
+    lo, hi = ds.start_ns * 1e-9, ds.end_ns * 1e-9
+    if run is not None:
+        stamps = read_run_frames(run)["stamp"]
+        offset = float(calib.get("time_offsets", {}).get("camera", 0))
+        lo = float(stamps[0]) + max(0., float(window[0])) - offset
+        hi = min(float(stamps[-1]), float(stamps[0]) + float(window[1])) - offset
+    else:
+        hi = min(hi, lo + float(end)) if end is not None else hi
+        lo += float(start or 0)
+    topic = calib["camera"]["stream_topic"].lstrip("/")
+    segments = [s.name for s in ds.segments if topic in s.topics
+                and min(hi, s.end_ns * 1e-9) - max(lo, s.start_ns * 1e-9) >= 1.0]
+    evidence = {"camera": selected_camera(calib), "camera_segments": segments,
+                "camera_segment_count": len(segments), "relative_window_s": [lo - ds.start_ns * 1e-9, hi - ds.start_ns * 1e-9]}
+    if selected_camera(calib) == "fisheye" and len(segments) < 2:
+        sys.exit("fisheye calibration requires at least two recorded camera bags in the selected window; use a longer multi-segment recording window")
+    return evidence
 
 
 # ----------------------------------------------------------------------------- bookkeeping
@@ -205,11 +237,13 @@ def summarize(calib):
             if key in e:
                 m = np.asarray(e[key], float).reshape(4, 4)
                 rows.append({"lidar": name, "key": key, "t": m[:3, 3].round(4).tolist(), "rpy_deg": rpy_deg(m)})
-    cam = calib.get("transforms", {}).get("midrange_camera_to_rear_axle", {}).get("transform_matrix")
+    cam = calib.get("transforms", {}).get(camera_transform_key(calib), {}).get("transform_matrix")
     out = {"lidars": rows}
     if cam:
         m = np.asarray(cam, float).reshape(4, 4)
         out["camera_to_rear"] = {"t": m[:3, 3].round(4).tolist(), "rpy_deg": rpy_deg(m)}
+    out["camera_selection"] = selected_camera(calib)
+    out["available_cameras"] = available_cameras(calib)
     out["camera"] = calib.get("camera")
     out["time_offsets"] = calib.get("time_offsets")
     return out
@@ -266,10 +300,12 @@ def finalize_version(out_dir, calib, *, mine, truck, stage, parent, note, inputs
                      report_lines=None, activate=False):
     out_dir.mkdir(parents=True, exist_ok=True)
     vid = f"{mine}/{truck}/{out_dir.name}"
+    sync_camera_profile(calib)
     calib["schema_version"] = 6
     calib["identity"] = {"id": vid, "mine": mine, "truck": truck, "version": out_dir.name, "stage": stage,
                          "parent": parent, "created": now()}
-    calib.setdefault("history", []).append({"stage": stage, "created": now(), "parent": parent, "note": note,
+    calib.setdefault("history", []).append({"stage": stage, "camera_selection": selected_camera(calib),
+                                            "created": now(), "parent": parent, "note": note,
                                             "inputs": inputs or {}, "metrics": metrics or {}})
     (out_dir / "calibration.json").write_text(json.dumps(calib, indent=2, ensure_ascii=False) + "\n")
     changes = {}
@@ -300,16 +336,19 @@ def finalize_version(out_dir, calib, *, mine, truck, stage, parent, note, inputs
         lines += ["## stage report", "", "```"] + list(report_lines) + ["```", ""]
     (out_dir / "report.md").write_text("\n".join(lines))
     reg = load_registry()
-    if stage != "scan" and (activate or f"{mine}/{truck}" not in reg["active"]):
+    activation_issues = fisheye_activation_issues(calib)
+    if stage != "scan" and not activation_issues and (activate or f"{mine}/{truck}" not in reg["active"]):
         reg["active"][f"{mine}/{truck}"] = vid
     save_registry(reg)
-    print(json.dumps({"id": vid, "dir": str(out_dir), "metrics": metrics or {}}, ensure_ascii=False))
+    print(json.dumps({"id": vid, "dir": str(out_dir), "metrics": metrics or {},
+                      **({"activation_blocked": activation_issues} if activate and activation_issues else {})}, ensure_ascii=False))
     return vid
 
 
-def parent_info(vid):
+def parent_info(vid, camera=None):
     d = version_dir(vid)
     calib = json.loads((d / "calibration.json").read_text())
+    calib = select_camera(calib, camera)
     ident = calib.get("identity", {})
     return d, calib, ident.get("mine") or vid.split("/")[0], ident.get("truck") or vid.split("/")[1]
 
@@ -526,7 +565,7 @@ def cmd_import(a):
             camera["distortion"] = [float(v) for v in mc[0]["distcoeff"]][:5] + [0.0] * (5 - len(mc[0]["distcoeff"]))
         camera["width"] = int(mc[0].get("image_width", camera["width"]))
         camera["height"] = int(mc[0].get("image_height", camera["height"]))
-    if a.intrinsics:
+    if a.intrinsics and a.camera != "fisheye":
         camera["intrinsics"] = [float(v) for v in a.intrinsics]
         source = "command line"
     elif source.startswith("defaults") and isinstance(mc, list) and mc and isinstance(mc[0], dict):
@@ -538,9 +577,11 @@ def cmd_import(a):
         if check is not None:
             camera["intrinsics_check"] = check
         notes.append(note)
-    if a.distortion:
+    if a.distortion and a.camera != "fisheye":
         camera["distortion"] = [float(v) for v in a.distortion]
     camera["source"] = source
+    calib["camera_selection"] = "midrange"
+    calib.pop("camera_profiles", None)
     calib["camera"] = camera
     offsets = dict(DEFAULT_TIME_OFFSETS)
     if a.lidar_offset is not None:
@@ -548,11 +589,27 @@ def cmd_import(a):
         offsets["lidar_source"] = "operator import"
     else:
         offsets["lidar_source"] = "import default (unmeasured; run the axle stage to auto-measure)"
-    if a.camera_offset is not None:
+    if a.camera_offset is not None and a.camera != "fisheye":
         offsets["camera"] = a.camera_offset
         offsets["camera_source"] = "operator import"
     offsets["source"] = "import (verify with camera-time / LIO evaluation)"
     calib["time_offsets"] = offsets
+    calib = select_camera(calib, "midrange")
+    fish = (calib.get("fish_camera") or [{}])[0]
+    if len(fish.get("camera_in_params", [])) == 12 and fish.get("tf_lidar_to_camera"):
+        calib = select_camera(calib, "fisheye")
+    elif calib.get("fish_camera"):
+        notes.append("fish_camera requires its own projection matrix before it can be selected")
+    calib = select_camera(calib, a.camera or "midrange")
+    if a.camera == "fisheye":
+        if a.intrinsics:
+            calib["camera"]["intrinsics"] = list(a.intrinsics)
+        if a.distortion:
+            calib["camera"]["distortion"] = list(a.distortion)
+        if a.camera_offset is not None:
+            calib["time_offsets"]["camera"] = a.camera_offset
+            calib["time_offsets"]["camera_source"] = "operator import (fisheye)"
+        calib = select_camera(calib)
     calib["calibration_type"] = calib.get("calibration_type", "") or (
         "supplier_raw_lidar_to_rear_axle" if raw_supplier else "multi_lidar_to_rear_axle_manual")
     out_dir = next_version_dir(a.mine, a.truck, "import")
@@ -564,6 +621,21 @@ def cmd_import(a):
 
 
 # ----------------------------------------------------------------------------- lidar stages
+def write_stage_input(out_dir, calib):
+    path = out_dir / "input_calibration.json"
+    path.write_text(json.dumps(calib, indent=2, ensure_ascii=False) + "\n")
+    return path
+
+
+def require_run_camera(run, calib):
+    path = pathlib.Path(run) / "parameters.txt"
+    params = dict(line.split("=", 1) for line in path.read_text().splitlines() if "=" in line)
+    if params.get("effective.camera_selection", "midrange") != selected_camera(calib):
+        sys.exit("camera calibration: the run uses a different camera; select a matching LIVO round")
+    if params.get("effective.camera_mode") != "livo":
+        sys.exit("camera calibration requires a LIVO round with paired image/scan timestamps")
+
+
 def run_script(cmd, log_path):
     print("+", " ".join(cmd), flush=True)
     with open(log_path, "w") as log:
@@ -640,7 +712,7 @@ def axle_lateral_pass(a, out_dir, ds_info, calib):
 
 
 def cmd_axle(a):
-    pdir, parent_calib, mine, truck = parent_info(a.id)
+    pdir, parent_calib, mine, truck = parent_info(a.id, getattr(a, "camera", None))
     _, ds_info = require_dataset(a.bag, what="axle")
     out_dir = next_version_dir(mine, truck, "axle")
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -655,7 +727,7 @@ def cmd_axle(a):
         dof = "xy" if "rear_axle_alignment" in ctype else "rpy_xy"
         print(f"axle: --dof auto -> {dof} (parent calibration_type {ctype or '-'})", flush=True)
     cmd = ["/usr/bin/python3", str(SCRIPTS / "refine_rear_axle_extrinsic.py"), "--calibration",
-           str(pdir / "calibration.json"), "--bag", a.bag, "--output", str(out_dir / "calibration.json"),
+           str(write_stage_input(out_dir, parent_calib)), "--bag", a.bag, "--output", str(out_dir / "calibration.json"),
            "--report", str(out_dir / "stage_report.txt"), "--window", str(a.window[0]), str(a.window[1]), "--dof", dof]
     cmd += axle_limit_args({key: getattr(a, key) for key in AXLE_LIMITS})
     if a.keep_time_offset:
@@ -717,12 +789,12 @@ def cmd_axle(a):
 
 
 def cmd_ground(a):
-    pdir, parent_calib, mine, truck = parent_info(a.id)
+    pdir, parent_calib, mine, truck = parent_info(a.id, getattr(a, "camera", None))
     _, ds_info = require_dataset(a.bag, what="ground")
     out_dir = next_version_dir(mine, truck, "ground")
     out_dir.mkdir(parents=True, exist_ok=True)
     cmd = ["/usr/bin/python3", str(SCRIPTS / "refine_multi_lidar_extrinsics.py"), "--calibration",
-           str(pdir / "calibration.json"), "--bag", a.bag, "--output", str(out_dir / "calibration.json"),
+           str(write_stage_input(out_dir, parent_calib)), "--bag", a.bag, "--output", str(out_dir / "calibration.json"),
            "--report", str(out_dir / "stage_report.txt"), "--stationary", str(a.stationary[0]), str(a.stationary[1]),
            "--moving", str(a.moving[0]), str(a.moving[1])]
     lines = run_script(cmd, out_dir / "stage.log")
@@ -739,7 +811,7 @@ def cmd_ground(a):
 
 
 def cmd_driven(a):
-    pdir, parent_calib, mine, truck = parent_info(a.id)
+    pdir, parent_calib, mine, truck = parent_info(a.id, getattr(a, "camera", None))
     _, ds_info = require_dataset(a.bag, what="driven")
     if not (pathlib.Path(a.run) / "frames.csv").exists():
         sys.exit(f"driven: {a.run} is not a fusion run directory (frames.csv missing); run a LIO round first")
@@ -751,7 +823,7 @@ def cmd_driven(a):
     offsets = parent_calib.get("time_offsets", {})
     lidar_offset = offsets.get("lidar_frontend", offsets.get("lidar", -0.125))
     cmd = ["/usr/bin/python3", str(SCRIPTS / "refine_multi_lidar_yaw.py"), "--calibration",
-           str(pdir / "calibration.json"), "--bag", a.bag, "--run", a.run, "--window", str(a.window[0]),
+           str(write_stage_input(out_dir, parent_calib)), "--bag", a.bag, "--run", a.run, "--window", str(a.window[0]),
            str(a.window[1]), "--lidar-time-offset", str(lidar_offset), "--output",
            str(out_dir / "calibration.json"), "--report", str(out_dir / "stage_report.txt")]
     if a.vertical_only:
@@ -768,7 +840,7 @@ def cmd_driven(a):
 
 
 def cmd_gcons(a):
-    pdir, parent_calib, mine, truck = parent_info(a.id)
+    pdir, parent_calib, mine, truck = parent_info(a.id, getattr(a, "camera", None))
     _, ds_info = require_dataset(a.bag, what="gcons")
     if not ((pathlib.Path(a.run) / "frames.csv").exists() and (pathlib.Path(a.run) / "trajectory_optimized.txt").exists()):
         sys.exit(f"gcons: {a.run} is not an RTK-fused fusion run directory (frames.csv / trajectory_optimized.txt missing)")
@@ -778,7 +850,7 @@ def cmd_gcons(a):
     offsets = parent_calib.get("time_offsets", {})
     lidar_offset = offsets.get("lidar_frontend", offsets.get("lidar", -0.125))
     cmd = ["/usr/bin/python3", str(SCRIPTS / "refine_lidar_ground_consensus.py"), "--calibration",
-           str(pdir / "calibration.json"), "--bag", a.bag, "--run", a.run, "--lidar-time-offset", str(lidar_offset),
+           str(write_stage_input(out_dir, parent_calib)), "--bag", a.bag, "--run", a.run, "--lidar-time-offset", str(lidar_offset),
            "--output", str(out_dir / "calibration.json"), "--report", str(out_dir / "stage_report.txt")]
     lines = run_script(cmd, out_dir / "stage.log")
     if not (out_dir / "calibration.json").exists():
@@ -797,7 +869,7 @@ def cmd_gcons(a):
 
 
 def cmd_from_precheck(a):
-    pdir, parent_calib, mine, truck = parent_info(a.id)
+    pdir, parent_calib, mine, truck = parent_info(a.id, getattr(a, "camera", None))
     report = pathlib.Path(a.run_dir) / "Log" / "extrinsic_precheck.json"
     if not report.exists():
         sys.exit(f"missing {report}")
@@ -867,13 +939,16 @@ def cmd_rtk_time(a):
               rtk_position of a probe round placed at the predicted optimum
       final : --run R1 --run2 R2 (round with the probe value) -> secant zero of the two corrections ->
               new version (stage rtktime)."""
-    pdir, parent_calib, mine, truck = parent_info(a.id)
+    pdir, parent_calib, mine, truck = parent_info(a.id, getattr(a, "camera", None))
     offsets = parent_calib.get("time_offsets") or {}
     rtk0 = float(offsets.get("rtk_position", DEFAULT_TIME_OFFSETS["rtk_position"]))
     run1 = _fusion_run(a.run)
     cal1 = _run_calibration_file(run1)
-    if cal1 and pathlib.Path(cal1).resolve() != (pdir / "calibration.json").resolve():
-        sys.exit(f"rtk-time: {run1} was mapped with {cal1}, not with the parent {a.id}")
+    if cal1:
+        used = select_camera(json.loads(pathlib.Path(cal1).read_text()))
+        fields = ("lidar", "body_filter", "transforms", "camera", "time_offsets", "camera_selection")
+        if any(used.get(key) != parent_calib.get(key) for key in fields):
+            sys.exit(f"rtk-time: {run1} calibration snapshot differs from parent {a.id} ({cal1})")
     work = run1.parent.parent.parent  # round directory
     try:
         est1, lines1 = estimate_rtk_time(run1, work / "rtk_time_estimate.log")
@@ -1028,10 +1103,11 @@ def measure_imu_ins_clock_lag(bag, max_lag=0.30, step=0.0025, max_duration=240.0
     return best_lag, best_corr, yaw_rms
 
 
-def decode_hevc(stream_path, scale, keep=None):
+def decode_hevc(stream_path, scale, keep=None, camera=None):
     """Decode an Annex-B HEVC stream with ffmpeg; yields (index, gray frame)."""
     import cv2  # noqa: F401
-    w, h = int(1920 * scale), int(1080 * scale)
+    camera = camera or DEFAULT_CAMERA
+    w, h = int(camera["width"] * scale), int(camera["height"] * scale)
     cmd = ["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "hevc", "-i", str(stream_path), "-vf", f"scale={w}:{h}",
            "-pix_fmt", "gray", "-f", "rawvideo", "-"]
     # -nostdin + DEVNULL: ffmpeg otherwise reads interactive commands from the caller's stdin (it swallowed the
@@ -1049,7 +1125,7 @@ def decode_hevc(stream_path, scale, keep=None):
     proc.wait()
 
 
-def dump_camera_stream(bag, out_dir, duration=None, start=0.0, t_from=None, t_to=None):
+def dump_camera_stream(bag, out_dir, duration=None, start=0.0, t_from=None, t_to=None, camera=None):
     """Write the HEVC packets to one Annex-B stream (index == packet index; every written packet decodes).
 
     t_from / t_to: absolute image-time span (s) a run-based stage needs. Only that part of the recording is
@@ -1058,7 +1134,11 @@ def dump_camera_stream(bag, out_dir, duration=None, start=0.0, t_from=None, t_to
     20261013: 26100 packets, camera-lidar 408 s) and read data outside the operator's calibration window.
     duration / start (legacy, s after the recording start): cap / skip for the camera-time stage."""
     from livo.dataset import Dataset
-    t0 = Dataset.open(bag).start_ns * 1e-9
+    ds = Dataset.open(bag)
+    topic_name = (camera or {}).get("stream_topic", "/midrange_camera/ffmpeg").lstrip("/")
+    if topic_name not in ds.topics:
+        raise ValueError(f"Selected camera stream {topic_name} is missing from {bag}")
+    t0 = ds.start_ns * 1e-9
     if t_from is not None:
         lo_s, hi_s = max(0.0, t_from - t0 - 3.0), (None if t_to is None else t_to - t0 + 1.0)  # GOP 2 s + margin
     else:
@@ -1067,7 +1147,9 @@ def dump_camera_stream(bag, out_dir, duration=None, start=0.0, t_from=None, t_to
     stamps, gop = [], []
     path = out_dir / "stream.h265"
     with open(path, "wb") as f:
-        for topic, m in read_bag_topics(bag, ["midrange_camera/ffmpeg"], lo_s, hi_s):
+        for topic, m in read_bag_topics(bag, [topic_name], lo_s, hi_s):
+            if camera and m.width and m.height and (int(m.width), int(m.height)) != (camera["width"], camera["height"]):
+                raise ValueError(f"Camera packet {m.width}x{m.height} does not match selected calibration {camera['width']}x{camera['height']}")
             t = m.header.stamp.sec + m.header.stamp.nanosec * 1e-9
             key = bool(int(getattr(m, "flags", 0)) & 1)
             if t_from is not None:
@@ -1091,6 +1173,13 @@ def dump_camera_stream(bag, out_dir, duration=None, start=0.0, t_from=None, t_to
                     break
             stamps.append(t)
             f.write(bytes(m.data))
+    if camera and stamps:
+        probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                                "-show_entries", "stream=width,height", "-of", "json", str(path)],
+                               capture_output=True, text=True, check=True)
+        info = json.loads(probe.stdout)["streams"][0]
+        if (info["width"], info["height"]) != (camera["width"], camera["height"]):
+            raise ValueError(f"Encoded image size {info} does not match camera calibration")
     return np.array(stamps), path
 
 
@@ -1110,16 +1199,23 @@ def read_imu(bag):
     return np.array(t), np.array(g)
 
 
-def estimate_camera_offset(bag, out_dir, fx, fy, scale=0.25, duration=None, start=0.0):
+def estimate_camera_offset(bag, out_dir, fx, fy, scale=0.25, duration=None, start=0.0, camera=None):
     import cv2
-    stamps, stream = dump_camera_stream(bag, out_dir, duration=duration, start=start)
+    stamps, stream = dump_camera_stream(bag, out_dir, duration=duration, start=start, camera=camera)
     ti, gyro = read_imu(bag)
     if np.abs(gyro).max() > 20:  # deg/s stream
         gyro = np.radians(gyro)
-    frames = [f for _, f in decode_hevc(stream, scale)]
+    frames = [f for _, f in decode_hevc(stream, scale, camera=camera)]
     n = min(len(frames), len(stamps))
     frames, stamps = frames[:n], stamps[:n]
+    if n < 2:
+        raise ValueError("Selected camera stream has fewer than two decodable frames in this window")
     h, w = frames[0].shape
+    if camera and np.any(np.asarray(camera.get("distortion", []))):
+        K = np.array([[fx * scale, 0., camera["intrinsics"][2] * scale],
+                      [0., fy * scale, camera["intrinsics"][3] * scale], [0., 0., 1.]])
+        mx, my = cv2.initUndistortRectifyMap(K, np.asarray(camera["distortion"]), None, K, (w, h), cv2.CV_32FC1)
+        frames = [cv2.remap(frame, mx, my, cv2.INTER_LINEAR) for frame in frames]
     feat = dict(maxCorners=400, qualityLevel=0.01, minDistance=6, blockSize=5)
     lk = dict(winSize=(15, 15), maxLevel=3, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03))
     wx = np.full(n, np.nan)
@@ -1216,26 +1312,31 @@ def camera_time_quality(result):
     gain = abs(float(yaw.get("gain") or float("nan")))
     if spread is not None and spread > CAMTIME_MAX_SPREAD_MS:
         problems.append(f"30 s segments disagree by {spread:.1f} ms (limit {CAMTIME_MAX_SPREAD_MS:.0f} ms)")
+    if result.get("camera_selection") == "fisheye" and (spread is None or not np.isfinite(spread)):
+        problems.append("fisheye time calibration needs at least two independently excited time segments")
     if np.isfinite(gain) and gain > CAMTIME_MAX_GAIN:
         problems.append(f"image yaw flow is {gain:.2f}x the gyro rate (limit {CAMTIME_MAX_GAIN}): lateral camera motion in "
                         "turns (near scene, camera far ahead of the rear axle) biases the lag")
-    if float(yaw.get("corr") or 0.0) < CAMTIME_MIN_CORR:
+    if not np.isfinite(float(yaw.get("corr") or 0.0)) or float(yaw.get("corr") or 0.0) < CAMTIME_MIN_CORR:
         problems.append(f"flow/gyro correlation {float(yaw.get('corr') or 0.0):.2f} < {CAMTIME_MIN_CORR}")
     return {"ok": not problems, "problems": problems, "segment_spread_ms": spread,
             "gain": round(gain, 3) if np.isfinite(gain) else None}
 
 
 def cmd_camera_time(a):
-    pdir, parent_calib, mine, truck = parent_info(a.id)
-    _, ds_info = require_dataset(a.bag, camera=True, what="camera-time")
+    pdir, parent_calib, mine, truck = parent_info(a.id, getattr(a, "camera", None))
+    _, ds_info = require_dataset(a.bag, camera=parent_calib["camera"], what="camera-time")
     out_dir = next_version_dir(mine, truck, "camtime")
     out_dir.mkdir(parents=True, exist_ok=True)
     fx, fy = parent_calib.get("camera", DEFAULT_CAMERA)["intrinsics"][:2]
     start = a.start
     if start is None:  # skip a standstill head: the flow/gyro correlation needs yaw excitation
         start = suggest_windows(motion_profile(a.bag))["camera_time_start_s"]
-    result = estimate_camera_offset(pathlib.Path(a.bag), out_dir, fx, fy, duration=a.duration, start=start)
+    coverage = require_camera_segments(a.bag, parent_calib, start=start, end=start + a.duration)
+    result = estimate_camera_offset(pathlib.Path(a.bag), out_dir, fx, fy, duration=a.duration, start=start, camera=parent_calib["camera"])
+    result["camera_selection"] = selected_camera(parent_calib)
     result["start_s"] = start
+    result["coverage"] = coverage
     from livo.dataset import Dataset
     short_recording = Dataset.open(a.bag).duration_s < 90.0
     if result["camera_offset_s"] is None and not short_recording:
@@ -1250,7 +1351,7 @@ def cmd_camera_time(a):
                          note=a.note or "camera->IMU time offset kept from parent (insufficient optical flow)",
                          inputs={"bag": a.bag, "dataset": ds_info, "duration": a.duration, "start_s": start},
                          metrics={"camera_offset_s": offsets.get("camera", 0.0), "estimated_offset_s": None,
-                                  "applied": False, "quality": quality},
+                                  "applied": False, "quality": quality, "coverage": coverage},
                          activate=a.activate)
         return
     calib = copy.deepcopy(parent_calib)
@@ -1270,7 +1371,8 @@ def cmd_camera_time(a):
                      inputs={"bag": a.bag, "dataset": ds_info, "duration": a.duration, "start_s": start},
                      metrics={"camera_offset_s": offsets["camera"], "estimated_offset_s": round(result["camera_offset_s"], 4),
                               "applied": quality["ok"], "quality": quality, "yaw": result["yaw"], "pitch": result["pitch"],
-                              "segments": result["segments"], "implied_fx_from_gain": result["implied_fx_from_gain"]},
+                              "segments": result["segments"], "coverage": coverage,
+                              "implied_fx_from_gain": result["implied_fx_from_gain"]},
                      activate=a.activate)
 
 
@@ -1454,14 +1556,14 @@ def camera_lidar_refine(calib, bag, run, out_dir, n_frames=12, window=(5.0, 60.0
     fx, fy, cx, cy = cam["intrinsics"]
     K = np.array([[fx * scale, 0, cx * scale], [0, fy * scale, cy * scale], [0, 0, 1]])
     dist = np.array(cam.get("distortion", [0] * 5), float)
-    T_rear_cam = np.asarray(calib["transforms"]["midrange_camera_to_rear_axle"]["transform_matrix"], float).reshape(4, 4)
+    T_rear_cam = np.asarray(calib["transforms"][camera_transform_key(calib)]["transform_matrix"], float).reshape(4, 4)
     cam_offset = calib.get("time_offsets", {}).get("camera", 0.0)
-    img_stamps, stream = dump_camera_stream(bag, out_dir, **_run_stream_span(stamps, window, cam_offset))
+    img_stamps, stream = dump_camera_stream(bag, out_dir, camera=calib["camera"], **_run_stream_span(stamps, window, cam_offset))
     eff = img_stamps + cam_offset
     t0 = stamps[0]
     targets = []
     short_recording = len(stamps) >= 2 and float(stamps[-1] - stamps[0]) < 90.0
-    min_targets = 1 if short_recording else 4
+    min_targets = 4
     for tq in np.linspace(t0 + window[0], min(t0 + window[1], stamps[-1] - 1), n_frames):
         j = int(np.argmin(np.abs(stamps - tq)))
         if speed[j] > 8.0:
@@ -1469,10 +1571,11 @@ def camera_lidar_refine(calib, bag, run, out_dir, n_frames=12, window=(5.0, 60.0
         k = int(np.argmin(np.abs(eff - stamps[j])))
         if abs(eff[k] - stamps[j]) > 0.02:
             continue
-        targets.append((j, k))
+        if (j, k) not in targets:
+            targets.append((j, k))
     if len(targets) < min_targets:
         sys.exit("not enough usable image/scan pairs (need a LIVO run whose frames end at image times)")
-    images = {k: img for k, img in decode_hevc(stream, scale, keep={k for _, k in targets})}
+    images = {k: img for k, img in decode_hevc(stream, scale, keep={k for _, k in targets}, camera=calib["camera"])}
     stream.unlink(missing_ok=True)
     h, w = next(iter(images.values())).shape
 
@@ -1523,6 +1626,8 @@ def camera_lidar_refine(calib, bag, run, out_dir, n_frames=12, window=(5.0, 60.0
         e_idx = idx[edge]
         e_idx = e_idx[e_idx >= 0]
         edge_pts = pr[e_idx]
+        if len(edge_pts) < 20:
+            continue
         img = images[k]
         blur = cv2.GaussianBlur(img, (3, 3), 0)
         canny = cv2.Canny(blur, 60, 160)
@@ -1543,6 +1648,9 @@ def camera_lidar_refine(calib, bag, run, out_dir, n_frames=12, window=(5.0, 60.0
         dt_img = np.minimum(dt_img, 10.0)
         frames_data.append({"j": j, "k": k, "edge_pts": edge_pts, "dt": dt_img, "img": img, "canny": canny,
                             "speed": float(speed[j])})
+
+    if len({f["j"] for f in frames_data}) < 4:
+        sys.exit("camera-lidar requires usable LiDAR/image edges in at least four distinct frames")
 
     def score(delta, T_base=T_rear_cam, return_parts=False):
         rv, tv = np.asarray(delta[:3], float).copy(), np.asarray(delta[3:6], float).copy()
@@ -1821,15 +1929,15 @@ def pole_yaw_refine(calib, bag, run, out_dir, n_frames=30, window=(5.0, 115.0), 
     fx, fy, cx, cy = cam["intrinsics"]
     K = np.array([[fx * scale, 0, cx * scale], [0, fy * scale, cy * scale], [0, 0, 1]])
     dist = np.array(cam.get("distortion", [0] * 5), float)
-    T_rear_cam = np.asarray(calib["transforms"]["midrange_camera_to_rear_axle"]["transform_matrix"], float).reshape(4, 4)
+    T_rear_cam = np.asarray(calib["transforms"][camera_transform_key(calib)]["transform_matrix"], float).reshape(4, 4)
     T_cam_rear = np.linalg.inv(T_rear_cam)
     cam_offset = calib.get("time_offsets", {}).get("camera", 0.0)
-    img_stamps, stream = dump_camera_stream(bag, out_dir, **_run_stream_span(stamps, window, cam_offset))
+    img_stamps, stream = dump_camera_stream(bag, out_dir, camera=calib["camera"], **_run_stream_span(stamps, window, cam_offset))
     eff = img_stamps + cam_offset
     t0 = stamps[0]
     targets = []
     short_recording = len(stamps) >= 2 and float(stamps[-1] - stamps[0]) < 90.0
-    min_targets = 1 if short_recording else 4
+    min_targets = 4
     for tq in np.linspace(t0 + window[0], min(t0 + window[1], stamps[-1] - 1), n_frames):
         j = int(np.argmin(np.abs(stamps - tq)))
         if speed[j] > 8.0:
@@ -1851,7 +1959,7 @@ def pole_yaw_refine(calib, bag, run, out_dir, n_frames=30, window=(5.0, 115.0), 
             if pc[:, 2].min() < 3.0:
                 continue
             uv = cv2.projectPoints(pc.reshape(-1, 1, 3), np.zeros(3), np.zeros(3), K, dist)[0].reshape(-1, 2)
-            w_img, h_img = int(1920 * scale), int(1080 * scale)
+            w_img, h_img = int(cam["width"] * scale), int(cam["height"] * scale)
             inside = (uv[:, 0] > 60) & (uv[:, 0] < w_img - 60) & (uv[:, 1] > 5) & (uv[:, 1] < h_img - 5)
             if inside.sum() < 20:
                 continue
@@ -1862,7 +1970,7 @@ def pole_yaw_refine(calib, bag, run, out_dir, n_frames=30, window=(5.0, 115.0), 
     if not per_frame:
         stream.unlink(missing_ok=True)
         return None, {"error": "no lamp/sign posts found in the accumulated scans", "frames_checked": len(targets)}
-    images = {k: img for k, img in decode_hevc(stream, scale, keep={k for _, k, _ in per_frame})}
+    images = {k: img for k, img in decode_hevc(stream, scale, keep={k for _, k, _ in per_frame}, camera=calib["camera"])}
     stream.unlink(missing_ok=True)
     # pixel shift produced by +0.1 deg about camera y (sign convention of `set --camera-rot-delta`)
     P = np.eye(4)
@@ -1946,13 +2054,17 @@ def pole_yaw_refine(calib, bag, run, out_dir, n_frames=30, window=(5.0, 115.0), 
                 n_dbg += 1
     metrics = {"method": "pole yaw (LiDAR pole axis vs image pole column)", "frames_checked": len(targets),
                "frames_with_poles": len(per_frame), "observations": obs, "rejected": candidates, "image_scale": scale}
-    if len(obs) < 3:
-        metrics["error"] = f"only {len(obs)} usable pole observations"
+    observed_frames = len({o["t"] for o in obs})
+    if len(obs) < 3 or observed_frames < 3:
+        metrics["error"] = f"only {len(obs)} usable pole observations across {observed_frames} frames (need at least 3 frames)"
         return None, metrics
     yaws = np.array([o["yaw_deg"] for o in obs])
     med = float(np.median(yaws))
     mad = float(np.median(np.abs(yaws - med)))
     keep = np.abs(yaws - med) <= max(3 * mad, 0.05)
+    if len({o["image"] for o, good in zip(obs, keep) if good}) < 3:
+        metrics["error"] = "pole outlier rejection leaves fewer than three distinct image frames"
+        return None, metrics
     yaw = float(np.median(yaws[keep]))
     rolls = np.array([o["roll_deg"] for o in obs if o.get("roll_deg") is not None], float)
     roll = 0.0
@@ -2001,12 +2113,12 @@ def camera_roll_skyline(calib, bag, run, out_dir, n_frames=150, window=(5.0, 115
     yaw_rate = np.degrees(np.abs(np.gradient(np.unwrap(rot.as_euler("zyx")[:, 0]), stamps)))
     cam = calib.get("camera", DEFAULT_CAMERA)
     fx, fy, cx, cy = cam["intrinsics"]
-    T_rear_cam = np.asarray(calib["transforms"]["midrange_camera_to_rear_axle"]["transform_matrix"], float).reshape(4, 4)
+    T_rear_cam = np.asarray(calib["transforms"][camera_transform_key(calib)]["transform_matrix"], float).reshape(4, 4)
     T_cam_rear = np.linalg.inv(T_rear_cam)
     cam_offset = calib.get("time_offsets", {}).get("camera", 0.0)
     t0 = stamps[0]
     win = (window[0], min(window[1], stamps[-1] - t0 - 1.0))
-    img_stamps, stream = dump_camera_stream(bag, out_dir, **_run_stream_span(stamps, win, cam_offset))
+    img_stamps, stream = dump_camera_stream(bag, out_dir, camera=calib["camera"], **_run_stream_span(stamps, win, cam_offset))
     eff = np.asarray(img_stamps) + cam_offset
     targets = []
     for tq in np.linspace(t0 + win[0], t0 + win[1], n_frames):
@@ -2019,9 +2131,10 @@ def camera_roll_skyline(calib, bag, run, out_dir, n_frames=150, window=(5.0, 115
     if len(targets) < 10:
         stream.unlink(missing_ok=True)
         return None, {"error": f"only {len(targets)} usable moving image/scan pairs", "frames_checked": n_frames}
-    images = {k: im for k, im in decode_hevc(stream, 1.0, keep={k for _, k in targets})}
+    images = {k: im for k, im in decode_hevc(stream, 1.0, keep={k for _, k in targets}, camera=calib["camera"])}
     stream.unlink(missing_ok=True)
-    project = lambda pc: pc[:, :2] / pc[:, 2:3] * np.array([fx, fy]) + np.array([cx, cy])  # noqa: E731
+    K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1.]])
+    project = lambda pc: cv2.projectPoints(pc, np.zeros(3), np.zeros(3), K, np.array(cam.get("distortion", [0.] * 5)))[0].reshape(-1, 2)  # noqa: E731
     rotations = {}
 
     def project_delta(p_cam, roll_deg):  # T_rear_cam @ Rz(roll): p_new = Rz^T p
@@ -2079,16 +2192,14 @@ def camera_roll_skyline(calib, bag, run, out_dir, n_frames=150, window=(5.0, 115
 
 
 def camera_focus_refine(calib, bag, run, out_dir, n_pairs=36, window=(5.0, 115.0), scale=1.0):
-    """Solve fx/fy scale and radial distortion k1 from optical flow against LiDAR depth + trajectory.
+    """Diagnose fx/fy scale and a delta to the existing k1 using optical flow and LiDAR depth.
 
-    Between two consecutive images the camera pose change is known from the run trajectory and each
-    tracked feature's depth from the LiDAR points projected into the first image. The rotational part
-    of the predicted flow scales directly with fx/fy and radial distortion bends it towards the image
-    border, so the intrinsics are observable without any target. Differencing consecutive frames
-    cancels (to first order) a constant extrinsic error, a camera time-offset error and the rolling
-    shutter row skew, so this probe is orthogonal to the closed-loop pitch and the pole yaw. The
-    36-line LiDAR edge sampling bias plays no role: only features inside smooth depth patches are used.
+    Images are paired at adjacent processed run poses, which can be slower than the recorded video.
+    Smooth depth patches reduce depth-association errors, but do not eliminate them. Extrinsic,
+    timestamp and rolling-shutter errors also affect predicted flow; this diagnostic alone cannot
+    establish a reliable intrinsic correction. Existing distortion terms are retained in the fit.
     """
+    from collections import Counter
     import cv2
     from scipy.spatial.transform import Rotation as R
     from scipy.optimize import least_squares
@@ -2098,33 +2209,56 @@ def camera_focus_refine(calib, bag, run, out_dir, n_pairs=36, window=(5.0, 115.0
     cam = calib.get("camera", DEFAULT_CAMERA)
     fx0, fy0, cx0, cy0 = [v * scale for v in cam["intrinsics"]]
     dist0 = np.array(cam.get("distortion", [0] * 5), float)
-    T_rear_cam = np.asarray(calib["transforms"]["midrange_camera_to_rear_axle"]["transform_matrix"], float).reshape(4, 4)
+    T_rear_cam = np.asarray(calib["transforms"][camera_transform_key(calib)]["transform_matrix"], float).reshape(4, 4)
     T_cam_rear = np.linalg.inv(T_rear_cam)
     T_imu_rear = np.eye(4)
     T_imu_rear[:3, 3] = fr["t_li"]
     cam_offset = calib.get("time_offsets", {}).get("camera", 0.0)
-    img_stamps, stream = dump_camera_stream(bag, out_dir, **_run_stream_span(stamps, window, cam_offset))
+    img_stamps, stream = dump_camera_stream(bag, out_dir, camera=calib["camera"], **_run_stream_span(stamps, window, cam_offset))
     eff = img_stamps + cam_offset
     t0 = stamps[0]
-    pairs = []
+    pairs, seen_pairs = [], set()
+    rejected = Counter()
+    max_pair_dt, max_pose_match = 0.35, 0.001
     for tq in np.linspace(t0 + window[0], min(t0 + window[1], stamps[-1] - 1.0), n_pairs):
-        k = int(np.argmin(np.abs(eff - tq)))
-        if k + 1 >= len(eff) or eff[k + 1] - eff[k] > 0.35:
-            continue
-        j1 = int(np.argmin(np.abs(stamps - eff[k])))
-        j2 = int(np.argmin(np.abs(stamps - eff[k + 1])))
-        if abs(stamps[j1] - eff[k]) > 0.02 or abs(stamps[j2] - eff[k + 1]) > 0.02 or j1 == j2:
-            continue
+        j1 = int(np.argmin(np.abs(stamps - tq)))
         if not (1.0 <= speed[j1] <= 8.5):
+            rejected["outside_speed_range"] += 1
             continue
-        pairs.append((k, j1, j2))
+        if not len(eff):
+            rejected["no_camera_frames"] += 1
+            continue
+        k1 = int(np.argmin(np.abs(eff - stamps[j1])))
+        if abs(stamps[j1] - eff[k1]) > max_pose_match:
+            rejected["first_pose_image_mismatch"] += 1
+            continue
+        pair = None
+        for j2 in range(j1 + 1, len(stamps)):
+            if stamps[j2] - stamps[j1] > max_pair_dt:
+                break
+            k2 = int(np.argmin(np.abs(eff - stamps[j2])))
+            if (k2 > k1 and 0 < eff[k2] - eff[k1] <= max_pair_dt
+                    and abs(stamps[j2] - eff[k2]) <= max_pose_match):
+                pair = (k1, k2, j1, j2)
+                break
+        if pair is None:
+            rejected["no_next_processed_pose_image_pair"] += 1
+        elif pair in seen_pairs:
+            rejected["duplicate_pair"] += 1
+        else:
+            seen_pairs.add(pair)
+            pairs.append(pair)
+    sampling = {"pairs_requested": n_pairs, "pairs_matched": len(pairs),
+                "max_pair_interval_s": max_pair_dt, "max_pose_image_match_s": max_pose_match,
+                "rejected": dict(rejected),
+                "pairing": "adjacent processed run poses and their matched video frames"}
     if len(pairs) < 6:
         stream.unlink(missing_ok=True)
-        return None, {"error": f"only {len(pairs)} usable consecutive image pairs"}
+        return None, {"error": f"only {len(pairs)} usable processed image/pose pairs", "sampling": sampling}
     keep = set()
-    for k, _, _ in pairs:
-        keep.update((k, k + 1))
-    images = {k: img for k, img in decode_hevc(stream, scale, keep=keep)}
+    for k1, k2, _, _ in pairs:
+        keep.update((k1, k2))
+    images = {k: img for k, img in decode_hevc(stream, scale, keep=keep, camera=calib["camera"])}
     stream.unlink(missing_ok=True)
 
     def T_world_cam(j):
@@ -2135,14 +2269,16 @@ def camera_focus_refine(calib, bag, run, out_dir, n_pairs=36, window=(5.0, 115.0
 
     K0 = np.array([[fx0, 0, cx0], [0, fy0, cy0], [0, 0, 1]])
     data, Ts, pair_meta = [], [], []
-    for k, j1, j2 in pairs:
-        im1, im2 = images.get(k), images.get(k + 1)
+    for k1, k2, j1, j2 in pairs:
+        im1, im2 = images.get(k1), images.get(k2)
         if im1 is None or im2 is None:
+            rejected["image_decode_missing"] += 1
             continue
         p_rear = accumulate_rear(fr, rot, stamps, j1, 0.45)
         pc = p_rear @ T_cam_rear[:3, :3].T + T_cam_rear[:3, 3]
         pc = pc[(pc[:, 2] > 3.0) & (pc[:, 2] < 70.0)]
         if len(pc) < 500:
+            rejected["insufficient_lidar_depth"] += 1
             continue
         uvz = cv2.projectPoints(pc.reshape(-1, 1, 3), np.zeros(3), np.zeros(3), K0, dist0)[0].reshape(-1, 2)
         h, w = im1.shape
@@ -2155,6 +2291,7 @@ def camera_focus_refine(calib, bag, run, out_dir, n_pairs=36, window=(5.0, 115.0
                 depth[key] = z_
         feats = cv2.goodFeaturesToTrack(im1, maxCorners=500, qualityLevel=0.01, minDistance=10)
         if feats is None:
+            rejected["no_image_features"] += 1
             continue
         nxt, st, _ = cv2.calcOpticalFlowPyrLK(im1, im2, feats, None, winSize=(21, 21), maxLevel=3)
         back, st2, _ = cv2.calcOpticalFlowPyrLK(im2, im1, nxt, None, winSize=(21, 21), maxLevel=3)
@@ -2175,18 +2312,26 @@ def camera_focus_refine(calib, bag, run, out_dir, n_pairs=36, window=(5.0, 115.0
         Ts.append(rel)
         rot_deg = float(np.linalg.norm(R.from_matrix(rel[:3, :3]).as_rotvec())) * 57.2958
         pair_meta.append({"t": round(float(stamps[j1] - t0), 1), "speed": round(float(speed[j1]), 2),
-                          "rot_deg": round(rot_deg, 3), "corrs": len(data) - n_before})
+                          "rot_deg": round(rot_deg, 3), "corrs": len(data) - n_before,
+                          "image_indices": [k1, k2], "pose_indices": [j1, j2],
+                          "image_dt_s": round(float(eff[k2] - eff[k1]), 6),
+                          "pose_dt_s": round(float(stamps[j2] - stamps[j1]), 6),
+                          "pose_image_error_ms": [round(float(stamps[j] - eff[k]) * 1000, 6)
+                                                  for j, k in ((j1, k1), (j2, k2))]})
+    sampling["rejected"] = dict(rejected)
     D = np.asarray(data, float)
-    if len(D) < 400:
-        return None, {"error": f"only {len(D)} flow/depth correspondences", "pairs": pair_meta}
+    if len(D) < 400 or sum(p["corrs"] > 0 for p in pair_meta) < 4:
+        return None, {"error": f"only {len(D)} flow/depth correspondences; need at least 400 across 4 image pairs",
+                      "pairs": pair_meta, "sampling": sampling, "correspondences": int(len(D))}
     u1, v1, u2, v2, Z, pidx = D[:, 0], D[:, 1], D[:, 2], D[:, 3], D[:, 4], D[:, 5].astype(int)
     Rs = np.array([T[:3, :3] for T in Ts])
     ts = np.array([T[:3, 3] for T in Ts])
 
     def residual(p, sel=None):
-        sfx, sfy, k1 = p
+        sfx, sfy, delta_k1 = p
         K = np.array([[fx0 * sfx, 0, cx0], [0, fy0 * sfy, cy0], [0, 0, 1]])
-        dd = np.array([k1, 0, 0, 0, 0], float)
+        dd = dist0.copy()
+        dd[0] += delta_k1
         m = np.ones(len(u1), bool) if sel is None else np.isin(pidx, sel)
         pts = np.stack([u1[m], v1[m]], 1).reshape(-1, 1, 2)
         xn = cv2.undistortPoints(pts, K, dd).reshape(-1, 2)
@@ -2201,9 +2346,10 @@ def camera_focus_refine(calib, bag, run, out_dir, n_pairs=36, window=(5.0, 115.0
     res1 = residual(sol.x)
     rng = np.random.default_rng(1)
     boots = []
-    n_pair_used = len(Ts)
+    used_pair_ids = np.unique(pidx)
+    n_pair_used = len(used_pair_ids)
     for _ in range(40):
-        sel = rng.choice(n_pair_used, max(4, int(0.7 * n_pair_used)), replace=False)
+        sel = rng.choice(used_pair_ids, max(4, int(0.7 * n_pair_used)), replace=False)
         try:
             b = least_squares(residual, sol.x, args=(sel,), loss="huber", f_scale=1.0,
                               x_scale=[0.01, 0.01, 0.01], max_nfev=40)
@@ -2212,34 +2358,43 @@ def camera_focus_refine(calib, bag, run, out_dir, n_pairs=36, window=(5.0, 115.0
             pass
     boots = np.array(boots) if boots else sol.x.reshape(1, 3)
     lo, hi = np.percentile(boots, [2.5, 97.5], axis=0)
-    metrics = {"method": "optical flow x LiDAR depth (consecutive frames; extrinsic/time/rolling-shutter cancel)",
-               "pairs_used": n_pair_used, "correspondences": int(len(D)),
+    distortion_after = dist0.copy()
+    distortion_after[0] += sol.x[2]
+    metrics = {"method": "optical flow x LiDAR depth at adjacent processed run poses",
+               "limitations": "Depth association, trajectory, extrinsic, time-offset and rolling-shutter errors can bias this diagnostic; independent validation is required.",
+               "sampling": sampling, "distortion_before": dist0.tolist(),
+               "pairs_used": n_pair_used, "pairs_processed": len(Ts), "correspondences": int(len(D)),
                "fx_scale": round(float(sol.x[0]), 5), "fy_scale": round(float(sol.x[1]), 5),
-               "k1": round(float(sol.x[2]), 5),
+               "delta_k1": round(float(sol.x[2]), 5), "k1": round(float(distortion_after[0]), 5),
                "ci95": {"fx_scale": [round(float(lo[0]), 5), round(float(hi[0]), 5)],
                          "fy_scale": [round(float(lo[1]), 5), round(float(hi[1]), 5)],
-                         "k1": [round(float(lo[2]), 5), round(float(hi[2]), 5)]},
+                         "delta_k1": [round(float(lo[2]), 5), round(float(hi[2]), 5)],
+                         "k1": [round(float(dist0[0] + lo[2]), 5), round(float(dist0[0] + hi[2]), 5)]},
                "residual_px_median_before": round(float(np.median(np.abs(res0))), 3),
                "residual_px_median_after": round(float(np.median(np.abs(res1))), 3),
                "intrinsics_before": [v / scale for v in (fx0, fy0, cx0, cy0)],
                "intrinsics_after": [fx0 * sol.x[0] / scale, fy0 * sol.x[1] / scale, cx0 / scale, cy0 / scale],
-               "distortion_after": [round(float(sol.x[2]), 5), 0.0, 0.0, 0.0, 0.0],
+               "distortion_after": distortion_after.tolist(),
                "image_scale": scale, "pairs": pair_meta}
     return sol.x, metrics
 
 
 def cmd_camera_focus(a):
-    pdir, parent_calib, mine, truck = parent_info(a.id)
-    _, ds_info = require_dataset(a.bag, camera=True, what="camera-focus")
+    pdir, parent_calib, mine, truck = parent_info(a.id, getattr(a, "camera", None))
+    _, ds_info = require_dataset(a.bag, camera=parent_calib["camera"], what="camera-focus")
     if not (pathlib.Path(a.run) / "frames.csv").exists():
         sys.exit(f"camera-focus: {a.run} is not a fusion run directory (frames.csv missing); run a LIVO round first")
+    require_run_camera(a.run, parent_calib)
+    coverage = require_camera_segments(a.bag, parent_calib, run=a.run, window=a.window)
     out_dir = next_version_dir(mine, truck, "camfocus")
     out_dir.mkdir(parents=True, exist_ok=True)
     x, metrics = camera_focus_refine(parent_calib, pathlib.Path(a.bag), a.run, out_dir,
                                      n_pairs=a.pairs, window=tuple(a.window), scale=a.scale)
     calib = copy.deepcopy(parent_calib)
     applied = []
-    if x is not None and a.apply:
+    if a.apply and selected_camera(parent_calib) == "fisheye":
+        metrics["application_note"] = "fisheye: this flow/depth fit is diagnostic; adopt intrinsics only through joint multi-view calibration and independent validation"
+    if x is not None and a.apply and selected_camera(parent_calib) != "fisheye":
         # ADVISORY by default: the pair bootstrap underestimates systematic depth-association bias.
         # Before --apply, cross-check fx against the static pole-azimuth test (camera-lidar --method
         # poles reports u_px per pole: an fx scale error s shows as du = (1/s-1)*(u-cx), i.e. tens of
@@ -2251,7 +2406,7 @@ def cmd_camera_focus(a):
             return abs(val - null) > tol and not (l <= null <= h)
         fx_ok = decisive("fx_scale", metrics["fx_scale"], 1.0, 0.008)
         fy_ok = decisive("fy_scale", metrics["fy_scale"], 1.0, 0.008)
-        k1_ok = decisive("k1", metrics["k1"], 0.0, 0.006)
+        k1_ok = decisive("delta_k1", metrics["delta_k1"], 0.0, 0.006)
         if fx_ok or fy_ok or k1_ok:
             cam = calib.setdefault("camera", copy.deepcopy(DEFAULT_CAMERA))
             fx, fy, cx, cy = cam["intrinsics"]
@@ -2262,6 +2417,7 @@ def cmd_camera_focus(a):
             cam["source"] = "livo_calib camera-focus (optical flow x LiDAR depth)"
             applied = [n for n, okf in (("fx", fx_ok), ("fy", fy_ok), ("k1", k1_ok)) if okf]
     metrics["applied"] = applied
+    metrics["coverage"] = coverage
     if x is None:
         note = f"camera-focus inconclusive: {metrics.get('error')}"
     elif applied:
@@ -2270,8 +2426,8 @@ def cmd_camera_focus(a):
                 f" (fx x{metrics['fx_scale']}, fy x{metrics['fy_scale']}, k1 {metrics['k1']:+.4f}; "
                 f"residual {metrics['residual_px_median_before']} -> {metrics['residual_px_median_after']} px)")
     else:
-        note = (f"camera intrinsics CONFIRMED by flow x depth (fx x{metrics['fx_scale']}, fy x{metrics['fy_scale']}, "
-                f"k1 {metrics['k1']:+.4f} all within noise); nothing applied")
+        note = (f"camera intrinsics diagnostic only (fx x{metrics['fx_scale']}, fy x{metrics['fy_scale']}, "
+                f"delta k1 {metrics['delta_k1']:+.4f}); no parameters applied; independent validation required")
     finalize_version(out_dir, calib, mine=mine, truck=truck, stage="camfocus", parent=a.id, note=a.note or note,
                      inputs={"bag": a.bag, "dataset": ds_info, "run": a.run, "pairs": a.pairs,
                              "window": list(a.window)},
@@ -2279,24 +2435,36 @@ def cmd_camera_focus(a):
 
 
 def cmd_camera_photo(a):
-    pdir, parent_calib, mine, truck = parent_info(a.id)
-    _, ds_info = require_dataset(a.bag, camera=True, what="camera-photo")
+    pdir, parent_calib, mine, truck = parent_info(a.id, getattr(a, "camera", None))
+    _, ds_info = require_dataset(a.bag, camera=parent_calib["camera"], what="camera-photo")
     run = _fusion_run(a.run)
+    require_run_camera(run, parent_calib)
+    require_camera_segments(a.bag, parent_calib, run=run, window=a.window or (3.0, 1e9))
     out_dir = next_version_dir(mine, truck, "camphoto")
     out_dir.mkdir(parents=True, exist_ok=True)
-    cmd = ["/usr/bin/python3", str(SCRIPTS / "refine_camera_photometric.py"), "--calibration", str(pdir / "calibration.json"),
+    input_file = out_dir / "input_calibration.json"
+    input_file.write_text(json.dumps(parent_calib, indent=2) + "\n")
+    cmd = ["/usr/bin/python3", str(SCRIPTS / "refine_camera_photometric.py"), "--calibration", str(input_file),
            "--bag", a.bag, "--run", str(run), "--output", str(out_dir / "calibration.json"),
            "--report", str(out_dir / "stage_report.txt"), "--json", str(out_dir / "photo_metrics.json")]
+    if a.window:
+        cmd += ["--window", *map(str, a.window)]
+    for validation_run in a.validation_run or []:
+        cmd += ["--validation-run", str(_fusion_run(validation_run))]
     lines = run_script(cmd, out_dir / "stage.log")
     if not (out_dir / "calibration.json").exists():
         # no significant / consistent correction: the parent stays the result (the pipeline continues with it)
         metrics_file = out_dir / "photo_metrics.json"
         metrics = json.loads(metrics_file.read_text()) if metrics_file.exists() else {}
-        shutil.rmtree(out_dir, ignore_errors=True)
+        # Rejected calibration evidence must remain inspectable without becoming
+        # a version that can be selected or activated.
+        evidence = REPO / "results" / "calibration_diagnostics" / mine / truck / (out_dir.name + "_" + dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
+        evidence.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(out_dir), str(evidence))
         if out_dir in CREATED_DIRS:
             CREATED_DIRS.remove(out_dir)
         print(json.dumps({"id": a.id, "kept": True, "reason": "no significant / consistent photo-consistency correction",
-                          "metrics": metrics}, ensure_ascii=False))
+                          "metrics": metrics, "evidence_dir": str(evidence)}, ensure_ascii=False))
         return
     calib = json.loads((out_dir / "calibration.json").read_text())
     applied = calib.get("refinement", {}).get("camera_photometric", {}).get("applied", {})
@@ -2309,29 +2477,33 @@ def cmd_camera_photo(a):
     else:
         note = f"相机光度标定：外参 / 时间 / 内参无显著改变{flat}"
     finalize_version(out_dir, calib, mine=mine, truck=truck, stage="camphoto", parent=a.id, note=a.note or note,
-                     inputs={"bag": a.bag, "dataset": ds_info, "run": str(run)},
+                     inputs={"bag": a.bag, "dataset": ds_info, "run": str(run),
+                             "window": a.window, "validation_runs": a.validation_run or []},
                      metrics={"camera_photometric": calib.get("refinement", {}).get("camera_photometric", {})},
                      report_lines=lines, activate=a.activate)
 
 
 def cmd_camera_lidar(a):
-    pdir, parent_calib, mine, truck = parent_info(a.id)
-    _, ds_info = require_dataset(a.bag, camera=True, what="camera-lidar")
+    pdir, parent_calib, mine, truck = parent_info(a.id, getattr(a, "camera", None))
+    _, ds_info = require_dataset(a.bag, camera=parent_calib["camera"], what="camera-lidar")
     if not (pathlib.Path(a.run) / "frames.csv").exists():
         sys.exit(f"camera-lidar: {a.run} is not a fusion run directory (frames.csv missing); run a LIVO round first")
+    require_run_camera(a.run, parent_calib)
+    coverage = require_camera_segments(a.bag, parent_calib, run=a.run, window=a.window)
     out_dir = next_version_dir(mine, truck, "camlidar")
     out_dir.mkdir(parents=True, exist_ok=True)
     if a.method == "poles":
         T_new, metrics = pole_yaw_refine(parent_calib, pathlib.Path(a.bag), a.run, out_dir, n_frames=a.frames,
                                          window=tuple(a.window), accumulate=a.accumulate)
         calib = copy.deepcopy(parent_calib)
+        metrics["coverage"] = coverage
         metrics["max_delta_deg"] = a.max_delta
         ok = T_new is not None and metrics.get("used", 0) >= 3 and metrics.get("yaw_mad_deg", 9) <= 0.15
         too_big = T_new is not None and abs(metrics["yaw_delta_deg"]) > a.max_delta
         metrics["applied"] = bool(ok and not too_big)
         if metrics["applied"]:
-            calib["transforms"]["midrange_camera_to_rear_axle"]["transform_matrix"] = T_new.reshape(-1).tolist()
-            calib["transforms"]["midrange_camera_to_rear_axle"]["refined_by"] = "livo_calib camera-lidar pole yaw"
+            calib["transforms"][camera_transform_key(calib)]["transform_matrix"] = T_new.reshape(-1).tolist()
+            calib["transforms"][camera_transform_key(calib)]["refined_by"] = "livo_calib camera-lidar pole yaw"
             calib["calibration_type"] = calib.get("calibration_type", "") + "+camera_pole_yaw"
             note = (f"camera yaw refined on {metrics['used']} pole observations: {metrics['yaw_delta_deg']:+.3f} deg "
                     f"(median shift {metrics['du_median_px']:+.1f} px, MAD {metrics['yaw_mad_deg']:.3f} deg)")
@@ -2370,12 +2542,12 @@ def cmd_camera_lidar(a):
             rm["reasons"] = reasons
             if rm["applied"]:
                 from scipy.spatial.transform import Rotation as R
-                T = np.asarray(calib["transforms"]["midrange_camera_to_rear_axle"]["transform_matrix"], float).reshape(4, 4)
+                T = np.asarray(calib["transforms"][camera_transform_key(calib)]["transform_matrix"], float).reshape(4, 4)
                 P = np.eye(4)
                 P[:3, :3] = R.from_euler("xyz", [0.0, 0.0, roll], degrees=True).as_matrix()
-                calib["transforms"]["midrange_camera_to_rear_axle"]["transform_matrix"] = (T @ P).reshape(-1).tolist()
-                calib["transforms"]["midrange_camera_to_rear_axle"]["refined_by"] = (
-                    calib["transforms"]["midrange_camera_to_rear_axle"].get("refined_by", "") + " + sky-line roll").strip(" +")
+                calib["transforms"][camera_transform_key(calib)]["transform_matrix"] = (T @ P).reshape(-1).tolist()
+                calib["transforms"][camera_transform_key(calib)]["refined_by"] = (
+                    calib["transforms"][camera_transform_key(calib)].get("refined_by", "") + " + sky-line roll").strip(" +")
                 calib["calibration_type"] = calib.get("calibration_type", "") + "+camera_sky_roll"
                 metrics["roll_applied"] = True
                 note += f"; camera roll {roll:+.3f} deg from the sky line (groups {rm.get('group_roll_deg')})"
@@ -2388,17 +2560,18 @@ def cmd_camera_lidar(a):
         return
     T_new, metrics = camera_lidar_refine(parent_calib, pathlib.Path(a.bag), a.run, out_dir, n_frames=a.frames,
                                          window=tuple(a.window), accumulate=a.accumulate,
-                                         solve_intrinsics=a.solve_intrinsics, dof=a.dof)
+                                         solve_intrinsics=a.solve_intrinsics and selected_camera(parent_calib) != "fisheye", dof=a.dof)
     calib = copy.deepcopy(parent_calib)
+    metrics["coverage"] = coverage
     improved = metrics["score_after_px"] < metrics["score_before_px"]
     too_big = max(abs(v) for v in metrics["delta_rot_deg_cam_xyz"]) > a.max_delta
     metrics["applied"] = bool(improved and not too_big)
     metrics["max_delta_deg"] = a.max_delta
     if metrics["applied"]:
-        calib["transforms"]["midrange_camera_to_rear_axle"]["transform_matrix"] = T_new.reshape(-1).tolist()
-        calib["transforms"]["midrange_camera_to_rear_axle"]["refined_by"] = f"livo_calib camera-lidar edge alignment ({metrics['dof']})"
+        calib["transforms"][camera_transform_key(calib)]["transform_matrix"] = T_new.reshape(-1).tolist()
+        calib["transforms"][camera_transform_key(calib)]["refined_by"] = f"livo_calib camera-lidar edge alignment ({metrics['dof']})"
         calib["calibration_type"] = calib.get("calibration_type", "") + "+camera_lidar_edge_refined"
-    if metrics.get("intrinsics_solved"):
+    if metrics.get("intrinsics_solved") and metrics["applied"] and selected_camera(calib) != "fisheye":
         calib.setdefault("camera", copy.deepcopy(DEFAULT_CAMERA))["intrinsics"] = metrics["intrinsics_used"]
         calib["camera"]["source"] = "livo_calib camera-lidar edge alignment (focal scale solved)"
     if metrics["applied"]:
@@ -2426,7 +2599,7 @@ def render_overlays(calib, bag, run, out_dir, times, accumulate=1.0, scale=0.5, 
     fx, fy, cx, cy = cam["intrinsics"]
     K = np.array([[fx * scale, 0, cx * scale], [0, fy * scale, cy * scale], [0, 0, 1]])
     dist = np.array(cam.get("distortion", [0] * 5), float)
-    T_rear_cam = np.asarray(calib["transforms"]["midrange_camera_to_rear_axle"]["transform_matrix"], float).reshape(4, 4)
+    T_rear_cam = np.asarray(calib["transforms"][camera_transform_key(calib)]["transform_matrix"], float).reshape(4, 4)
     if rot_delta is not None and any(abs(v) > 0 for v in rot_delta):
         P = np.eye(4)
         P[:3, :3] = R.from_euler("xyz", rot_delta, degrees=True).as_matrix()
@@ -2434,7 +2607,7 @@ def render_overlays(calib, bag, run, out_dir, times, accumulate=1.0, scale=0.5, 
     if cam_offset is None:
         cam_offset = calib.get("time_offsets", {}).get("camera", 0.0)
     img_stamps, stream = dump_camera_stream(
-        bag, out_dir, **_run_stream_span(stamps, (min(times) - 1.5, max(times) + 1.5), cam_offset))
+        bag, out_dir, camera=calib["camera"], **_run_stream_span(stamps, (min(times) - 1.5, max(times) + 1.5), cam_offset))
     eff = img_stamps + cam_offset
     t0 = stamps[0]
     targets, index = [], []
@@ -2457,7 +2630,7 @@ def render_overlays(calib, bag, run, out_dir, times, accumulate=1.0, scale=0.5, 
     if not targets:
         stream.unlink(missing_ok=True)
         return index
-    images = {k: img for k, img in decode_hevc(stream, scale, keep={k for _, _, k in targets})}
+    images = {k: img for k, img in decode_hevc(stream, scale, keep={k for _, _, k in targets}, camera=calib["camera"])}
     stream.unlink(missing_ok=True)
     T_imu_rear = np.eye(4)
     T_imu_rear[:3, 3] = fr["t_li"]
@@ -2520,8 +2693,8 @@ def render_overlays(calib, bag, run, out_dir, times, accumulate=1.0, scale=0.5, 
 
 
 def cmd_overlay(a):
-    pdir, calib, mine, truck = parent_info(a.id)
-    require_dataset(a.bag, camera=True, what="overlay")
+    pdir, calib, mine, truck = parent_info(a.id, getattr(a, "camera", None))
+    require_dataset(a.bag, camera=calib["camera"], what="overlay")
     run = pathlib.Path(a.run)
     if not (run / "frames.csv").exists() or not (run / "scans.bin").exists():
         sys.exit(f"overlay: {run} has no frames.csv/scans.bin (run a LIVO round with save_map)")
@@ -2538,6 +2711,19 @@ def cmd_overlay(a):
 
 
 # ----------------------------------------------------------------------------- bookkeeping cmds
+def cmd_camera_select(a):
+    pdir, parent, mine, truck = parent_info(a.parent)
+    original = json.loads((pdir / "calibration.json").read_text())
+    calib = select_camera(parent, a.camera)
+    if selected_camera(original) == a.camera and a.camera in original.get("camera_profiles", {}):
+        print(json.dumps({"id": a.parent, "kept": True, "camera": a.camera}))
+        return
+    out = next_version_dir(mine, truck, "camselect")
+    finalize_version(out, calib, mine=mine, truck=truck, stage="camselect", parent=a.parent,
+                     note=a.note or f"Select {a.camera}; independent camera calibration and validation required",
+                     inputs={"camera": a.camera}, metrics={"camera_selection": a.camera}, activate=False)
+
+
 def cmd_list(a):
     reg = load_registry()
     rows = all_versions()
@@ -2560,6 +2746,10 @@ def cmd_list(a):
 def validate_calibration(calib, *, strict=False):
     """Structural + plausibility checks; returns {"ok", "errors", "warnings"}."""
     errors, warnings = [], []
+    try:
+        calib = select_camera(calib)
+    except (ValueError, KeyError, TypeError) as exc:
+        return {"ok": False, "errors": [str(exc)], "warnings": []}
     lidar = calib.get("lidar") or []
     if not lidar:
         errors.append("lidar[] missing")
@@ -2590,9 +2780,9 @@ def validate_calibration(calib, *, strict=False):
             warnings.append(f"{name}: roll/pitch {rpy[:2]} deg exceed 15 deg")
         if not (-1.0 <= m[2, 3] <= 8.0):
             warnings.append(f"{name}: z {m[2, 3]:.3f} m outside [-1, 8]")
-    cam_tf = (calib.get("transforms") or {}).get("midrange_camera_to_rear_axle", {}).get("transform_matrix")
+    cam_tf = (calib.get("transforms") or {}).get(camera_transform_key(calib), {}).get("transform_matrix")
     if cam_tf is None:
-        errors.append("transforms.midrange_camera_to_rear_axle.transform_matrix missing")
+        errors.append(f"transforms.{camera_transform_key(calib)}.transform_matrix missing")
     else:
         m = np.asarray(cam_tf, float)
         if m.size != 16:
@@ -2623,9 +2813,9 @@ def validate_calibration(calib, *, strict=False):
         v = offs.get(k)
         if not isinstance(v, (int, float)):
             (errors if strict else warnings).append(f"time_offsets.{k} missing")
-        elif abs(v) > 1.0:
+        elif not np.isfinite(v) or abs(v) > 1.0:
             errors.append(f"time_offsets.{k} = {v} s implausible")
-    if offs.get("camera") == 0.0 and "camera_source" not in offs:
+    if "unmeasured" in str(offs.get("camera_source", "")).lower() or (offs.get("camera") == 0.0 and "camera_source" not in offs):
         warnings.append("time_offsets.camera is 0.0 and unverified (run the camera-time stage)")
     return {"ok": not errors, "errors": errors, "warnings": warnings}
 
@@ -2670,6 +2860,11 @@ def cmd_activate(a):
     meta = json.loads((d / "meta.json").read_text()) if (d / "meta.json").exists() else {}
     if meta.get("stage") == "scan" or d.name.endswith("_scan"):
         sys.exit("temporary pitch scan versions cannot be activated; select the parent or a validated result")
+    calib = select_camera(json.loads((d / "calibration.json").read_text()))
+    closed_loop = json.loads((d / "closed_loop.json").read_text()) if (d / "closed_loop.json").is_file() else None
+    issues = fisheye_activation_issues(calib, closed_loop)
+    if issues:
+        sys.exit("fisheye activation blocked: " + "; ".join(issues))
     reg = load_registry()
     mine, truck, _ = a.id.strip("/").split("/")
     reg["active"][f"{mine}/{truck}"] = a.id
@@ -2684,7 +2879,7 @@ def cmd_export(a):
 
 def cmd_set(a):
     """Create a child version with explicit camera/time-offset values (operator-entered)."""
-    pdir, parent_calib, mine, truck = parent_info(a.id)
+    pdir, parent_calib, mine, truck = parent_info(a.id, getattr(a, "camera", None))
     calib = copy.deepcopy(parent_calib)
     changes = {}
     if a.camera_offset is not None:
@@ -2713,23 +2908,25 @@ def cmd_set(a):
         if not (rdir / "source.json").exists():
             sys.exit(f"--intrinsics-from-supplier: lineage root {root} has no source.json (not an import)")
         supplier = json.loads((rdir / "source.json").read_text())
-        mc = supplier.get("midrange_camera")
+        field = CAMERAS[selected_camera(calib)]
+        mc = supplier.get(field)
         mc0 = mc[0] if isinstance(mc, list) and mc and isinstance(mc[0], dict) else {}
-        T_sup = json.loads((rdir / "calibration.json").read_text())["transforms"]["midrange_camera_to_rear_axle"]["transform_matrix"]
+        root_calib = select_camera(json.loads((rdir / "calibration.json").read_text()), selected_camera(calib))
+        T_sup = root_calib["transforms"][camera_transform_key(root_calib)]["transform_matrix"]
         cam = calib.setdefault("camera", copy.deepcopy(DEFAULT_CAMERA))
         fit, info = intrinsics_from_ground_equations(ground_equations(mc0), T_sup, cam.get("width", 1920), cam.get("height", 1080))
         if fit is None:
             sys.exit(f"--intrinsics-from-supplier: {info.get('reason')}")
         cam["intrinsics"] = fit
         cam["source"] = f"supplier ground-distance curves equation_*m of {root} ({info['model']}, rms {info['rms_px']} px)"
-        cam["intrinsics_check"] = {"method": "supplier ground-distance curves (midrange_camera[0].equation_*m)", **info}
+        cam["intrinsics_check"] = {"method": f"supplier ground-distance curves ({field}[0].equation_*m)", **info}
         changes["camera.intrinsics"] = fit
     if a.distortion:
         calib.setdefault("camera", copy.deepcopy(DEFAULT_CAMERA))["distortion"] = [float(v) for v in a.distortion]
         changes["camera.distortion"] = calib["camera"]["distortion"]
     if a.camera_rot_delta:
         from scipy.spatial.transform import Rotation as R
-        tf = calib["transforms"]["midrange_camera_to_rear_axle"]
+        tf = calib["transforms"][camera_transform_key(calib)]
         T = np.asarray(tf["transform_matrix"], float).reshape(4, 4)
         P = np.eye(4)
         P[:3, :3] = R.from_euler("xyz", a.camera_rot_delta, degrees=True).as_matrix()
@@ -2755,7 +2952,7 @@ def cmd_set(a):
         sys.exit("nothing to set")
     stage = a.stage or "manual"
     if stage == "camloop":
-        calib["transforms"]["midrange_camera_to_rear_axle"]["refined_by"] = "livo_calib closed-loop pitch scan (native odometry scale vs RTK)"
+        calib["transforms"][camera_transform_key(calib)]["refined_by"] = "livo_calib closed-loop pitch scan (native odometry scale vs RTK)"
         calib["calibration_type"] = calib.get("calibration_type", "") + "+camera_closed_loop"
     metrics = {"changes": changes}
     if a.metrics_json:
@@ -2763,6 +2960,7 @@ def cmd_set(a):
             metrics.update(json.loads(a.metrics_json))
         except json.JSONDecodeError as exc:
             sys.exit(f"--metrics-json is not valid JSON: {exc}")
+    calib = select_camera(calib)
     out_dir = next_version_dir(mine, truck, stage)
     finalize_version(out_dir, calib, mine=mine, truck=truck, stage=stage, parent=a.id,
                      note=a.note or "operator-entered values", metrics=metrics, activate=a.activate)
@@ -2775,8 +2973,15 @@ def main():
     def common(p, need_id=True):
         if need_id:
             p.add_argument("--id", required=True, help="parent version id <mine>/<truck>/<version>")
+        p.add_argument("--camera", choices=tuple(CAMERAS), help="camera to calibrate; default inherits parent")
         p.add_argument("--note", default="")
         p.add_argument("--activate", action="store_true", help="make the new version active")
+
+    p = sub.add_parser("camera-select", help="select the camera from the same vehicle calibration")
+    p.add_argument("--parent", required=True)
+    p.add_argument("--camera", choices=tuple(CAMERAS), required=True)
+    p.add_argument("--note", default="")
+    p.set_defaults(func=cmd_camera_select)
 
     p = sub.add_parser("import")
     p.add_argument("--source", required=True)
@@ -2833,7 +3038,7 @@ def main():
     p.set_defaults(func=cmd_driven)
 
     p = sub.add_parser("camera-time")
-    p.add_argument("--bag", required=True, help="recording containing midrange_camera/ffmpeg and imu_data (raw root)")
+    p.add_argument("--bag", required=True, help="recording root containing the selected camera stream and imu_data")
     p.add_argument("--duration", type=float, default=None,
                    help="seconds of video used from the first image (default: all); ~60 s of driving is enough")
     p.add_argument("--start", type=float, default=None,
@@ -2858,7 +3063,7 @@ def main():
     p.set_defaults(func=cmd_windows)
 
     p = sub.add_parser("camera-lidar")
-    p.add_argument("--bag", required=True, help="recording containing midrange_camera/ffmpeg (raw root)")
+    p.add_argument("--bag", required=True, help="recording root containing the selected camera stream (fisheye requires multiple Camera bags)")
     p.add_argument("--run", required=True, help="fusion run directory of a LIVO round (frames end at image times)")
     p.add_argument("--frames", type=int, default=30, help="image/scan pairs to inspect (poles are found in a subset)")
     p.add_argument("--window", nargs=2, type=float, default=(5.0, 115.0))
@@ -2885,7 +3090,7 @@ def main():
     p.set_defaults(func=cmd_from_precheck)
 
     p = sub.add_parser("camera-focus", help="fx/fy/k1 from optical flow vs LiDAR depth + trajectory (no target)")
-    p.add_argument("--bag", required=True, help="recording containing midrange_camera/ffmpeg (raw root)")
+    p.add_argument("--bag", required=True, help="recording root containing the selected camera stream (fisheye requires multiple Camera bags)")
     p.add_argument("--run", required=True, help="fusion run directory of a LIVO round (frames end at image times)")
     p.add_argument("--pairs", type=int, default=36, help="consecutive image pairs to sample")
     p.add_argument("--window", nargs=2, type=float, default=(5.0, 115.0))
@@ -2898,8 +3103,10 @@ def main():
 
     p = sub.add_parser("camera-photo", help="camera rotation + time offset (intrinsics check) from multi-view "
                                             "photo-consistency of a LIVO round")
-    p.add_argument("--bag", required=True, help="recording containing midrange_camera/ffmpeg (raw root)")
+    p.add_argument("--bag", required=True, help="recording root containing the selected camera stream (fisheye requires multiple Camera bags)")
     p.add_argument("--run", required=True, help="fusion run (or round) directory of a LIVO round mapped with the parent")
+    p.add_argument("--window", nargs=2, type=float)
+    p.add_argument("--validation-run", action="append", help="independent LIVO round; evaluate fixed candidate without refitting")
     common(p)
     p.set_defaults(func=cmd_camera_photo)
 
@@ -2929,7 +3136,7 @@ def main():
     p.set_defaults(func=cmd_set)
 
     p = sub.add_parser("overlay", help="project the LiDAR scans of a LIVO round into camera frames (visual check)")
-    p.add_argument("--bag", required=True, help="recording containing midrange_camera/ffmpeg (raw root)")
+    p.add_argument("--bag", required=True, help="recording root containing the selected camera stream (fisheye requires multiple Camera bags)")
     p.add_argument("--run", required=True, help="fusion run directory of a LIVO round (frames.csv + scans.bin)")
     p.add_argument("--out", required=True, help="output directory for overlay_*.jpg + index.json")
     p.add_argument("--times", default="20,60,100", help="seconds after run start, comma separated")

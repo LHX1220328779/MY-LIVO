@@ -126,53 +126,25 @@ def static_visibility(points, frames, header, protected, tree, sky_masks=True,ca
     return ~remove
 
 
-def seed_map(root, output, voxel, static_filter, sky_masks=True):
+def seed_map(root, output, voxel, static_filter, sky_masks=True, distant_surface=False):
+    if distant_surface:
+        raise ValueError("D-stage geometry uses native accepted rows; distant-return supplementation is disabled")
     header, frames = frames_from(root)
-    w, h, fx, fy, _, _ = map(float, header.split())
+    _, _, fx, fy, _, _ = map(float, header.split())
     source=root.parent/"preparation.json"
     if not source.exists():source=frames[0]["folder"].resolve().parent.parent/"preparation.json"
-    native_geometry=None;native_info=None;native_tree=None
-    if source.exists():
-        from livo.gaussian_native import native_surface
-        preparation=json.loads(source.read_text())
-        native_geometry,native_info=native_surface(preparation["fusion"],voxel)
-        native_tree=cKDTree(native_geometry)
-        print(f"[shared] native surface association: {len(native_geometry)} accepted anchors",flush=True)
+    if not source.is_file():
+        raise ValueError("Gaussian geometry requires preparation.json and its native accepted surface; raw-view fallback is disabled")
+    from livo.gaussian_native import ECHO_POLICY,native_surface,colour_surface
+    preparation=json.loads(source.read_text())
+    native_geometry,native_info=native_surface(preparation["fusion"],voxel)
+    native_tree=cKDTree(native_geometry)
+    print(f"[shared] native surface association: {len(native_geometry)} accepted anchors",flush=True)
     source_candidates=sum(f["n"] for f in frames if not f["validation"])
-    native_supported=0
-    if native_geometry is not None:
-        from livo.gaussian_native import colour_surface
-        points,native_supported=colour_surface(native_geometry,native_tree,frames,header,
-            preparation.get("options",{}).get("max_depth",120),sky_masks)
-        del native_tree,native_geometry
-        print(f"[shared] {len(points)} visible accepted surface anchors",flush=True)
-    else:
-        # Keep the closest measured return in each cell, not a displaced centroid.
-        points = np.empty((0, 7), np.float32)
-        keys = np.empty(0, np.uint64)
-        pending = []
-        for index, frame in enumerate(frames):
-            if not frame["validation"]:
-                p = np.fromfile(frame["folder"]/(frame["name"]+".bin"), dtype="<f4",
-                                offset=int(w*h)*4).reshape(-1, 7)
-                if len(p) != frame["n"]:
-                    raise ValueError("Prepared point count mismatch")
-                pending.append(p)
-            if (index+1) % 80 == 0 or index == len(frames)-1:
-                block = np.concatenate(pending) if pending else np.empty((0,7),np.float32)
-                q = np.floor(block[:, :3].astype(float)/voxel).astype(np.int64) + (1 << 20)
-                if np.any(q < 0) or np.any(q >= 1 << 21):
-                    raise ValueError("Map coordinates exceed voxel key range")
-                q = q.astype(np.uint64)
-                k = (q[:, 0] << np.uint64(42)) | (q[:, 1] << np.uint64(21)) | q[:, 2]
-                points = np.concatenate([points, block])
-                keys = np.concatenate([keys, k])
-                order = np.lexsort((points[:, 6], keys))
-                sorted_keys = keys[order]
-                keep = order[np.r_[True, sorted_keys[1:] != sorted_keys[:-1]]]
-                points, keys = points[keep], keys[keep]
-                pending.clear()
-                print(f"[shared] seed {index+1}/{len(frames)} frames: {len(points)} unique measured anchors", flush=True)
+    points,native_supported=colour_surface(native_geometry,native_tree,frames,header,
+        preparation.get("options",{}).get("max_depth",120),sky_masks)
+    del native_tree,native_geometry
+    print(f"[shared] {len(points)} visible native surface anchors",flush=True)
     if len(points) < 32:
         raise ValueError("Insufficient training LiDAR anchors")
     model = np.lib.format.open_memmap(output/"state.npy", mode="w+", dtype="<f4", shape=(len(points),59))
@@ -190,9 +162,11 @@ def seed_map(root, output, voxel, static_filter, sky_masks=True):
         delta = neighbors-neighbors.mean(1, keepdims=True)
         cov = np.einsum("nki,nkj->nij", delta, delta)/32
         eig, vectors = np.linalg.eigh(cov)
+        footprint_m = points[start:stop, 6] / ((fx+fy)/2)
+        neighborhood = np.maximum(.6, 4*footprint_m)
         planar = ((eig[:, 0] < .08*np.maximum(eig[:, 1], 1e-9)) & (eig[:, 1] > .08*eig[:, 2]) &
-                  (dist[:, -1]<np.maximum(.6,4*points[start:stop,6]/((fx+fy)/2))))
-        tangent = np.clip(np.maximum(dist[:, 3]*.65, points[start:stop, 6]/((fx+fy)/2)*.7), .012, .18)
+                  (dist[:, -1] < neighborhood))
+        tangent = np.clip(np.maximum(dist[:, 3]*.65, footprint_m*.7), .012, .18)
         scales = np.repeat(tangent[:, None], 3, axis=1)
         normal = np.clip(np.sqrt(np.maximum(eig[:, 0], 0)), .005, .02)
         scales[planar, :2] = tangent[planar, None]
@@ -248,7 +222,9 @@ def seed_map(root, output, voxel, static_filter, sky_masks=True):
     (output/"seed_info.json").write_text(json.dumps(dict(anchors=len(model), planar_anchors_before_visibility=planar_count,
         static_visibility_filter=static_filter,visibility_rejected=before_filter-len(model),
         native_surface=native_info,source_candidates=source_candidates,native_supported_observations=native_supported,
-        voxel_m=voxel, centres="accepted native surface anchors; never optimized" if native_info else "measured training returns; never optimized",
+        echo_policy=ECHO_POLICY,distant_surface=False,distant_min_camera_depth_m=None,
+        distant_anchors_before_visibility=0,distant_anchors=0,voxel_m=voxel,
+        centres="D-stage accepted native surface anchors; never optimized",
         heldout_rgb_seeds=0,native_geometry_all_scans=bool(native_info)), indent=2))
     return header, frames, model, bounds
 
@@ -258,37 +234,65 @@ def visibility_index(xyz,header=None):
     return dict(cells=cells,inverse=inverse,header=header,cache=OrderedDict())
 
 
-def visible_rows(xyz, frames, header, index=None, margin=2.,far=None):
+def visible_rows(xyz, frames, header, index=None, margin=2.,far=None,support_beyond=None,support_masks=True):
     # Centres and poses stay fixed. Reuse packed per-camera frusta between
     # temporal/replay batches rather than reprojecting the route for each tile.
     index=visibility_index(xyz,header) if index is None else index
     base=index["header"] or header;cache=index["cache"]
     n=len(xyz);packed=np.zeros((n+7)//8,np.uint8)
     cells=index["cells"];centres=(cells.astype(float)+.5)*32
-    def project(ids,T,intrinsics):
+    def project(ids,frame,intrinsics,check_support=False):
+        T=frame["T"]
         w,h,fx,fy,cx,cy=map(float,intrinsics.split())
+        depth=None
+        if check_support and support_beyond is not None and not frame["validation"]:
+            width,height=int(w),int(h)
+            depth=np.fromfile(frame["folder"]/(frame["name"]+".bin"),dtype="<f4",count=width*height).reshape(height,width)
+            valid=(depth>0)&np.isfinite(depth)
+            allowed_static=np.ones(depth.shape,bool)
+            dynamic_path=frame["folder"]/(frame["name"]+"_dynamic.png")
+            if support_masks and dynamic_path.is_file():
+                dynamic=cv2.imread(str(dynamic_path),cv2.IMREAD_GRAYSCALE)
+                if dynamic is None or dynamic.shape!=depth.shape:
+                    raise ValueError(f"Invalid dynamic mask: {dynamic_path}")
+                allowed_static=cv2.dilate(dynamic,np.ones((3,3),np.uint8))<128
+                valid&=allowed_static
+            depth=cv2.erode(np.where(valid,depth,np.inf),np.ones((3,3),np.uint8))
+            depth[~allowed_static]=np.inf
         keep=np.zeros(len(ids),bool)
         for start in range(0,len(ids),100000):
             selected=ids[start:start+100000]
             p=(np.asarray(xyz[selected],float)-T[:3,3])@T[:3,:3];z=np.maximum(p[:,2],0)
-            keep[start:start+len(selected)]=((p[:,2]>-margin)&
+            visible=((p[:,2]>-margin)&
                 ((p[:,2]<far+margin) if far is not None else True)&(p[:,0]>-(cx+3)/fx*z-margin)&
                 (p[:,0]<(w-cx+3)/fx*z+margin)&(p[:,1]>-(cy+3)/fy*z-margin)&(p[:,1]<(h-cy+3)/fy*z+margin))
+            if check_support and support_beyond is not None:
+                distant=np.flatnonzero(visible&(p[:,2]>support_beyond+margin))
+                visible[distant]=False
+                if depth is not None and len(distant):
+                    u=np.rint(p[distant,0]*fx/p[distant,2]+cx).astype(int)
+                    v=np.rint(p[distant,1]*fy/p[distant,2]+cy).astype(int)
+                    inside=(u>=0)&(u<int(w))&(v>=0)&(v<int(h))
+                    distant,u,v=distant[inside],u[inside],v[inside]
+                    measured=depth[v,u]
+                    consistent=np.isfinite(measured)&(np.abs(p[distant,2]-measured)<=.4+.02*measured)
+                    visible[distant[consistent]]=True
+            keep[start:start+len(selected)]=visible
         return ids[keep]
     for frame in frames:
-        key=(frame["name"],margin,far);T=frame["T"]
+        key=(frame["name"],margin,far,support_beyond,support_masks);T=frame["T"]
         if key not in cache:
             w,h,fx,fy,cx,cy=map(float,base.split())
             p=(centres-T[:3,3])@T[:3,:3];z=np.maximum(p[:,2],0)
             cell_margin=30*(1+max(cx/fx,(w-cx)/fx,cy/fy,(h-cy)/fy))
             coarse=((p[:,2]>-30)&((p[:,2]<far+32) if far is not None else True)&(p[:,0]>-(cx+3)/fx*z-cell_margin)&
                 (p[:,0]<(w-cx+3)/fx*z+cell_margin)&(p[:,1]>-(cy+3)/fy*z-cell_margin)&(p[:,1]<(h-cy+3)/fy*z+cell_margin))
-            ids=project(np.flatnonzero(coarse[index["inverse"]]),T,base)
+            ids=project(np.flatnonzero(coarse[index["inverse"]]),frame,base,check_support=True)
             mask=np.zeros(n,bool);mask[ids]=True;cache[key]=np.packbits(mask)
             while len(cache)>max(1,(256<<20)//len(packed)):cache.popitem(last=False)
         cache.move_to_end(key);bits=cache[key]
         if header!=base:
-            ids=project(np.flatnonzero(np.unpackbits(bits,count=n)),T,header)
+            ids=project(np.flatnonzero(np.unpackbits(bits,count=n)),frame,header)
             mask=np.zeros(n,bool);mask[ids]=True;bits=np.packbits(mask)
         packed|=bits
     return np.flatnonzero(np.unpackbits(packed,count=n))
@@ -329,9 +333,30 @@ def prepare_batch(folder, header, frames, crop=None, sky_masks=True,background=N
 
 
 def refine(root, output, binary, voxel=.08, epochs=12, sweeps=2, batch_frames=40,
-           max_active=3000000, surface=True, evaluate=True, replay_views=40, static_filter=True,sky_masks=True,initial_state=None):
+           max_active=3000000, surface=True, evaluate=True, replay_views=40, static_filter=True,sky_masks=True,initial_state=None,distant_surface=False,
+           training_depth=None,replay_reference=None,surface_scale_factor=None,
+           color_weight=0.):
     started = time.monotonic()
     output = Path(output).resolve(); root = Path(root).resolve(); binary = Path(binary).resolve()
+    if distant_surface:
+        raise ValueError("D-stage geometry uses native accepted rows; distant-return supplementation is disabled")
+    if initial_state is not None:
+        from livo.gaussian_native import ECHO_POLICY
+        initial_state=Path(initial_state).resolve()
+        seed_info=json.loads((initial_state/"seed_info.json").read_text())
+        native=seed_info.get("native_surface") or {}
+        if (seed_info.get("echo_policy")!=ECHO_POLICY or
+                (native.get("signature") or {}).get("echo_policy")!=ECHO_POLICY or
+                seed_info.get("distant_surface") or seed_info.get("distant_anchors_before_visibility",0) or
+                seed_info.get("distant_anchors",0)):
+            raise ValueError("Rebuild seeds from the D-stage native accepted surface; old or distant-return states cannot be resumed")
+    if color_weight and not surface:
+        raise ValueError("Color regularization requires shared surface constraints")
+    retention=root.parent/"input_retention.json"
+    if retention.is_file() and not json.loads(retention.read_text()).get("training_available",True):
+        raise ValueError("This preparation retains heldout evaluation inputs only; decode training inputs again before refinement")
+    if subprocess.check_output([str(binary),"--version"],text=True).strip()!="MY-LIVO Gaussian-LIC adapter 8":
+        raise ValueError("Rebuild the Gaussian adapter before shared surface refinement (adapter 8 required)")
     output.mkdir(parents=True, exist_ok=False)
     _,source_frames=frames_from(root)
     missing_sky=any(not (f["folder"]/(f["name"]+"_sky.png")).is_file() for f in source_frames)
@@ -344,10 +369,9 @@ def refine(root, output, binary, voxel=.08, epochs=12, sweeps=2, batch_frames=40
     semantics=json.loads(semantic_info.read_text()) if semantic_info.exists() and sky_masks else {}
     background=semantics.get("background_rgb",[0.,0.,0.])
     if initial_state is None:
-        header, frames, model, bounds = seed_map(root, output, voxel, static_filter, sky_masks)
+        header, frames, model, bounds = seed_map(root, output, voxel, static_filter, sky_masks, distant_surface)
     else:
         # Reuse expensive native geometry/colour preparation during real-data iterations.
-        initial_state=Path(initial_state).resolve()
         for name in ["state.npy","bounds.npy","seed_info.json"]:
             shutil.copyfile(initial_state/name,output/name)
         seed_info=json.loads((output/"seed_info.json").read_text())
@@ -359,12 +383,63 @@ def refine(root, output, binary, voxel=.08, epochs=12, sweeps=2, batch_frames=40
         if model.ndim!=2 or model.shape[1]!=59 or bounds.shape!=(len(model),6):
             raise ValueError("Initial state has incompatible Gaussian/scale rows")
         print(f"[shared] reused prepared state: {len(model)} anchors from {initial_state}",flush=True)
+    seed_info=json.loads((output/"seed_info.json").read_text())
+    previous_factor=float(seed_info.get("surface_scale_factor",1.))
+    if surface_scale_factor is None:
+        surface_scale_factor=previous_factor
+    if surface_scale_factor!=previous_factor:
+        # In this seed schema only PCA planes have equal tangent upper bounds
+        # and a smaller third (normal) bound. Lines have the last two equal;
+        # uncertain compact seeds have three equal bounds.
+        bounds=np.load(output/"bounds.npy",mmap_mode="r+")
+        planar=(np.abs(bounds[:,3]-bounds[:,4])<1e-6)&(bounds[:,4]>bounds[:,5]+1e-6)
+        upper=bounds[planar,3:5]+np.log(surface_scale_factor/previous_factor)
+        bounds[planar,3:5]=np.minimum(upper,np.log(.3*surface_scale_factor))
+        bounds.flush()
+        seed_info.update(surface_scale_factor=surface_scale_factor,relaxed_planar_anchors=int(planar.sum()))
+        (output/"seed_info.json").write_text(json.dumps(seed_info,indent=2))
+        print(f"[shared] planar tangent upper bounds: {previous_factor:g} -> {surface_scale_factor:g}, {int(planar.sum())} anchors; normals unchanged",flush=True)
+    if training_depth is None:
+        training_depth=60.
+    if not np.isfinite(training_depth) or training_depth<=1:
+        raise ValueError("Training depth must be finite and greater than 1 m")
+    print(f"[shared] training camera depth limit: {training_depth:g} m",flush=True)
     if (root.parent/"camera_poses.json").is_file():
         shutil.copyfile(root.parent/"camera_poses.json",output/"camera_poses.json")
     spatial_index = visibility_index(model[:, :3],header)
     camera_positions = np.array([f["T"][:3,3] for f in frames])
+    frozen_replays={}
+    if replay_reference is not None:
+        replay_reference=Path(replay_reference).resolve()
+        reference=json.loads(replay_reference.read_text())
+        if reference.get("batch_frames")!=batch_frames or reference.get("frames")!=len(frames):
+            raise ValueError("Replay reference must use the same frame count and temporal batch size")
+        poses_path=root.parent/"camera_poses.json"
+        reference_poses=replay_reference.parent/"camera_poses.json"
+        if not poses_path.is_file() or not reference_poses.is_file():
+            raise ValueError("Replay reference requires both recorded camera pose lists")
+        poses=json.loads(poses_path.read_text())
+        prior=json.loads(reference_poses.read_text())
+        if len(poses)!=len(prior) or any(
+                any(a[key]!=b[key] for key in ("frame","stamp","scan_stamp","validation")) or
+                not np.allclose(a["T_world_camera"],b["T_world_camera"],rtol=0,atol=1e-7)
+                for a,b in zip(poses,prior)):
+            raise ValueError("Replay reference cameras differ from this prepared recording")
+        by_name={f["name"]:f for f in frames}
+        for k in range(0,len(frames),batch_frames):
+            names=tuple(f["name"] for f in frames[k:k+batch_frames])
+            matching=[row["views"][len(names):] for row in reference["working_sets"]
+                      if row["crop"] is None and tuple(row["views"][:len(names)])==names]
+            if not matching or any(row!=matching[0] for row in matching):
+                raise ValueError(f"Replay reference has no consistent unpartitioned group: {names[0]}")
+            selected=matching[0]
+            if (len(selected)>replay_views or len(set(selected))!=len(selected) or
+                    any(name not in by_name or name in names or by_name[name]["validation"] for name in selected)):
+                raise ValueError(f"Replay reference has invalid training views: {names[0]}")
+            frozen_replays[names]=[by_name[name] for name in selected]
     work = output/"work"; work.mkdir()
     history = []
+    covered=np.zeros(len(model),bool)
     for sweep in range(sweeps):
         groups = [(frames[k:k+batch_frames],None) for k in range(0,len(frames),batch_frames)]
         if sweep % 2: groups.reverse()
@@ -382,11 +457,14 @@ def refine(root, output, binary, voxel=.08, epochs=12, sweeps=2, batch_frames=40
             distance = np.linalg.norm(camera_positions-center,axis=1)
             candidates = [f for k,f in enumerate(frames) if distance[k]<radius and not f["validation"] and f["name"] not in ids]
             current_header=crop_header(header,crop)
-            base_active=visible_rows(model[:,:3],group,current_header,spatial_index,far=60.)
+            support_beyond=60. if training_depth>60. else None
+            base_active=visible_rows(model[:,:3],group,current_header,spatial_index,far=training_depth,support_beyond=support_beyond,support_masks=sky_masks)
             # Distance alone admits cameras looking down a different road. Select
             # replay using common observed surfaces, including opposite-direction
-            # revisits when they actually see those surfaces.
-            sample=base_active[::max(1,len(base_active)//2048)]
+            # revisits when they actually see those surfaces. Keep the local replay
+            # selection unchanged when expanding the optimization depth range.
+            replay_active=base_active if training_depth==60. else visible_rows(model[:,:3],group,current_header,spatial_index,far=60.)
+            sample=replay_active[::max(1,len(replay_active)//2048)]
             targets=np.asarray(model[sample,:3],float)
             near=cKDTree(group_positions).query(targets)[0]<80 if len(targets) else np.zeros(0,bool)
             targets=targets[near]
@@ -401,8 +479,13 @@ def refine(root, output, binary, voxel=.08, epochs=12, sweeps=2, batch_frames=40
                 candidates = [candidates[k] for k in np.linspace(0,len(candidates)-1,replay_views,dtype=int)]
             elif replay_views == 0:
                 candidates = []
+            if frozen_replays:
+                names=tuple(f["name"] for f in group)
+                if names not in frozen_replays:
+                    raise ValueError("Replay reference requires the same temporal groups; increase GPU budget instead of splitting groups")
+                candidates=frozen_replays[names]
             cameras = group+candidates
-            active = visible_rows(model[:, :3], cameras, current_header, spatial_index,far=60.) if candidates else base_active
+            active = visible_rows(model[:, :3], cameras, current_header, spatial_index,far=training_depth,support_beyond=support_beyond,support_masks=sky_masks) if candidates else base_active
             if len(active)>max_active:
                 w0,h0=map(int,header.split()[:2]);x,y,w,h=crop or (0,0,w0,h0)
                 if min(w,h)>64:
@@ -425,6 +508,8 @@ def refine(root, output, binary, voxel=.08, epochs=12, sweeps=2, batch_frames=40
             prepare_batch(folder, header, cameras, crop,sky_masks,background)
             write_ply(folder/"input.ply", model[active])
             np.asarray(bounds[active],dtype="<f4").tofile(folder/"scale_bounds.bin")
+            if color_weight:
+                (folder/"appearance_regularization.txt").write_text(f"{color_weight}\n")
             dest = folder/"optimized"
             print(f"[shared] sweep {sweep+1}/{sweeps} group {group_index}: {len(active)} anchors, {len(group)} views + {len(candidates)} replay, crop={crop}",flush=True)
             with open(output/"training.log","a") as log:
@@ -437,6 +522,7 @@ def refine(root, output, binary, voxel=.08, epochs=12, sweeps=2, batch_frames=40
                 raise ValueError("Non-finite shared map")
             model[active] = trained
             model.flush()
+            covered[active]=True
             del trained
             optimization=json.loads((dest/"training_info.json").read_text()) if (dest/"training_info.json").exists() else {}
             history.append(dict(sweep=sweep,group=group_index,active=len(active),crop=crop,
@@ -445,17 +531,29 @@ def refine(root, output, binary, voxel=.08, epochs=12, sweeps=2, batch_frames=40
             group_index += 1
         write_ply(output/"point_cloud.ply",model)
     save_centres(output/"gaussian_centers.pcd",model)
+    seed_info=json.loads((output/"seed_info.json").read_text())
     info=dict(status="trained_pending_replay",backend="Gaussian-LIC shared fixed-pose surface map",frames=len(frames),
               prepared_input=str(root),initial_state=str(initial_state) if initial_state else None,
               intrinsics=dict(zip(["width","height","fx","fy","cx","cy"],map(float,header.split()))),
               train_frames=sum(not f["validation"] for f in frames),heldout_frames=sum(f["validation"] for f in frames),
               gaussians=len(model),pose_optimization=False,depth_source="accepted native LiDAR surface; measured per-camera depth",
               surface_constraints=surface,voxel_m=voxel,sweeps=sweeps,epochs_per_batch=epochs,
-              static_visibility_filter=json.loads((output/"seed_info.json").read_text())["static_visibility_filter"],
+              surface_scale_factor=surface_scale_factor,surface_rgb_min_alpha=.5,
+              color_weight=color_weight,
+              training_order=("fixed mt19937 seed 42 per working-set process; a new shuffle seed per epoch"
+                              if surface else "upstream system-random view order"),
+              static_visibility_filter=seed_info["static_visibility_filter"],
+              echo_policy=seed_info["echo_policy"],
+              distant_surface=seed_info.get("distant_surface",bool(seed_info.get("distant_anchors_before_visibility"))),
+              distant_anchors_before_visibility=seed_info.get("distant_anchors_before_visibility",0),
               sky_masks=sky_masks,dynamic_masks=sky_masks,
               background_rgb=background,
-              batch_frames=batch_frames,max_active=max_active,training_depth_limit_m=60.,elapsed_sec=time.monotonic()-started,
-              replay_views=replay_views,metrics=[],working_sets=history)
+              batch_frames=batch_frames,max_active=max_active,training_depth_limit_m=training_depth,
+              measured_support_beyond_m=60. if training_depth>60. else None,
+              anchors_in_training_worksets=int(covered.sum()),anchors_outside_training_worksets=int((~covered).sum()),
+              elapsed_sec=time.monotonic()-started,
+              replay_views=replay_views,replay_reference=str(replay_reference) if replay_reference else None,
+              metrics=[],working_sets=history)
     if (root.parent/"preparation.json").is_file():
         info["preparation"]=json.loads((root.parent/"preparation.json").read_text())
     (output/"map_info.json").write_text(json.dumps(info,indent=2))
@@ -476,7 +574,9 @@ def replay_saved_map(root,model_path,output,binary,background,batch_frames=2):
     for start in range(0,len(heldout),batch_frames):
         group=heldout[start:start+batch_frames];dest=output/f"batch_{start:04d}"
         csv_path=dest/"metrics.csv";rows=list(csv.DictReader(csv_path.open())) if csv_path.is_file() else []
-        ready=sorted(r["frame"] for r in rows)==sorted(f["name"] for f in group)
+        ready=(sorted(r["frame"] for r in rows)==sorted(f["name"] for f in group) and
+               all((dest/("merged_"+f["name"]+"_alpha.png")).is_file() and
+                   (dest/("merged_"+f["name"]+"_depth.bin")).is_file() for f in group))
         if not ready:
             if dest.exists():shutil.rmtree(dest)
             if work.exists():shutil.rmtree(work)
@@ -513,12 +613,19 @@ def main():
     ap.add_argument("--sweeps",type=int,default=2);ap.add_argument("--batch-frames",type=int,default=40)
     ap.add_argument("--max-active",type=int,default=3000000)
     ap.add_argument("--replay-views",type=int,default=40)
+    ap.add_argument("--replay-reference",type=Path,help="Reuse per-temporal-group training replay lists from an unpartitioned map_info.json")
+    ap.add_argument("--training-depth",type=float,help="Maximum camera depth in training worksets (default: 60 m; native geometry selection remains fixed)")
+    ap.add_argument("--surface-scale-factor",type=float,help="Absolute multiplier of original PCA-plane tangent upper bounds (default: retain initial-state bounds, or 1)")
+    ap.add_argument("--color-weight",type=float,default=0.,help="Soft penalty for DC colors outside [0,1]")
     ap.add_argument("--resume-replay",action="store_true",help="Finish heldout replay from an exported training checkpoint")
     ap.add_argument("--initial-state",type=Path,help="Reuse state.npy/bounds.npy/seed_info.json from a prior native preparation or refinement")
     ap.add_argument("--no-surface",action="store_true");ap.add_argument("--no-evaluate",action="store_true")
     ap.add_argument("--no-static-filter",action="store_true")
     ap.add_argument("--no-sky-masks",action="store_true")
+    ap.add_argument("--distant-surface",action="store_true",help="Unsupported: D-stage geometry does not supplement distant returns")
     a=ap.parse_args()
+    if a.distant_surface:
+        ap.error("--distant-surface is disabled; D-stage mapping requires the native accepted surface")
     if a.resume_replay:
         output=a.output.resolve();info_path=output/"map_info.json";info=json.loads(info_path.read_text());started=time.monotonic()
         info["metrics"]=replay_saved_map(a.prepared,output/"point_cloud.ply",output/"views",a.binary.resolve(),info["background_rgb"])
@@ -528,9 +635,12 @@ def main():
         if (output/"work").exists():shutil.rmtree(output/"work")
         print(json.dumps({k:info[k] for k in ["status","frames","gaussians","elapsed_sec"]}),flush=True)
         return
-    if not (.01<=a.voxel<=.3 and a.epochs>=1 and a.sweeps>=1 and a.batch_frames>=2 and a.max_active>=1000 and a.replay_views>=0):
+    if not (.01<=a.voxel<=.3 and a.epochs>=1 and a.sweeps>=1 and a.batch_frames>=2 and a.max_active>=1000 and a.replay_views>=0
+            and (a.training_depth is None or np.isfinite(a.training_depth) and a.training_depth>1)
+            and (a.surface_scale_factor is None or 1<=a.surface_scale_factor<=2)
+            and 0<=a.color_weight<=1):
         ap.error("Invalid shared mapping budget")
-    refine(a.prepared,a.output,a.binary,a.voxel,a.epochs,a.sweeps,a.batch_frames,a.max_active,not a.no_surface,not a.no_evaluate,a.replay_views,not a.no_static_filter,not a.no_sky_masks,a.initial_state)
+    refine(a.prepared,a.output,a.binary,a.voxel,a.epochs,a.sweeps,a.batch_frames,a.max_active,not a.no_surface,not a.no_evaluate,a.replay_views,not a.no_static_filter,not a.no_sky_masks,a.initial_state,a.distant_surface,a.training_depth,a.replay_reference,a.surface_scale_factor,a.color_weight)
 
 
 if __name__=="__main__":main()

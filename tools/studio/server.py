@@ -145,7 +145,7 @@ class Handler(BaseHTTPRequestHandler):
         reload_app_modules()
         try:
             fn()
-        except StudioError as exc:
+        except common.StudioError as exc:
             self._send(400, {"error": str(exc)})
         except PermissionError as exc:
             self._send(403, {"error": str(exc)})

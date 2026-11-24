@@ -22,6 +22,7 @@ REPO = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "tools" / "calib"))
 sys.path.insert(0, str(REPO / "tools"))
 from livo_calib import dump_camera_stream, decode_hevc, read_run_frames  # noqa: E402
+from livo.camera import camera_transform_key, select_camera  # noqa: E402
 
 
 def read_params(fusion):
@@ -51,11 +52,11 @@ def main():
     fusion = pathlib.Path(a.fusion_dir)
     params = read_params(fusion)
     cam_offset = float(params.get("effective.img_time_offset_sec", params.get("time_offset.img_time_offset", 0.0)))
-    calib = json.loads(pathlib.Path(a.calibration).read_text())
+    calib = select_camera(json.loads(pathlib.Path(a.calibration).read_text()))
     cam = calib["camera"]; fx, fy, cx, cy = cam["intrinsics"]; dist = np.array(cam.get("distortion", [0] * 5), float)
     s = a.scale
     K = np.array([[fx * s, 0, cx * s], [0, fy * s, cy * s], [0, 0, 1]])
-    T_rear_cam = np.asarray(calib["transforms"]["midrange_camera_to_rear_axle"]["transform_matrix"], float).reshape(4, 4)
+    T_rear_cam = np.asarray(calib["transforms"][camera_transform_key(calib)]["transform_matrix"], float).reshape(4, 4)
     T_cam_rear = np.linalg.inv(T_rear_cam)
 
     fr = read_run_frames(fusion)
@@ -74,7 +75,9 @@ def main():
         rj = json.loads(round_json.read_text())
         start_rel = float((rj.get("options") or {}).get("start_offset") or (rj.get("playback") or {}).get("start_offset") or 0.0)
     img_stamps, stream = dump_camera_stream(pathlib.Path(a.bag), out_dir, duration=stamps[-1] - stamps[0] + 6.0,
-                                            start=max(0.0, start_rel - 3.0))
+                                            start=max(0.0, start_rel - 3.0), camera=cam)
+    if not len(img_stamps):
+        sys.exit("selected camera stream has no decodable frames in the run window")
     eff = img_stamps + cam_offset
     if eff[-1] < stamps[0] or eff[0] > stamps[-1]:
         sys.exit("camera stream does not overlap the run window (start offset?)")
@@ -86,7 +89,7 @@ def main():
     step = max(1, len(cand) // a.frames)
     chosen = [int(k) for k in cand[::step]][:a.frames]
     images = {}
-    for k, img in decode_hevc(stream, s, keep=set(chosen)):
+    for k, img in decode_hevc(stream, s, keep=set(chosen), camera=cam):
         g = cv2.GaussianBlur(img, (0, 0), 1.0).astype(np.float32)
         gx = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3); gy = cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3)
         mag = cv2.GaussianBlur(np.sqrt(gx * gx + gy * gy), (0, 0), 1.5)
