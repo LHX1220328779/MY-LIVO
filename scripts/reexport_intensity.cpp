@@ -1,4 +1,4 @@
-// Regenerate intensity chunks and exact row masks from native scan archives and final correction knots.
+// Regenerate intensity chunks/row masks, or RGB chunks from existing accepted rows and paired colours.
 // Does not rerun or alter the estimator; rejects an existing output directory.
 #include "rtk_fusion.h"
 #include <fstream>
@@ -11,7 +11,9 @@
 int main(int argc, char **argv)
 {
   try {
-    if (argc != 3) throw std::runtime_error("usage: reexport_intensity SOURCE_FUSION NEW_OUTPUT");
+    const bool rgb_only = argc == 4 && std::string(argv[3]) == "--rgb-only";
+    if (argc != 3 && !rgb_only)
+      throw std::runtime_error("usage: reexport_intensity SOURCE_FUSION NEW_OUTPUT [--rgb-only]");
     const std::filesystem::path source = std::filesystem::absolute(argv[1]);
     const std::filesystem::path output = std::filesystem::absolute(argv[2]);
     if (std::filesystem::exists(output)) throw std::runtime_error("output must be a new directory");
@@ -51,7 +53,7 @@ int main(int argc, char **argv)
       const auto scratch=output/"context";
       RtkFusion fusion(node,rotation,translation,V3D::Zero(),scratch.string());
       fusion.finish(); // Stop the empty worker before loading the saved final state.
-      fusion.archive.close();fusion.color_archive.close();fusion.frame_index.close();
+      fusion.archive.close();fusion.source_archive.close();fusion.color_archive.close();fusion.frame_index.close();
       fusion.directory=output;
       fusion.frames=std::move(frames);fusion.observations_enabled=true;
       const auto number = [&](const char *key, double &value) {
@@ -68,6 +70,15 @@ int main(int argc, char **argv)
       number("rtk.save_map_priority_free_range_m", fusion.save_map_priority_free_range);
       flag("rtk.save_map_priority_enabled", fusion.save_map_priority_enabled);
       flag("rtk.save_map_priority_fill", fusion.save_map_priority_fill);
+      if (rgb_only) {
+        fusion.color_enabled = true;
+        number("rtk.save_rgb_max_range", fusion.save_rgb_max_range);
+        number("rtk.save_rgb_voxel", fusion.save_rgb_voxel);
+        if (fusion.save_rgb_max_range < 0) fusion.save_rgb_max_range = fusion.save_map_max_range;
+        if (!std::filesystem::is_regular_file(source / "colors.bin") ||
+            !std::filesystem::is_regular_file(source / "map_rows.bin"))
+          throw std::runtime_error("RGB re-export requires paired colours and the accepted intensity row mask");
+      }
       // Restore physical mounts in the archived source order, as LIVMapper does.
       if (std::filesystem::exists(source/"sources.bin")) {
         Json::Value calibration; std::ifstream calib(params.at("multi_lidar.calibration_file"));
@@ -93,14 +104,20 @@ int main(int argc, char **argv)
         fusion.keyframes.push_back(k);
       }
       if(fusion.keyframes.empty())throw std::runtime_error("no correction knots");
-      for(const char* file:{"scans.bin","sources.bin","frames.csv","corrections.txt","parameters.txt","keyframes.csv"}) {
+      for(const char* file:{"scans.bin","sources.bin","frames.csv","corrections.txt","parameters.txt","keyframes.csv","colors.bin"}) {
         if (!std::filesystem::exists(source/file)) continue;
         const auto target=output/file;
         if(std::filesystem::exists(target)) throw std::runtime_error("output archive link already exists");
         std::filesystem::create_symlink(source/file,target);
       }
-      std::cout<<"Re-exporting "<<fusion.frames.size()<<" saved frames using RtkFusion::exportIntensityMap"<<std::endl;
-      fusion.exportIntensityMap();
+      if (rgb_only) {
+        std::filesystem::create_symlink(source / "map_rows.bin", output / "map_rows.bin");
+        std::cout<<"Re-exporting "<<fusion.frames.size()<<" saved frames using RtkFusion::exportRgbMap and the existing row mask"<<std::endl;
+        fusion.exportRgbMap();
+      } else {
+        std::cout<<"Re-exporting "<<fusion.frames.size()<<" saved frames using RtkFusion::exportIntensityMap"<<std::endl;
+        fusion.exportIntensityMap();
+      }
     }
     rclcpp::shutdown();return 0;
   } catch(const std::exception& e){std::cerr<<e.what()<<std::endl;return 1;}

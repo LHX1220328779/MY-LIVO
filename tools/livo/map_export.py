@@ -9,21 +9,20 @@ point = native scan-end pose * LiDAR extrinsic * p, delivered point = C(t) * nat
 
 Products (default <fusion_run>/map/):
   global_map.pcd          native accepted rows, reduced to 10 cm voxels by default (centroid; x y z intensity)
-  global_map_rgb.pcd      independent paired-frame camera map: every original coloured return before geometry
-                          row masks / range priority; one nearest/slowest original observation per 3 cm voxel
-                          (LIVORGB2 current scans, or LIVORGB1 older coloured observations)
+  global_map_rgb.pcd      same native accepted rows with valid paired-frame camera colors; one nearest/slowest
+                          original observation per 3 cm voxel (requires scan-aligned LIVORGB2 colors)
   tiles/tile_<i>_<j>.pcd  optional square tiles (--tile M) of the same products for large sites
   keyframes/              optional (--keyframe-clouds): per-keyframe body-frame clouds + poses.txt (TUM)
   map_info.json           frame, voxel size, source, ranges, counts, bounds, time span, inputs, calibration
 
 Source: --source all (every scan) | keyframes (only the scans at backend keyframes: ~5x lighter,
-same surfaces). Standard intensity products require a positive voxel size and map_rows.bin from a D-stage run:
+same surfaces). Both products require map_rows.bin from a D-stage run; intensity also requires a positive voxel:
 native range priority enabled, ratio 1.5, margin 2 m, cell 0.5 m, seen-free range 25 m, detail fill enabled and
 a finite positive native map filter. They always preserve the mapper's accepted-row decision.
 --max-range / --min-range only further crop these rows; --priority-* must match the source run and cannot
-disable its selection. Raw/full-return intensity export is not supported.
-The independent RGB product retains its own paired-frame observations and 3 cm voxel; --rgb-only does not
-require an intensity row mask.
+disable its selection. Raw/full-return geometry export is not supported.
+RGB uses the same accepted-row mask and crop before selecting valid paired-frame colors and applying its
+3 cm voxel. --rgb-only also requires this mask; old non-aligned LIVORGB1 colors cannot be exported safely.
 
     /usr/bin/python3 tools/livo/map_export.py results/<round> [--voxel 0.1] [--source all] [--tile 100]
 """
@@ -41,7 +40,6 @@ import time
 import numpy as np
 
 HEADER_SCANS = b"LIVORTK3"
-HEADER_COLORS = b"LIVORGB1"       # older rounds: float32 x,y,z,r,g,b per coloured return (native world)
 HEADER_COLOUR_ROWS = b"LIVORGB2"  # uint32 per scans.bin return: view distance m << 24 | rgb, 0 = none
 
 
@@ -318,7 +316,7 @@ def voxel_keys(xyz, voxel):
 
 
 def voxel_select_rgb(rec, voxel):
-    """恢复独立彩色产品：每个 RGB 体素保留全图最优的原始观测，坐标和颜色一起保留。"""
+    """每个 RGB 体素保留全图最优的已选原始观测，坐标和颜色一起保留。"""
     if not len(rec):
         return np.empty(0, XYZRGB)
     xyz = np.stack([rec["x"], rec["y"], rec["z"]], 1)
@@ -376,7 +374,7 @@ def _project_frames(job):
     rgbbuf = TileBuffer(tmp / "rgb", RGBREC, limit=6_000_000, prefix=f"w{wid}_") if c["rgb_wanted"] else None
     st = {"returns_in": 0, "returns_kept": 0, "returns_in_cap": 0, "t0": None, "t1": None, "kf": [], "rgb_frames": []}
     n_frames = len(fr["stamp"])
-    rows = np.memmap(c["rows"], dtype=np.uint8, mode="r") if c["rows"] else None
+    rows = np.memmap(c["rows"], dtype=np.uint8, mode="r")
     with open(run / "scans.bin", "rb") as scans:
         colors = open(run / "colors.bin", "rb") if rgbbuf is not None else None
         for i in frame_ids:
@@ -391,16 +389,15 @@ def _project_frames(job):
             rng = np.linalg.norm(p, axis=1)
             in_cap = keep & (rng <= c["max_range"]) if c["max_range"] > 0 else keep
             st["returns_in_cap"] += int(np.count_nonzero(in_cap))
-            if rows is not None:   # the mapper's decision (its float32 cap, range priority, seen-free cells)
-                s0 = int(c["rows_start"][i])
-                keep &= np.unpackbits(rows[s0:s0 + (cnt + 7) // 8], bitorder="little")[:cnt].astype(bool)
+            # The shared mapper decision includes range priority, seen-free cells and chunk filtering.
+            s0 = int(c["rows_start"][i])
+            keep &= np.unpackbits(rows[s0:s0 + (cnt + 7) // 8], bitorder="little")[:cnt].astype(bool)
             keep &= in_cap  # explicit distance limits can only crop the accepted native surface
             if a.min_range > 0:
                 keep &= rng >= a.min_range
+            st["returns_kept"] += int(np.count_nonzero(keep))
             begin, stamp = fr["begin"][i], fr["stamp"][i]
-            if a.rgb_only:
-                keep[:] = False
-            if keep.any():
+            if not a.rgb_only and keep.any():
                 p, inten, off = p[keep], pts[keep, 3], pts[keep, 4].astype(np.float64)
                 times = np.clip(begin + off / 1000.0, begin, stamp)
                 native = p @ (raw_R[i] @ lr).T + (raw_R[i] @ lt + raw_t[i])
@@ -409,7 +406,6 @@ def _project_frames(job):
                 rec["x"], rec["y"], rec["z"], rec["intensity"] = world[:, 0], world[:, 1], world[:, 2], inten
                 rec["r"], rec["f"] = rng[keep], i
                 geo.add(tile_key(world[:, :2], c["tile"], a.voxel), rec)
-                st["returns_kept"] += len(rec)
                 st["t0"] = stamp if st["t0"] is None else min(st["t0"], stamp)
                 st["t1"] = stamp if st["t1"] is None else max(st["t1"], stamp)
                 ordinal = c["kf_ordinal"].get(round(float(stamp), 6)) if a.keyframe_clouds else None
@@ -424,14 +420,13 @@ def _project_frames(job):
                     Rc, tc = correction_at(corr, stamp)
                     Rw, tw = Rc @ raw_R[i], Rc @ raw_t[i] + tc
                     st["kf"].append((ordinal, float(stamp), *map(float, tw), *rot_to_quat(Rw), name))
-            # 必须读取完整原始扫描的颜色，不能复用上面的 keep 或强度图行掩码，
-            # 否则即使每帧都已正确取色，导出后仍会大面积稀疏、出现条带。
-            if rgbbuf is not None and c["colour_rows"]:
+            # 颜色码逐行对应原始扫描，先共用强度 D 掩码与裁剪，再保留同帧有效颜色。
+            if rgbbuf is not None:
                 if int(fr["color_count"][i]) != cnt:
                     raise ValueError(f"camera colour count differs from scan {i}")
                 colors.seek(int(fr["color_offset_bytes"][i]))
                 code = np.frombuffer(colors.read(cnt * 4), dtype="<u4")
-                m = ((code >> 24) > 0) & np.isfinite(pts[:, :3]).all(1)
+                m = ((code >> 24) > 0) & keep
                 if c["rgb_range"] > 0:
                     m &= rng <= c["rgb_range"]
                 st["rgb_frames"].append((int(i), int(m.sum())))
@@ -449,28 +444,6 @@ def _project_frames(job):
                     rr["rgb"] = code[m] & 0xFFFFFF
                     # 与建图程序评分一致：距离越近越好，快速转向时提高代价。
                     rr["s"] = rng[m] + 20.0 * omega
-                    rgbbuf.add(tile_key(cw[:, :2], c["tile"], a.rgb_voxel), rr)
-            if rgbbuf is not None and not c["colour_rows"] and int(fr["color_count"][i]) > 0:
-                cc = int(fr["color_count"][i])
-                colors.seek(int(fr["color_offset_bytes"][i]))
-                col = np.frombuffer(colors.read(cc * 24), dtype="<f4").reshape(cc, 6).astype(np.float64)
-                origin = raw_R[i] @ lt + raw_t[i]
-                rng_c = np.linalg.norm(col[:, :3] - origin, axis=1)
-                m = rng_c <= c["rgb_range"] if c["rgb_range"] > 0 else np.ones(cc, bool)
-                st["rgb_frames"].append((int(i), int(m.sum())))
-                if m.any():
-                    st["t0"] = stamp if st["t0"] is None else min(st["t0"], stamp)
-                    st["t1"] = stamp if st["t1"] is None else max(st["t1"], stamp)
-                    omega = 0.0
-                    if i + 1 < n_frames:
-                        dtf = max(fr["stamp"][i + 1] - stamp, 1e-3)
-                        omega = np.linalg.norm(rot_log(raw_R[i].T @ raw_R[i + 1])) / dtf
-                    cw = apply_correction(col[m, :3], np.full(int(m.sum()), stamp), corr)
-                    r8, g8, b8 = (np.clip(col[m, k], 0, 255).astype(np.uint32) for k in (3, 4, 5))
-                    rr = np.empty(len(cw), RGBREC)
-                    rr["x"], rr["y"], rr["z"] = cw[:, 0], cw[:, 1], cw[:, 2]
-                    rr["rgb"] = (r8 << 16) | (g8 << 8) | b8
-                    rr["s"] = rng_c[m] + 20.0 * omega  # nearest observation wins; fast rotation penalised
                     rgbbuf.add(tile_key(cw[:, :2], c["tile"], a.rgb_voxel), rr)
         if colors:
             colors.close()
@@ -500,7 +473,7 @@ def _reduce_tile(tile_id):
 
 
 def _colour_tile(tile_id):
-    """独立归约全部彩色观测，使用 RGB 自身的分区，不受强度图分区和行掩码限制。"""
+    """归约共用原生掩码后的同帧着色观测，使用 RGB 自身的体素分区。"""
     c = _CTX
     rr = TileBuffer.load_all(c["tmp"] / "rgb", tile_id, RGBREC)
     return _tile_result("rgb", tile_id, voxel_select_rgb(rr, c["a"].rgb_voxel))
@@ -534,12 +507,12 @@ def export(a):
         except ValueError:
             max_range = 0.0
     rgb_wanted = bool(a.rgb and (run / "colors.bin").exists() and "color_count" in fr and fr["color_count"].sum() > 0)
-    colour_rows = False
     if a.rgb_only and not rgb_wanted:
         raise SystemExit("--rgb-only requires a camera colour archive")
     if rgb_wanted:
         with open(run / "colors.bin", "rb") as f:
-            colour_rows = f.read(8) == HEADER_COLOUR_ROWS
+            if f.read(8) != HEADER_COLOUR_ROWS:
+                raise SystemExit("D-stage RGB export requires scan-aligned LIVORGB2 colors; LIVORGB1 has no native row correspondence")
     rgb_range = a.rgb_max_range
     if rgb_wanted and rgb_range is None:
         try:
@@ -548,52 +521,49 @@ def export(a):
             rgb_range = -1.0
         if rgb_range < 0:
             rgb_range = max_range
-    priority = [0.0, 2.0, 0.5]  # RGB-only observations do not use intensity range priority.
-    native_selection = dict(echo_policy=None, seen_free_range_m=None, detail_fill=None, map_filter_m=None)
     rows_path, rows_start = run / "map_rows.bin", None
-    if not a.rgb_only:
-        enabled = prm.get("rtk.save_map_priority_enabled", "false")
-        if str(enabled).lower() not in ("true", "1"):
-            raise SystemExit("Standard intensity maps require a source run with native range priority enabled")
-        priority = []
-        for name, key in (("priority_ratio", "rtk.save_map_priority_ratio"),
-                          ("priority_margin", "rtk.save_map_priority_margin_m"),
-                          ("priority_cell", "rtk.save_map_priority_voxel_m")):
-            if key not in prm:
-                raise SystemExit(f"D-stage source selection is not recorded: {key}")
-            try:
-                native = float(prm[key])
-            except ValueError:
-                raise SystemExit(f"Invalid native range-priority setting: {key}") from None
-            requested = getattr(a, name)
-            if requested is not None and requested != native:
-                raise SystemExit(f"--{name.replace('_', '-')} must match the source run ({native:g}); "
-                                 "native accepted-row selection cannot be overridden")
-            priority.append(native)
-        if not np.isfinite(priority).all() or priority != [1.5, 2.0, 0.5]:
-            raise SystemExit("D-stage intensity maps require native ratio 1.5, margin 2 m and cell 0.5 m")
+    enabled = prm.get("rtk.save_map_priority_enabled", "false")
+    if str(enabled).lower() not in ("true", "1"):
+        raise SystemExit("Standard maps require a source run with native range priority enabled")
+    priority = []
+    for name, key in (("priority_ratio", "rtk.save_map_priority_ratio"),
+                      ("priority_margin", "rtk.save_map_priority_margin_m"),
+                      ("priority_cell", "rtk.save_map_priority_voxel_m")):
+        if key not in prm:
+            raise SystemExit(f"D-stage source selection is not recorded: {key}")
         try:
-            free_range = float(prm.get("rtk.save_map_priority_free_range_m", "0"))
-            native_filter = float(prm.get("rtk.save_map_filter", "0"))
+            native = float(prm[key])
         except ValueError:
-            raise SystemExit("Invalid native seen-free range or map filter") from None
-        detail_fill = str(prm.get("rtk.save_map_priority_fill", "false")).lower() in ("true", "1")
-        if not np.isfinite(free_range) or free_range != 25.0 or not detail_fill:
-            raise SystemExit("D-stage intensity maps require a native 25 m seen-free range and enabled detail fill")
-        if not np.isfinite(native_filter) or native_filter <= 0:
-            raise SystemExit("D-stage intensity maps require a finite positive native map filter")
-        native_selection = dict(echo_policy="native_accepted_rows_D_v1", seen_free_range_m=free_range,
-                                detail_fill=detail_fill, map_filter_m=native_filter)
-        if not rows_path.is_file():
-            raise SystemExit(f"Standard intensity maps require {rows_path}; occupied-cell fallback cannot reproduce native accepted rows")
-        if n_frames == 0:
-            raise SystemExit("The source run has no archived frames")
-        # Always preserve the mapper's decision, including with explicit crop/priority arguments.
-        counts = fr["count"].astype(np.int64)
-        rows_start = 8 + np.concatenate([[0], np.cumsum((counts + 7) // 8)[:-1]])
-        head = np.fromfile(rows_path, dtype=np.uint8, count=8)
-        if bytes(head) != b"LIVOMSK1" or rows_path.stat().st_size != int(rows_start[-1] + (counts[-1] + 7) // 8):
-            raise SystemExit(f"{rows_path} does not match frames.csv")
+            raise SystemExit(f"Invalid native range-priority setting: {key}") from None
+        requested = getattr(a, name)
+        if requested is not None and requested != native:
+            raise SystemExit(f"--{name.replace('_', '-')} must match the source run ({native:g}); "
+                             "native accepted-row selection cannot be overridden")
+        priority.append(native)
+    if not np.isfinite(priority).all() or priority != [1.5, 2.0, 0.5]:
+        raise SystemExit("D-stage maps require native ratio 1.5, margin 2 m and cell 0.5 m")
+    try:
+        free_range = float(prm.get("rtk.save_map_priority_free_range_m", "0"))
+        native_filter = float(prm.get("rtk.save_map_filter", "0"))
+    except ValueError:
+        raise SystemExit("Invalid native seen-free range or map filter") from None
+    detail_fill = str(prm.get("rtk.save_map_priority_fill", "false")).lower() in ("true", "1")
+    if not np.isfinite(free_range) or free_range != 25.0 or not detail_fill:
+        raise SystemExit("D-stage maps require a native 25 m seen-free range and enabled detail fill")
+    if not np.isfinite(native_filter) or native_filter <= 0:
+        raise SystemExit("D-stage maps require a finite positive native map filter")
+    native_selection = dict(echo_policy="native_accepted_rows_D_v1", seen_free_range_m=free_range,
+                            detail_fill=detail_fill, map_filter_m=native_filter)
+    if not rows_path.is_file():
+        raise SystemExit(f"Standard maps require {rows_path}; occupied-cell fallback cannot reproduce native accepted rows")
+    if n_frames == 0:
+        raise SystemExit("The source run has no archived frames")
+    # Always preserve the mapper's decision, including with explicit crop/priority arguments.
+    counts = fr["count"].astype(np.int64)
+    rows_start = 8 + np.concatenate([[0], np.cumsum((counts + 7) // 8)[:-1]])
+    head = np.fromfile(rows_path, dtype=np.uint8, count=8)
+    if bytes(head) != b"LIVOMSK1" or rows_path.stat().st_size != int(rows_start[-1] + (counts[-1] + 7) // 8):
+        raise SystemExit(f"{rows_path} does not match frames.csv")
     tile = a.tile if a.tile > 0 else 50.0
     tmp = pathlib.Path(tempfile.mkdtemp(prefix="map_export_", dir=out))
     for d in ("geo", "rgb", "red"):
@@ -602,10 +572,9 @@ def export(a):
     if a.keyframe_clouds:
         kf_dir.mkdir(exist_ok=True)
     _CTX.update(a=a, run=run, fr=fr, lt=lt, lr=lr, corr=corr, tmp=tmp, tile=tile, max_range=max_range or 0.0,
-                priority=(0.0, priority[1], priority[2]) if rows_start is not None else tuple(priority),
-                rows=str(rows_path) if rows_start is not None else None, rows_start=rows_start,
+                priority=(0.0, priority[1], priority[2]),
+                rows=str(rows_path), rows_start=rows_start,
                 rgb_wanted=rgb_wanted, rgb_range=(rgb_range or 0.0) if rgb_wanted else 0.0, kf_dir=kf_dir,
-                colour_rows=colour_rows,
                 raw_R=quat_to_rot(np.stack([fr["qx"], fr["qy"], fr["qz"], fr["qw"]], 1)),
                 raw_t=np.stack([fr["tx"], fr["ty"], fr["tz"]], 1),
                 kf_ordinal={round(float(s), 6): k for k, s in enumerate(kf_stamps)} if kf_stamps is not None else {})
@@ -637,7 +606,7 @@ def export(a):
         reduced = pool.map(_reduce_tile, jobs, chunksize=1)
         if rgb_wanted:
             reduced += pool.map(_colour_tile, TileBuffer.tiles_on_disk(tmp / "rgb"), chunksize=1)
-    stats["returns_range_priority"] = int(sum(r[6] for r in reduced if r[0] == "geo"))
+    stats["returns_range_priority"] = stats["returns_kept"]  # native selected rows, also in RGB-only exports
     files, tile_counts = {}, {}
     bounds = [np.full(3, np.inf), np.full(3, -np.inf)]
     tile_dir = out / "tiles"
@@ -685,15 +654,14 @@ def export(a):
         "frame": {"name": "mine", "description": "local metric frame of the INS odometry (x east, y north, z up); "
                   "trajectory_optimized.txt / corrections.txt use the same frame", "units": "m"},
         "projection": "point time t = scan begin + offset; delivered = C(t) * (native scan-end pose * LiDAR extrinsic * p); "
-                      "C(t) = SE(3) interpolation of the final correction knots (identical to the mapper's map_N.pcd, <1e-5 m)",
-        "source": a.source, "rgb_only": a.rgb_only, "rgb_geometry": "independent paired-frame camera observations", "voxel_m": a.voxel, "min_points_per_voxel": a.min_points,
+                      "C(t) = SE(3) interpolation of the final correction knots (same transform convention as the mapper; float32 rounding may differ)",
+        "source": a.source, "rgb_only": a.rgb_only, "rgb_geometry": "native accepted rows with paired-frame camera colors", "voxel_m": a.voxel, "min_points_per_voxel": a.min_points,
         "rgb_voxel_m": a.rgb_voxel if rgb_wanted else None,
         "range_m": {"min": a.min_range, "max": max_range or 0.0, "rgb_max": rgb_range if rgb_wanted else None},
         "range_priority": {"ratio": priority[0], "margin_m": priority[1], "cell_m": priority[2],
                            **native_selection,
-                           "rows": "map_rows.bin (mapper decision incl. seen-free cells)" if rows_start is not None
-                           else "not applied to independent RGB observations",
-                           "returns_in": stats["returns_in_cap"] if rows_start is not None else stats["returns_kept"],
+                           "rows": "map_rows.bin (shared intensity/RGB mapper decision incl. seen-free cells)",
+                           "returns_in": stats["returns_in_cap"],
                            "returns_kept": stats["returns_range_priority"]},
         "tile_m": a.tile if a.tile > 0 else None, "tiles": tile_counts or None,
         "points": files, "frames": stats,
@@ -703,8 +671,8 @@ def export(a):
         "keyframe_clouds": len(kf_poses) if a.keyframe_clouds else None,
         "fields": {"global_map.pcd": "x y z intensity (float32; voxel centroid and mean intensity)",
                    "global_map_rgb.pcd": "x y z rgb (packed uint32 0x00RRGGBB): original camera-observed points; "
-                                         "best range + 20*angular_rate observation per RGB voxel, independent of "
-                                         "intensity-map filters and chunk order"},
+                                         "best range + 20*angular_rate observation per RGB voxel after the shared native "
+                                         "intensity-map row mask and range crop"},
         "elapsed_s": round(time.time() - t_start, 1), "project_s": round(t_project, 1), "jobs": a.jobs,
     }
     (out / "map_info.json").write_text(json.dumps(info, indent=2, ensure_ascii=False) + "\n")
@@ -749,9 +717,9 @@ def build_parser():
                     help="drop geometry voxels with fewer returns (noise / briefly seen moving objects; 1 = keep all)")
     ap.add_argument("--rgb", dest="rgb", action="store_true", default=True)
     ap.add_argument("--no-rgb", dest="rgb", action="store_false", help="skip the colour map (LIVO rounds)")
-    ap.add_argument("--rgb-only", action="store_true", help="rebuild only the independent camera map from the full archive")
+    ap.add_argument("--rgb-only", action="store_true", help="rebuild only the colored native accepted rows from the scan-aligned color archive")
     ap.add_argument("--rgb-voxel", type=float, default=0.03,
-                    help="independent camera-map voxel (m): globally nearest/slowest original observation")
+                    help="color-map voxel (m): globally nearest/slowest accepted original observation")
     ap.add_argument("--rgb-max-range", type=float, default=None, help="colour range cap (m; default: the round's)")
     ap.add_argument("--jobs", type=int, default=min(8, max(1, (os.cpu_count() or 2) // 3)),
                     help="parallel worker processes (projection and per-tile reduction)")
